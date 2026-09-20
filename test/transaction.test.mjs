@@ -10,12 +10,23 @@ const rawTransaction = serializeTransaction(funding).toString('hex');
 const utxo = { txid: transactionId(funding), vout: 0, amount: funding.outputs[0].amount, rawTransaction, privateKey: account.privateKey };
 
 test('money keeps exact 10-decimal precision and rejects floats/negative/overflow', () => {
+  assert.equal(COIN, 10000000000n);
+  assert.equal(parseCoinAmount('0.0000000001'), 1n);
+  assert.equal(formatCoinAmount('1'), '0.0000000001');
   assert.equal(parseCoinAmount('1.0000000001'), 10000000001n);
   assert.equal(formatCoinAmount('10000000001'), '1.0000000001');
   assert.equal(formatCoinAmount('10000000000'), '1');
   for (const value of ['-1', '1e3', '0.00000000001', '100000001', '01', 'Infinity', 'NaN', '.1', '1.']) assert.throws(() => parseCoinAmount(value));
   assert.throws(() => amountInConnects(100));
   assert.throws(() => amountInConnects('01'));
+});
+
+test('invalid coin amounts identify CONN and its existing decimal precision', () => {
+  for (const value of ['1.00000000001', '1 CONN', '1 CC', 1]) {
+    assert.throws(() => parseCoinAmount(value), {
+      name: 'Error', message: 'Enter a CONN amount with at most 10 decimal places',
+    });
+  }
 });
 test('typed outputs roundtrip canonically without Bitcoin Script wire encoding', () => {
   assert.deepEqual(parseTransaction(rawTransaction), funding);

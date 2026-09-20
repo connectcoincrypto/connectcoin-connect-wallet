@@ -5,7 +5,7 @@ import { decodeAddress, hash256, publicKeyFromPrivate, sha256, signSchnorr, tagg
 
 export const COIN = 10_000_000_000n;
 export const MAX_MONEY = 100_000_000n * COIN;
-export const DEFAULT_FEE_RATE = 1500; // integer connects/vbyte, NOT CC or sat/vbyte
+export const DEFAULT_FEE_RATE = 1500; // integer connects/vbyte, NOT CONN or sat/vbyte
 export const MAX_PROOF_SIZE = 65536;
 const MAX_TX_BYTES = 4_000_000;
 const MAX_INPUTS = 10000;
@@ -18,7 +18,7 @@ export function amountInConnects(value) {
   return amount;
 }
 export function parseCoinAmount(value) {
-  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,8})(\.[0-9]{1,10})?$/.test(value)) throw new Error('Enter a CC amount with at most 10 decimal places');
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,8})(\.[0-9]{1,10})?$/.test(value)) throw new Error('Enter a CONN amount with at most 10 decimal places');
   const [whole, decimal = ''] = value.split('.');
   return amountInConnects(BigInt(whole) * COIN + BigInt(decimal.padEnd(10, '0')));
 }

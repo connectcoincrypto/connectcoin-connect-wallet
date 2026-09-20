@@ -85,7 +85,7 @@ m/44'/1'/0'/0/index    receive addresses
 m/44'/1'/0'/1/index    change addresses
 ```
 
-The child key is used as a **native ConnectCoin x-only P2PK key**, with no Bitcoin Taproot/BIP86 key tweak. Amounts use 10 decimal places: **1 CC = 10,000,000,000 connects**. Bitcoin transaction libraries cannot be substituted for ConnectCoin's typed-output serialization.
+The child key is used as a **native ConnectCoin x-only P2PK key**, with no Bitcoin Taproot/BIP86 key tweak. Amounts use 10 decimal places: **1 CONN = 10,000,000,000 connects**. Bitcoin transaction libraries cannot be substituted for ConnectCoin's typed-output serialization.
 
 Restoration scans both chains with a **20-unused-address gap**. Restored wallets continue watching that lookahead for later payments to previously issued, unused addresses. Creating receive addresses is bounded by the same gap. Discovery can take time because requests respect the public API's rate limits. This release has a 1,000-address safety limit per chain; it reports an error instead of silently claiming complete recovery beyond that limit. Keep the derivation convention with your offline backup. A BIP39 phrase alone does not make the wallet compatible with every other application's derivation scheme. This is not an importer for ConnectCoin Core's `wallet.dat`.
 

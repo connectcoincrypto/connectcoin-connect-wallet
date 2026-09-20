@@ -18,10 +18,10 @@ const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
 const fixture = {
   phase: 'unlocked', setupActive: false, securityEpoch: 1,
-  wallet: { name: 'Presentation fixture', address: 'test-fixture-not-an-address', balance: { available: '0', confirmed: '0', pending: '0' } },
+  wallet: { name: 'Presentation fixture', address: 'test-fixture-not-an-address', balance: { available: '1.0000000001', confirmed: '1', pending: '0.0000000001' } },
   network: { chain: 'testnet4', host: '127.0.0.1', port: 1, status: 'connected', height: 60000 },
   config,
-  history: Array.from({ length: 500 }, (_, index) => ({ txid: index.toString(16).padStart(64, '0'), direction: 'received', amount: '1', confirmations: 1, status: 'confirmed' })),
+  history: Array.from({ length: 500 }, (_, index) => ({ txid: index.toString(16).padStart(64, '0'), direction: 'received', amount: index === 0 ? '0.0000000001' : '1', confirmations: 1, status: 'confirmed' })),
   claims: { enabled: true, available: 1000, sent: 0, completed: 0, attempts: 0, status: 'searching', helperAvailable: true, lastError: null },
   busy: false, error: null, diagnostics: null,
 };
@@ -65,6 +65,24 @@ try {
     window.setSize(1080, 720);
     window.webContents.send('connectwallet:state', snapshot);
   }, fixture);
+
+  stage = 'CONN monetary displays and exact precision';
+  await page.getByRole('heading', { name: 'A little more connected.' }).waitFor();
+  assert.equal(await page.locator('.balance-number').textContent(), '1.0000000001CONN');
+  assert.deepEqual(await page.locator('.balance-detail strong').allTextContents(), ['1 CONN', '0.0000000001 CONN']);
+  assert.equal(await page.locator('.activity-row .amount').first().textContent(), '+0.0000000001 CONN');
+  assert.doesNotMatch(await page.locator('#app').textContent(), /\bCC\b/, 'Overview must use the CONN monetary ticker.');
+  await page.locator('[data-view="send"]').first().click();
+  for (const mode of ['address', 'bounty']) {
+    await page.locator(`[data-send-mode="${mode}"]`).click();
+    await page.getByRole('heading', { name: mode === 'bounty' ? 'Pay for a connection.' : 'Send ConnectCoin', exact: true }).waitFor();
+    assert.equal(await page.locator('.input-suffix').textContent(), 'CONN');
+    assert.equal(await page.locator('#send-form .field-label small').first().textContent(), 'Available: 1.0000000001 CONN');
+    assert.match(await page.locator('.advanced-fee .field-help').textContent(), /10,000,000,000 connects = 1 CONN\./);
+    assert.equal(await page.locator('#send-fee').inputValue(), '1500');
+    assert.doesNotMatch(await page.locator('#app').textContent(), /\bCC\b/, `${mode} payment mode must use the CONN monetary ticker.`);
+  }
+
   await page.locator('[data-view="claims"]').first().click();
   await page.getByRole('heading', { name: 'Every connection has potential.' }).waitFor();
   await page.evaluate(() => {
@@ -168,4 +186,4 @@ try {
   await rm(absolute, { recursive: true, force: true });
   if (!passed) console.error(`Load metrics: ${JSON.stringify(measurements)}`);
 }
-if (passed) console.log(`PASS: isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress and graceful shutdown (${measurements.closeMs} ms). No wallet or RPC used.`);
+if (passed) console.log(`PASS: CONN overview/Send/bounty displays with exact precision, isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress and graceful shutdown (${measurements.closeMs} ms). No wallet or RPC used.`);
