@@ -9,7 +9,7 @@ export const GENESIS = Object.freeze({
 });
 export const DEFAULT_CONFIG = Object.freeze({
   version: 1, network: 'testnet4', rpc: Object.freeze({ host: 'connectcoin4.com', port: 48190 }),
-  claims: Object.freeze({ maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }),
+  claims: Object.freeze({ enabled: false, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }),
   autoLockMinutes: 15, feeRate: 1500, theme: 'system', developerMode: false,
 });
 export function validateTheme(theme) {
@@ -50,6 +50,7 @@ export function validateConfig(input, { allowRegtest = false } = {}) {
     developerMode: validateDeveloperMode(merged.developerMode),
     rpc: validateRpcEndpoint(merged.rpc),
     claims: {
+      enabled: boolean(merged.claims.enabled, 'Automatic Claims'),
       maxConnectionsPerSecond: integer(merged.claims.maxConnectionsPerSecond, 1, 256, 'Connection starts per second'),
       maxConcurrent: integer(merged.claims.maxConcurrent, 1, 256, 'Simultaneous connections'),
       lookbackBlocks: integer(merged.claims.lookbackBlocks, 1, 600, 'Recent blocks'),
@@ -57,6 +58,10 @@ export function validateConfig(input, { allowRegtest = false } = {}) {
     autoLockMinutes: integer(merged.autoLockMinutes, 1, 60, 'Auto-lock minutes'),
     feeRate: integer(merged.feeRate, 1201, 100000, 'Fee rate'),
   };
+}
+function boolean(value, name) {
+  if (typeof value !== 'boolean') throw new Error(`Choose whether ${name} should be enabled.`);
+  return value;
 }
 export async function writeConfig(directory, config, options) {
   const validated = validateConfig(config, options);

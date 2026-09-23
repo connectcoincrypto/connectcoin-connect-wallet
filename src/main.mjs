@@ -12,11 +12,42 @@ const ICON = join(ROOT, '..', 'assets', 'icon.png');
 const ICON_URL = pathToFileURL(ICON).href;
 const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
-let window, service, quitting = false, actionInProgress = false;
+let window, service, quitting = false, closing = false, actionInProgress = false, closeSequence = 0;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
 function applyTheme(theme) {
   if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
   if (window && !window.isDestroyed()) window.setBackgroundColor(themeBackground());
+}
+
+async function flushWindowPreferences() {
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return true;
+  const requestId = ++closeSequence;
+  return new Promise(resolve => {
+    const finish = saved => { clearTimeout(timer); ipcMain.removeListener('connectwallet:close-ready', listener); resolve(saved); };
+    const listener = (event, reply) => {
+      if (event.sender === window?.webContents && event.senderFrame === window.webContents.mainFrame && event.senderFrame.url === UI_URL && reply?.requestId === requestId) finish(reply.saved === true);
+    };
+    const timer = setTimeout(() => finish(false), 5000);
+    ipcMain.on('connectwallet:close-ready', listener);
+    window.webContents.send('connectwallet:before-close', requestId);
+  });
+}
+
+async function quitAfterSavingPreferences() {
+  try {
+    while (!await flushWindowPreferences()) {
+      const { response } = await dialog.showMessageBox(window, {
+        type: 'warning', title: 'Settings have not finished saving',
+        message: 'Your latest settings could not be saved before closing.',
+        detail: 'Retry saving, keep the wallet open, or quit and discard any unsaved settings.',
+        buttons: ['Retry saving', 'Keep wallet open', 'Quit without saving'], defaultId: 0, cancelId: 1,
+      });
+      if (response === 1) return;
+      if (response === 2) break;
+    }
+    quitting = true;
+    try { await service?.close(); } finally { app.exit(0); }
+  } finally { closing = false; }
 }
 
 // Development UI tests use isolated temporary profiles; installed builds ignore this override.
@@ -37,9 +68,8 @@ else {
   app.on('second-instance', () => { window?.restore(); window?.focus(); });
   app.on('before-quit', event => {
     if (quitting) return;
-    event.preventDefault(); quitting = true;
-    void service?.close().finally(() => app.exit(0));
-    if (!service) app.exit(0);
+    event.preventDefault();
+    if (!closing) { closing = true; void quitAfterSavingPreferences(); }
   });
   app.on('window-all-closed', () => app.quit());
   // Do not top-level-await readiness: Electron waits for ESM evaluation first.
@@ -62,6 +92,8 @@ else {
         partition: 'connectwallet-ui', navigateOnDragDrop: false,
       },
     });
+    // Keep the renderer alive until its valid preference drafts reach disk.
+    window.on('close', event => { if (!quitting) { event.preventDefault(); app.quit(); } });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('will-navigate', event => event.preventDefault());
     window.webContents.on('will-attach-webview', event => event.preventDefault());

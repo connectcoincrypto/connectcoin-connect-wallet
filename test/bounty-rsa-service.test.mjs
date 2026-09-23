@@ -100,7 +100,7 @@ test('ordinary payments never probe and invalid bounties never open a TLS connec
   assert.equal(calls, 0);
 });
 
-for (const reason of ['cancel', 'lock', 'disconnect', 'settings']) {
+for (const reason of ['cancel', 'lock', 'disconnect', 'RPC settings']) {
   test(`${reason} cancels the probe and a late success cannot revive its preview`, async t => {
     const started = deferred(), finish = deferred(); let signal;
     const { service, broadcasts } = await fixture(t, async (_input, options) => { signal = options.signal; started.resolve(); return finish.promise; });
@@ -109,7 +109,7 @@ for (const reason of ['cancel', 'lock', 'disconnect', 'settings']) {
     await started.promise;
     if (reason === 'lock') await service.lock();
     else if (reason === 'disconnect') service.rpc.emit('disconnected');
-    else if (reason === 'settings') await service.saveConfig({ autoLockMinutes: 10 });
+    else if (reason === 'RPC settings') await service.saveConfig({ rpc: { port: 18001 } });
     else service.cancelSendPreview();
     assert.equal(signal.aborted, true);
     finish.resolve({ verified: true, status: 'verified' });

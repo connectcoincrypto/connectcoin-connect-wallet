@@ -57,6 +57,8 @@ export class WalletService extends EventEmitter {
     this.reserved = new Set(); this.fundingCache = new Map(); this.fundingPending = new Map(); this.lastActivity = Date.now(); this.persisting = Promise.resolve();
     this.statePublisher = new StatePublisher({ publish: () => this.emit('state', this.getState()) });
     this.statePriority = null;
+    this.settingsWrite = Promise.resolve(); this.claimToggleGeneration = 0; this.claimsResumePending = false;
+    this.walletGeneration = 0; this.claimsReviewRequired = false; this.claimsReviewGeneration = 0;
   }
   async initialize() {
     this.vaultFile = selectVaultFile(this.directory);
@@ -83,6 +85,7 @@ export class WalletService extends EventEmitter {
     this.network = { status: 'offline', chain: this.config.network, height: null };
     rpc.on('disconnected', () => {
       if (this.rpc !== rpc) return;
+      this.claimsResumePending = Boolean(this.config.claims.enabled && (this.engine?.enabled || this.claimsResumePending));
       this.tip = null;
       this.network.status = 'offline';
       this.cancelSendPreview();
@@ -134,7 +137,7 @@ export class WalletService extends EventEmitter {
     if (!this.config) return;
     // Progress bursts must not serialize history/QR/diagnostics once per bounty.
     // Security transitions and actionable errors bypass the progress throttle.
-    const priority = [this.epoch, Boolean(this.session), this.walletExists, this.config.developerMode,
+    const priority = [this.epoch, Boolean(this.session), this.walletExists, this.config.developerMode, this.config.claims.enabled,
       this.network.status, Boolean(this.engine?.enabled), this.error,
       this.claimInfo.lastErrorDiagnostic === true || this.claimInfo.lastErrorTransient === true
         ? null : this.claimInfo.lastError ?? null];
@@ -219,12 +222,14 @@ export class WalletService extends EventEmitter {
       else await createVault(this.vaultFile, data, password, { check });
     } catch (error) {
       if (error.walletPublished === true) {
+        this.walletGeneration++; this.claimsReviewRequired = false;
         this.walletExists = true; this.replacement = null; this.setup = null; this.epoch++;
         this.error = error.message; this.emitState();
       }
       throw error;
     }
     this.walletExists = true;
+    this.walletGeneration++; this.claimsReviewRequired = false;
     this.replacement = null;
     // Cancellation may arrive after publication while cleanup is still pending.
     // The saved wallet remains available, but that cancelled setup cannot unlock it.
@@ -250,6 +255,7 @@ export class WalletService extends EventEmitter {
     this.replacement = null; this.setup = null;
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
     this.buildAccounts(); await this.makeQR(); this.emitState();
+    if (this.session && !this.closed && this.config.claims.enabled) void this.resumeClaims();
     void this.refresh().catch(() => {});
   }
   publicAccount(index, change) {
@@ -283,6 +289,7 @@ export class WalletService extends EventEmitter {
   }
   async lock() {
     this.cancelSendPreview();
+    this.claimToggleGeneration++; this.claimsResumePending = false;
     this.epoch++; this.preview = null; this.setup = null; this.replacement = null;
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
@@ -454,7 +461,8 @@ export class WalletService extends EventEmitter {
       await this.persist(); this.assertSession(epoch); this.buildAccounts();
     }
     this.assertSession(epoch); this.error = null; this.emitState();
-    if (this.engine.enabled) await this.syncBounties();
+    if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
+    else if (this.engine.enabled) await this.syncBounties();
     return this.getState();
   }
   async funding(txid, { signal } = {}) {
@@ -575,61 +583,123 @@ export class WalletService extends EventEmitter {
       return { txid: preview.txid, status: 'submitted' };
     } catch { throw new Error(`Broadcast was not confirmed. Check transaction ${preview.txid} before trying again; selected inputs remain reserved until the wallet is reopened.`); }
   }
-  async saveConfig(input = {}) {
-    const config = validateConfig({ ...this.config, ...input, network: this.config.network, rpc: { ...this.config.rpc, ...input.rpc }, claims: { ...this.config.claims, ...input.claims } }, { allowRegtest: this.allowRegtest });
-    this.cancelSendPreview();
-    this.epoch++; this.replacement = null; this.setup = null; this.rpc?.close(); this.refreshing = null;
-    await this.engine.stop(); this.engine.clear(); this.preview = null;
+  queueSettings(operation, { duringClose = false } = {}) {
+    if (this.closed && !duringClose) return Promise.reject(new Error('The wallet is closing.'));
+    const pending = this.settingsWrite.catch(() => {}).then(operation);
+    this.settingsWrite = pending;
+    return pending;
+  }
+  saveConfig(input = {}) {
+    return this.queueSettings(() => this.applyConfig(input));
+  }
+  async applyConfig(input, { retryClaims = false } = {}) {
+    // Merge inside the write queue, not when the action was requested: changing
+    // appearance while a limits write is pending must not restore old limits.
+    const previous = this.config;
+    const config = validateConfig({ ...previous, ...input, network: previous.network,
+      rpc: { ...previous.rpc, ...input.rpc }, claims: { ...previous.claims, ...input.claims } }, { allowRegtest: this.allowRegtest });
+    if (this.claimsReviewRequired) config.claims.enabled = false;
+    const reconnect = config.rpc.host !== previous.rpc.host || config.rpc.port !== previous.rpc.port;
+    const claimsChanged = Object.keys(config.claims).some(key => config.claims[key] !== previous.claims[key]);
+    // Preferences are durable even if locked, offline, or the helper is absent.
+    // A failed disk write must not stop workers or switch to an unsaved server.
     this.config = await writeConfig(this.directory, config, { allowRegtest: this.allowRegtest });
-    this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.connectClient();
-    this.engine.setOptions({ connectionsPerSecond: config.claims.maxConnectionsPerSecond, concurrency: config.claims.maxConcurrent });
-    this.emitState(); if (this.session) void this.refresh().catch(() => {}); return this.getState();
+    if (this.closed) return this.getState();
+    if (reconnect || claimsChanged || retryClaims) {
+      this.claimsResumePending = false;
+      const generation = ++this.claimToggleGeneration;
+      if (reconnect) {
+        this.cancelSendPreview(); this.epoch++; this.replacement = null; this.setup = null;
+        this.rpc?.close(); this.refreshing = null;
+        this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null;
+        this.retiredClaims.clear(); this.fundingCache.clear(); this.fundingPending.clear();
+        this.connectClient();
+      }
+      await this.engine.stop();
+      // A lock/new unlock may have started a newer lifecycle while the old
+      // helper was draining. That lifecycle reads the already-saved config.
+      if (this.closed || generation !== this.claimToggleGeneration) return this.getState();
+      if (reconnect) this.engine.clear();
+      this.engine.setOptions({ connectionsPerSecond: config.claims.maxConnectionsPerSecond, concurrency: config.claims.maxConcurrent });
+      // Auto-lock, appearance and diagnostics do not interrupt network activity.
+      if (this.session && !this.closed && config.claims.enabled) await this.resumeClaims();
+      if (reconnect && this.session && !this.closed) void this.refresh().catch(() => {});
+    }
+    this.emitState(); return this.getState();
   }
   async setTheme({ theme } = {}) {
     validateTheme(theme);
     // Appearance is independent of keys, RPC and claims. Do not reconnect,
     // invalidate payment reviews or change the security epoch for a color change.
-    this.config = await writeConfig(this.directory, { ...this.config, theme }, { allowRegtest: this.allowRegtest });
-    this.emitState(); return this.getState();
+    return this.saveConfig({ theme });
   }
   async setDeveloperMode({ enabled } = {}) {
     validateDeveloperMode(enabled);
     // Diagnostic visibility is independent of wallet, RPC and claim execution.
-    this.config = await writeConfig(this.directory, { ...this.config, developerMode: enabled }, { allowRegtest: this.allowRegtest });
-    this.emitState(); return this.getState();
+    return this.saveConfig({ developerMode: enabled });
   }
   async setClaims({ enabled, maxConnectionsPerSecond, maxConcurrent, lookbackBlocks } = {}) {
-    if (typeof enabled !== 'boolean') throw new Error('Choose whether Automatic Claims should be enabled.');
-    this.assertSession();
-    const epoch = this.epoch, rpc = this.rpc, engine = this.engine;
-    const generation = this.claimToggleGeneration = (this.claimToggleGeneration ?? 0) + 1;
-    const check = () => {
-      this.assertSession(epoch);
-      if (this.rpc !== rpc || this.engine !== engine || this.claimToggleGeneration !== generation) throw new Error('Automatic Claims settings changed; try again.');
-    };
-    const config = validateConfig({ ...this.config, claims: { ...this.config.claims,
+    if (enabled !== undefined && typeof enabled !== 'boolean') throw new Error('Choose whether Automatic Claims should be enabled.');
+    const reviewGeneration = this.claimsReviewGeneration;
+    const claims = {
+      ...(enabled === undefined ? {} : { enabled }),
       ...(maxConnectionsPerSecond === undefined ? {} : { maxConnectionsPerSecond }),
       ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
-      ...(lookbackBlocks === undefined ? {} : { lookbackBlocks }) } }, { allowRegtest: this.allowRegtest });
-    if (enabled && !this.proofRunner && !this.connectionPoolFactory && !getClaimsHelper({ resourcesPath: this.resourcesPath })) throw new Error('Install the Automatic Claims helper first (npm run setup:claims), or use the packaged desktop app.');
-    await engine.stop(); check();
-    // A previous scan must settle before a new run can publish any state.
-    if (enabled && this.bountySync) await this.bountySync.catch(() => {});
-    check();
-    const saved = await writeConfig(this.directory, config, { allowRegtest: this.allowRegtest });
-    check(); this.config = saved;
-    engine.setOptions({ connectionsPerSecond: saved.claims.maxConnectionsPerSecond, concurrency: saved.claims.maxConcurrent });
-    if (enabled) {
+      ...(lookbackBlocks === undefined ? {} : { lookbackBlocks }),
+    };
+    return this.queueSettings(() => {
+      // An enable click queued before a broadcast warning is not consent to
+      // dismiss that later warning. Only a fresh action can resume after review.
+      if (enabled === true && reviewGeneration === this.claimsReviewGeneration) this.claimsReviewRequired = false;
+      return this.applyConfig({ claims }, { retryClaims: enabled === true && !this.engine.enabled });
+    });
+  }
+  async resumeClaims() {
+    if (this.closed || !this.session || !this.config.claims.enabled || this.claimsReviewRequired) return;
+    this.claimsResumePending = false;
+    const epoch = this.epoch, rpc = this.rpc, engine = this.engine;
+    const generation = ++this.claimToggleGeneration;
+    const current = () => !this.closed && Boolean(this.session) && this.epoch === epoch && this.rpc === rpc &&
+      this.engine === engine && this.claimToggleGeneration === generation && this.config.claims.enabled && !this.claimsReviewRequired;
+    const check = () => {
+      if (!current()) throw Object.assign(new Error('Automatic Claims startup cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
+    };
+    try {
+      if (!this.proofRunner && !this.connectionPoolFactory && !getClaimsHelper({ resourcesPath: this.resourcesPath })) throw new Error('Install the Automatic Claims helper first (npm run setup:claims), or use the packaged desktop app.');
+      await engine.stop(); check();
+      // An old session's scan must settle before this run can publish any work.
+      if (this.bountySync) await this.bountySync.catch(() => {});
+      check();
+      engine.setOptions({ connectionsPerSecond: this.config.claims.maxConnectionsPerSecond, concurrency: this.config.claims.maxConcurrent });
       await this.ensureNetwork(); check();
       // Existing queue entries cannot run before the journal and window catch up.
       await engine.suspend(); check(); engine.start();
       void this.syncBounties().catch(error => {
-        if (epoch !== this.epoch || this.rpc !== rpc || this.claimToggleGeneration !== generation) return;
+        if (!current()) return;
         if (error?.name === 'AbortError' && error.code === 'ABORT_ERR' && !error.unknownOutcome) return;
         this.error = error.message; void engine.stop(); this.emitState();
       });
+    } catch (error) {
+      if (!current()) return;
+      this.claimsResumePending = true;
+      this.error = error.message;
+      engine.notify({ lastError: error.message, status: 'off' });
+      this.recordDiagnostic('claims.start_failed', { stage: 'lifecycle', error });
     }
-    this.emitState(); return this.getState();
+    this.emitState();
+  }
+  stopClaimsForReview(message) {
+    this.claimsReviewGeneration++;
+    this.claimsReviewRequired = true; this.claimsResumePending = false; this.claimToggleGeneration++;
+    this.error = message;
+    this.config = { ...this.config, claims: { ...this.config.claims, enabled: false } };
+    void this.engine.stop(); this.emitState();
+    // A sent request can become uncertain while lock/close drains its worker.
+    // Persist that safety stop even then; it is not a new user action.
+    void this.queueSettings(() => this.applyConfig({ claims: { enabled: false } }), { duringClose: true }).catch(error => {
+      this.error = `${message} The safety setting could not be saved; keep Automatic Claims off until you have checked this transaction.`;
+      this.recordDiagnostic('claims.safety_save_failed', { stage: 'lifecycle', error }); this.emitState();
+    });
   }
   async blockBounties(hash, { rpc = this.rpc, epoch = this.epoch, height, check: parentCheck = () => {}, budget } = {}) {
     const check = () => {
@@ -731,7 +801,7 @@ export class WalletService extends EventEmitter {
     const rewardAddress = reusable ? previous.rewardAddress : this.getState().wallet.address;
     const prepared = prepareClaim({ bounty: current, rawTransaction, rewardAddress, fee: reusable ? previous.fee : estimateClaimFee(this.config.feeRate), network: this.config.network });
     check();
-    return { ...prepared, epoch, rpc, rewardAddress, context: {
+    return { ...prepared, epoch, rpc, walletGeneration: this.walletGeneration, rewardAddress, context: {
       domain: prepared.bounty.domain, txid: prepared.txid, input_index: 0,
       connection_work_target: prepared.bounty.target, root_certificates_version: prepared.bounty.rootVersion,
       signature_algorithms_mask: prepared.bounty.mask, validation_time: tip.mediantime,
@@ -771,12 +841,11 @@ export class WalletService extends EventEmitter {
       // A timeout, disconnect, mismatched reply or already-known TX can follow a
       // successful broadcast. Stop instead of producing and retrying another claim.
       const message = `Claim broadcast was not confirmed. Check transaction ${signed.txid} before enabling Automatic Claims again.`;
-      if (this.epoch === prepared.epoch && this.rpc === prepared.rpc) this.error = message;
       // Close the global dispatch gate immediately, before another proof can
       // broadcast. Never await stop from one of the tasks it must drain.
-      if (this.epoch === prepared.epoch && this.rpc === prepared.rpc && this.engine === engine) {
-        void engine.stop(); this.emitState();
-      }
+      // Locking changes the session, not the wallet that sent the transaction.
+      // A replaced wallet, however, must not inherit another wallet's response.
+      if (prepared.walletGeneration === this.walletGeneration) this.stopClaimsForReview(message);
       throw Object.assign(new Error(message), { code: error.code, data: { node_code: error.data?.node_code }, unknownOutcome: true });
     }
   }
@@ -794,6 +863,7 @@ export class WalletService extends EventEmitter {
     // Finish any already-started atomic encrypted write before Electron exits.
     await this.persisting.catch(() => {});
     await this.walletWrite?.catch(() => {});
+    await this.settingsWrite.catch(() => {});
     this.recordDiagnostic('wallet.closed', { stage: 'lifecycle' });
     await this.diagnostics?.flush();
   }

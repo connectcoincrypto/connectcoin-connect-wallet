@@ -114,11 +114,14 @@ function claimFixture(rpc) {
     inputs: [{ txid: '99'.repeat(32), vout: 0, sequence: 0xffffffff, scriptSig: '', witness: [] }],
     outputs: [{ type: 2, amount: '1000000000', domain: 'example.com', target: 'f'.repeat(64), rootVersion: 1, mask: 7 }] };
   const bounty = { txid: transactionId(funding), vout: 0, amount: '1000000000', status: 'available' };
-  const prepared = { ...prepareClaim({ bounty, rawTransaction: serializeTransaction(funding).toString('hex'), rewardAddress: account.address }), epoch: 7, rpc };
+  const prepared = { ...prepareClaim({ bounty, rawTransaction: serializeTransaction(funding).toString('hex'), rewardAddress: account.address }), epoch: 7, walletGeneration: 0, rpc };
   const hello = Buffer.concat([Buffer.from('010000220303', 'hex'), Buffer.from(prepared.challenge, 'hex')]);
   const proof = Buffer.concat([Buffer.from([2]), hello, ...[2, 8, 11, 15].map(type => Buffer.from([type, 0, 0, 0]))]).toString('hex');
   const service = new WalletService({ directory: '/unused-rpc-cancellation-test' });
   service.rpc = rpc; service.epoch = 7; service.session = { data: {} };
+  service.config = { claims: { enabled: true } };
+  service.queueSettings = async operation => operation();
+  service.applyConfig = async input => { Object.assign(service.config.claims, input.claims); };
   service.engine = { enabled: true, stopped: 0, async stop() { this.enabled = false; this.stopped++; } };
   const key = `${bounty.txid}:0`; service.claimOutpoints = new Map([[key, bounty]]); service.emitState = () => {};
   return { service, prepared, proof, key };

@@ -249,6 +249,10 @@ function serviceFixture() {
   const service = new WalletService({ directory: '/unused-unit-test' });
   service.config = structuredClone(DEFAULT_CONFIG);
   service.session = { data: {} }; service.epoch = 7;
+  // This fixture is memory-only. Real durable safety stops are exercised by
+  // claims-preferences.test.mjs using an isolated temporary profile.
+  service.queueSettings = async operation => operation();
+  service.applyConfig = async input => { Object.assign(service.config.claims, input.claims); };
   service.tip = tip(1);
   service.engine = { enabled: true, stopped: 0, async stop() { this.enabled = false; this.stopped++; } };
   service.claimBlocks.set(hash(2), [bounty]); service.claimOutpoints = new Map([[`${bounty.txid}:0`, bounty]]);
@@ -320,12 +324,13 @@ test('unrecognized or uncertain node rejection replies keep reservations and sto
   }
 });
 
-test('late responses from an old session cannot stop or unreserve a new session', async () => {
+test('late responses from a replaced wallet cannot stop or unreserve the new wallet', async () => {
   const { service, bounty } = serviceFixture();
   const prepared = await service.prepareAutomaticClaim(bounty);
   service.rpc.request = async method => {
     if (method === 'getchaintip') return tip(1);
     service.epoch++;
+    service.walletGeneration++;
     throw new Error('old connection closed after locking');
   };
   await assert.rejects(service.submitAutomaticClaim(prepared, structuralProof(prepared)), /broadcast was not confirmed/);

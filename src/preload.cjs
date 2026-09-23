@@ -18,4 +18,13 @@ contextBridge.exposeInMainWorld('connectwallet', Object.freeze({
     ipcRenderer.on('connectwallet:state', listener);
     return () => ipcRenderer.removeListener('connectwallet:state', listener);
   },
+  onBeforeClose: callback => {
+    if (typeof callback !== 'function') throw new Error('A callback is required.');
+    const listener = async (_event, requestId) => {
+      try { await callback(); ipcRenderer.send('connectwallet:close-ready', { requestId, saved: true }); }
+      catch { ipcRenderer.send('connectwallet:close-ready', { requestId, saved: false }); }
+    };
+    ipcRenderer.on('connectwallet:before-close', listener);
+    return () => ipcRenderer.removeListener('connectwallet:before-close', listener);
+  },
 }));

@@ -51,6 +51,7 @@ try {
     const realLock = WalletService.prototype.lock;
     WalletService.prototype.lock = function (...args) {
       globalThis.rsaUiLocks++;
+      globalThis.rsaUiService = this;
       this.walletExists = true; // Presentation fixture only; no vault is opened.
       globalThis.rsaUiRefresh?.(); globalThis.rsaUiRefresh = null;
       return realLock.apply(this, args);
@@ -125,6 +126,10 @@ try {
       const modulePath = process.getBuiltinModule('url').fileURLToPath(moduleUrl);
       const { WalletService } = process.getBuiltinModule('module').createRequire(moduleUrl)(modulePath);
       WalletService.prototype.refresh = function () { return new Promise(resolve => { globalThis.rsaUiRefresh = resolve; }); };
+      // Each case injects an unlocked presentation while the real service is
+      // still locked. Its completed previous lock may have one coalesced
+      // publication pending; drain that fixture boundary before replacing it.
+      globalThis.rsaUiService.statePublisher.cancelPending();
       BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', { ...snapshot, securityEpoch: 100 });
     }, { moduleUrl: new URL('../src/core/wallet-service.mjs', import.meta.url).href, snapshot });
     await page.locator('[data-view="settings"]').first().click();

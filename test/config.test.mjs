@@ -23,8 +23,8 @@ test('endpoint validation supports IPv4/IPv6 and rejects URLs, Unicode control t
   for (const port of [0, 65536, -1, 1.5, '48190', Infinity, NaN]) assert.throws(() => validateRpcEndpoint({ host: 'localhost', port }));
 });
 
-test('claims default to 100 starts and concurrent connections without overwriting saved limits', async () => {
-  const expected = { maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 };
+test('claims default off with 100 starts and concurrent connections without overwriting saved limits', async () => {
+  const expected = { enabled: false, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 };
   assert.deepEqual(DEFAULT_CONFIG.claims, expected);
   assert.deepEqual(validateConfig({}).claims, expected);
   assert.deepEqual(validateConfig({ claims: { maxConcurrent: 20 } }).claims, { ...expected, maxConcurrent: 20 });
@@ -33,12 +33,42 @@ test('claims default to 100 starts and concurrent connections without overwritin
   const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-claims-defaults-test-'));
   try {
     assert.deepEqual((await readConfig(directory)).claims, expected);
-    const custom = { maxConnectionsPerSecond: 5, maxConcurrent: 12, lookbackBlocks: 300 };
+    const custom = { enabled: true, maxConnectionsPerSecond: 5, maxConcurrent: 12, lookbackBlocks: 300 };
     await writeConfig(directory, { claims: custom });
     assert.deepEqual((await readConfig(directory)).claims, custom);
   } finally {
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
     assert.ok(path.basename(directory).startsWith('connectwallet-claims-defaults-test-'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Automatic Claims preference accepts only booleans and migrates legacy limits without enabling execution', async () => {
+  for (const enabled of [true, false]) assert.equal(validateConfig({ claims: { enabled } }).claims.enabled, enabled);
+  for (const enabled of [undefined, null, '', 'true', 'false', 0, 1, {}, [], new Boolean(false)]) {
+    assert.throws(() => validateConfig({ claims: { enabled } }), /Automatic Claims/);
+  }
+  let accessed = false;
+  assert.throws(() => validateConfig({ claims: { get enabled() { accessed = true; return true; } } }), /plain/);
+  assert.equal(accessed, false);
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-claims-migration-test-'));
+  try {
+    const limits = { maxConnectionsPerSecond: 3, maxConcurrent: 7, lookbackBlocks: 42 };
+    const legacy = JSON.stringify({ version: 1, claims: limits, theme: 'dark', developerMode: true });
+    const file = path.join(directory, 'config.json');
+    await writeFile(file, legacy);
+    const loaded = await readConfig(directory);
+    assert.deepEqual(loaded.claims, { enabled: false, ...limits });
+    assert.equal(await readFile(file, 'utf8'), legacy, 'reading an older profile must not rewrite it');
+    for (const enabled of [true, false]) {
+      const expected = { ...loaded, claims: { ...loaded.claims, enabled } };
+      await writeConfig(directory, expected);
+      assert.deepEqual(await readConfig(directory), expected);
+      assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), expected);
+    }
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
+    assert.ok(path.basename(directory).startsWith('connectwallet-claims-migration-test-'));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -104,7 +134,7 @@ test('legacy configurations default Developer Mode off and persist either prefer
     const saved = JSON.stringify(legacy);
     await writeFile(file, saved);
     const loaded = await readConfig(directory);
-    assert.deepEqual(loaded, { ...legacy, developerMode: false });
+    assert.deepEqual(loaded, { ...legacy, claims: { enabled: false, ...legacy.claims }, developerMode: false });
     assert.equal(await readFile(file, 'utf8'), saved);
     for (const developerMode of [true, false]) {
       const expected = { ...loaded, developerMode };

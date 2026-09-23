@@ -1,3 +1,6 @@
+import { acknowledgePreferences, createPreferenceSaver, preferenceBatch } from './preferences.mjs';
+import { reconcileChildren } from './reconcile.mjs';
+
 const $ = selector => document.querySelector(selector);
 const app = $('#app');
 const dialog = $('#modal');
@@ -45,8 +48,23 @@ let setup = null;
 let replacement = null;
 let busy = false;
 let locking = false;
-const emptySend = () => ({ address: '', domain: '', amount: '', expectedConnections: '1000', feeRate: '1500' });
+const emptySend = () => ({ address: '', domain: '', amount: '', expectedConnections: '1000' });
 let draft = { send: emptySend(), claims: {}, settings: {} };
+let rpcDraftReady = false;
+const preferences = createPreferenceSaver({
+  snapshot: () => preferenceBatch(state.config, draft, { rpcReady: rpcDraftReady }),
+  save: patch => invoke('saveConfig', patch),
+  saved: (next, batch) => {
+    acknowledgePreferences(draft, batch);
+    document.querySelectorAll('.inline-error[data-error-source="preferences"]').forEach(target => {
+      target.textContent = ''; target.classList.add('hidden'); delete target.dataset.errorSource;
+    });
+    if (!Object.hasOwn(draft.settings, 'host') && !Object.hasOwn(draft.settings, 'port')) rpcDraftReady = false;
+    if (next) acceptState(next, { background: true });
+  },
+  failed: error => showError(new Error(`Settings were not saved. ${errorMessage(error)} Your edits are retained; edit the setting again to retry.`), 'preferences'),
+  blocked: () => busy || locking || compositionActive,
+});
 let historyFilter = 'all';
 let toastTimer, secretTimer;
 let currentPreview;
@@ -57,6 +75,8 @@ let pointerActive = false;
 let actionKeyActive = false;
 let compositionActive = false;
 let lastShellMarkup = null;
+let lastShellView = null;
+let rendering = false;
 
 function scheduleRender() {
   if (renderTimer !== null) return;
@@ -75,10 +95,10 @@ function toast(message) {
   toastTimer = setTimeout(() => target.classList.remove('show'), 4000);
 }
 function errorMessage(error) { return error?.message || 'Something went wrong. Please try again.'; }
-function showError(error) {
+function showError(error, source = '') {
   const message = errorMessage(error);
   const container = dialog.open ? $('#modal-error') : $('#view-error');
-  if (container) { container.textContent = message; container.classList.remove('hidden'); container.setAttribute('role', 'alert'); }
+  if (container) { container.textContent = message; container.classList.remove('hidden'); container.setAttribute('role', 'alert'); container.dataset.errorSource = source; }
   else toast(message);
 }
 function setBusy(value) {
@@ -94,7 +114,7 @@ async function run(operation) {
   if (busy || locking) return;
   document.querySelectorAll('.inline-error').forEach(target => { target.textContent = ''; target.classList.add('hidden'); });
   setBusy(true);
-  try { await operation(); } catch (error) { showError(error); } finally { setBusy(false); }
+  try { rpcDraftReady = true; await preferences.flush(); await operation(); } catch (error) { showError(error); } finally { setBusy(false); }
 }
 async function reload() { acceptState(await invoke('getState')); }
 async function lockWallet() {
@@ -102,7 +122,7 @@ async function lockWallet() {
   // pending. Keep that action's busy state and independently guard repeat locks.
   if (locking || state.phase !== 'unlocked') return;
   locking = true; closeModal(); setBusy(busy);
-  try { await invoke('lock'); await reload(); }
+  try { await invoke('lock'); rpcDraftReady = true; await preferences.flush(); await reload(); }
   catch (error) { showError(error); }
   finally { locking = false; setBusy(busy); }
 }
@@ -120,6 +140,9 @@ function acceptState(next, { background = false } = {}) {
     (next.claims?.lastError && !next.claims.lastErrorDiagnostic &&
       !next.claims.lastErrorTransient && next.claims.lastError !== state.claims?.lastError);
   const securityChanged = state.securityEpoch !== undefined && next.securityEpoch !== state.securityEpoch;
+  // A new security context must never retain live controls/drafts from the old
+  // wallet, even if both snapshots happen to report an unlocked phase.
+  if (securityChanged) { lastShellMarkup = null; lastShellView = null; }
   const replacementEnded = Boolean(replacement && (next.replacementActive !== true || next.phase !== 'locked' || securityChanged));
   const clearSetup = Boolean(setup && next.setupActive === false) || securityChanged || replacementEnded;
   if (clearSetup) {
@@ -143,6 +166,7 @@ function pageHeading(heading, description, action = '') {
 }
 function online() { return ['connected', 'ready', 'online', 'synced'].includes(state.network?.status); }
 function render() {
+  rendering = true;
   clearTimeout(renderTimer); renderTimer = null;
   const scrollX = window.scrollX, scrollY = window.scrollY;
   const diagnosticScroll = $('.diagnostic-list')?.scrollTop;
@@ -153,22 +177,30 @@ function render() {
   if (state.phase === 'unlocked') renderShell();
   else {
     lastShellMarkup = null;
+    lastShellView = null;
     if (setup && ['backup', 'verify'].includes(authView)) renderBackup();
     else renderAuth();
   }
-  if (focusId) {
+  if (focusId && !focused.isConnected) {
     const replacement = document.getElementById(focusId);
     if (replacement) { replacement.focus({ preventScroll: true }); if (typeof replacement.setSelectionRange === 'function' && start != null) { try { replacement.setSelectionRange(start, end); } catch { /* number/select input */ } } }
   }
   setBusy(busy);
   window.scrollTo(scrollX, scrollY);
   if (diagnosticScroll != null && $('.diagnostic-list')) $('.diagnostic-list').scrollTop = diagnosticScroll;
+  rendering = false;
 }
 function updateShell(markup) {
   // Unrelated claim progress must not rebuild Activity, Settings or a form.
   if (markup === lastShellMarkup) return;
-  app.innerHTML = markup;
+  if (lastShellMarkup === null || lastShellView !== view) app.innerHTML = markup;
+  else {
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    reconcileChildren(app, template.content);
+  }
   lastShellMarkup = markup;
+  lastShellView = view;
 }
 function renderShell() {
   const wallet = state.wallet ?? {};
@@ -177,7 +209,7 @@ function renderShell() {
 }
 function overview() {
   const balance = state.wallet?.balance ?? {};
-  return `${pageHeading('A little more connected.', 'Your coins, your keys. A simpler way to explore ConnectCoin.', `<button class="text-button" data-action="external" data-url="https://connectcoincrypto.com/">Explore ConnectCoin ${icon('external')}</button>`)}<div class="dashboard-grid"><section class="card balance-card" aria-label="Wallet balance"><div class="card-top"><span class="caption">Available balance</span><span class="coin-mark">${mark()} CONNECTCOIN</span></div><div class="balance-number">${e(format(balance.available))}<span class="currency">CONN</span></div><p class="balance-sub">${e(state.wallet?.name ?? 'Your wallet')} <span aria-hidden="true">·</span> Testnet funds</p><div class="balance-actions"><button class="button" data-view="send">${icon('send')} Send coins</button><button class="button secondary" data-view="receive">${icon('receive')} Receive</button></div><div class="balance-details"><div class="balance-detail"><label>Confirmed</label><strong>${e(cc(balance.confirmed))}</strong></div><div class="balance-detail"><label>Pending</label><strong>${e(cc(balance.pending))}</strong></div></div></section><section class="card claims-promo"><div class="eyebrow">${icon('spark')} A DIFFERENT WAY TO PARTICIPATE</div><h2>Make connections.<br>Collect rewards.</h2><p>Explore Pay-to-Connect bounties. Let your wallet look for eligible HTTPS connection proofs.</p><button class="button lime" data-view="claims">${state.claims?.enabled ? 'Manage automatic claims' : 'Explore automatic claims'} ${icon('arrow')}</button><div class="promo-foot">${icon('shield')} Optional. Always in your control.</div><div class="orbit-art">${orb()}</div></section></div><div class="section-heading"><h2>Recent activity</h2><button class="text-button" data-view="activity">View all activity ${icon('arrow')}</button></div>${activityTable((state.history ?? []).slice(0, 5))}<div class="footer-links"><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Join the community ↗</button><button data-action="external" data-url="https://connectcoincrypto.com/whitepaper.pdf">Read the whitepaper ↗</button></div>`;
+  return `${pageHeading('A little more connected.', 'Your coins, your keys. A simpler way to explore ConnectCoin.', `<button class="text-button" data-action="external" data-url="https://connectcoincrypto.com/">Explore ConnectCoin ${icon('external')}</button>`)}<div class="dashboard-grid"><section class="card balance-card" aria-label="Wallet balance"><div class="card-top"><span class="caption">Available balance</span><span class="coin-mark">${mark()} CONNECTCOIN</span></div><div class="balance-number">${e(format(balance.available))}<span class="currency">CONN</span></div><p class="balance-sub">${e(state.wallet?.name ?? 'Your wallet')} <span aria-hidden="true">·</span> Testnet funds</p><div class="balance-actions"><button class="button" data-view="send">${icon('send')} Send coins</button><button class="button secondary" data-view="receive">${icon('receive')} Receive</button></div><div class="balance-details"><div class="balance-detail"><label>Confirmed</label><strong>${e(cc(balance.confirmed))}</strong></div><div class="balance-detail"><label>Pending</label><strong>${e(cc(balance.pending))}</strong></div></div></section><section class="card claims-promo"><div class="eyebrow">${icon('spark')} A DIFFERENT WAY TO PARTICIPATE</div><h2>Make connections.<br>Collect rewards.</h2><p>Explore Pay-to-Connect bounties. Let your wallet look for eligible HTTPS connection proofs.</p><button class="button lime" data-view="claims">${state.config?.claims?.enabled ? 'Manage automatic claims' : 'Explore automatic claims'} ${icon('arrow')}</button><div class="promo-foot">${icon('shield')} Optional. Always in your control.</div><div class="orbit-art">${orb()}</div></section></div><div class="section-heading"><h2>Recent activity</h2><button class="text-button" data-view="activity">View all activity ${icon('arrow')}</button></div>${activityTable((state.history ?? []).slice(0, 5))}<div class="footer-links"><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Join the community ↗</button><button data-action="external" data-url="https://connectcoincrypto.com/whitepaper.pdf">Read the whitepaper ↗</button></div>`;
 }
 function activityTable(items) {
   if (!items.length) return '<section class="card activity-card"><div class="activity-head"><span>Transaction</span><span>Transaction ID</span><span>Amount</span><span>Status</span></div><div class="empty-state"><div class="empty-icon">'+icon('activity')+'</div><h3>Your story starts here.</h3><p>Receive your first testnet coins or explore automatic claims. Your transactions will appear here.</p></div></section>';
@@ -189,9 +221,9 @@ function activityTable(items) {
   }).join('')}</section>`;
 }
 function sendPage() {
-  const values = draft.send;
+  const values = { ...draft.send, feeRate: draft.settings.feeRate ?? state.config?.feeRate ?? 1500 };
   const bounty = sendMode === 'bounty';
-  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : 'Make sure the destination is a ConnectCoin testnet address.'}</p><form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}<label class="field"><span class="field-label">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></span><div class="input-row"><input class="input" id="send-amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div></label>${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="send.feeRate" name="feeRate" value="${e(values.feeRate)}" inputmode="numeric" required><p class="field-help">Default: 1,500 connects/vB. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using testnet</strong><p>Only send to compatible ConnectCoin testnet addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
+  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : 'Make sure the destination is a ConnectCoin testnet address.'}</p><form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}<label class="field"><span class="field-label">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></span><div class="input-row"><input class="input" id="send-amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div></label>${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="settings.feeRate" name="feeRate" value="${e(values.feeRate)}" type="number" min="1201" max="100000" step="1" inputmode="numeric" required><p class="field-help">Saved automatically for future payments. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using testnet</strong><p>Only send to compatible ConnectCoin testnet addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
 }
 function receivePage() {
   const address = state.wallet?.address;
@@ -212,8 +244,9 @@ function claimsPage() { return claimsControlsPage() + diagnosticPanel(); }
 function claimsControlsPage() {
   const config = { maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600, ...state.config?.claims, ...draft.claims };
   const claims = state.claims ?? {};
+  const enabled = state.config?.claims?.enabled === true;
   const high = Number(config.maxConnectionsPerSecond) > 100 || Number(config.maxConcurrent) > 100;
-  return `${pageHeading('Every connection has potential.', 'Discover Pay-to-Connect bounties without running a full node.')}<div class="claim-control"><div><h3>Automatic claims</h3><p>${claims.enabled ? 'Your wallet is looking for eligible proofs. Locking your wallet pauses claiming.' : 'Off until you choose. Your wallet can connect to websites, build proofs and submit eligible claims.'}</p></div><button class="switch ${claims.enabled ? 'on' : ''}" role="switch" aria-checked="${Boolean(claims.enabled)}" aria-label="Enable automatic claims" data-action="toggle-claims" data-busy><span></span></button></div><div class="stat-grid"><div class="stat-card"><div class="caption">Connection attempts</div><strong>${e(claims.attempts == null ? '—' : Number(claims.attempts).toLocaleString('en-US'))}</strong></div><div class="stat-card"><div class="caption">Bounties queued</div><strong>${e(claims.available == null ? '—' : Number(claims.available).toLocaleString('en-US'))}</strong></div><div class="stat-card"><div class="caption">Claims submitted</div><strong>${e(claims.sent == null ? '—' : Number(claims.sent).toLocaleString('en-US'))}</strong></div></div><div class="form-layout"><section class="card form-card"><div class="card-top"><h2>Your pace. Your limits.</h2><span class="status-badge ${claims.enabled ? '' : 'pending'}">${e(claims.status ?? (claims.enabled ? 'Active' : 'Paused'))}</span></div><p class="card-description">Start small. Connection capacity depends on your device, router and internet provider.</p>${claims.helperAvailable === false ? notice('<strong>Automatic Claims helper not installed.</strong> Install the optional helper with <span class="inline-code">npm run setup:claims</span>, or use a desktop package that includes it. Payments and receiving still work.') : ''}${claims.lastError && (state.config?.developerMode === true || claims.lastErrorDiagnostic !== true) ? notice(e(claims.lastError), 'danger') : ''}<form id="claims-form"><div class="two-fields"><label class="field"><span class="field-label">Maximum starts per second</span><input class="input" id="claims-rate" name="maxConnectionsPerSecond" data-draft="claims.maxConnectionsPerSecond" type="number" min="1" max="256" step="1" value="${e(config.maxConnectionsPerSecond)}" required></label><label class="field"><span class="field-label">Maximum simultaneous connections</span><input class="input" id="claims-concurrent" name="maxConcurrent" data-draft="claims.maxConcurrent" type="number" min="1" max="256" step="1" value="${e(config.maxConcurrent)}" required></label></div><div id="claims-warning" class="${high ? '' : 'hidden'}">${notice('<strong>High connection load.</strong> Values above 100 can saturate your router or ISP connection, interrupt other apps, and burden destination websites. Increase cautiously.', 'danger')}</div><label class="field"><span class="field-label">Look back through recent blocks <small>1–600</small></span><input class="input" id="claims-lookback" name="lookbackBlocks" data-draft="claims.lookbackBlocks" type="number" min="1" max="600" step="1" value="${e(config.lookbackBlocks)}" required><p class="field-help">This light-wallet server exposes only the last 600 blocks. Larger windows may include older, less useful “trash bounties”; unlimited history isn’t available through this API.</p></label><div class="form-actions"><button class="button" type="submit" data-busy>Save connection settings ${icon('check')}</button></div></form></section><section class="card"><h3>Not CPU mining.</h3><ul class="tip-list"><li>${icon('globe')}<div><strong>Connect to eligible websites</strong><p>Bounties specify a domain and proof requirements. A successful connection does not guarantee a reward.</p></div></li><li>${icon('shield')}<div><strong>Submit cryptographic evidence</strong><p>The wallet prepares a claim. Network nodes validate the proof and transaction.</p></div></li><li>${icon('lock')}<div><strong>Stay in control</strong><p>Stop whenever you like. Claims use bandwidth and network fees. No CPU miner runs in this wallet.</p></div></li></ul></section></div>`;
+  return `${pageHeading('Every connection has potential.', 'Discover Pay-to-Connect bounties without running a full node.')}<div class="claim-control"><div><h3>Automatic claims</h3><p>${enabled ? (claims.enabled ? 'Your wallet is looking for eligible proofs. Claims pause while locked and resume automatically when you unlock.' : 'Enabled for this wallet. Claims resume when the wallet is unlocked and its connection is ready. Check any alert below.') : 'Off until you choose. Your choice is saved, including after restarting the app.'}</p></div><button class="switch ${enabled ? 'on' : ''}" role="switch" aria-checked="${enabled}" aria-label="Enable automatic claims" data-action="toggle-claims" data-busy><span></span></button></div><div class="stat-grid"><div class="stat-card"><div class="caption">Connection attempts</div><strong>${e(claims.attempts == null ? '—' : Number(claims.attempts).toLocaleString('en-US'))}</strong></div><div class="stat-card"><div class="caption">Bounties queued</div><strong>${e(claims.available == null ? '—' : Number(claims.available).toLocaleString('en-US'))}</strong></div><div class="stat-card"><div class="caption">Claims submitted</div><strong>${e(claims.sent == null ? '—' : Number(claims.sent).toLocaleString('en-US'))}</strong></div></div><div class="form-layout"><section class="card form-card"><div class="card-top"><h2>Your pace. Your limits.</h2><span class="status-badge ${claims.enabled ? '' : 'pending'}">${e(claims.status ?? (claims.enabled ? 'Active' : 'Paused'))}</span></div><p class="card-description">Valid changes save automatically. Connection capacity depends on your device, router and internet provider.</p>${claims.helperAvailable === false ? notice('<strong>Automatic Claims helper not installed.</strong> Install the optional helper with <span class="inline-code">npm run setup:claims</span>, or use a desktop package that includes it. Payments and receiving still work.') : ''}${claims.lastError && (state.config?.developerMode === true || claims.lastErrorDiagnostic !== true) ? notice(e(claims.lastError), 'danger') : ''}<form id="claims-form"><div class="two-fields"><label class="field"><span class="field-label">Maximum starts per second</span><input class="input" id="claims-rate" name="maxConnectionsPerSecond" data-draft="claims.maxConnectionsPerSecond" type="number" min="1" max="256" step="1" value="${e(config.maxConnectionsPerSecond)}" required></label><label class="field"><span class="field-label">Maximum simultaneous connections</span><input class="input" id="claims-concurrent" name="maxConcurrent" data-draft="claims.maxConcurrent" type="number" min="1" max="256" step="1" value="${e(config.maxConcurrent)}" required></label></div><div id="claims-warning" class="${high ? '' : 'hidden'}">${notice('<strong>High connection load.</strong> Values above 100 can saturate your router or ISP connection, interrupt other apps, and burden destination websites. Increase cautiously.', 'danger')}</div><label class="field"><span class="field-label">Look back through recent blocks <small>1–600</small></span><input class="input" id="claims-lookback" name="lookbackBlocks" data-draft="claims.lookbackBlocks" type="number" min="1" max="600" step="1" value="${e(config.lookbackBlocks)}" required><p class="field-help">This light-wallet server exposes only the last 600 blocks. Larger windows may include older, less useful “trash bounties”; unlimited history isn’t available through this API.</p></label></form></section><section class="card"><h3>Not CPU mining.</h3><ul class="tip-list"><li>${icon('globe')}<div><strong>Connect to eligible websites</strong><p>Bounties specify a domain and proof requirements. A successful connection does not guarantee a reward.</p></div></li><li>${icon('shield')}<div><strong>Submit cryptographic evidence</strong><p>The wallet prepares a claim. Network nodes validate the proof and transaction.</p></div></li><li>${icon('lock')}<div><strong>Stay in control</strong><p>Stop whenever you like. Claims use bandwidth and network fees. No CPU miner runs in this wallet.</p></div></li></ul></section></div>`;
 }
 function activityPage() {
   const items = (state.history ?? []).filter(item => historyFilter === 'all' || (historyFilter === 'pending' ? item.status === 'pending' || item.confirmations === 0 : item.status !== 'pending' && item.confirmations > 0));
@@ -226,7 +259,7 @@ function developerSettings() {
 function settingsPage() {
   const rpc = { host: 'connectcoin4.com', port: 48190, ...state.config?.rpc, ...draft.settings };
   const autoLockMinutes = draft.settings.autoLockMinutes ?? state.config?.autoLockMinutes ?? 15;
-  return `${pageHeading('Make yourself at home.', 'Your connection, your security, your preferences.')}<div class="settings-stack"><section class="card form-card appearance-row"><div><h2>Appearance</h2><p class="card-description" id="theme-description">Make this space feel like yours. System follows your device’s light or dark appearance automatically.</p></div><label class="field appearance-field"><span class="field-label">Color theme</span><select class="select" id="theme-preference" aria-describedby="theme-description" data-busy>${[['system','System (default)'],['light','Light'],['dark','Dark']].map(([value,label]) => `<option value="${value}" ${themePreference() === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label></section><section class="card form-card"><h2>Network connection</h2><p class="card-description">Connect to a restricted ConnectCoin JSON-RPC server. This wallet does not run a full node.</p><form id="settings-form"><div class="two-fields"><label class="field"><span class="field-label">Server hostname or IP</span><input class="input" id="rpc-host" name="host" data-draft="settings.host" value="${e(rpc.host)}" spellcheck="false" autocomplete="off" required></label><label class="field"><span class="field-label">TCP port</span><input class="input" id="rpc-port" name="port" data-draft="settings.port" type="number" min="1" max="65535" value="${e(rpc.port)}" required></label></div><label class="field"><span class="field-label">Lock after inactivity <small>Minutes · 1–60</small></span><input class="input" id="auto-lock" name="autoLockMinutes" data-draft="settings.autoLockMinutes" type="number" min="1" max="60" step="1" value="${e(autoLockMinutes)}" required></label>${notice('<strong>This connection is not encrypted.</strong> Queried addresses and transactions can be observed or altered in transit. The server supplies balances, transaction history and bounty data; this is not independent full-node verification. Use a server you trust.')}<div class="form-actions"><button class="button" type="submit" data-busy>Save & reconnect ${icon('connection')}</button></div></form></section><section class="card form-card"><h2>Security & backup</h2><p class="card-description">Your recovery phrase controls your coins. Keep an offline copy somewhere safe.</p><div class="setting-row"><div><strong>Recovery phrase</strong><p>View your words privately. Your wallet password is required.</p></div><button class="button secondary" data-action="recovery">${icon('key')} View recovery phrase</button></div><div class="setting-row"><div><strong>Encrypted wallet backup</strong><p>Save an encrypted copy of this wallet. Keep the password separately.</p></div><button class="button secondary" data-action="export" data-busy>${icon('file')} Export wallet</button></div><div class="setting-row"><div><strong>Lock your wallet</strong><p>Automatic claims pause while locked. Wallet locks after ${e(state.config?.autoLockMinutes ?? 15)} minutes of inactivity.</p></div><button class="button secondary" data-action="lock">${icon('lock')} Lock now</button></div></section>${developerSettings()}<section class="card"><h3>ConnectWallet, by ConnectCoin.</h3><p class="card-description">A lighter way to participate. Built for ConnectCoin testnet.</p><div class="footer-links"><button data-action="external" data-url="https://connectcoincrypto.com/">ConnectCoin ↗</button><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Community ↗</button><button data-action="external" data-url="https://explorer.connectcoincrypto.com/">Block explorer ↗</button></div></section></div>`;
+  return `${pageHeading('Make yourself at home.', 'Your connection, your security, your preferences.')}<div class="settings-stack"><section class="card form-card appearance-row"><div><h2>Appearance</h2><p class="card-description" id="theme-description">Make this space feel like yours. System follows your device’s light or dark appearance automatically.</p></div><label class="field appearance-field"><span class="field-label">Color theme</span><select class="select" id="theme-preference" aria-describedby="theme-description" data-busy>${[['system','System (default)'],['light','Light'],['dark','Dark']].map(([value,label]) => `<option value="${value}" ${themePreference() === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label></section><section class="card form-card"><h2>Network connection</h2><p class="card-description">Changes save automatically. The server reconnects when you finish editing its hostname and port.</p><form id="settings-form"><div class="two-fields"><label class="field"><span class="field-label">Server hostname or IP</span><input class="input" id="rpc-host" name="host" data-draft="settings.host" value="${e(rpc.host)}" spellcheck="false" autocomplete="off" required></label><label class="field"><span class="field-label">TCP port</span><input class="input" id="rpc-port" name="port" data-draft="settings.port" type="number" min="1" max="65535" value="${e(rpc.port)}" required></label></div><label class="field"><span class="field-label">Lock after inactivity <small>Minutes · 1–60</small></span><input class="input" id="auto-lock" name="autoLockMinutes" data-draft="settings.autoLockMinutes" type="number" min="1" max="60" step="1" value="${e(autoLockMinutes)}" required></label>${notice('<strong>This connection is not encrypted.</strong> Queried addresses and transactions can be observed or altered in transit. The server supplies balances, transaction history and bounty data; this is not independent full-node verification. Use a server you trust.')}</form></section><section class="card form-card"><h2>Security & backup</h2><p class="card-description">Your recovery phrase controls your coins. Keep an offline copy somewhere safe.</p><div class="setting-row"><div><strong>Recovery phrase</strong><p>View your words privately. Your wallet password is required.</p></div><button class="button secondary" data-action="recovery">${icon('key')} View recovery phrase</button></div><div class="setting-row"><div><strong>Encrypted wallet backup</strong><p>Save an encrypted copy of this wallet. Keep the password separately.</p></div><button class="button secondary" data-action="export" data-busy>${icon('file')} Export wallet</button></div><div class="setting-row"><div><strong>Lock your wallet</strong><p>Enabled automatic claims pause while locked and resume when you unlock. Wallet locks after ${e(state.config?.autoLockMinutes ?? 15)} minutes of inactivity.</p></div><button class="button secondary" data-action="lock">${icon('lock')} Lock now</button></div></section>${developerSettings()}<section class="card"><h3>ConnectWallet, by ConnectCoin.</h3><p class="card-description">A lighter way to participate. Built for ConnectCoin testnet.</p><div class="footer-links"><button data-action="external" data-url="https://connectcoincrypto.com/">ConnectCoin ↗</button><button data-action="external" data-url="https://discord.gg/JYWbz5PsPp">Community ↗</button><button data-action="external" data-url="https://explorer.connectcoincrypto.com/">Block explorer ↗</button></div></section></div>`;
 }
 function passwordField(id, label, confirm = false) {
   const existing = id === 'unlock-password' || id === 'recovery-password';
@@ -296,8 +329,14 @@ document.addEventListener('input', event => {
   if (target.dataset.draft) {
     const [section, key] = target.dataset.draft.split('.');
     if (Object.hasOwn(draft, section)) draft[section][key] = target.value;
+    if (section === 'settings' && ['host', 'port'].includes(key)) rpcDraftReady = false;
+    else if (['claims', 'settings'].includes(section)) preferences.schedule();
   }
   if (target.id === 'claims-rate' || target.id === 'claims-concurrent') $('#claims-warning')?.classList.toggle('hidden', !(Number($('#claims-rate').value) > 100 || Number($('#claims-concurrent').value) > 100));
+});
+document.addEventListener('focusout', event => {
+  if (rendering || !['rpc-host', 'rpc-port'].includes(event.target.id) || ['rpc-host', 'rpc-port'].includes(event.relatedTarget?.id)) return;
+  rpcDraftReady = true; preferences.schedule(0);
 });
 document.addEventListener('change', event => {
   if (event.target.id !== 'theme-preference') return;
@@ -321,7 +360,7 @@ document.addEventListener('click', event => {
   if (button?.dataset.action === 'lock') { void lockWallet(); return; }
   if (button && modalKind === 'send-preparing' && ['close-modal', 'cancel-send-review'].includes(button.dataset.action)) { cancelSendReview(); return; }
   if (!button || busy || locking) return;
-  if (button.dataset.view && state.phase === 'unlocked') { view = button.dataset.view; render(); return; }
+  if (button.dataset.view && state.phase === 'unlocked') { rpcDraftReady = true; preferences.schedule(0); view = button.dataset.view; render(); return; }
   if (button.dataset.sendMode) { sendMode = button.dataset.sendMode; render(); return; }
   if (button.dataset.filter) { historyFilter = button.dataset.filter; render(); return; }
   const action = button.dataset.action;
@@ -379,9 +418,8 @@ document.addEventListener('click', event => {
         draft.send = emptySend(); view = 'activity'; await reload(); toast('Payment submitted to the network.'); break;
       }
       case 'toggle-claims': {
-        const config = { ...state.config?.claims, ...draft.claims };
-        await invoke('setClaims', { enabled: !state.claims?.enabled, maxConnectionsPerSecond: Number(config.maxConnectionsPerSecond ?? 100), maxConcurrent: Number(config.maxConcurrent ?? 100), lookbackBlocks: Number(config.lookbackBlocks ?? 600) });
-        await reload(); toast(state.claims?.enabled ? 'Automatic claims enabled.' : 'Automatic claims paused.'); break;
+        await invoke('setClaims', { enabled: state.config?.claims?.enabled !== true });
+        await reload(); toast(state.config?.claims?.enabled ? 'Automatic claims enabled. They resume when you unlock.' : 'Automatic claims disabled.'); break;
       }
     }
   });
@@ -439,11 +477,11 @@ document.addEventListener('submit', event => {
         break;
       }
       case 'claims-form': {
-        const config = Object.fromEntries(['maxConnectionsPerSecond','maxConcurrent','lookbackBlocks'].map(key => [key, Number(values[key])]));
-        if (Object.values(config).some(value => !Number.isSafeInteger(value) || value < 1) || config.lookbackBlocks > 600) throw new Error('Use positive whole numbers and a lookback between 1 and 600 blocks.');
-        await invoke('setClaims', { enabled: Boolean(state.claims?.enabled), ...config }); draft.claims = {}; await reload(); toast('Connection settings saved.'); break;
+        await reload(); toast('Connection settings saved.'); break;
       }
-      case 'settings-form': await invoke('saveConfig', { rpc: { host: values.host.trim(), port: Number(values.port) }, autoLockMinutes: Number(values.autoLockMinutes) }); draft.settings = {}; await reload(); toast('Connection settings saved.'); break;
+      case 'settings-form':
+        if (['host', 'port'].some(key => Object.hasOwn(draft.settings, key))) throw new Error('Enter a valid server hostname or IP address and a port between 1 and 65535.');
+        await reload(); toast('Connection settings saved.'); break;
       case 'recovery-form': {
         const securityEpoch = state.securityEpoch;
         const result = await invoke('getRecoveryPhrase', { password: values.password }); form.reset(); values.password = '';
@@ -463,6 +501,10 @@ dialog.addEventListener('cancel', event => {
 document.addEventListener('keydown', event => {
   if (['Enter', ' '].includes(event.key) && event.target.closest('button, select')) actionKeyActive = true;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'l' && state.phase === 'unlocked') { event.preventDefault(); void lockWallet(); }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
+    event.preventDefault();
+    void run(async () => { window.location.reload(); });
+  }
 });
 document.addEventListener('keyup', () => { actionKeyActive = false; });
 document.addEventListener('pointerdown', () => { pointerActive = true; }, { capture: true });
@@ -476,5 +518,6 @@ window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; r
 
 render();
 if (bridge?.onState) unsubscribe = bridge.onState(next => acceptState(next, { background: true }));
+if (bridge?.onBeforeClose) bridge.onBeforeClose(async () => { rpcDraftReady = true; await preferences.flush(); });
 if (bridge?.invoke) void invoke('getState').then(next => { state = { ...state, phase: '' }; acceptState(next); }).catch(showError);
 else showError(new Error('Desktop preview only. Wallet actions are available in the ConnectWallet app.'));

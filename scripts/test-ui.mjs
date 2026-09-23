@@ -20,7 +20,7 @@ const requests = [];
 const sockets = new Set();
 let connectionCount = 0;
 let failNextHistory = false;
-const fixture = net.createServer(socket => {
+const serve = socket => {
   connectionCount++;
   sockets.add(socket); socket.on('close', () => sockets.delete(socket)); socket.on('error', () => socket.destroy());
   let buffer = '';
@@ -44,8 +44,11 @@ const fixture = net.createServer(socket => {
       socket.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
     }
   });
-});
+};
+const fixture = net.createServer(serve);
+const alternateFixture = net.createServer(serve);
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
+await new Promise(resolve => alternateFixture.listen(0, '127.0.0.1', resolve));
 await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
 let application;
 let page;
@@ -111,6 +114,30 @@ async function toggleDeveloperMode(enabled) {
   await waitForUiCondition(page, async value => (await window.connectwallet.invoke('getState')).config.developerMode === value && document.querySelector('#developer-mode')?.getAttribute('aria-checked') === String(value) && document.querySelector('#app')?.getAttribute('aria-busy') !== 'true', enabled, { message: 'The saved Developer Mode and idle switch must match the requested boolean.' });
   const persisted = JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).developerMode;
   assert.equal(persisted, enabled, `Developer Mode persistence mismatch (expected=${enabled}, persisted=${typeof persisted === 'boolean' ? persisted : typeof persisted}).`);
+}
+
+async function pressEnterInPreference(selector) {
+  await page.locator(selector).focus();
+  await page.evaluate(selector => {
+    window.preferenceEnterField = document.querySelector(selector);
+    window.preferenceEnterSubmitCount = 0;
+    window.preferenceEnterListener = event => {
+      if (['claims-form', 'settings-form'].includes(event.target.id)) window.preferenceEnterSubmitCount++;
+    };
+    document.addEventListener('submit', window.preferenceEnterListener, true);
+  }, selector);
+  await page.keyboard.press('Enter');
+}
+
+async function assertPreferenceEnterStayedPut(selector) {
+  assert.deepEqual(await page.evaluate(selector => {
+    document.removeEventListener('submit', window.preferenceEnterListener, true);
+    return {
+      submits: window.preferenceEnterSubmitCount,
+      sameNode: window.preferenceEnterField === document.querySelector(selector),
+      focused: document.activeElement === window.preferenceEnterField,
+    };
+  }, selector), { submits: 0, sameNode: true, focused: true }, 'Enter in an autosaved preference must not submit a form, reload the page, or replace/focus another control.');
 }
 
 let presentationSequence = 0;
@@ -214,11 +241,16 @@ try {
   await assertLoadedImage('.coin-mark img');
   await page.screenshot({ path: path.join(screenshots, 'overview.png') });
 
-  stage = 'appearance settings preserve wallet and drafts';
+  stage = 'automatic settings persistence and appearance preserve invalid drafts';
   await page.locator('[data-view="settings"]').first().click();
+  assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0, 'Settings should expose autosave without a manual Save button.');
+  assert.equal(await page.getByRole('button', { name: 'Export wallet', exact: true }).isVisible(), true);
   assert.equal(await page.locator('#theme-preference').inputValue(), 'system');
-  await page.locator('#rpc-host').fill('127.0.0.2');
+  await page.locator('#rpc-host').fill('https://unfinished.example');
   await page.locator('#auto-lock').fill('30');
+  await pressEnterInPreference('#auto-lock');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.autoLockMinutes === 30);
+  await assertPreferenceEnterStayedPut('#auto-lock');
   const beforeTheme = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const beforeThemeConnections = connectionCount;
   await selectTheme('dark', { ui: true });
@@ -230,15 +262,30 @@ try {
   assert.deepEqual(afterTheme.config.rpc, beforeTheme.config.rpc);
   assert.equal(afterTheme.config.autoLockMinutes, beforeTheme.config.autoLockMinutes);
   assert.equal(connectionCount, beforeThemeConnections);
-  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  assert.equal(await page.locator('#rpc-host').inputValue(), 'https://unfinished.example');
   assert.equal(await page.locator('#auto-lock').inputValue(), '30');
   assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1);
   await page.screenshot({ path: path.join(screenshots, 'settings-dark.png'), fullPage: true });
   await selectTheme('light', { ui: true });
   assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), lightCanvas);
-  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  assert.equal(await page.locator('#rpc-host').inputValue(), 'https://unfinished.example');
   await selectTheme('system', { ui: true });
   await selectTheme('dark', { ui: true });
+  const beforeRpcConnections = connectionCount;
+  await page.locator('#rpc-port').fill('');
+  await page.locator('#rpc-host').fill('127.0.0.1');
+  await page.locator('#rpc-port').fill(String(alternateFixture.address().port));
+  assert.deepEqual((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.rpc, beforeTheme.config.rpc, 'endpoint edits must stay together until leaving both fields');
+  await page.locator('#auto-lock').focus();
+  await waitForUiCondition(page, async expected => {
+    const current = await window.connectwallet.invoke('getState');
+    return current.config.rpc.port === expected && current.network.status === 'online' && !current.busy;
+  }, alternateFixture.address().port);
+  assert.equal(connectionCount, beforeRpcConnections + 1, 'one completed endpoint edit should reconnect once');
+  const persistedSettings = JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8'));
+  assert.equal(persistedSettings.autoLockMinutes, 30);
+  assert.equal(persistedSettings.rpc.port, alternateFixture.address().port);
+  assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1, 'RPC preferences save on leaving the fields while the Settings page stays open.');
   await page.locator('[data-view="overview"]').first().click();
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.screenshot({ path: path.join(screenshots, 'overview-dark.png') });
@@ -251,26 +298,131 @@ try {
   await assertLoadedImage('.sidebar .brand-mark img');
   await assertLoadedImage('.receive-card img.qr');
   await page.locator('[data-view="send"]').first().click();
+  assert.equal(await page.getByRole('button', { name: 'Review payment', exact: true }).isVisible(), true);
   await page.getByRole('button', { name: 'Create a bounty', exact: true }).click();
   await page.locator('#send-domain').fill('example.com');
   await page.locator('#send-amount').fill('1');
   await page.locator('#send-expected').fill('1000');
+  await page.locator('.advanced-fee summary').click();
+  await page.locator('#send-fee').fill('2200');
+  await page.evaluate(() => {
+    window.editingFeeField = document.querySelector('#send-fee');
+    window.openFeeDetails = document.querySelector('.advanced-fee');
+  });
   assert.equal(await page.getByRole('button', { name: 'Review bounty' }).isVisible(), true);
   await selectTheme('light');
   assert.equal(await page.locator('#send-domain').inputValue(), 'example.com');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.feeRate === 2200);
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 300)));
+  assert.deepEqual(await page.evaluate(() => ({
+    sameField: window.editingFeeField === document.querySelector('#send-fee'),
+    sameDetails: window.openFeeDetails === document.querySelector('.advanced-fee'),
+    open: document.querySelector('.advanced-fee').open,
+  })), { sameField: true, sameDetails: true, open: true }, 'Saving an edited fee and applying appearance must preserve the open native details and input nodes.');
   assert.equal(await page.locator('#send-amount').inputValue(), '1');
   assert.equal(await page.locator('#send-expected').inputValue(), '1000');
   await selectTheme('dark');
   assert.equal(await page.locator('#send-domain').inputValue(), 'example.com');
   // No funds, no broadcast: verify the form only and do not create a preview.
   await page.locator('[data-view="claims"]').first().click();
+  assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0, 'Automatic claims should expose autosave without a manual Save button.');
   assert.equal(await page.locator('#claims-rate').inputValue(), '100');
   assert.equal(await page.locator('#claims-concurrent').inputValue(), '100');
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
   assert.equal(await page.locator('#claims-warning').isVisible(), false);
+  stage = 'autosave acknowledgement preserves the native numeric caret';
+  await page.locator('#claims-rate').fill('12');
+  await page.keyboard.press('Home');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('1');
+  assert.equal(await page.locator('#claims-rate').inputValue(), '112');
+  await pressEnterInPreference('#claims-rate');
+  await page.evaluate(() => {
+    window.editingClaimField = document.querySelector('#claims-rate');
+    window.claimEditingEvents = { focus: 0, blur: 0 };
+    for (const type of ['focus', 'blur']) document.addEventListener(type, event => {
+      if (event.target.id === 'claims-rate') window.claimEditingEvents[type]++;
+    }, true);
+  });
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.maxConnectionsPerSecond === 112);
+  await assertPreferenceEnterStayedPut('#claims-rate');
+  // Persistence can complete before the renderer's 200 ms state coalescing
+  // timer; include that acknowledgement render before the next keystroke.
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 300)));
+  await page.keyboard.press('3');
+  assert.deepEqual(await page.evaluate(() => ({
+    value: document.querySelector('#claims-rate').value,
+    sameNode: window.editingClaimField === document.querySelector('#claims-rate'),
+    focused: document.activeElement === window.editingClaimField,
+    ...window.claimEditingEvents,
+  })), { value: '1132', sameNode: true, focused: true, focus: 0, blur: 0 }, 'A successful autosave must preserve number-input identity and insert the next digit at the original caret.');
+
+  stage = 'autosave errors survive updates and clear only after a successful retry';
+  await application.evaluate((_electron, moduleUrl) => {
+    const modulePath = process.getBuiltinModule('url').fileURLToPath(moduleUrl);
+    const { WalletService } = process.getBuiltinModule('module').createRequire(moduleUrl)(modulePath);
+    const original = WalletService.prototype.saveConfig;
+    WalletService.prototype.saveConfig = function () {
+      WalletService.prototype.saveConfig = original;
+      throw new Error('Isolated autosave write failure');
+    };
+  }, new URL('../src/core/wallet-service.mjs', import.meta.url).href);
+  await page.locator('#claims-rate').fill('110');
+  await page.waitForFunction(() => document.querySelector('#view-error')?.textContent.includes('Isolated autosave write failure'));
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims.maxConnectionsPerSecond, 112);
+  const errorSnapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
+  errorSnapshot.claims.status = 'autosave-error-background-check';
+  await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), errorSnapshot);
+  await page.waitForFunction(() => document.querySelector('.status-badge')?.textContent === 'autosave-error-background-check');
+  assert.equal(await page.locator('#view-error').isVisible(), true);
+  assert.match(await page.locator('#view-error').textContent(), /Isolated autosave write failure/);
+  await page.locator('#claims-rate').fill('111');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.maxConnectionsPerSecond === 111 && document.querySelector('#view-error').classList.contains('hidden'));
+
+  stage = 'successful autosave keeps unrelated action errors visible';
+  failNextHistory = true;
+  await page.getByRole('button', { name: 'Refresh wallet', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('#view-error').classList.contains('hidden') && document.querySelector('#app').getAttribute('aria-busy') === 'false');
+  const actionError = await page.locator('#view-error').textContent();
+  assert.ok(actionError.length > 0);
+  await page.locator('#claims-rate').fill('109');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.maxConnectionsPerSecond === 109);
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 300)));
+  assert.equal(await page.locator('#view-error').isVisible(), true);
+  assert.equal(await page.locator('#view-error').textContent(), actionError);
+  await page.getByRole('button', { name: 'Refresh wallet', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('#view-error').classList.contains('hidden') && document.querySelector('#app').getAttribute('aria-busy') === 'false');
+
+  stage = 'automatic claim limits and invalid drafts';
   await page.locator('#claims-rate').fill('101');
   assert.equal(await page.locator('#claims-warning').isVisible(), true);
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
+  await page.locator('#claims-concurrent').fill('77');
+  await page.locator('#claims-lookback').fill('345');
+  await page.locator('[data-view="activity"]').first().click();
+  await waitForUiCondition(page, async () => {
+    const { config } = await window.connectwallet.invoke('getState');
+    return config.claims.maxConnectionsPerSecond === 101 && config.claims.maxConcurrent === 77 && config.claims.lookbackBlocks === 345;
+  });
+  await page.reload();
+  await page.locator('[data-view="claims"]').first().click();
+  assert.equal(await page.locator('#claims-rate').inputValue(), '101');
+  assert.equal(await page.locator('#claims-concurrent').inputValue(), '77');
+  assert.equal(await page.locator('#claims-lookback').inputValue(), '345');
+  await page.locator('#claims-rate').fill('');
+  await page.locator('#claims-concurrent').fill('999');
+  await page.locator('#claims-lookback').fill('0');
+  await page.locator('[data-view="overview"]').first().click();
+  const invalidClaims = (await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims;
+  assert.deepEqual(invalidClaims, { enabled: false, maxConnectionsPerSecond: 101, maxConcurrent: 77, lookbackBlocks: 345 });
+  await page.reload();
+  await page.locator('[data-view="claims"]').first().click();
+  await page.getByRole('switch', { name: 'Enable automatic claims' }).click();
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.enabled === true && document.querySelector('#app').getAttribute('aria-busy') !== 'true');
+  assert.equal(await page.getByRole('switch', { name: 'Enable automatic claims' }).getAttribute('aria-checked'), 'true');
+  await page.getByRole('switch', { name: 'Enable automatic claims' }).click();
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.enabled === false && document.querySelector('#app').getAttribute('aria-busy') !== 'true');
+  assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).claims.enabled, false);
 
   stage = 'persistent diagnostic history';
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.developerMode, false);
@@ -311,7 +463,7 @@ try {
   assert.equal(afterDeveloper.claims.enabled, beforeDeveloper.claims.enabled);
   assert.deepEqual(afterDeveloper.config, { ...beforeDeveloper.config, developerMode: true });
   assert.equal(connectionCount, beforeDeveloperConnections);
-  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.2');
+  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.1');
   assert.equal(await page.locator('#auto-lock').inputValue(), '30');
   await page.locator('#developer-mode').scrollIntoViewIfNeeded();
   await page.screenshot({ path: path.join(screenshots, 'developer-mode-settings.png') });
@@ -341,8 +493,10 @@ try {
   await page.evaluate(() => window.connectwallet.invoke('refresh'));
 
   stage = 'lock and unlock';
+  await page.locator('#claims-lookback').fill('344');
   await page.getByRole('button', { name: 'Lock wallet', exact: true }).click();
   await page.locator('#unlock-password').waitFor();
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.lookbackBlocks === 344);
   await waitForScheme(true);
   await selectTheme('light');
   assert.equal(await page.locator('#unlock-password').isVisible(), true);
@@ -353,6 +507,7 @@ try {
   await page.locator('[data-view="settings"]').first().waitFor();
   await page.locator('[data-view="settings"]').first().click();
   assert.equal(await page.locator('#theme-preference').inputValue(), 'light');
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims.lookbackBlocks, 344);
   await selectTheme('dark', { ui: true });
   await page.getByRole('button', { name: 'View recovery phrase' }).click();
   await page.locator('#recovery-password').fill(password);
@@ -372,11 +527,24 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
   assert.deepEqual(failedBrandRequests, [], 'ConnectWallet artwork must remain allowed by the renderer resource policy.');
+  stage = 'close flushes valid numeric and endpoint drafts';
+  await page.locator('#unlock-password').fill(password);
+  await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+  await page.locator('[data-view="settings"]').first().click();
+  await page.locator('#auto-lock').fill('29');
+  await page.locator('#rpc-port').fill(String(fixture.address().port));
+  await closeElectronTest(application); application = null;
+  const closedConfig = JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8'));
+  assert.equal(closedConfig.autoLockMinutes, 29);
+  assert.equal(closedConfig.rpc.port, fixture.address().port);
+  assert.equal(closedConfig.feeRate, 2200);
+  for (const secret of [password, seed.join(' '), 'example.com']) assert.ok(!JSON.stringify(closedConfig).includes(secret));
   passed = true;
 } catch (error) {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
   console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}${sourceLine ? `, test line ${sourceLine}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  if (stage === 'system appearance and startup persistence') console.error(String(error.message).slice(0, 800));
   if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || /^(?:Native appearance must match|Developer Mode persistence mismatch)/.test(String(error.message)))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;
 } finally {
@@ -385,6 +553,7 @@ try {
   catch { passed = false; process.exitCode = 1; console.error('UI graceful shutdown failed.'); }
   for (const socket of sockets) socket.destroy();
   await new Promise(resolve => fixture.close(resolve));
+  await new Promise(resolve => alternateFixture.close(resolve));
   if (passed) {
     const absolute = path.resolve(profile);
     assert.equal(path.dirname(absolute), path.resolve(tmpdir()));
@@ -392,4 +561,4 @@ try {
     await rm(absolute, { recursive: true, force: true });
   }
 }
-if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, persistence, draft preservation, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);
+if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, automatic preference persistence with native numeric caret and open details retained, atomic RPC edits, invalid-draft preservation, claims on/off persistence, lock/close flush, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);

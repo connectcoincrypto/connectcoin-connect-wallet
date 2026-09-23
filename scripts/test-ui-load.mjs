@@ -85,6 +85,7 @@ try {
 
   await page.locator('[data-view="claims"]').first().click();
   await page.getByRole('heading', { name: 'Every connection has potential.' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0);
   await page.evaluate(() => {
     window.loadTestShellReplacements = 0;
     window.loadTestObserver = new MutationObserver(records => {
@@ -103,7 +104,7 @@ try {
   measurements.burstMs = Math.round(performance.now() - burstStarted);
   measurements.shellReplacements = await page.evaluate(() => window.loadTestShellReplacements);
   assert.ok(measurements.burstMs < 5000, `Latest state took ${measurements.burstMs} ms to become visible.`);
-  assert.ok(measurements.shellReplacements < 100, `1000 updates caused ${measurements.shellReplacements} complete shell replacements.`);
+  assert.equal(measurements.shellReplacements, 0, 'Background progress must update the existing shell without replacing it.');
   assert.equal(await page.locator('.stat-card').nth(2).locator('strong').textContent(), '1,000');
   assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - scrollBefore) <= 2, 'Background progress reset the scroll position.');
 
@@ -111,8 +112,44 @@ try {
   const beforeErrors = await page.evaluate(() => window.loadTestShellReplacements);
   await burst(1000, true); await waitForLatest();
   measurements.errorReplacements = await page.evaluate(() => window.loadTestShellReplacements) - beforeErrors;
-  assert.ok(measurements.errorReplacements < 100, `Retry warnings caused ${measurements.errorReplacements} shell replacements.`);
+  assert.equal(measurements.errorReplacements, 0, 'Transient claim errors must update the existing shell without replacing it.');
   assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - scrollBefore) <= 2, 'Retry warnings reset scroll.');
+
+  stage = 'numeric caret and DOM identity survive background progress';
+  // Number inputs do not expose selectionStart/selectionEnd. Type in the
+  // middle, let background state render, then type again at that exact caret.
+  // Out-of-range digits keep this presentation-only fixture from autosaving
+  // into the real service, which intentionally has no wallet.
+  await page.locator('#claims-rate').fill('1000');
+  await page.keyboard.press('Home');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('2');
+  assert.equal(await page.locator('#claims-rate').inputValue(), '12000');
+  await page.evaluate(() => {
+    window.numericEditingField = document.querySelector('#claims-rate');
+    window.numericEditingEvents = { focus: 0, blur: 0 };
+    for (const type of ['focus', 'blur']) document.addEventListener(type, event => {
+      if (event.target.id === 'claims-rate') window.numericEditingEvents[type]++;
+    }, true);
+  });
+  await burst(20, true); await waitForLatest();
+  for (const message of ['Presentation fixture connection alert.', null]) {
+    await application.evaluate(({ BrowserWindow }, { snapshot, index, message }) => {
+      BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', {
+        ...snapshot, error: message, network: { ...snapshot.network, height: 60000 + index },
+        claims: { ...snapshot.claims, sent: index, attempts: index, lastError: message, lastErrorDiagnostic: false, lastErrorTransient: false },
+      });
+    }, { snapshot: fixture, index: sequence, message });
+    await page.waitForFunction(expected => Boolean(document.querySelector('.page-error')) === expected &&
+      Boolean([...document.querySelectorAll('.form-card .notice.danger')].find(node => node.textContent.includes('Presentation fixture connection alert.'))) === expected, message !== null);
+  }
+  await page.keyboard.press('3');
+  assert.deepEqual(await page.evaluate(() => ({
+    value: document.querySelector('#claims-rate').value,
+    sameNode: window.numericEditingField === document.querySelector('#claims-rate'),
+    focused: document.activeElement === window.numericEditingField,
+    ...window.numericEditingEvents,
+  })), { value: '123000', sameNode: true, focused: true, focus: 0, blur: 0 }, 'Background progress must preserve the actual number input and its native caret without blur/refocus.');
 
   stage = 'navigation during a held pointer and transient errors';
   const settings = page.locator('[data-view="settings"]').first();
@@ -126,17 +163,27 @@ try {
   assert.equal(await page.evaluate(() => window.loadTestPressedButton.isConnected), true, 'Background state detached the pressed navigation button before pointerup.');
   await page.mouse.up();
   await page.getByRole('heading', { name: 'Make yourself at home.' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0);
   await waitForLatest();
 
   stage = 'draft, focus, selection and scroll during updates';
+  // A valid endpoint draft must not commit just because background rendering
+  // replaces and refocuses the field while the user is still editing it.
   await page.locator('#rpc-host').fill('unsaved-host.example');
   await page.locator('#rpc-host').evaluate(field => field.setSelectionRange(3, 12));
+  await page.evaluate(() => {
+    window.editingHostField = document.querySelector('#rpc-host');
+    window.hostEditingEvents = { focus: 0, blur: 0 };
+    for (const type of ['focus', 'blur']) document.addEventListener(type, event => {
+      if (event.target.id === 'rpc-host') window.hostEditingEvents[type]++;
+    }, true);
+  });
   await page.evaluate(() => window.scrollTo(0, 150));
   const settingsScroll = await page.evaluate(() => window.scrollY);
   await burst(100);
   await waitForLatest();
-  assert.deepEqual(await page.locator('#rpc-host').evaluate(field => ({ value: field.value, focused: document.activeElement === field, start: field.selectionStart, end: field.selectionEnd })), {
-    value: 'unsaved-host.example', focused: true, start: 3, end: 12,
+  assert.deepEqual(await page.locator('#rpc-host').evaluate(field => ({ value: field.value, focused: document.activeElement === field, sameNode: window.editingHostField === field, start: field.selectionStart, end: field.selectionEnd, ...window.hostEditingEvents })), {
+    value: 'unsaved-host.example', focused: true, sameNode: true, start: 3, end: 12, focus: 0, blur: 0,
   });
   assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - settingsScroll) <= 2, 'Background progress moved a settings draft.');
 
@@ -156,6 +203,9 @@ try {
   assert.equal(await page.evaluate(() => window.loadTestShellReplacements), unchangedBefore);
 
   stage = 'lock supersedes pending progress';
+  // The service behind this presentation fixture has no wallet. Leave an
+  // invalid draft so intentional blur cannot commit and replace the fixture.
+  await page.locator('#rpc-host').fill('unfinished-host.example/');
   const claimsBox = await page.locator('[data-view="claims"]').first().boundingBox();
   assert.ok(claimsBox);
   await page.mouse.move(claimsBox.x + claimsBox.width / 2, claimsBox.y + claimsBox.height / 2);
@@ -186,4 +236,4 @@ try {
   await rm(absolute, { recursive: true, force: true });
   if (!passed) console.error(`Load metrics: ${JSON.stringify(measurements)}`);
 }
-if (passed) console.log(`PASS: CONN overview/Send/bounty displays with exact precision, isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), held-pointer navigation, scroll/draft/focus retention, unchanged-page DOM identity, immediate lock over pending progress and graceful shutdown (${measurements.closeMs} ms). No wallet or RPC used.`);
+if (passed) console.log(`PASS: CONN overview/Send/bounty displays with exact precision, isolated renderer load, 500 history rows, 1000-update burst (${measurements.burstMs} ms; ${measurements.shellReplacements} shell replacements), 1000 transient errors (${measurements.errorReplacements} replacements), native numeric caret and input identity without blur/refocus, held-pointer navigation, text selection and scroll retention, unchanged-page DOM identity, immediate lock over pending progress and graceful shutdown (${measurements.closeMs} ms). No wallet or RPC used.`);
