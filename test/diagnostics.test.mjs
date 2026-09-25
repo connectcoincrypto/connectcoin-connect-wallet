@@ -31,6 +31,55 @@ test('helper DNS, blocked destination and target exhaustion retain safe distinct
   }
 });
 
+test('only the exact allowlisted TLS attempt timeout receives its precise description', () => {
+  const message = 'One TCP/TLS connection attempt timed out before producing a usable TLS capture. No claim transaction was broadcast from this attempt.';
+  assert.deepEqual(diagnosticError(new Error('TLS connection timed out')), { category: 'tls-timeout', message });
+  assert.deepEqual(diagnosticError(new Error('private wrapper', { cause: new Error('TLS connection timed out') })), { category: 'tls-timeout', message });
+  for (const error of [
+    new Error('RPC request timed out.'),
+    new Error('TLS connection timed out: private endpoint'),
+    new Error('tls connection timed out'),
+    new Error('TLS connection timed out.'),
+    new Error('TLS handshake exceeded the connection timeout'),
+    { message: 'Claims helper request timed out after 45000 ms', helperFatal: true },
+    { message: 'Claims helper startup timed out; update or rebuild the helper', helperFatal: true },
+    { message: 'TLS connection timed out', helperFatal: true },
+    { code: 'ETIMEDOUT' },
+  ]) {
+    assert.equal(diagnosticError(error).category, 'timeout');
+  }
+  assert.equal(diagnosticError({ message: 'helper private text', helperFatal: true }).category, 'helper-failed');
+  assert.equal(diagnosticError({ message: 'wrapper', helperFatal: true, cause: new Error('TLS connection timed out') }).category, 'helper-failed');
+});
+
+test('broadcast uncertainty and cancellation retain precedence over the TLS timeout message', () => {
+  for (const metadata of [{ name: 'AbortError' }, { code: 'ABORT_ERR' }]) {
+    assert.equal(diagnosticError({ message: 'TLS connection timed out', ...metadata }).category, 'cancelled');
+    assert.equal(diagnosticError({ message: 'TLS connection timed out', ...metadata, unknownOutcome: true }).category, 'broadcast-unknown');
+  }
+  assert.equal(diagnosticError({ message: 'TLS connection timed out', unknownOutcome: true }).category, 'broadcast-unknown');
+  assert.equal(diagnosticError(new Error('Broadcast outcome is unknown.', { cause: new Error('TLS connection timed out') })).category, 'broadcast-unknown');
+  assert.equal(diagnosticError({ message: 'wrapper', name: 'AbortError', cause: new Error('TLS connection timed out') }).category, 'cancelled');
+});
+
+test('TLS timeout logs preserve classification while redacting domains, proofs and private fields', async t => {
+  const directory = await fixture(t), log = new DiagnosticLog({ directory });
+  const secret = 'PRIVATE-TLS-domain-address-transaction-proof-password';
+  const cause = Object.assign(new Error('TLS connection timed out'), { domain: secret, address: secret, proof: secret, stack: secret });
+  log.record('claim.failed', { stage: 'proof', durationMs: 10012, domain: secret, endpoint: secret, transaction: secret,
+    error: Object.assign(new Error(secret, { cause }), { password: secret, stack: secret }) });
+  log.record('claim.failed', { stage: 'proof', error: new Error('RPC request timed out.') });
+  log.record('helper.failed', { stage: 'proof', error: { message: 'Claims helper request timed out after 45000 ms', helperFatal: true } });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.equal(stored[0].details.error.category, 'tls-timeout');
+  assert.equal(stored[0].details.durationMs, 10012);
+  assert.equal(stored[1].details.error.category, 'timeout');
+  assert.equal(stored[2].details.error.category, 'timeout');
+  assert.equal((await readFile(log.snapshot().file, 'utf8')).includes(secret), false);
+  assert.equal(JSON.stringify(log.snapshot()).includes(secret), false);
+});
+
 test('diagnostics persist UTC, session and sequence metadata across launches', async t => {
   const directory = await fixture(t);
   const log = new DiagnosticLog({ directory });

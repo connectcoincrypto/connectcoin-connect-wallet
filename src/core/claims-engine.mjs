@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 import { validateClaimContext, isKnownClaimRejection } from './claims.mjs';
 import { ConnectionPool, validateConnectionOptions, claimAborted } from './claim-pool.mjs';
 import { ClaimScheduler } from './claim-scheduler.mjs';
+import { diagnosticError } from './diagnostics.mjs';
 import { claimPriority, selectionPriority, domainPriority, isWorthAttempting, compareClaimPriority, P2CDomainStats, validateAttemptStats,
   PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, isP2CClaimConnectionLimitExceeded, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
 
@@ -57,7 +58,7 @@ export class ClaimsEngine {
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
     this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
     this.nextStart = 0; this.awaitingStart = false; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
-    this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorDiagnostic: false, lastErrorTransient: false };
+    this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
     this.diagnosticOperations = new Set(); this.cancellationReasons = new WeakMap();
   }
@@ -134,8 +135,8 @@ export class ClaimsEngine {
   notify(patch = {}) {
     // Severity belongs to the warning, not the scheduler's current status.
     // A retry can become waiting/submitting without turning into a fatal alert.
-    if (Object.hasOwn(patch, 'lastError')) patch = { lastErrorDiagnostic: false, lastErrorTransient: false, ...patch };
-    if (patch.lastError === null) patch = { ...patch, lastErrorDiagnostic: false, lastErrorTransient: false };
+    if (Object.hasOwn(patch, 'lastError')) patch = { lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false, ...patch };
+    if (patch.lastError === null) patch = { ...patch, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.state = { ...this.state, ...patch };
     try { this.onState(this.snapshot()); } catch { /* Presentation cannot stop workers. */ }
   }
@@ -587,7 +588,12 @@ export class ClaimsEngine {
     // Other in-flight jobs can fail during teardown. Keep their diagnostics,
     // but do not replace the fatal/unknown-broadcast warning with a retry alert.
     if (this.haltReason === 'fatal') return;
-    this.notify({ status: this.enabled ? 'retrying' : 'off', lastError: String(error.message ?? error).slice(0, 500), lastErrorTransient: true, lastErrorDiagnostic: stage === 'submit' && isKnownClaimRejection(error) });
+    const diagnostic = stage === 'proof' ? diagnosticError(error) : null;
+    const connectionTimeout = diagnostic?.category === 'tls-timeout';
+    this.notify({ status: this.enabled ? 'retrying' : 'off',
+      lastError: connectionTimeout ? diagnostic.message : String(error.message ?? error).slice(0, 500),
+      lastErrorCategory: connectionTimeout ? 'tls-timeout' : null,
+      lastErrorTransient: true, lastErrorDiagnostic: stage === 'submit' && isKnownClaimRejection(error) });
   }
   fatal(error) {
     // Cancellation can reveal that an in-flight broadcast has an unknown

@@ -15,6 +15,8 @@ import { StatePublisher } from './state-publisher.mjs';
 import { performance } from 'node:perf_hooks';
 import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
 import { createRsaProbe } from './rsa-probe.mjs';
+import { LiveUpdates } from './live-updates.mjs';
+import { EventRefresh } from './event-refresh.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
@@ -59,6 +61,7 @@ export class WalletService extends EventEmitter {
     this.statePriority = null;
     this.settingsWrite = Promise.resolve(); this.claimToggleGeneration = 0; this.claimsResumePending = false;
     this.walletGeneration = 0; this.claimsReviewRequired = false; this.claimsReviewGeneration = 0;
+    this.claimRevision = 0;
   }
   async initialize() {
     this.vaultFile = selectVaultFile(this.directory);
@@ -72,25 +75,87 @@ export class WalletService extends EventEmitter {
       if (this.setup && Date.now() > this.setup.expires) { this.setup = null; this.emitState(); }
       if (this.replacement && Date.now() > this.replacement.expires) this.cancelWalletReplacement();
       if (this.session && Date.now() - this.lastActivity >= this.config.autoLockMinutes * 60000) void this.lock();
-      else if (this.session) void this.refresh().catch(() => {});
-    }, 20000);
+      // Local security housekeeping only. Network updates arrive via RPC subscriptions.
+    }, 1000);
     this.timer.unref?.();
     return this.getState();
   }
   connectClient() {
+    this.stopLiveUpdates();
     this.cancelSendPreview();
     this.rpc?.close(); this.refreshing = null; this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.tip = null;
+    this.liveUpdateWarning = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
+    this.walletUpdateRevision = 0; this.walletReadRevision = -1;
+    const active = () => !this.closed && Boolean(this.session) && this.rpc === rpc;
+    this.walletUpdates = new EventRefresh({ isActive: active, delayMs: 150, run: async () => {
+      // An event during an existing read needs a fresh pass, not its old promise.
+      if (this.refreshing) await this.refreshing.catch(() => {});
+      if (active() && this.walletReadRevision < this.walletUpdateRevision) await this.refresh();
+    } });
+    this.bountyUpdates = new EventRefresh({ isActive: active, run: async () => {
+      await this.claimSuspending;
+      if (this.bountySync) await this.bountySync.catch(() => {});
+      if (!active()) return;
+      if (!this.engine.enabled && this.claimsResumePending) {
+        await this.resumeClaims({ retryErrors: true });
+        await this.bountySync;
+      } else if (this.engine.enabled) await this.syncBounties();
+    } });
+    this.liveUpdates = new LiveUpdates({ rpc, network: this.config.network, isActive: active,
+      getAddresses: () => {
+        // Watch the currently displayed receive/change addresses first when a
+        // large recovered wallet reaches the shared server subscription limit.
+        const current = this.accounts.filter(account => account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
+        return [...new Set([...current, ...this.accounts, ...this.accountCache.values()].map(account => account.address))];
+      },
+      onChange: ({ wallet, bounties, reset, catchup }) => {
+        if (!active()) return;
+        if (reset) {
+          // Reject an in-flight pre-reorg snapshot before it can resume workers.
+          this.claimRevision++; this.claimCursor = null; this.claimBlocks.clear();
+          this.claimSuspending = this.engine.suspend();
+        }
+        if (bounties) this.bountyUpdates.request();
+        // Refresh subscribes before reading each address. Its registration
+        // catch-ups are already covered by those reads; actual pushes are not.
+        if (wallet) {
+          if (!(catchup && this.refreshing)) this.walletUpdateRevision++;
+          // Keep a waiter even for a covered catch-up: if that read fails, its
+          // revision is not acknowledged and the waiter retries the snapshot.
+          this.walletUpdates.request();
+        }
+      },
+      onError: error => {
+        if (!active()) return;
+        if (error.code === 'LIVE_UPDATE_ADDRESS_CAPACITY') this.liveUpdateWarning = error.message;
+        this.error = error.message;
+        this.recordDiagnostic('wallet.subscription_failed', { stage: 'request', error });
+        this.emitState();
+      },
+    });
+    rpc.on('connected', () => {
+      if (this.rpc !== rpc) return;
+      // A new connection negotiates address capacity again, including after an
+      // automatic reconnect which deliberately reuses this RpcClient instance.
+      if (this.error === this.liveUpdateWarning) this.error = null;
+      this.liveUpdateWarning = null;
+    });
     rpc.on('disconnected', () => {
       if (this.rpc !== rpc) return;
-      this.claimsResumePending = Boolean(this.config.claims.enabled && (this.engine?.enabled || this.claimsResumePending));
+      this.claimsResumePending = Boolean(this.session && this.config.claims.enabled && !this.claimsReviewRequired);
+      this.claimRevision++; this.claimToggleGeneration++;
+      this.walletUpdateRevision++;
       this.tip = null;
       this.network.status = 'offline';
       this.cancelSendPreview();
-      void this.engine?.stop(); this.emitState();
+      this.claimSuspending = this.engine?.stop(); this.emitState();
     });
+  }
+  stopLiveUpdates() {
+    this.liveUpdates?.close(); this.walletUpdates?.close(); this.bountyUpdates?.close();
   }
   createEngine() {
     this.engine = new ClaimsEngine({
@@ -129,7 +194,7 @@ export class WalletService extends EventEmitter {
         lastErrorDiagnostic: this.claimInfo.lastErrorDiagnostic === true,
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
         helperAvailable: Boolean(this.proofRunner || this.connectionPoolFactory || getClaimsHelper({ resourcesPath: this.resourcesPath })), scanning: Boolean(this.scanningBounties) },
-      busy: Boolean(this.refreshing), error: this.error,
+      busy: Boolean(this.refreshing), error: this.error ?? this.liveUpdateWarning,
       diagnostics: this.session && this.config.developerMode ? this.diagnostics?.snapshot() ?? null : null,
     };
   }
@@ -255,6 +320,7 @@ export class WalletService extends EventEmitter {
     this.replacement = null; this.setup = null;
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
     this.buildAccounts(); await this.makeQR(); this.emitState();
+    this.liveUpdates.start();
     if (this.session && !this.closed && this.config.claims.enabled) void this.resumeClaims();
     void this.refresh().catch(() => {});
   }
@@ -274,6 +340,7 @@ export class WalletService extends EventEmitter {
       const maximum = this.session.data.scanLookahead ? Math.min(999, Math.max(issued, used + 20)) : issued;
       for (let index = 0; index <= maximum; index++) this.accounts.push(this.publicAccount(index, change));
     }
+    this.liveUpdates?.updateAddresses();
   }
   async makeQR() {
     const epoch = this.epoch;
@@ -288,6 +355,7 @@ export class WalletService extends EventEmitter {
     this.persisting = operation; await operation;
   }
   async lock() {
+    this.stopLiveUpdates(); this.claimRevision++;
     this.cancelSendPreview();
     this.claimToggleGeneration++; this.claimsResumePending = false;
     this.epoch++; this.preview = null; this.setup = null; this.replacement = null;
@@ -312,6 +380,7 @@ export class WalletService extends EventEmitter {
     try { await this.persist(); }
     catch(error) { if (epoch === this.epoch && this.session) this.session.data.receiveIndex = previousIndex; throw error; }
     this.assertSession(epoch); this.buildAccounts(); await this.makeQR(); this.emitState();
+    this.walletUpdateRevision++; this.walletUpdates?.request();
     void this.refresh().catch(() => {});
     return { address: this.getState().wallet.address, qrDataUrl: this.qrDataUrl };
   }
@@ -367,6 +436,8 @@ export class WalletService extends EventEmitter {
           this.assertSession(epoch);
           if (index >= 1000) throw new Error('Recovery reached the 1,000-address safety limit. Contact support before using this wallet.');
           const account = this.publicAccount(index, change);
+          if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address);
+          this.assertSession(epoch);
           const history = await this.page('getaddresshistory', account.address, { firstOnly: true, onTip });
           if (history.length) { lastUsed[change] = index; gap = 0; } else gap++;
           if (!history.length && stableTip) emptyAddresses.add(account.address);
@@ -399,6 +470,7 @@ export class WalletService extends EventEmitter {
   }
   async refreshInternal(epoch) {
     await this.ensureNetwork(); this.assertSession(epoch);
+    const updateRevision = this.walletUpdateRevision;
     const rpc = this.rpc, recoveryTipHash = this.tip.hash;
     const emptyAddresses = this.session.data.needsRecovery ? await this.recoverAddresses(epoch) : null;
     // Reuse only fully exhausted empty discovery results inside this refresh.
@@ -419,6 +491,8 @@ export class WalletService extends EventEmitter {
       // Restored wallets must keep watching their unused gap: a payment may arrive
       // later at an address issued by the old installation before restoration.
       const reuseEmpty = stableRecoveryTip && emptyAddresses?.has(account.address);
+      if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address);
+      this.assertSession(epoch);
       const transactions = reuseEmpty ? [] : await this.page('getaddresshistory', account.address, { onTip });
       reusedEmptyHistory ||= Boolean(reuseEmpty);
       if (transactions.length && account.change === 0) highestReceive = Math.max(highestReceive, account.index);
@@ -457,12 +531,21 @@ export class WalletService extends EventEmitter {
       amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
     }));
     if (highestReceive !== this.session.data.lastUsedReceive || highestChange !== this.session.data.lastUsedChange) {
+      const readAddresses = new Set(this.accounts.map(account => account.address));
       this.session.data.lastUsedReceive = highestReceive; this.session.data.lastUsedChange = highestChange;
       await this.persist(); this.assertSession(epoch); this.buildAccounts();
+      if (this.accounts.some(account => !readAddresses.has(account.address))) {
+        // These new lookahead addresses were not part of this pass's reads.
+        this.walletUpdateRevision++; this.walletUpdates?.request();
+      }
     }
     this.assertSession(epoch); this.error = null; this.emitState();
+    this.walletReadRevision = Math.max(this.walletReadRevision, updateRevision);
+    // Bounty discovery has its own event queue; address RPC latency must not gate it.
+    this.liveUpdates?.updateAddresses();
+    // An explicit refresh can also recover a saved start that failed offline.
+    // Normal discovery never waits here; its subscription queue runs independently.
     if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
-    else if (this.engine.enabled) await this.syncBounties();
     return this.getState();
   }
   async funding(txid, { signal } = {}) {
@@ -620,6 +703,7 @@ export class WalletService extends EventEmitter {
       // helper was draining. That lifecycle reads the already-saved config.
       if (this.closed || generation !== this.claimToggleGeneration) return this.getState();
       if (reconnect) this.engine.clear();
+      if (reconnect && this.session) this.liveUpdates.start();
       this.engine.setOptions({ connectionsPerSecond: config.claims.maxConnectionsPerSecond, concurrency: config.claims.maxConcurrent });
       // Auto-lock, appearance and diagnostics do not interrupt network activity.
       if (this.session && !this.closed && config.claims.enabled) await this.resumeClaims();
@@ -654,7 +738,7 @@ export class WalletService extends EventEmitter {
       return this.applyConfig({ claims }, { retryClaims: enabled === true && !this.engine.enabled });
     });
   }
-  async resumeClaims() {
+  async resumeClaims({ retryErrors = false } = {}) {
     if (this.closed || !this.session || !this.config.claims.enabled || this.claimsReviewRequired) return;
     this.claimsResumePending = false;
     const epoch = this.epoch, rpc = this.rpc, engine = this.engine;
@@ -685,6 +769,10 @@ export class WalletService extends EventEmitter {
       this.error = error.message;
       engine.notify({ lastError: error.message, status: 'off' });
       this.recordDiagnostic('claims.start_failed', { stage: 'lifecycle', error });
+      // No periodic poll remains to rescue a transient startup failure. The
+      // event queue owns bounded failure retries, including the initial unlock.
+      if (retryErrors) { this.emitState(); throw error; }
+      this.bountyUpdates?.request();
     }
     this.emitState();
   }
@@ -722,6 +810,7 @@ export class WalletService extends EventEmitter {
       });
       if (!cancelled && epoch === this.epoch && this.rpc === rpc && this.engine === engine && engine.enabled) {
         this.error = error.message;
+        this.claimsResumePending = [-32001, -32011, -32029].includes(error?.code) || !rpc.socket || rpc.socket.destroyed;
         // Never continue queued work after a partial/invalid discovery.
         void engine.stop();
       }
@@ -734,9 +823,9 @@ export class WalletService extends EventEmitter {
     this.bountySync = pending; return pending;
   }
   async syncBountiesInternal(epoch) {
-    const rpc = this.rpc, engine = this.engine;
+    const rpc = this.rpc, engine = this.engine, revision = this.claimRevision;
     const check = () => {
-      if (!this.session || epoch !== this.epoch || this.rpc !== rpc || this.engine !== engine || !engine.enabled) {
+      if (!this.session || epoch !== this.epoch || this.rpc !== rpc || this.engine !== engine || !engine.enabled || revision !== this.claimRevision) {
         throw Object.assign(new Error('Automatic Claims stopped or its connection changed.'), { name: 'AbortError', code: 'ABORT_ERR' });
       }
     };
@@ -853,6 +942,7 @@ export class WalletService extends EventEmitter {
     this.closed = true;
     clearInterval(this.timer);
     const refreshing = this.refreshing;
+    const liveWork = [this.liveUpdates?.running, this.walletUpdates?.running, this.bountyUpdates?.running, this.bountySync].filter(Boolean);
     // lock() publishes cleared sensitive state synchronously before its first await.
     const locking = this.lock();
     this.statePublisher.close();
@@ -860,6 +950,7 @@ export class WalletService extends EventEmitter {
     // The interrupted refresh must publish its terminal diagnostic before the
     // lifecycle marker is flushed and Electron exits.
     await refreshing?.catch(() => {});
+    await Promise.allSettled(liveWork);
     // Finish any already-started atomic encrypted write before Electron exits.
     await this.persisting.catch(() => {});
     await this.walletWrite?.catch(() => {});

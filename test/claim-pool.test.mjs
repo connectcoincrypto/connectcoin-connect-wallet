@@ -103,7 +103,7 @@ test('budget rejection before TCP does not invent a capture or start notificatio
 });
 
 for (const [message, expected, category] of [
-  ['TLS connection timed out', 'TLS connection timed out', 'timeout'],
+  ['TLS connection timed out', 'TLS connection timed out', 'tls-timeout'],
   ['TLS capture or proof validation failed', 'TLS capture or proof validation failed', 'proof-failed'],
   ['TLS capture cancelled', 'TLS capture cancelled', 'unknown'],
   ['Public DNS resolution is required', 'Public DNS resolution is required', 'unknown'],

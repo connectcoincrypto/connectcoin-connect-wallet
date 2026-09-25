@@ -72,6 +72,10 @@ Valid preferences are saved automatically, including appearance, Developer Mode,
 
 This is **raw, newline-delimited TCP JSON-RPC, not HTTP or HTTPS**. No node username/password is required. Never point it at an unrestricted administrative node RPC service. The corresponding server is [connectcoin-json-rpc](https://github.com/connectcoincrypto/connectcoin-json-rpc).
 
+While unlocked, ConnectWallet subscribes to chain-tip, bounty and address updates over its persistent RPC connection. Notifications trigger validated reads; there is **no 20-second network polling loop**. Bounty discovery runs independently of balance/history refreshes, and notification bursts are combined without losing updates received during a read. After a disconnect, the wallet reconnects with bounded backoff, subscribes again and catches up before resuming claims. Locking closes subscriptions and cancels reconnect attempts. The local inactivity/auto-lock timer remains independent of network updates.
+
+Address subscriptions are subject to the server's per-IP capacity, shared with other clients. If that capacity is exhausted, the wallet reports it: block notifications still refresh confirmed balances/history, but pending-only changes on unsubscribed addresses require a manual refresh. Subscription notifications are hints, not cryptographic proof of blockchain state.
+
 **Trust and privacy:** network traffic is unencrypted. Your queried addresses, history and transactions can be observed, censored or modified in transit. The wallet pins the expected chain/genesis identity, but that check is not proof of consensus: a dishonest server can repeat the expected identity while lying about chain state. This is not an SPV wallet or an independently validating node. Choose a server you trust.
 
 Private keys, passwords and recovery words are never sent to RPC. Before signing, the wallet parses funding transaction bytes, recomputes their transaction IDs, and checks the amounts and ownership against the locally derived keys. Recipients and fees are constructed locally. These checks do **not** prove inclusion, confirmations or unspentness.
@@ -123,9 +127,9 @@ Stopping also releases claim preparation from shared funding lookups without can
 
 ## Local diagnostic logs
 
-**Developer Mode** in Settings is off by default, including for existing configurations that do not contain this preference. Enable it to show recoverable claim-rejection warnings and the **Recent diagnostic errors** panel in Automatic Claims. The preference persists without reconnecting RPC or stopping claims. Connection failures, security warnings and errors requiring user action remain visible in normal mode.
+**Developer Mode** in Settings is off by default, including for existing configurations that do not contain this preference. Enable it to show recoverable claim-rejection warnings and the **Recent diagnostic events** panel in Automatic Claims. The preference persists without reconnecting RPC or stopping claims. Connection failures, security warnings and errors requiring user action remain visible in normal mode.
 
-The diagnostic panel retains the last 50 errors from the current app session, even when the next bounty clears a transient warning. **Open log folder** opens the application's local diagnostic directory. Local logging remains active with Developer Mode off; the switch controls diagnostic visibility, not collection.
+The diagnostic panel retains the last 50 errors and individual attempt failures from the current app session, even after recovery. It is a history, not the current status of Automatic Claims. **Open log folder** opens the application's local diagnostic directory. Local logging remains active with Developer Mode off; the switch controls diagnostic visibility, not collection.
 
 The data folder described above contains `logs/diagnostics.jsonl`, plus up to two rotated files, `diagnostics.1.jsonl` and `diagnostics.2.jsonl`. Each file is limited to 2 MiB (approximately 6 MiB total). Entries include UTC timestamps, an app-session identifier, claim stages and session-local claim numbers, durations, retry counters, and RPC/node error codes when available. File records survive app restarts; the in-app list is for the current session only.
 
@@ -133,7 +137,7 @@ Automatic Claims writes `claims.progress` at most once every five seconds, with 
 
 Only allowlisted metadata and canonical error descriptions are recorded. Passwords, recovery words, private keys, addresses, transaction IDs/bytes, TLS proofs, arbitrary backend error text, helper stderr and RPC parameters are **not** written. Unknown errors use a generic description rather than copying potentially sensitive remote text. Logs remain on your device; nothing is uploaded automatically. Review them before sharing, since operation timing and error categories still describe wallet activity.
 
-TLS capture timeouts have their own fixed diagnostic description, distinct from generic capture/proof failures. This does not change connection deadlines, retry rules or successful-capture budgets. See the [helper protocol](helpers/PROTOCOL.md).
+Individual TCP/TLS capture timeouts use the `tls-timeout` category: that attempt did not produce a usable capture or broadcast a claim transaction, and the timeout itself does not stop Automatic Claims. Its inline warning is informational; fatal and unknown-broadcast warnings remain prominent. Generic proof-processing, helper-watchdog and RPC timeouts are not labeled as TLS connection timeouts. The displayed bounty job number identifies a bounty's local job, not a connection-attempt number. This does not change connection deadlines, retry rules or successful-capture budgets. See the [helper protocol](helpers/PROTOCOL.md).
 
 Writes are asynchronous with a bounded queue and automatic rotation. If the disk or directory is unavailable, claiming continues and the panel reports the logging problem when Developer Mode is enabled; errors remain in bounded memory until the app closes. Diagnostics cannot recover warnings from versions that did not record them.
 

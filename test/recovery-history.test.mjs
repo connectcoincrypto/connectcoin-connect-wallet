@@ -15,8 +15,13 @@ const transaction = digit => ({ txid: digit.repeat(64), status: 'confirmed', blo
 
 class Backend extends EventEmitter {
   constructor() { super(); this.socket = {}; this.tip = originalTip; this.calls = []; this.historyBudget = Infinity; }
+  async connect() { if (!this.socket) { this.socket = {}; this.emit('connected'); } return this.socket; }
   async request(method, params = {}) {
     this.calls.push({ method, ...params });
+    if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
+      subscription_id: `${method}-${params.address ?? 'global'}`, tip: this.tip, cursor: 'fixture-journal',
+    };
+    if (method === 'unsubscribe') return { removed: true };
     if (method === 'getchaintip') return this.chainTip?.() ?? this.tip;
     if (method === 'getaddressbalance') {
       this.beforeBalance?.(params);

@@ -12,8 +12,13 @@ const PASSWORD = 'local-test-password-only';
 const tip = { chain:'testnet4',height:999,hash:'a'.repeat(64),mediantime:1789500000,genesis_hash:GENESIS.testnet4 };
 class Backend extends EventEmitter {
   constructor() { super(); this.socket = {}; this.calls = []; this.negative = false; }
+  async connect() { if (!this.socket) { this.socket = {}; this.emit('connected'); } return this.socket; }
   async request(method, params) {
     this.calls.push([method,params]);
+    if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
+      subscription_id: `${method}-${params?.address ?? 'global'}`, tip, cursor: 'fixture-journal',
+    };
+    if (method === 'unsubscribe') return { removed: true };
     if(method==='getchaintip')return tip;
     if(method==='getaddressbalance')return {tip,address:params.address,unit:'connects',confirmed:'10000000000',available_confirmed:'0',immature:'0',pending_delta:this.negative?'-10000000000':'0'};
     if(['getaddresshistory','getaddressutxos'].includes(method))return {tip,address:params.address,unit:'connects',items:[],next_cursor:null};
@@ -34,6 +39,20 @@ async function create(service) {
   const answers=Object.fromEntries(setup.checkIndexes.map(index=>[index,words[index]]));
   await service.confirmWallet({setupId:setup.setupId,answers});
   await service.refresh();
+  // Tests deliberately start their own mocked engine or snapshot RPC counters.
+  // Drain initial registration catch-ups first, including their debounce timer,
+  // so those independent operations cannot race the behavior being asserted.
+  let idle = false;
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const live = service.liveUpdates;
+    idle = live.baseReady && service.accounts.every(account => live.registrations.has(`address:${account.address}`)) &&
+      !service.refreshing && !service.bountySync && !live.running && !live.requested &&
+      !live.retryTimer && !live.addressTimer && !live.addressPending &&
+      [service.walletUpdates, service.bountyUpdates].every(queue => !queue.running && !queue.timer && !queue.dirty);
+    if (idle) break;
+    await new Promise(done => setTimeout(done, 5));
+  }
+  assert.ok(idle, 'Initial live subscription catch-ups must finish before the test takes ownership');
   return setup;
 }
 

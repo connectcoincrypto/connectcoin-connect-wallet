@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
+import { diagnosticError } from '../src/core/diagnostics.mjs';
 import { createRequire } from 'node:module';
 import { waitForUiCondition } from './ui-wait.mjs';
 import { closeElectronTest } from './ui-close.mjs';
@@ -38,6 +39,8 @@ const serve = socket => {
       }
       let result;
       if (method === 'getchaintip') result = tip;
+      else if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) result = { subscription_id: `${method}:${params.address ?? ''}`, tip, cursor: 'ui-empty-journal' };
+      else if (method === 'unsubscribe') result = { removed: true };
       else if (method === 'getaddressbalance') result = { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', pending_delta: '0', immature: '0' };
       else if (['getaddresshistory', 'getaddressutxos'].includes(method)) result = { tip, address: params.address, unit: 'connects', items: [], next_cursor: null };
       else { socket.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Unsupported fixture method' } })}\n`); continue; }
@@ -141,13 +144,15 @@ async function assertPreferenceEnterStayedPut(selector) {
 }
 
 let presentationSequence = 0;
-async function showClaimPresentation({ message, diagnostic, enabled, pageError = null }) {
+async function showClaimPresentation({ message, diagnostic, enabled, pageError = null, category = null, transient = false, diagnosticRows = null }) {
   // Renderer-only fixtures: no real claims, helper calls or broadcasts. Core
   // tests separately verify how structured rejection codes set this flag.
   const snapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const status = `presentation-check-${++presentationSequence}`;
-  snapshot.claims = { ...snapshot.claims, lastError: message, lastErrorDiagnostic: diagnostic, enabled, status };
+  snapshot.claims = { ...snapshot.claims, lastError: message, lastErrorDiagnostic: diagnostic,
+    lastErrorCategory: category, lastErrorTransient: transient, enabled, status };
   snapshot.error = pageError;
+  if (diagnosticRows !== null) snapshot.diagnostics = { status: 'ready', file: '', dropped: 0, ...snapshot.diagnostics, recent: diagnosticRows };
   await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), snapshot);
   await page.waitForFunction(expected => document.querySelector('.status-badge')?.textContent === expected, status);
 }
@@ -425,6 +430,10 @@ try {
   assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).claims.enabled, false);
 
   stage = 'persistent diagnostic history';
+  // The toggle's persisted response can precede the last coalesced stop-state
+  // publication. Drain that known 200 ms UI window before injecting isolated
+  // renderer snapshots, which must not race real main-process state updates.
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 300)));
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.developerMode, false);
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).diagnostics, null);
   assert.equal(await page.locator('.diagnostics-card').count(), 0);
@@ -436,10 +445,28 @@ try {
   assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), null);
   const claimWarning = 'The node rejected this claim. Its bounty or proof may no longer be valid.';
   const claimNotice = () => page.locator('.form-card .notice.danger').filter({ hasText: claimWarning });
+  const tlsTimeout = diagnosticError(new Error('TLS connection timed out'));
+  const tlsTitle = 'TCP/TLS connection attempt timed out';
+  const genericTimeout = diagnosticError(new Error('RPC request timed out.'));
+  const diagnosticRows = [
+    { event: 'claim.failed', details: { stage: 'proof', claimId: 1, durationMs: 10016, error: tlsTimeout } },
+    { event: 'claim.failed', details: { stage: 'proof', claimId: 2, durationMs: 45000, error: diagnosticError(new Error('Proof generation timed out')) } },
+    { event: 'rpc.failed', details: { stage: 'request', method: 'getchaintip', durationMs: 10016, error: genericTimeout } },
+    { event: 'helper.failed', details: { stage: 'proof', durationMs: 45000,
+      error: diagnosticError({ message: 'Claims helper startup timed out; update or rebuild the helper', helperFatal: true }) } },
+    { event: 'claim.failed', details: { stage: 'submit', claimId: 3, durationMs: 10016, unknownOutcome: true,
+      error: diagnosticError({ message: 'TLS connection timed out', unknownOutcome: true }) } },
+  ].map((row, sequence) => ({ timestamp: '2026-09-25T10:33:13.380Z', session: 'isolated-ui-fixture', sequence: sequence + 1, ...row }));
   await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
   assert.equal(await claimNotice().count(), 0, 'recoverable claim rejection is hidden by default');
   await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: false });
   assert.equal(await claimNotice().count(), 0, 'pausing claims must not reveal the same recoverable diagnostic');
+  await showClaimPresentation({ message: tlsTimeout.message, diagnostic: false, enabled: true,
+    category: 'tls-timeout', transient: true, diagnosticRows });
+  assert.equal(await page.locator('.diagnostics-card').count(), 0, 'synthetic history is still hidden without Developer Mode');
+  assert.equal(await page.locator('.form-card .notice.info').filter({ hasText: tlsTimeout.message }).isVisible(), true,
+    'an individual TLS timeout is informational in normal mode too');
+  assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: tlsTimeout.message }).count(), 0);
   const unknownBroadcast = 'Claim broadcast was not confirmed. Check the transaction before enabling Automatic Claims again.';
   await showClaimPresentation({ message: unknownBroadcast, diagnostic: false, enabled: false, pageError: unknownBroadcast });
   assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: unknownBroadcast }).isVisible(), true);
@@ -477,6 +504,47 @@ try {
   await page.getByRole('button', { name: 'Open log folder' }).click();
   assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), path.join(profile, 'logs'));
   await page.locator('.diagnostics-card').screenshot({ path: path.join(screenshots, 'claims-diagnostics.png') });
+  stage = 'precise TLS diagnostic history and transient inline presentation';
+  await showClaimPresentation({ message: tlsTimeout.message, diagnostic: false, enabled: true,
+    category: 'tls-timeout', transient: true, diagnosticRows });
+  assert.equal(await page.locator('.diagnostics-card h2').textContent(), 'Recent diagnostic events');
+  assert.match(await page.locator('.diagnostics-card > .card-description').first().textContent(), /not the current status of Automatic Claims/);
+  const tlsHistory = page.locator('.diagnostic-list li').filter({ hasText: 'bounty job #1' });
+  assert.equal(await tlsHistory.locator('strong').textContent(), tlsTitle);
+  assert.match(await tlsHistory.textContent(), /TCP\/TLS connection · bounty job #1 · 10\.016 s/);
+  assert.match(await tlsHistory.locator('.diagnostic-explanation').textContent(), /No claim transaction was broadcast from this attempt\./);
+  assert.match(await tlsHistory.locator('.diagnostic-explanation').textContent(), /This individual timeout did not stop Automatic Claims\./);
+  assert.equal(await page.locator('.form-card .notice.info').filter({ hasText: tlsTimeout.message }).isVisible(), true);
+  assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: tlsTimeout.message }).count(), 0);
+  const otherHistory = page.locator('.diagnostic-list li').filter({ hasNotText: 'bounty job #1' });
+  assert.equal(await otherHistory.count(), 4);
+  for (const row of await otherHistory.all()) {
+    assert.equal(await row.locator('.diagnostic-explanation').count(), 0);
+    const text = await row.textContent();
+    assert.ok(!text.includes('TCP/TLS connection') && !text.includes('No claim transaction was broadcast') && !text.includes('did not stop Automatic Claims'),
+      'RPC, generic proof, fatal helper and unknown-broadcast failures cannot inherit individual-TLS-timeout claims');
+  }
+  assert.equal(await page.locator('.diagnostic-list li').filter({ hasText: 'getchaintip' }).locator('strong').textContent(), genericTimeout.message);
+  assert.match(await page.locator('.diagnostic-list li').filter({ hasText: 'bounty job #3' }).locator('strong').textContent(), /broadcast outcome is unknown/i);
+  await tlsHistory.scrollIntoViewIfNeeded();
+  await page.locator('.diagnostics-card').screenshot({ path: path.join(screenshots, 'claims-diagnostics-tls-timeout.png') });
+  // Both flags are required for an informational inline notice. Neither a
+  // generic timeout nor an incorrectly marked broadcast warning may become info.
+  for (const sample of [
+    { message: tlsTimeout.message, category: 'tls-timeout', transient: false },
+    { message: genericTimeout.message, category: 'timeout', transient: true },
+    { message: 'The Automatic Claims helper failed.', category: 'helper-failed', transient: true },
+    { message: unknownBroadcast, category: 'broadcast-unknown', transient: true, pageError: unknownBroadcast },
+  ]) {
+    await showClaimPresentation({ ...sample, diagnostic: false, enabled: false, diagnosticRows });
+    assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: sample.message }).isVisible(), true);
+    assert.equal(await page.locator('.form-card .notice.info').filter({ hasText: sample.message }).count(), 0);
+  }
+  assert.equal(await page.locator('.page-error .notice.danger').isVisible(), true);
+  await showClaimPresentation({ message: null, diagnostic: false, enabled: false, diagnosticRows });
+  assert.equal(await tlsHistory.isVisible(), true, 'clearing the live warning and stopping claims must preserve history');
+  assert.equal(await page.locator('.form-card .notice').filter({ hasText: tlsTimeout.message }).count(), 0);
+  assert.equal(await page.locator('.page-error').count(), 0);
   const diagnosticText = await readFile(path.join(profile, 'logs', 'diagnostics.jsonl'), 'utf8');
   assert.match(diagnosticText, /rpc.failed/);
   assert.match(diagnosticText, /wallet.refresh_failed/);
@@ -487,6 +555,10 @@ try {
   await page.locator('[data-view="claims"]').first().click();
   await showClaimPresentation({ message: claimWarning, diagnostic: true, enabled: true });
   assert.equal(await claimNotice().count(), 0);
+  await showClaimPresentation({ message: tlsTimeout.message, diagnostic: false, enabled: false,
+    category: 'tls-timeout', transient: true, diagnosticRows });
+  assert.equal(await page.locator('.form-card .notice.info').filter({ hasText: tlsTimeout.message }).isVisible(), true);
+  assert.equal(await page.locator('.form-card .notice.danger').filter({ hasText: tlsTimeout.message }).count(), 0);
   assert.equal(await page.locator('.diagnostics-card').count(), 0);
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).diagnostics, null);
   await page.screenshot({ path: path.join(screenshots, 'claims-normal-mode.png'), fullPage: true });
@@ -544,6 +616,7 @@ try {
   // Avoid Playwright action dumps: they could contain a generated backup word.
   const sourceLine = /test-ui\.mjs:(\d+):\d+/.exec(String(error.stack ?? ''))?.[1];
   console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}${sourceLine ? `, test line ${sourceLine}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
+  if (stage.includes('diagnostic')) console.error(`Diagnostic presentation fixture number: ${presentationSequence}.`);
   if (stage === 'system appearance and startup persistence') console.error(String(error.message).slice(0, 800));
   if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || /^(?:Native appearance must match|Developer Mode persistence mismatch)/.test(String(error.message)))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;

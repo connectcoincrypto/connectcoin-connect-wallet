@@ -55,6 +55,15 @@ test('method/parameter allowlist cannot leak secrets or invoke getters', () => {
   assert.deepEqual(validateRpcParams('getbountychanges', { cursor: null }), { cursor: null });
 });
 
+test('unsubscribe accepts opaque bounded IDs and rejects overlong or control-character IDs', () => {
+  for (const subscription_id of ['subscribetip:', 'subscribeaddress:abcdefgh1', 'x'.repeat(100)]) {
+    assert.deepEqual(validateRpcParams('unsubscribe', { subscription_id }), { subscription_id });
+  }
+  for (const subscription_id of ['', 'x'.repeat(101), 'bad\u0000id', 'bad\nID', 'bad\u007fID']) {
+    assert.throws(() => validateRpcParams('unsubscribe', { subscription_id }), /Invalid RPC subscription ID/);
+  }
+});
+
 test('concurrent requests share one connection; chunk fragmentation is reassembled', async () => {
   const server = await mock((request, socket) => {
     const encoded = line(response(request, { method: request.method }));

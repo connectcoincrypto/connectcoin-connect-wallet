@@ -4,6 +4,7 @@
 
 /* Appearance is a local preference, separate from network settings. */
 .diagnostics-card{margin-top:24px}.diagnostic-path{font-family:var(--mono);font-size:10px;color:var(--muted);overflow-wrap:anywhere;margin:14px 0}.diagnostic-list{list-style:none;padding:0;margin:18px 0 0;max-height:380px;overflow:auto}.diagnostic-list li{padding:13px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.diagnostic-list strong{font-size:12px;line-height:1.6}.diagnostic-list p{font-size:10px;color:var(--muted);margin-top:5px}.diagnostic-meta{display:flex;flex-wrap:wrap;gap:12px;font-size:10px;color:var(--subtle);margin-bottom:6px}
+.diagnostic-list .diagnostic-explanation{font-size:12px;line-height:1.6;color:var(--ink)}
 .button.ghost:hover{background:var(--wash);color:var(--ink)}
 .appearance-row{display:flex;align-items:center;justify-content:space-between;gap:30px}.appearance-row .card-description{margin-bottom:0;max-width:570px}.appearance-field{width:190px;flex-shrink:0;margin-bottom:0}.appearance-field .select{cursor:pointer}.orb-lime{fill:var(--orb-lime);stroke:var(--orb-lime)}.orb-violet{fill:var(--orb-violet);stroke:var(--orb-violet)}select:disabled{cursor:wait;opacity:.55}@media(max-width:800px){.appearance-row{align-items:start;flex-direction:column;gap:18px}.appearance-field{width:100%;max-width:300px}}
 .recovery-actions{margin-top:24px}.recovery-confirm{margin-top:20px}.auth-content>.notice{margin-bottom:20px}

@@ -37,7 +37,7 @@ export function validateRpcParams(method, params) {
     if ((key === 'block_hash' || key === 'txid') && !/^[0-9a-f]{64}$/i.test(value)) throw new Error('Invalid RPC hash.');
     if (key === 'address' && (value.length < 8 || value.length > 90 || !/^[a-zA-Z0-9]+$/.test(value))) throw new Error('Invalid RPC address.');
     if (key === 'cursor' && (value.length < 1 || value.length > 1024 || !/^[A-Za-z0-9_.-]+$/.test(value))) throw new Error('Invalid RPC cursor.');
-    if (key === 'subscription_id' && (value.length < 1 || value.length > 100 || !/^[A-Za-z0-9_-]+$/.test(value))) throw new Error('Invalid RPC subscription ID.');
+    if (key === 'subscription_id' && (value.length < 1 || value.length > 100 || /[\x00-\x1f\x7f]/.test(value))) throw new Error('Invalid RPC subscription ID.');
     if (key === 'transaction_hex' && (value.length < 20 || value.length > 800000 || value.length % 2 || !/^[0-9a-f]+$/i.test(value))) throw new Error('Invalid or oversized transaction bytes.');
     clean[key] = key === 'block_hash' || key === 'txid' ? value.toLowerCase() : value;
   }

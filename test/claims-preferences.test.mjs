@@ -24,11 +24,19 @@ class Backend extends EventEmitter {
   constructor(options, control) {
     super(); this.options = options; this.control = control; this.calls = []; this.socket = null;
   }
+  async connect() {
+    if (!this.control.online) throw new Error('Isolated test RPC is offline.');
+    if (!this.socket) { this.socket = {}; this.emit('connected'); }
+    return this.socket;
+  }
   async request(method, params = {}, { onChunk } = {}) {
     this.calls.push(method);
-    if (!this.control.online) throw new Error('Isolated test RPC is offline.');
-    this.socket = {};
+    await this.connect();
     const currentTip = this.control.validChain ? tip : { ...tip, chain: 'main' };
+    if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
+      subscription_id: `${method}-${params.address ?? 'global'}`, tip: currentTip, cursor: 'empty-journal',
+    };
+    if (method === 'unsubscribe') return { removed: true };
     if (method === 'getchaintip') return currentTip;
     if (method === 'getaddressbalance') return { tip: currentTip, address: params.address, unit: 'connects',
       confirmed: '0', available_confirmed: '0', immature: '0', pending_delta: '0' };
@@ -77,8 +85,37 @@ async function fixture(t, { online = true, validChain = true, config = {} } = {}
 }
 
 async function settle(service) {
+  if (service.rpc.control.online && service.rpc.control.validChain && service.liveUpdates.started) {
+    // Real sockets emit connected before replies; after an offline or invalid
+    // network attempt, subscriptions recover asynchronously under backoff.
+    // Wait for those actual registrations instead of treating a manual refresh
+    // during reconnect as proof that automatic recovery failed.
+    let ready = false;
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      ready = service.liveUpdates.baseReady && service.accounts.every(account =>
+        service.liveUpdates.registrations.has(`address:${account.address}`));
+      if (ready) break;
+      await new Promise(done => setTimeout(done, 5));
+    }
+    assert.ok(ready, 'Valid online RPC must recover its live subscriptions within the bounded retry window');
+  }
   await service.refresh();
   await service.bountySync;
+  if (service.rpc.control.online && service.rpc.control.validChain && service.liveUpdates.started) {
+    // Wait for the startup catch-up queues as well as registration. Appearance
+    // and preference tests below measure only work caused by their own edit,
+    // not a subscription catch-up that happened to be delayed under build load.
+    let idle = false;
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const live = service.liveUpdates;
+      idle = !service.refreshing && !service.bountySync && !live.running && !live.requested &&
+        !live.retryTimer && !live.addressTimer && !live.addressPending &&
+        [service.walletUpdates, service.bountyUpdates].every(queue => !queue.running && !queue.timer && !queue.dirty);
+      if (idle) break;
+      await new Promise(done => setTimeout(done, 5));
+    }
+    assert.ok(idle, 'Initial live catch-up work must settle before checking a subsequent settings edit');
+  }
 }
 async function unlock(service) {
   await service.unlock({ password });

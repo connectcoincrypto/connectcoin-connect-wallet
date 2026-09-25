@@ -44,6 +44,8 @@ const fixture = net.createServer(socket => {
       if (method === 'getaddresshistory') historyAddresses.push(params.address);
       let result;
       if (method === 'getchaintip') result = tip;
+      else if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) result = { subscription_id: `${method}:${params.address ?? ''}`, tip, cursor: 'ui-empty-journal' };
+      else if (method === 'unsubscribe') result = { removed: true };
       else if (method === 'getaddressbalance') result = { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', pending_delta: '0', immature: '0' };
       else if (['getaddresshistory', 'getaddressutxos'].includes(method)) result = { tip, address: params.address, unit: 'connects', items: [], next_cursor: null };
       else {

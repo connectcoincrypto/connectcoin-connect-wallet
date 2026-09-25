@@ -3,7 +3,7 @@ import { mkdir, lstat, open, rename, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const EVENTS = new Set([
-  'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled',
+  'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled', 'wallet.subscription_failed',
   'claims.started', 'claims.stopped', 'claims.suspended', 'claims.resumed', 'claims.progress', 'claims.failed',
   'claim.started', 'claim.succeeded', 'claim.failed',
   'claim.cancelled', 'rpc.connected', 'rpc.disconnected', 'rpc.failed', 'rpc.cancelled', 'rpc.slow', 'helper.failed',
@@ -35,6 +35,7 @@ const MESSAGES = Object.freeze({
   dns: 'DNS resolution failed.',
   network: 'The network connection failed or was interrupted.',
   timeout: 'The operation exceeded its time limit.',
+  'tls-timeout': 'One TCP/TLS connection attempt timed out before producing a usable TLS capture. No claim transaction was broadcast from this attempt.',
   quota: 'The RPC request or rate limit was reached.',
   'index-not-ready': 'The node index is not ready; retry later.',
   'snapshot-stale': 'The bounty snapshot must be refreshed.',
@@ -92,6 +93,10 @@ function describeError(error, includeCause) {
   else if (code === -32004) category = 'data-unavailable';
   else if (code === -32011) category = 'snapshot-stale';
   else if (['ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL'].includes(code)) category = 'dns';
+  // This exact message is emitted by the local capture helper and allowlisted
+  // by claim-pool. Neither an arbitrary timeout at stage "proof" nor a helper
+  // watchdog/RPC timeout establishes that one TCP/TLS attempt timed out.
+  else if (message === 'TLS connection timed out' && own(error, 'helperFatal') !== true && own(cause, 'helperFatal') !== true) category = 'tls-timeout';
   else if (['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ERR_SOCKET_CONNECTION_TIMEOUT'].includes(code)) category = 'timeout';
   else if (['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EPIPE', 'ERR_SOCKET_CLOSED'].includes(code)) category = 'network';
   else if (['EMFILE', 'ENFILE', 'ENOMEM', 'ENOBUFS'].includes(code)) category = 'resource-limit';
