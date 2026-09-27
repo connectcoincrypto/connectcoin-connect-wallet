@@ -8,6 +8,8 @@ import { bech32m } from '@scure/base';
 
 export const NETWORKS = Object.freeze({ main: Object.freeze({ hrp: 'cc', coin: 0 }), testnet4: Object.freeze({ hrp: 'tcc', coin: 1 }), regtest: Object.freeze({ hrp: 'ccrt', coin: 1 }) });
 export const WORD_COUNTS = Object.freeze([12, 18, 24]);
+// Normal BIP32 children; the following index would enter the hardened range.
+export const MAX_ADDRESS_INDEX = 0x7fffffff;
 export function networkParameters(network = 'testnet4') {
   const parameters = Object.hasOwn(NETWORKS, network) ? NETWORKS[network] : undefined;
   if (!parameters) throw new Error('Unsupported ConnectCoin network');
@@ -63,7 +65,7 @@ export function decodeAddress(address, network = 'testnet4') {
 export function deriveAccount(mnemonic, { network = 'testnet4', index = 0, change = 0, passphrase = '' } = {}) {
   const phrase = normalizeMnemonic(mnemonic);
   if (!validateMnemonic(phrase)) throw new Error('Recovery phrase has an invalid word count or checksum');
-  if (!Number.isSafeInteger(index) || index < 0 || index >= 0x80000000 || ![0, 1].includes(change)) throw new Error('Invalid derivation index');
+  if (!Number.isSafeInteger(index) || index < 0 || index > MAX_ADDRESS_INDEX || ![0, 1].includes(change)) throw new Error('Invalid derivation index');
   if (typeof passphrase !== 'string' || passphrase.length > 1024) throw new Error('Invalid BIP39 passphrase');
   const path = `m/44'/${networkParameters(network).coin}'/0'/${change}/${index}`;
   const seed = mnemonicToSeedSync(phrase, passphrase);

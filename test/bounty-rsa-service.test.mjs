@@ -29,7 +29,7 @@ async function fixture(t, rsaProbe) {
   } });
   await service.initialize(); clearInterval(service.timer);
   service.session = { data: { mnemonic, receiveIndex: 0, changeIndex: 0 }, password: 'not-used-in-test' };
-  service.buildAccounts();
+  await service.buildAccounts();
   service.utxos = [{ txid: transactionId(funding), vout: 0, amount: funding.outputs[0].amount, status: 'confirmed', mature: true, account: { index: 0, change: 0 } }];
   service.refresh = async () => {};
   service.ensureNetwork = async () => {};

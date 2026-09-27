@@ -260,7 +260,7 @@ test('address subscription capacity warning survives refresh and clears after su
     return original(method, params, options);
   };
   s.session.data.receiveIndex = 1;
-  s.buildAccounts();
+  await s.buildAccounts();
   const current = s.accounts.find(account => account.change === 0 && account.index === 1).address;
   assert.equal(s.liveUpdates.getAddresses()[0], current, 'Current receive address should have first subscription priority');
   await until(() => Boolean(s.liveUpdateWarning));
@@ -312,7 +312,7 @@ test('a same-tip address push during the initial read forces a fresh wallet pass
 test('lookahead addresses discovered after a wallet pass are read by a follow-up without another push', async t => {
   const { service: s } = await fixture(t);
   s.session.data.scanLookahead = true;
-  s.buildAccounts();
+  await s.buildAccounts();
   await settled(s);
   const edge = s.accounts.find(account => account.change === 0 && account.index === 19).address;
   const original = s.rpc.request.bind(s.rpc);

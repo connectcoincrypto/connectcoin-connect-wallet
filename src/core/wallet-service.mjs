@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import QRCode from 'qrcode';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
-import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic } from './crypto.mjs';
+import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, MAX_ADDRESS_INDEX } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
 import { ClaimsEngine, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
@@ -17,9 +17,12 @@ import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
 import { createRsaProbe } from './rsa-probe.mjs';
 import { LiveUpdates } from './live-updates.mjs';
 import { EventRefresh } from './event-refresh.mjs';
+import { setImmediate as yieldTask } from 'node:timers/promises';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
+const ADDRESS_GAP = 20;
+const ADDRESS_BUILD_BATCH = 32;
 function amount(value) {
   if (typeof value !== 'string' || !MONEY.test(value) || BigInt(value) > 1000000000000000000n || BigInt(value) < -1000000000000000000n) throw new Error('RPC returned an invalid monetary amount.');
   return BigInt(value);
@@ -315,11 +318,16 @@ export class WalletService extends EventEmitter {
   }
   async openSession(data, password) {
     if (data.network !== this.config.network) throw new Error('Wallet and RPC configuration belong to different networks.');
-    for (const key of ['receiveIndex', 'changeIndex']) if (!Number.isSafeInteger(data[key]) || data[key] < 0 || data[key] > 999) throw new Error('Unsupported wallet address index.');
+    for (const key of ['receiveIndex', 'changeIndex']) if (!Number.isSafeInteger(data[key]) || data[key] < 0 || data[key] > MAX_ADDRESS_INDEX) throw new Error('Unsupported wallet address index.');
+    for (const key of ['lastUsedReceive', 'lastUsedChange']) {
+      const index = data[key] === undefined ? -1 : data[key];
+      if (!Number.isSafeInteger(index) || index < -1 || index > MAX_ADDRESS_INDEX) throw new Error('Unsupported last-used wallet address index.');
+    }
     walletName(data.name);
     this.replacement = null; this.setup = null;
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
-    this.buildAccounts(); await this.makeQR(); this.emitState();
+    const epoch = this.epoch;
+    await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch); this.emitState();
     this.liveUpdates.start();
     if (this.session && !this.closed && this.config.claims.enabled) void this.resumeClaims();
     void this.refresh().catch(() => {});
@@ -332,15 +340,56 @@ export class WalletService extends EventEmitter {
     const { privateKey, ...publicData } = account; privateKey.fill(0);
     this.accountCache.set(cacheKey, publicData); return publicData;
   }
-  buildAccounts() {
-    this.accounts = [];
-    for (const change of [0,1]) {
+  async buildAccounts() {
+    this.assertSession();
+    const epoch = this.epoch;
+    for (;;) {
+      let build = this.accountBuild;
+      if (build?.epoch !== epoch) {
+        build = { epoch };
+        build.promise = this.buildAccountsInternal(epoch).finally(() => {
+          if (this.accountBuild === build) this.accountBuild = null;
+        });
+        this.accountBuild = build;
+      }
+      const limits = await build.promise;
+      this.assertSession(epoch);
+      // A small build can finish synchronously before another caller extends
+      // the range in the same turn. Recheck even when joining a finished build.
+      if (this.accountRangeMaxima().every((maximum, change) => maximum === limits[change])) return;
+    }
+  }
+  accountRangeMaxima() {
+    return [0, 1].map(change => {
       const issued = this.session.data[change ? 'changeIndex' : 'receiveIndex'];
       const used = this.session.data[change ? 'lastUsedChange' : 'lastUsedReceive'] ?? -1;
-      const maximum = this.session.data.scanLookahead ? Math.min(999, Math.max(issued, used + 20)) : issued;
-      for (let index = 0; index <= maximum; index++) this.accounts.push(this.publicAccount(index, change));
+      return this.session.data.scanLookahead ? Math.min(MAX_ADDRESS_INDEX, Math.max(issued, used + ADDRESS_GAP)) : issued;
+    });
+  }
+  async buildAccountsInternal(epoch) {
+    const chains = [[], []];
+    let prepared = 0;
+    for (;;) {
+      this.assertSession(epoch);
+      const limits = this.accountRangeMaxima();
+      for (const change of [0, 1]) {
+        if (chains[change].length > limits[change] + 1) chains[change].length = limits[change] + 1;
+        for (let index = chains[change].length; index <= limits[change]; index++) {
+          chains[change].push(this.publicAccount(index, change));
+          // Large address ranges must not block lock/suspend or the UI. Only
+          // public accounts are retained; never publish a cancelled partial list.
+          if (++prepared % ADDRESS_BUILD_BATCH === 0) {
+            await yieldTask(); this.assertSession(epoch);
+          }
+        }
+      }
+      // A refresh or new-address action may extend the range while we yield.
+      // Share this build and include the latest range before publishing it.
+      if (this.accountRangeMaxima().some((maximum, change) => maximum !== limits[change])) continue;
+      this.accounts = chains[0].concat(chains[1]);
+      this.liveUpdates?.updateAddresses();
+      return limits;
     }
-    this.liveUpdates?.updateAddresses();
   }
   async makeQR() {
     const epoch = this.epoch;
@@ -374,12 +423,13 @@ export class WalletService extends EventEmitter {
     this.assertSession();
     const epoch = this.epoch;
     if (this.session.data.needsRecovery) throw new Error('Wait for recovery discovery to finish.');
-    if (this.session.data.receiveIndex >= 999 || this.session.data.receiveIndex >= (this.session.data.lastUsedReceive ?? -1) + 20) throw new Error('Use one of your existing receive addresses before creating more. Recovery keeps a 20-address gap.');
+    if (this.session.data.receiveIndex >= MAX_ADDRESS_INDEX) throw new Error('The BIP32 receive-address index range is exhausted.');
+    if (this.session.data.receiveIndex >= (this.session.data.lastUsedReceive ?? -1) + ADDRESS_GAP) throw new Error('Use one of your existing receive addresses before creating more. Recovery keeps a 20-address gap.');
     const previousIndex = this.session.data.receiveIndex;
     this.session.data.receiveIndex++;
     try { await this.persist(); }
     catch(error) { if (epoch === this.epoch && this.session) this.session.data.receiveIndex = previousIndex; throw error; }
-    this.assertSession(epoch); this.buildAccounts(); await this.makeQR(); this.emitState();
+    this.assertSession(epoch); await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch); this.emitState();
     this.walletUpdateRevision++; this.walletUpdates?.request();
     void this.refresh().catch(() => {});
     return { address: this.getState().wallet.address, qrDataUrl: this.qrDataUrl };
@@ -432,23 +482,23 @@ export class WalletService extends EventEmitter {
       const lastUsed = [-1,-1];
       for (const change of [0,1]) {
         let gap = 0;
-        for (let index = 0; gap < 20; index++) {
+        for (let index = 0; index <= MAX_ADDRESS_INDEX && gap < ADDRESS_GAP; index++) {
           this.assertSession(epoch);
-          if (index >= 1000) throw new Error('Recovery reached the 1,000-address safety limit. Contact support before using this wallet.');
           const account = this.publicAccount(index, change);
           if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address);
           this.assertSession(epoch);
           const history = await this.page('getaddresshistory', account.address, { firstOnly: true, onTip });
           if (history.length) { lastUsed[change] = index; gap = 0; } else gap++;
           if (!history.length && stableTip) emptyAddresses.add(account.address);
+          if ((index + 1) % ADDRESS_BUILD_BATCH === 0) { await yieldTask(); this.assertSession(epoch); }
         }
       }
       this.assertSession(epoch);
-      this.session.data.receiveIndex = Math.max(this.session.data.receiveIndex, lastUsed[0] + 1);
-      this.session.data.changeIndex = Math.max(this.session.data.changeIndex, lastUsed[1] + 1);
+      this.session.data.receiveIndex = Math.min(MAX_ADDRESS_INDEX, Math.max(this.session.data.receiveIndex, lastUsed[0] + 1));
+      this.session.data.changeIndex = Math.min(MAX_ADDRESS_INDEX, Math.max(this.session.data.changeIndex, lastUsed[1] + 1));
       this.session.data.lastUsedReceive = lastUsed[0]; this.session.data.lastUsedChange = lastUsed[1]; this.session.data.needsRecovery = false;
       this.session.data.scanLookahead = true;
-      await this.persist(); this.assertSession(epoch); this.buildAccounts(); await this.makeQR();
+      await this.persist(); this.assertSession(epoch); await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch);
       return emptyAddresses;
     } finally { this.recovering = false; this.emitState(); }
   }
@@ -533,7 +583,7 @@ export class WalletService extends EventEmitter {
     if (highestReceive !== this.session.data.lastUsedReceive || highestChange !== this.session.data.lastUsedChange) {
       const readAddresses = new Set(this.accounts.map(account => account.address));
       this.session.data.lastUsedReceive = highestReceive; this.session.data.lastUsedChange = highestChange;
-      await this.persist(); this.assertSession(epoch); this.buildAccounts();
+      await this.persist(); this.assertSession(epoch); await this.buildAccounts(); this.assertSession(epoch);
       if (this.accounts.some(account => !readAddresses.has(account.address))) {
         // These new lookahead addresses were not part of this pass's reads.
         this.walletUpdateRevision++; this.walletUpdates?.request();
@@ -654,9 +704,10 @@ export class WalletService extends EventEmitter {
     await this.ensureNetwork(); this.assertSession(preview.epoch);
     // Persist the change path BEFORE broadcast; recovery must never rely on success responses.
     if (BigInt(preview.change) > 0n) {
-      if (this.session.data.changeIndex >= 999 || this.session.data.changeIndex >= (this.session.data.lastUsedChange ?? -1) + 20) throw new Error('Too many unused change addresses. Wait for pending payments to appear before sending again.');
+      if (this.session.data.changeIndex >= MAX_ADDRESS_INDEX) throw new Error('The BIP32 change-address index range is exhausted.');
+      if (this.session.data.changeIndex >= (this.session.data.lastUsedChange ?? -1) + ADDRESS_GAP) throw new Error('Too many unused change addresses. Wait for pending payments to appear before sending again.');
       this.session.data.changeIndex = Math.max(this.session.data.changeIndex, preview.changeIndex + 1);
-      await this.persist(); this.assertSession(preview.epoch); this.buildAccounts();
+      await this.persist(); this.assertSession(preview.epoch); await this.buildAccounts(); this.assertSession(preview.epoch);
     }
     for (const input of preview.selected) this.reserved.add(`${input.txid}:${input.vout}`);
     try {

@@ -50,7 +50,7 @@ async function fixture(t) {
     network: 'testnet4', passphrase: '', receiveIndex: 0, changeIndex: 0,
     lastUsedReceive: -1, lastUsedChange: -1, needsRecovery: true } };
   service.persist = async () => {};
-  service.buildAccounts();
+  await service.buildAccounts();
   t.after(async () => {
     await service.close();
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
