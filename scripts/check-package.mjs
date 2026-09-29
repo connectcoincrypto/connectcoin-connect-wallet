@@ -1,8 +1,9 @@
-import { access } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { access, readFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
+import { pinnedCryptographyVersion, validateHelperSecurity } from './helper-security.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const helper = resolve(root, 'helpers/bin/connectwallet-claims', process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims');
@@ -13,11 +14,14 @@ try {
 } catch {
   throw new Error('Desktop packaging requires the native Automatic Claims helper and icons. Run npm run build:claims and npm run build:icon on this operating system first.');
 }
-await new Promise((accept, reject) => {
-  const child = spawn(helper, ['--self-test'], { cwd: root, shell: false, windowsHide: true, stdio: 'inherit', timeout: 30000 });
-  child.once('error', reject);
-  child.once('exit', code => code === 0 ? accept() : reject(new Error('Bundled Automatic Claims helper failed its self-test.')));
+const expectedVersion = pinnedCryptographyVersion(await readFile(resolve(root, 'helpers/requirements.txt'), 'utf8'));
+const selfTest = spawnSync(helper, ['--self-test'], {
+  cwd: root, shell: false, windowsHide: true, encoding: 'utf8',
+  timeout: 30000, maxBuffer: 8192, input: '',
 });
+if (selfTest.error || selfTest.status !== 0) throw new Error('Bundled Automatic Claims helper failed its self-test. Run npm run build:claims.');
+const security = validateHelperSecurity(selfTest.stdout, expectedVersion);
+console.log(`Bundled cryptography ${security.cryptographyVersion}; ${security.opensslVersion}.`);
 // A legacy one-shot executable can pass its own self-test but still be
 // incompatible with the wallet. Exercise the real protocol-3 handshake too;
 // this sends no DNS requests, TLS connections, RPC calls or wallet data.

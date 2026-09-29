@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from dataclasses import asdict
@@ -28,6 +29,31 @@ CONTEXT_KEYS = {
     "root_certificates_version", "signature_algorithms_mask", "validation_time",
 }
 OPTION_KEYS = {"connectionsPerSecond", "concurrency", "overallTimeout", "maxAttempts"}
+MINIMUM_CRYPTOGRAPHY_VERSION = (50, 0, 1)
+
+
+def security_provider_versions() -> dict[str, str]:
+    """Report the loaded certificate provider and reject unsupported builds.
+
+    This release floor includes the fixes for GHSA-jwv3-5hgf-82ww and
+    GHSA-m2h6-j472-rp4c. Read the imported package and its own OpenSSL backend;
+    distribution metadata or Python's ssl module can describe another runtime.
+    """
+    import cryptography
+
+    version = cryptography.__version__
+    minimum = ".".join(map(str, MINIMUM_CRYPTOGRAPHY_VERSION))
+    if (
+        re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
+        or tuple(map(int, version.split("."))) < MINIMUM_CRYPTOGRAPHY_VERSION
+    ):
+        raise RuntimeError(
+            f"cryptography {minimum} or newer stable release is required; loaded {version}"
+        )
+    from cryptography.hazmat.backends.openssl.backend import backend
+
+    return {"cryptographyVersion": version, "minimumCryptographyVersion": minimum,
+            "opensslVersion": backend.openssl_version_text()}
 
 
 def emit(value: dict) -> None:
@@ -105,8 +131,9 @@ def main() -> int:
         return run_service(sys.stdin.buffer, emit, parse_context, ROOT / "p2c_roots_v1.pem")
     if sys.argv[1:] == ["--self-test"]:
         from connectcoin_p2c_tools.verify import validate_root_bundle
+        security = security_provider_versions()
         validate_root_bundle(ROOT / "p2c_roots_v1.pem", 1)
-        emit({"type": "ready", "protocol": 3, "roots": 1})
+        emit({"type": "ready", "protocol": 3, "roots": 1, "security": security})
         return 0
     if sys.argv[1:]:
         raise ValueError("unknown helper arguments")

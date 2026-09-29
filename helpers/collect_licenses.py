@@ -11,6 +11,7 @@ import importlib.metadata as metadata
 import io
 import json
 import re
+import shutil
 import ssl
 import sys
 import tarfile
@@ -19,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
-OUTPUT = (PROJECT / "tmp" / "claims-licenses").resolve()
+OUTPUT = PROJECT / "tmp" / "claims-licenses"
 CACHE = (PROJECT / "tmp" / "claims-license-cache").resolve()
 MANIFEST: list[dict] = []
 
@@ -82,6 +83,13 @@ def crate_notices(component: dict) -> list[dict]:
 
 
 def main() -> None:
+    # Rebuild only this generated staging directory. Otherwise notices/SBOMs
+    # from an older provider are silently shipped beside the new manifest.
+    # Never follow a substituted link/junction to a different directory.
+    if OUTPUT.resolve() != PROJECT / "tmp" / "claims-licenses" or OUTPUT.is_symlink():
+        raise ValueError("Unexpected license staging directory")
+    if OUTPUT.exists():
+        shutil.rmtree(OUTPUT)
     OUTPUT.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
     version = ".".join(map(str, sys.version_info[:3]))

@@ -56,6 +56,8 @@ npm run pack
 
 Keep the Windows installer's explicit `build.nsis.guid` stable so upgrades recognize an existing ConnectWallet installation.
 
+The claims helper pins `cryptography==50.0.1`, including fixes for duplicate-certificate path construction and wildcard DNS name constraints. After changing helper dependencies, rebuild the native helper and the desktop package: updating the source environment alone does not update an existing executable. Packaging checks the **bundled** provider version against the pin and rejects older helpers without security metadata. The consensus root bundle and proof format are unchanged.
+
 ## RPC configuration
 
 On first launch, a `config.json` is created alongside the encrypted wallet in the application's data folder:

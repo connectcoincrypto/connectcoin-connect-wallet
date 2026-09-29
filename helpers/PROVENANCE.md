@@ -83,6 +83,16 @@ external resources (not inside ASAR). Its launcher is `connectwallet-claims.exe`
 Windows and `connectwallet-claims` on macOS/Linux. A user-created source installation
 can use the virtual environment instead.
 
+The provider is pinned to `cryptography==50.0.1` (official wheels include OpenSSL
+4.0.2). This includes the fixes for GHSA-jwv3-5hgf-82ww, GHSA-m2h6-j472-rp4c,
+GHSA-537c-gmf6-5ccf and GHSA-g6cj-pr64-35w5. The first two affect certificate
+path verification; listing the latter advisories does not imply their affected
+APIs were reachable from this helper. `--self-test` reports the actual provider
+and its OpenSSL backend and rejects obsolete or prerelease providers. Desktop
+packaging requires that report to match the source pin, preventing reuse of an
+old helper after a source-only dependency upgrade. Existing distributed apps
+must be rebuilt/replaced; there is no remote runtime dependency download.
+
 The build copies original Python, provider, CFFI, parser and bootloader notices
 into `_internal/licenses/dependencies`. It includes the installed provider's
 SBOMs and obtains the original OpenSSL notices from version-tagged upstream

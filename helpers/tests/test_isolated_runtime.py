@@ -8,6 +8,9 @@ import sys
 import tempfile
 import unittest
 
+import cryptography
+from cryptography.hazmat.backends.openssl.backend import backend
+
 
 BRIDGE = Path(__file__).resolve().parents[1] / "claims_bridge.py"
 
@@ -45,7 +48,31 @@ class IsolatedRuntimeTests(unittest.TestCase):
         result = self.invoke(["--self-test"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
-        self.assertEqual(json.loads(result.stdout), {"type": "ready", "protocol": 3, "roots": 1})
+        self.assertEqual(json.loads(result.stdout), {
+            "type": "ready", "protocol": 3, "roots": 1,
+            "security": {"cryptographyVersion": cryptography.__version__,
+                         "minimumCryptographyVersion": "50.0.1",
+                         "opensslVersion": backend.openssl_version_text()},
+        })
+
+    def test_self_test_exits_with_error_for_vulnerable_loaded_dependency(self):
+        # Simulate an old embedded package without installing or contacting one.
+        script = (
+            "import cryptography, runpy, sys; "
+            "cryptography.__version__ = '47.0.0'; "
+            "sys.argv = [sys.argv[1], '--self-test']; "
+            "runpy.run_path(sys.argv[0], run_name='__main__')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(BRIDGE)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        frame = json.loads(result.stdout)
+        self.assertEqual(frame["type"], "error")
+        self.assertIn("cryptography 50.0.1", frame["message"])
+        self.assertIn("loaded 47.0.0", frame["message"])
 
     def test_service_rejects_wrong_protocol_without_starting_work(self):
         result = self.invoke(["--service"], '{"type":"start","protocol":2,"options":{}}\n')

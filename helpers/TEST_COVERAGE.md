@@ -8,6 +8,15 @@ targets, signature policies and the production-root pin are rejected.
 The custom CA exception exists only in the test's direct verifier call, not
 in `claims_bridge.py` or the wallet's production worker.
 
+Provider security regressions use complete locally signed proofs with DNS
+name-constrained intermediate CAs and duplicate self-signed intermediates at
+the eight-certificate limit. They check wildcard escape rejection, legitimate
+exact-name/wildcard acceptance and trusted duplicate-chain acceptance. The
+duplicate-chain cases run in killable subprocesses with five-second deadlines.
+No external endpoint or production trust-anchor substitution is involved.
+Self-test regressions reject obsolete/prerelease providers; desktop packaging
+also rejects legacy self-test output or a provider different from the source pin.
+
 Offline telemetry tests cover completion order under concurrency, rolling
 100-entry snapshots and monotonic completion counts, successful captures that
 miss the work target or fail later certificate verification, queued cancellation,
