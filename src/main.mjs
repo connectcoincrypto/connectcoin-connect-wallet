@@ -10,7 +10,8 @@ const INDEX = join(ROOT, 'ui', 'index.html');
 const UI_URL = pathToFileURL(INDEX).href;
 const ICON = join(ROOT, '..', 'assets', 'icon.png');
 const ICON_URL = pathToFileURL(ICON).href;
-const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
+const PAYMENT_URI_URL = pathToFileURL(join(ROOT, 'core', 'payment-uri.mjs')).href;
+const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','paymentRequest','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, quitting = false, closing = false, actionInProgress = false, closeSequence = 0;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
@@ -101,7 +102,7 @@ else {
     session.setPermissionRequestHandler((_contents,_permission,callback) => callback(false));
     session.setPermissionCheckHandler(() => false);
     session.webRequest.onBeforeRequest((details, callback) => {
-      const allowed = details.url === ICON_URL || details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
+      const allowed = details.url === ICON_URL || details.url === PAYMENT_URI_URL || details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
       callback({ cancel: !allowed });
     });
     service.on('state', state => {
@@ -121,6 +122,23 @@ else {
         if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== UI_URL) throw new Error('Untrusted wallet window.');
         if (typeof method !== 'string' || !payload || typeof payload !== 'object' || Array.isArray(payload) || Buffer.byteLength(JSON.stringify(payload)) > 16384) throw new Error('Invalid wallet action.');
         if (method === 'getState') return { ok:true,value:service.getState() };
+        // A read-only QR preview must not fail behind a slow refresh or wallet
+        // mutation. The service rechecks its epoch and address after encoding;
+        // copying remains serialized and requires the exact displayed URI.
+        if (method === 'paymentRequest') return { ok:true,value:await service.paymentRequest(payload) };
+        if (method === 'pastePaymentRequest') {
+          // Explicit Paste action only. Never expose arbitrary clipboard text
+          // to the renderer, poll it, log it, or send it to a remote service.
+          service.assertSession();
+          const epoch = service.epoch;
+          let uri;
+          try { uri = clipboard.readText(); }
+          catch { throw new Error('Could not read the clipboard. Copy a connectcoin: payment link and try again.'); }
+          if (!uri.trim()) throw new Error('The clipboard has no text. Copy a connectcoin: payment link first.');
+          const value = await service.parsePaymentRequest({ uri });
+          service.assertSession(epoch);
+          return { ok:true,value };
+        }
         // Lock and review cancellation can interrupt pending work; other
         // mutations remain serialized (in particular, no parallel broadcasts).
         if (method === 'lock') return { ok:true,value:await service.lock() };
@@ -134,6 +152,9 @@ else {
             service.assertSession(); const address = service.getState().wallet.address;
             if (!address) throw new Error('No receive address is available.');
             clipboard.writeText(address); value = { copied:true };
+          } else if (method === 'copyPaymentRequest') {
+            const { uri } = service.paymentRequestForCopy(payload);
+            clipboard.writeText(uri); value = { copied: true };
           } else if (method === 'openDiagnostics') {
             service.assertSession();
             if (!service.config.developerMode) throw new Error('Enable Developer Mode to open diagnostic logs.');

@@ -1,13 +1,15 @@
 // Real Electron/preload/service/vault UI smoke test. RPC uses an empty local
 // fixture; no remote servers, user wallets, clipboard, or live coins are touched.
 import assert from 'node:assert/strict';
-import { _electron as electron } from '@playwright/test';
+import { _electron as electron, expect } from '@playwright/test';
+import QRCode from 'qrcode';
 import net from 'node:net';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { GENESIS } from '../src/core/config.mjs';
+import { decodeAddress, encodeAddress } from '../src/core/crypto.mjs';
 import { diagnosticError } from '../src/core/diagnostics.mjs';
 import { createRequire } from 'node:module';
 import { waitForUiCondition } from './ui-wait.mjs';
@@ -88,6 +90,205 @@ async function assertLoadedImage(selector) {
     return images.length > 0 && images.every(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
   }, selector);
 }
+async function assertReceiveRequest(uri) {
+  await page.waitForFunction(expected => document.querySelector('#receive-uri')?.value === expected
+    && document.querySelector('[data-action="copy-payment-request"]')?.disabled === false, uri);
+  assert.equal(await page.locator('#receive-uri').getAttribute('readonly'), '');
+  await assertLoadedImage('#receive-qr');
+  // Generating the expected image independently makes this assert the QR's
+  // actual payload, not merely that a previous address QR is still displayed.
+  const modules = QRCode.create(uri, { errorCorrectionLevel: 'M' }).modules.size + 8;
+  const width = modules * Math.max(4, Math.ceil(280 / modules));
+  const qr = await QRCode.toDataURL(uri, { errorCorrectionLevel: 'M', margin: 4, width, color: { dark: '#17211b', light: '#ffffff' } });
+  await expect.poll(() => page.locator('#receive-qr').getAttribute('src')).toBe(qr);
+  await assertLoadedImage('#receive-qr');
+}
+async function assertCopiedReceiveValue(action, expected) {
+  const previous = await application.evaluate(() => globalThis.receiveClipboardWrites.length);
+  await page.locator(`[data-action="${action}"]`).click();
+  await expect.poll(() => application.evaluate(() => globalThis.receiveClipboardWrites.length)).toBe(previous + 1);
+  assert.equal(await application.evaluate(() => globalThis.receiveClipboardWrites.at(-1)), expected);
+}
+async function pasteIntoField(field, text, type = 'text/plain') {
+  return field.evaluate((input, transfer) => {
+    // Supply synthetic data without reading or writing the OS clipboard, then
+    // emulate only an allowed native insertion so real Undo can be verified.
+    const clipboardData = new DataTransfer();
+    if (transfer.type) clipboardData.setData(transfer.type, transfer.text);
+    const event = new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true });
+    input.dispatchEvent(event);
+    if (!event.defaultPrevented && transfer.type === 'text/plain') {
+      if (!document.execCommand('insertText', false, transfer.text)) throw new Error('Native paste insertion failed.');
+    }
+    return event.defaultPrevented;
+  }, { text, type });
+}
+async function assertAmountInputGuard(selector) {
+  const amount = page.locator(selector);
+  const original = await amount.inputValue();
+  const editingState = () => amount.evaluate(input => ({
+    value: input.value, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection,
+  }));
+  const caretState = () => amount.evaluate(input => ({ value: input.value, start: input.selectionStart, end: input.selectionEnd }));
+  const select = (start, end = start, direction = 'none') => amount.evaluate((input, selection) => {
+    input.focus();
+    input.setSelectionRange(...selection);
+  }, [start, end, direction]);
+  const paste = (text, type) => pasteIntoField(amount, text, type);
+
+  assert.equal(await amount.getAttribute('inputmode'), 'decimal');
+  await amount.fill('');
+  await page.keyboard.type('1.2345678901');
+  assert.equal(await amount.inputValue(), '1.2345678901', `${selector} must preserve all ten decimal places.`);
+  const fullPrecision = await editingState();
+  await page.keyboard.type('2');
+  assert.deepEqual(await editingState(), fullPrecision, `${selector} must block an eleventh decimal digit without moving the caret.`);
+
+  await amount.fill('12.34');
+  await select(5);
+  const beforeInvalidKey = await editingState();
+  for (const character of ['a', 'e', 'E', '+', '-', '.', ',']) {
+    await page.keyboard.type(character);
+    assert.deepEqual(await editingState(), beforeInvalidKey, `${selector} must reject the invalid key ${JSON.stringify(character)}.`);
+  }
+  await amount.fill('');
+  await page.keyboard.type('1,2345678901');
+  assert.equal(await amount.inputValue(), '1.2345678901', `${selector} must normalize a typed decimal comma to a dot.`);
+  await select(2, 12);
+  await page.keyboard.type('9876543210');
+  assert.deepEqual(await caretState(), { value: '1.9876543210', start: 12, end: 12 },
+    `${selector} must allow replacement of a full-precision fraction.`);
+
+  await amount.fill('123.456');
+  await select(1, 2);
+  await page.keyboard.type('9');
+  assert.deepEqual(await caretState(), { value: '193.456', start: 2, end: 2 });
+  await page.keyboard.press('Backspace');
+  assert.deepEqual(await caretState(), { value: '13.456', start: 1, end: 1 });
+  await page.keyboard.press('Delete');
+  assert.deepEqual(await caretState(), { value: '1.456', start: 1, end: 1 });
+  await page.keyboard.press('ControlOrMeta+A');
+  await page.keyboard.press('Backspace');
+  assert.equal(await amount.inputValue(), '', `${selector} must remain clearable with normal keyboard shortcuts.`);
+
+  for (const text of ['99999999.9999999999', '99999999,9999999999']) {
+    await amount.fill('12.34');
+    await select(0, 5);
+    assert.equal(await paste(text), text.includes(','), `${selector} must keep canonical paste native and handle normalization.`);
+    assert.deepEqual(await caretState(), { value: '99999999.9999999999', start: 19, end: 19 },
+      `${selector} must preserve an exact pasted amount and place the caret after it.`);
+    await page.keyboard.press('ControlOrMeta+Z');
+    assert.deepEqual(await caretState(), { value: '12.34', start: 0, end: 5 },
+      `${selector} must allow native Undo to restore the amount replaced by ${JSON.stringify(text)}.`);
+  }
+  await amount.fill('1234');
+  await select(1, 3);
+  assert.equal(await paste('7,89'), true);
+  assert.deepEqual(await caretState(), { value: '17.894', start: 5, end: 5 },
+    `${selector} must paste over only the selected text and normalize the comma.`);
+  await page.keyboard.press('ControlOrMeta+Z');
+  assert.equal(await amount.inputValue(), '1234', `${selector} must support Undo after a normalized paste over part of the amount.`);
+
+  for (const [text, type] of [['', 'text/plain'], ['', null], ['<b>image-only clipboard fixture</b>', 'text/html']]) {
+    await amount.fill('12.34');
+    await select(1, 4, 'backward');
+    const beforePaste = await editingState();
+    assert.equal(await paste(text, type), true, `${selector} must cancel empty or nontext paste.`);
+    assert.deepEqual(await editingState(), beforePaste, `${selector} must not let empty or nontext paste delete the selection.`);
+  }
+
+  for (const text of ['1x2', '1e2', '-1', '+1', '1.2.3', '1,2.3', '1.00000000001', ' 1 ', '1\n2']) {
+    await amount.fill('12.34');
+    await select(1, 4, 'backward');
+    const beforePaste = await editingState();
+    assert.equal(await paste(text), true, `${selector} must cancel an invalid paste.`);
+    assert.deepEqual(await editingState(), beforePaste,
+      `${selector} must reject the whole paste ${JSON.stringify(text)} without stripping, truncating, or changing the selection.`);
+  }
+  await amount.fill('1.2345678901');
+  await select(12);
+  const beforeExtraPastedDigit = await editingState();
+  assert.equal(await paste('2'), true);
+  assert.deepEqual(await editingState(), beforeExtraPastedDigit,
+    `${selector} must validate the resulting amount when pasted text adds an eleventh decimal digit.`);
+  await amount.fill(original);
+}
+async function assertTextInputLimit(selector, limit) {
+  const field = page.locator(selector);
+  const original = await field.inputValue();
+  const editingState = () => field.evaluate(input => ({
+    value: input.value, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection,
+  }));
+  const select = (start, end = start, direction = 'none') => field.evaluate((input, selection) => {
+    input.focus();
+    input.setSelectionRange(...selection);
+  }, [start, end, direction]);
+  assert.equal(await field.getAttribute('data-text-limit'), String(limit));
+  await field.fill('a'.repeat(limit));
+  await select(limit);
+  const atLimit = await editingState();
+  await page.keyboard.type('x');
+  assert.deepEqual(await editingState(), atLimit, `${selector} must block a character beyond its limit without moving the caret.`);
+  const middle = Math.floor(limit / 2);
+  await select(middle, middle + 1, 'backward');
+  await page.keyboard.type('Z');
+  const replaced = `${'a'.repeat(middle)}Z${'a'.repeat(limit - middle - 1)}`;
+  assert.equal(await field.inputValue(), replaced, `${selector} must allow selected text replacement at the character limit.`);
+  assert.deepEqual(await field.evaluate(input => [input.selectionStart, input.selectionEnd]), [middle + 1, middle + 1]);
+  const afterReplacement = await editingState();
+  await page.keyboard.type('x');
+  assert.deepEqual(await editingState(), afterReplacement, `${selector} must enforce its limit for insertion in the middle too.`);
+
+  await field.fill('before');
+  await select(0, 6, 'backward');
+  assert.equal(await pasteIntoField(field, 'b'.repeat(limit)), false, `${selector} must keep an accepted paste native.`);
+  assert.equal(await field.inputValue(), 'b'.repeat(limit));
+  await page.keyboard.press('ControlOrMeta+Z');
+  assert.equal(await field.inputValue(), 'before', `${selector} must preserve native paste Undo.`);
+  assert.deepEqual(await field.evaluate(input => [input.selectionStart, input.selectionEnd]), [0, 6]);
+  await select(1, 4, 'backward');
+  const beforeRejectedPaste = await editingState();
+  assert.equal(await pasteIntoField(field, 'c'.repeat(limit + 1)), true, `${selector} must cancel an over-limit whole paste.`);
+  assert.deepEqual(await editingState(), beforeRejectedPaste,
+    `${selector} must reject an over-limit paste atomically without truncating it or deleting the selection.`);
+
+  if (selector.endsWith('-label')) {
+    await field.fill('');
+    const emojiLabel = '🚀'.repeat(limit);
+    assert.equal(await pasteIntoField(field, emojiLabel), false);
+    assert.equal(await field.inputValue(), emojiLabel, 'One hundred emoji are one hundred label characters, despite using two UTF-16 units each.');
+    assert.equal([...(await field.inputValue())].length, limit);
+    const fullEmojiLabel = await editingState();
+    await page.keyboard.type('x');
+    assert.deepEqual(await editingState(), fullEmojiLabel);
+    await select(0, emojiLabel.length, 'backward');
+    const beforeEmojiPaste = await editingState();
+    assert.equal(await pasteIntoField(field, `${emojiLabel}🚀`), true);
+    assert.deepEqual(await editingState(), beforeEmojiPaste, 'An over-limit emoji label must be rejected as a whole.');
+    // This label exceeds the separately enforced aggregate URI byte cap; its
+    // acceptance by the editing guard does not imply QR generation will succeed.
+  } else {
+    await field.fill('m'.repeat(limit - 1));
+    await select(limit - 1);
+    await page.keyboard.press('Enter');
+    assert.equal(await field.inputValue(), `${'m'.repeat(limit - 1)}\n`, 'A message newline must count as one character.');
+    const messageWithNewline = await editingState();
+    await page.keyboard.type('x');
+    assert.deepEqual(await editingState(), messageWithNewline, 'A newline at the message limit must leave no extra character slot.');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type('z');
+    assert.equal(await field.inputValue(), `${'m'.repeat(limit - 1)}z`, 'Deleting the newline must free exactly one character slot.');
+    await field.fill('');
+    const unicodeMessage = `${'m'.repeat(limit - 2)}🚀🚀`;
+    assert.equal(await pasteIntoField(field, unicodeMessage), false);
+    assert.equal(await field.inputValue(), unicodeMessage, 'The message limit must count emoji as one character each too.');
+    assert.equal([...(await field.inputValue())].length, limit);
+    const fullUnicodeMessage = await editingState();
+    await page.keyboard.type('x');
+    assert.deepEqual(await editingState(), fullUnicodeMessage);
+  }
+  await field.fill(original);
+}
 async function waitForScheme(dark) {
   await page.waitForFunction(expected => matchMedia('(prefers-color-scheme: dark)').matches === expected, dark);
   // Allow the media-query style recalculation and the next paint to complete.
@@ -141,6 +342,316 @@ async function assertPreferenceEnterStayedPut(selector) {
       focused: document.activeElement === window.preferenceEnterField,
     };
   }, selector), { submits: 0, sameNode: true, focused: true }, 'Enter in an autosaved preference must not submit a form, reload the page, or replace/focus another control.');
+}
+
+async function assertTrailingPeriodPreference(selector, value, configPath, { endpoint = false } = {}) {
+  const field = page.locator(selector);
+  const original = await field.inputValue();
+  const originalConfig = await page.evaluate(async keys => keys.reduce((current, key) => current[key],
+    (await window.connectwallet.invoke('getState')).config), configPath);
+  const host = endpoint ? await page.locator('#rpc-host').inputValue() : null;
+  const commitEndpoint = () => field.evaluate(input => {
+    // Endpoint saving starts when editing leaves both host and port. Return to
+    // the field before the queued save, to check its acknowledgement in place.
+    document.querySelector('#auto-lock').focus();
+    input.focus();
+  });
+  await field.fill(String(value));
+  await page.keyboard.press('End');
+  await page.keyboard.type('.');
+  await field.evaluate(input => {
+    window.trailingPeriodEditingField = input;
+    input.setSelectionRange(input.value.length - 1, input.value.length, 'backward');
+  });
+  if (endpoint) await commitEndpoint();
+  await waitForUiCondition(page, async ({ keys, expected }) => {
+    const state = await window.connectwallet.invoke('getState');
+    return keys.reduce((current, key) => current[key], state.config) === expected
+      && !state.busy && document.querySelector('#app')?.getAttribute('aria-busy') === 'false';
+  }, { keys: configPath, expected: value }, { message: `${selector} must save its trailing-period value as an integer.` });
+  // Include the coalesced acknowledgement render while the period is selected.
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 300)));
+  const draft = `${value}.`;
+  assert.deepEqual(await field.evaluate((input, endpoint) => ({
+    value: input.value, focused: document.activeElement === input,
+    start: input.selectionStart, end: input.selectionEnd, valid: input.checkValidity(),
+    // A changed endpoint advances the security epoch and replaces the shell;
+    // ordinary preference acknowledgements must keep their existing controls.
+    ...(!endpoint ? { sameNode: input === window.trailingPeriodEditingField, direction: input.selectionDirection } : {}),
+  }), endpoint), { value: draft, focused: true, start: draft.length - 1, end: draft.length, valid: true,
+    ...(!endpoint ? { sameNode: true, direction: 'backward' } : {}) },
+  `${selector} must save a trailing period as an integer while preserving the editable draft and selection.`);
+  if (endpoint) {
+    assert.equal(await page.locator('#rpc-host').inputValue(), host, 'Editing the local RPC port must not change its host.');
+  }
+  assert.equal(await page.locator('#view-error').isVisible(), false);
+  await page.keyboard.press('Backspace');
+  assert.equal(await field.inputValue(), String(value), `${selector} must remain editable after autosave.`);
+  await field.fill(original);
+  if (endpoint) await commitEndpoint();
+  await waitForUiCondition(page, async ({ keys, expected }) => keys.reduce((current, key) => current[key],
+    (await window.connectwallet.invoke('getState')).config) === expected, { keys: configPath, expected: originalConfig });
+}
+
+async function assertTrailingPeriodSendReview({ bounty, address }) {
+  if (bounty) {
+    await page.locator('#send-domain').fill('example.com');
+    await page.locator('#send-expected').fill('1000.');
+  } else await page.locator('#send-address').fill(address);
+  await page.locator('#send-amount').fill('123.');
+  if (await page.locator('.advanced-fee').getAttribute('open') === null) await page.locator('.advanced-fee summary').click();
+  const previousPreviews = await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.length);
+  for (const invalidFee of ['1200.', '100001.']) {
+    await page.locator('#send-fee').fill(invalidFee);
+    assert.equal(await page.locator('#send-fee').evaluate(input => input.checkValidity()), false,
+      'A trailing period must not bypass the fee rate bounds.');
+    await page.getByRole('button', { name: bounty ? 'Review bounty' : 'Review payment', exact: true }).click();
+    assert.equal(await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.length), previousPreviews,
+      'An out-of-range fee must not reach preview IPC.');
+    assert.equal(await page.locator('dialog[open]').count(), 0);
+  }
+  await page.locator('#send-fee').fill('1500.');
+  assert.equal(await page.locator('#send-fee').evaluate(input => input.checkValidity()), true);
+  await page.getByRole('button', { name: bounty ? 'Review bounty' : 'Review payment', exact: true }).click();
+  await page.getByRole('heading', { name: 'One final look.', exact: true }).waitFor();
+  const payload = await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.at(-1));
+  assert.deepEqual(payload, {
+    ...(bounty ? { domain: 'example.com', expectedConnections: '1000' } : { address }), amount: '123', feeRate: 1500,
+  }, 'Review IPC must receive canonical numeric values after trailing-period drafts.');
+  assert.equal(await page.locator('#send-amount').inputValue(), '123.');
+  assert.equal(await page.locator('#send-fee').inputValue(), '1500.');
+  if (bounty) assert.equal(await page.locator('#send-expected').inputValue(), '1000.');
+  await page.getByRole('button', { name: 'Go back', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('dialog[open]') && document.querySelector('#app')?.getAttribute('aria-busy') === 'false');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.feeRate === 1500);
+  if (await page.locator('.advanced-fee').getAttribute('open') !== null) await page.locator('.advanced-fee summary').click();
+}
+
+async function assertSendDraft(expected) {
+  await expect.poll(() => page.locator('#send-form').evaluate(form => Object.fromEntries(
+    ['address', 'amount', 'label', 'message'].map(name => [name, form.querySelector(`#send-${name}`)?.value]),
+  ))).toEqual(expected);
+}
+
+async function usePaymentLink(uri, { clipboardError = false } = {}) {
+  // This replaces only the test application's clipboard reader. Neither the
+  // real clipboard contents nor other applications are read or modified.
+  const previousReads = await application.evaluate((_electron, value) => {
+    const fixture = globalThis.paymentLinkFixture;
+    fixture.clipboardText = value.uri; fixture.clipboardError = value.clipboardError;
+    return fixture.clipboardReads;
+  }, { uri, clipboardError });
+  await page.locator('[data-action="import-payment-link"]').click();
+  await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.clipboardReads)).toBe(previousReads + 1);
+  assert.equal(await page.locator('dialog[open]').count(), 0, 'Paste payment link must use the clipboard directly, without opening a dialog.');
+}
+
+async function assertPaymentLinkImport(address, otherAddress) {
+  // Parsing uses the real main-process implementation. Clipboard input is
+  // synthetic, and the delay is applied after successful parsing so the
+  // renderer must not overwrite an edited draft or revive one after locking.
+  await application.evaluate(({ clipboard }, moduleUrl) => {
+    const { WalletService } = process.getBuiltinModule('node:module').createRequire(moduleUrl)('./wallet-service.mjs');
+    const prototype = WalletService.prototype;
+    const fixture = { prototype, originals: {}, parseCalls: [], previews: [], confirmations: [], entered: false, completed: 0,
+      clipboard, originalClipboardReadText: clipboard.readText, clipboardReads: 0, clipboardText: '', clipboardError: false };
+    clipboard.readText = () => {
+      fixture.clipboardReads++;
+      if (fixture.clipboardError) throw new Error('Isolated clipboard failure.');
+      return fixture.clipboardText;
+    };
+    for (const method of ['parsePaymentRequest', 'previewSend', 'confirmSend']) fixture.originals[method] = prototype[method];
+    prototype.parsePaymentRequest = async function (payload) {
+      fixture.parseCalls.push(payload);
+      const result = await fixture.originals.parsePaymentRequest.call(this, payload);
+      if (fixture.gate) { fixture.entered = true; await fixture.gate; }
+      fixture.completed++;
+      return result;
+    };
+    prototype.previewSend = async function (payload) {
+      fixture.previews.push(payload);
+      return { previewId: 'isolated-payment-link-preview', type: 'payment', address: payload.address,
+        amount: payload.amount, label: payload.label, message: payload.message,
+        fee: '0.000001', total: '0.0000010001' };
+    };
+    prototype.confirmSend = async function (payload) {
+      fixture.confirmations.push(payload);
+      throw new Error('The isolated UI fixture never broadcasts transactions.');
+    };
+    globalThis.paymentLinkFixture = fixture;
+  }, pathToFileURL(path.join(root, 'src/core/wallet-service.mjs')).href);
+  const imported = { address, amount: '0.0000000001', label: 'Café + 東京 🚀', message: 'Olá & <amigos>\nConexão = 50% # 🌍' };
+  const uri = `connectcoin:${address}?amount=${imported.amount}&label=${encodeURIComponent(imported.label)}&message=${encodeURIComponent(imported.message)}`;
+  const assertNoAutomaticSend = async (expectedPreviews = 0) => {
+    assert.deepEqual(await application.evaluate(() => ({
+      previews: globalThis.paymentLinkFixture.previews.length, confirmations: globalThis.paymentLinkFixture.confirmations.length,
+    })), { previews: expectedPreviews, confirmations: 0 }, 'Importing a payment link must never automatically review or send a payment.');
+    assert.ok(!requests.includes('sendrawtransaction'));
+  };
+  try {
+    stage = 'send payment link import preserves precision and Unicode metadata';
+    await page.locator('#send-address').fill(otherAddress);
+    await page.locator('#send-amount').fill('12.34');
+    await usePaymentLink(uri);
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await assertSendDraft(imported);
+    assert.equal(await page.locator('#send-metadata').evaluate(details => details.open), true,
+      'Imported metadata must be visible for the user to review.');
+    await page.screenshot({ path: path.join(screenshots, 'send-imported.png'), fullPage: true });
+    assert.deepEqual(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.at(-1)), { uri });
+    for (const [field, limit] of [['label', 100], ['message', 200]]) {
+      assert.equal(await page.locator(`#send-${field}`).getAttribute('data-draft'), `send.${field}`);
+      await assertTextInputLimit(`#send-${field}`, limit);
+    }
+    await assertSendDraft(imported);
+    await page.locator('[data-view="activity"]').first().click();
+    await page.locator('[data-view="send"]').first().click();
+    await assertSendDraft(imported);
+    await assertNoAutomaticSend();
+
+    stage = 'send payment link rejects invalid requests without partial changes';
+    const wrongNetworkAddress = encodeAddress(decodeAddress(address), 'main');
+    const invalidUris = [
+      `https://example.com/${otherAddress}?amount=2`,
+      `connectcoin:${wrongNetworkAddress}?amount=2&label=replacement`,
+      `connectcoin:${otherAddress}?amount=2&amount=3`,
+      `connectcoin:${otherAddress}?label=first&label=second`,
+      `connectcoin:${otherAddress}?amount=2&req-feature=1`,
+      `connectcoin:${otherAddress}?amount=2&label=%ZZ`,
+      `connectcoin:${otherAddress}?amount=0&label=replacement`,
+      `connectcoin:${otherAddress}?amount=2&label=hidden%0Atext`,
+      `connectcoin:${otherAddress}?amount=2&message=hidden%E2%80%AEtext`,
+    ];
+    for (const invalidUri of invalidUris) {
+      const previousCalls = await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length);
+      await usePaymentLink(invalidUri);
+      await expect(page.locator('#view-error')).toBeVisible();
+      assert.ok((await page.locator('#view-error').textContent()).trim());
+      assert.equal(await page.locator('dialog[open]').count(), 0);
+      assert.equal(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length), previousCalls + 1,
+        'Payment link validation must reach the main-process service.');
+      await assertSendDraft(imported);
+      await assertNoAutomaticSend();
+    }
+
+    stage = 'send payment link handles empty and unavailable clipboard without changing drafts';
+    for (const [clipboardText, clipboardError] of [['', false], [' \n\t ', false], ['', true]]) {
+      await usePaymentLink(clipboardText, { clipboardError });
+      await expect(page.locator('#view-error')).toBeVisible();
+      assert.ok((await page.locator('#view-error').textContent()).trim());
+      await assertSendDraft(imported);
+      await assertNoAutomaticSend();
+    }
+
+    stage = 'send payment link exposes unused optional fields';
+    await usePaymentLink(`${uri}&unknown-field=ignored`);
+    await assertSendDraft(imported);
+    await expect(page.locator('.notice.warning').filter({ hasText: 'unknown-field' })).toBeVisible();
+    await assertNoAutomaticSend();
+
+    stage = 'send payment link replaces absent amount and metadata';
+    await usePaymentLink(`connectcoin:${otherAddress}`);
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await assertSendDraft({ address: otherAddress, amount: '', label: '', message: '' });
+    await assertNoAutomaticSend();
+    await usePaymentLink(uri);
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await assertSendDraft(imported);
+
+    stage = 'send payment link metadata remains visible in explicit review';
+    await page.getByRole('button', { name: 'Review payment', exact: true }).click();
+    await page.getByRole('heading', { name: 'One final look.', exact: true }).waitFor();
+    const reviewPayload = await application.evaluate(() => globalThis.paymentLinkFixture.previews.at(-1));
+    assert.deepEqual({ address: reviewPayload.address, amount: reviewPayload.amount, label: reviewPayload.label, message: reviewPayload.message }, imported);
+    assert.ok((await page.locator('dialog[open]').textContent()).includes(imported.label));
+    assert.ok((await page.locator('dialog[open]').textContent()).includes(imported.message));
+    assert.equal(await page.locator('dialog[open] amigos').count(), 0, 'Payment metadata must render as text, never markup.');
+    await page.getByRole('button', { name: 'Go back', exact: true }).click();
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await assertNoAutomaticSend(1);
+
+    const composingLabel = '編集中 café';
+    for (const changedContext of ['navigation', 'send-mode', 'focus', 'draft-edit', 'composition', 'lock']) {
+      stage = `send payment link repastes original details before ${changedContext}`;
+      await usePaymentLink(uri);
+      await assertSendDraft(imported);
+      stage = `send payment link protects a pending clipboard import during ${changedContext}`;
+      await application.evaluate(() => {
+        const fixture = globalThis.paymentLinkFixture;
+        fixture.entered = false;
+        fixture.gate = new Promise(resolve => { fixture.release = resolve; });
+      });
+      const previousCompletions = await application.evaluate(() => globalThis.paymentLinkFixture.completed);
+      await usePaymentLink(`connectcoin:${otherAddress}?amount=9&label=Late%20result&message=Must%20be%20discarded`);
+      await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.entered)).toBe(true);
+      if (changedContext === 'navigation') {
+        await page.locator('[data-view="activity"]').first().click();
+        await expect(page.locator('#send-form')).toHaveCount(1);
+      } else if (changedContext === 'send-mode') {
+        await page.locator('[data-send-mode="bounty"]').click();
+        await expect(page.locator('#send-domain')).toHaveCount(0);
+      } else if (changedContext === 'focus') await page.locator('#send-amount').focus();
+      else if (changedContext === 'draft-edit') await page.locator('#send-amount').fill('7.5');
+      else if (changedContext === 'composition') {
+        await page.locator('#send-label').evaluate((input, value) => {
+          input.focus();
+          window.paymentImportCompositionField = input;
+          input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+          input.value = value;
+          input.setSelectionRange(value.length, value.length);
+          input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: value, isComposing: true }));
+        }, composingLabel);
+      }
+      else await page.keyboard.press('ControlOrMeta+L');
+      await expect(page.locator('dialog[open]')).toHaveCount(0);
+      if (changedContext === 'lock') await page.locator('#unlock-password').waitFor();
+      else await assertSendDraft({ ...imported,
+        ...(changedContext === 'draft-edit' ? { amount: '7.5' } : {}),
+        ...(changedContext === 'composition' ? { label: composingLabel } : {}) });
+      await application.evaluate(() => {
+        const fixture = globalThis.paymentLinkFixture;
+        fixture.gate = null;
+        fixture.release();
+        fixture.release = null;
+      });
+      await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.completed)).toBe(previousCompletions + 1);
+      await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') === 'false');
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      assert.equal(await page.locator('dialog[open]').count(), 0, 'A late parse response must not reopen any modal.');
+      if (changedContext === 'lock') {
+        await page.locator('#unlock-password').fill(password);
+        await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+        await page.locator('[data-view="send"]').first().click();
+        await assertSendDraft({ address: '', amount: '', label: '', message: '' });
+      } else if (changedContext === 'draft-edit') await assertSendDraft({ ...imported, amount: '7.5' });
+      else if (changedContext === 'composition') {
+        await assertSendDraft({ ...imported, label: composingLabel });
+        assert.deepEqual(await page.locator('#send-label').evaluate(input => ({
+          sameNode: input === window.paymentImportCompositionField,
+          focused: document.activeElement === input, start: input.selectionStart, end: input.selectionEnd,
+        })), { sameNode: true, focused: true, start: composingLabel.length, end: composingLabel.length },
+        'A late clipboard response must preserve the active composition node, text and caret before it commits.');
+        await page.locator('#send-label').evaluate((input, value) => {
+          input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: value }));
+          delete window.paymentImportCompositionField;
+        }, composingLabel);
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+        await page.locator('[data-view="activity"]').first().click();
+        await page.locator('[data-view="send"]').first().click();
+        await assertSendDraft({ ...imported, label: composingLabel });
+      }
+      else await assertSendDraft({ address: otherAddress, amount: '9', label: 'Late result', message: 'Must be discarded' });
+      await assertNoAutomaticSend(1);
+    }
+  } finally {
+    await application.evaluate(() => {
+      const fixture = globalThis.paymentLinkFixture;
+      for (const [method, original] of Object.entries(fixture.originals)) fixture.prototype[method] = original;
+      fixture.clipboard.readText = fixture.originalClipboardReadText;
+      fixture.release?.();
+      delete globalThis.paymentLinkFixture;
+    });
+  }
 }
 
 let presentationSequence = 0;
@@ -199,6 +710,20 @@ try {
 
   stage = 'create and backup';
   await page.getByRole('button', { name: 'Create a new wallet' }).click();
+  assert.equal(await page.locator('#setup-name').getAttribute('data-text-limit'), '40');
+  assert.equal(await page.locator('#setup-name').getAttribute('data-text-count'), 'utf16');
+  assert.equal(await page.locator('input[type="password"][data-text-limit], textarea[name="mnemonic"][data-text-limit]').count(), 0,
+    'The public text guard must not apply to password or recovery phrase fields.');
+  await page.locator('#setup-name').fill('n'.repeat(40));
+  await page.keyboard.press('End');
+  await page.keyboard.type('x');
+  assert.equal(await page.locator('#setup-name').inputValue(), 'n'.repeat(40));
+  await page.keyboard.press('ControlOrMeta+A');
+  assert.equal(await pasteIntoField(page.locator('#setup-name'), '🚀'.repeat(21)), true);
+  assert.equal(await page.locator('#setup-name').inputValue(), 'n'.repeat(40), 'An over-limit wallet name paste must not truncate or replace the selected name.');
+  assert.deepEqual(await page.locator('#setup-name').evaluate(input => [input.selectionStart, input.selectionEnd]), [0, 40]);
+  assert.equal(await pasteIntoField(page.locator('#setup-name'), '🚀'.repeat(20)), false);
+  assert.equal(await page.locator('#setup-name').inputValue(), '🚀'.repeat(20), 'Wallet names retain their existing UTF-16 limit.');
   assert.equal(await page.locator('input[name="wordCount"]:checked').inputValue(), '24');
   await page.locator('input[name="wordCount"][value="12"]').check();
   await page.locator('#setup-name').fill('UI smoke test');
@@ -248,6 +773,8 @@ try {
 
   stage = 'automatic settings persistence and appearance preserve invalid drafts';
   await page.locator('[data-view="settings"]').first().click();
+  assert.equal(await page.locator('#rpc-host').getAttribute('data-text-limit'), '253');
+  assert.equal(await page.locator('#rpc-host').getAttribute('data-text-count'), 'utf16');
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0, 'Settings should expose autosave without a manual Save button.');
   assert.equal(await page.getByRole('button', { name: 'Export wallet', exact: true }).isVisible(), true);
   assert.equal(await page.locator('#theme-preference').inputValue(), 'system');
@@ -291,20 +818,296 @@ try {
   assert.equal(persistedSettings.autoLockMinutes, 30);
   assert.equal(persistedSettings.rpc.port, alternateFixture.address().port);
   assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1, 'RPC preferences save on leaving the fields while the Settings page stays open.');
+  stage = 'settings trailing periods save integers and preserve editing';
+  await assertTrailingPeriodPreference('#auto-lock', 31, ['autoLockMinutes']);
+  await assertTrailingPeriodPreference('#rpc-port', fixture.address().port, ['rpc', 'port'], { endpoint: true });
+  assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.1');
   await page.locator('[data-view="overview"]').first().click();
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.screenshot({ path: path.join(screenshots, 'overview-dark.png') });
 
-  stage = 'receiving and bounty form';
+  stage = 'receiving payment URI, QR and guarded copy';
   await page.locator('[data-view="receive"]').first().click();
+  const receiveAddressCard = page.locator('.receive-address-card');
+  assert.equal(await receiveAddressCard.locator('.address-box').count(), 1);
+  assert.equal(await receiveAddressCard.locator('[data-action="copy-address"]').count(), 1);
+  assert.equal(await receiveAddressCard.locator('[data-action="new-address"]').count(), 1);
+  assert.equal(await receiveAddressCard.locator('#receive-amount, #receive-label, #receive-message').count(), 0,
+    'The public address card must be separate from optional payment request details.');
+  const receiveDetails = page.locator('.receive-details');
+  assert.equal(await receiveDetails.getByRole('heading', { level: 2, name: 'Payment request details', exact: true }).count(), 1);
+  for (const field of ['amount', 'label', 'message']) {
+    assert.equal(await receiveDetails.locator(`#receive-${field}`).count(), 1,
+      `The ${field} field must belong to Payment request details.`);
+  }
+  const receiveMetadataHelp = receiveDetails.locator('#receive-metadata-help');
+  assert.equal(await receiveMetadataHelp.isVisible(), true);
+  const receiveMetadataWarning = await receiveMetadataHelp.textContent();
+  assert.match(receiveMetadataWarning, /label and message are not written to the blockchain/i);
+  assert.match(receiveMetadataWarning, /sending wallet can store them locally/i);
+  assert.match(receiveMetadataWarning, /Both are visible to anyone with this link or QR code/i);
+  for (const field of ['label', 'message']) {
+    const descriptions = (await page.locator(`#receive-${field}`).getAttribute('aria-describedby') ?? '').split(/\s+/);
+    assert.ok(descriptions.includes('receive-metadata-help'),
+      `The ${field} field must expose the shared off-chain storage and privacy warning.`);
+  }
   const address = await page.locator('.address-box').textContent();
   assert.match(address, /^tcc1p[a-z0-9]+$/);
-  assert.match(await page.locator('img.qr').getAttribute('src'), /^data:image\/png;base64,/);
+  for (const field of ['amount', 'label', 'message']) assert.equal(await page.locator(`#receive-${field}`).inputValue(), '');
+  await assertReceiveRequest(`connectcoin:${address}`);
+  stage = 'receive panel alignment and responsive content heights';
+  const receiveViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  const receivePanelBounds = () => page.locator('.receive-details, .payment-request').evaluateAll(panels => panels.map(panel => {
+    const bounds = panel.getBoundingClientRect();
+    const style = getComputedStyle(panel);
+    return { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right,
+      contentBottom: panel.lastElementChild.getBoundingClientRect().bottom,
+      bottomPadding: parseFloat(style.paddingBottom) + parseFloat(style.borderBottomWidth) };
+  }));
+  try {
+    await page.setViewportSize({ width: 1280, height: receiveViewport.height });
+    const [details, payment] = await receivePanelBounds();
+    assert.ok(details.right < payment.left, 'The desktop Receive panels must be side by side.');
+    assert.ok(Math.abs(details.top - payment.top) <= 1 && Math.abs(details.bottom - payment.bottom) <= 1,
+      'The desktop Receive panels must share their top and bottom edges.');
+    await page.setViewportSize({ width: 1000, height: receiveViewport.height });
+    const stacked = await receivePanelBounds();
+    assert.ok(stacked[1].top > stacked[0].bottom, 'Narrow Receive panels must stack vertically.');
+    for (const panel of stacked) {
+      assert.ok(Math.abs(panel.bottom - panel.contentBottom - panel.bottomPadding) <= 1,
+        'Stacked Receive panels must fit their content without extra equal-height space.');
+    }
+  } finally {
+    await page.setViewportSize(receiveViewport);
+  }
+  stage = 'receive amount keyboard, paste and precision guard';
+  await assertAmountInputGuard('#receive-amount');
+  await assertReceiveRequest(`connectcoin:${address}`);
+  stage = 'receiving payment URI, QR and guarded copy';
   await assertLoadedImage('.sidebar .brand-mark img');
-  await assertLoadedImage('.receive-card img.qr');
+  // Intercept the real IPC copy endpoint inside this isolated Electron process;
+  // no test reads or writes the user's operating-system clipboard.
+  await application.evaluate(({ clipboard }) => {
+    globalThis.receiveOriginalClipboardWriteText = clipboard.writeText;
+    globalThis.receiveClipboardWrites = [];
+    clipboard.writeText = value => { globalThis.receiveClipboardWrites.push(value); };
+  });
+  await assertCopiedReceiveValue('copy-payment-request', `connectcoin:${address}`);
+  await assertCopiedReceiveValue('copy-address', address);
+  stage = 'receive text limits preserve Unicode, native editing and drafts';
+  await assertTextInputLimit('#receive-label', 100);
+  await assertTextInputLimit('#receive-message', 200);
+  const limitedLabel = `${'L'.repeat(80)}${'🚀'.repeat(10)}`;
+  const limitedMessage = 'm'.repeat(200);
+  await page.locator('#receive-label').fill(limitedLabel);
+  await page.locator('#receive-message').fill(limitedMessage);
+  const limitedUri = `connectcoin:${address}?label=${encodeURIComponent(limitedLabel)}&message=${limitedMessage}`;
+  await assertReceiveRequest(limitedUri);
+  await assertCopiedReceiveValue('copy-payment-request', limitedUri);
+  await page.locator('#receive-label').evaluate(input => {
+    window.limitedReceiveEditingField = input;
+    input.focus();
+    input.setSelectionRange(82, 86, 'backward');
+  });
+  await selectTheme('light');
+  assert.deepEqual(await page.locator('#receive-label').evaluate(input => ({
+    value: input.value, sameNode: window.limitedReceiveEditingField === input, focused: document.activeElement === input,
+    start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection,
+  })), { value: limitedLabel, sameNode: true, focused: true, start: 82, end: 86, direction: 'backward' },
+  'A background appearance render must preserve Unicode text, focus, and the selected emoji.');
+  assert.equal(await page.locator('#receive-message').inputValue(), limitedMessage);
+  await selectTheme('dark');
+  await page.locator('[data-view="activity"]').first().click();
+  await page.locator('[data-view="receive"]').first().click();
+  assert.equal(await page.locator('#receive-label').inputValue(), limitedLabel);
+  assert.equal(await page.locator('#receive-message').inputValue(), limitedMessage);
+  await assertReceiveRequest(limitedUri);
+  await page.locator('#receive-label').fill('');
+  await page.locator('#receive-message').fill('');
+  await assertReceiveRequest(`connectcoin:${address}`);
+  stage = 'receive trailing period preserves URI, QR and copied request';
+  await page.locator('#receive-amount').fill('123');
+  await assertReceiveRequest(`connectcoin:${address}?amount=123`);
+  const wholeAmountQr = await page.locator('#receive-qr').getAttribute('src');
+  await page.keyboard.press('End');
+  await page.keyboard.type('.');
+  assert.equal(await page.locator('#receive-amount').inputValue(), '123.');
+  await assertReceiveRequest(`connectcoin:${address}?amount=123`);
+  assert.equal(await page.locator('#receive-qr').getAttribute('src'), wholeAmountQr);
+  await assertCopiedReceiveValue('copy-payment-request', `connectcoin:${address}?amount=123`);
+  await page.locator('#receive-amount').focus();
+  await page.keyboard.press('End');
+  await page.keyboard.type('4');
+  assert.equal(await page.locator('#receive-amount').inputValue(), '123.4');
+  await assertReceiveRequest(`connectcoin:${address}?amount=123.4`);
+  await page.locator('#receive-amount').fill('');
+  await assertReceiveRequest(`connectcoin:${address}`);
+  stage = 'receiving payment URI, QR and guarded copy';
+  const receiveDraft = { amount: '1.2345678901', label: 'Café + amigos & família', message: 'Olá, João? = 50% # conexão / 東京 🚀' };
+  for (const [field, value] of Object.entries(receiveDraft)) await page.locator(`#receive-${field}`).fill(value);
+  const receiveQuery = `?amount=${receiveDraft.amount}&label=${encodeURIComponent(receiveDraft.label)}&message=${encodeURIComponent(receiveDraft.message)}`;
+  const paymentUri = `connectcoin:${address}${receiveQuery}`;
+  await assertReceiveRequest(paymentUri);
+  assert.ok(!paymentUri.includes('+'), 'Spaces and literal plus signs must use percent encoding.');
+  assert.ok(paymentUri.includes('%20') && paymentUri.includes('%2B') && paymentUri.includes('%26') && paymentUri.includes('%F0%9F%9A%80'));
+  await assertCopiedReceiveValue('copy-payment-request', paymentUri);
+
+  stage = 'receive draft survives navigation, background state and appearance';
+  await page.locator('[data-view="activity"]').first().click();
+  await page.evaluate(() => window.connectwallet.invoke('refresh'));
+  await page.locator('[data-view="receive"]').first().click();
+  for (const [field, value] of Object.entries(receiveDraft)) assert.equal(await page.locator(`#receive-${field}`).inputValue(), value);
+  await assertReceiveRequest(paymentUri);
+  await page.locator('#receive-label').focus();
+  await page.evaluate(() => { window.receiveEditingField = document.querySelector('#receive-label'); });
+  await selectTheme('light');
+  for (const [field, value] of Object.entries(receiveDraft)) assert.equal(await page.locator(`#receive-${field}`).inputValue(), value);
+  assert.equal(await page.evaluate(() => window.receiveEditingField === document.querySelector('#receive-label')
+    && document.activeElement === window.receiveEditingField), true, 'Background appearance updates must retain the active receive input.');
+  await assertReceiveRequest(paymentUri);
+  await page.screenshot({ path: path.join(screenshots, 'receive-light.png'), fullPage: true });
+  await selectTheme('dark');
+  await assertReceiveRequest(paymentUri);
+  await page.screenshot({ path: path.join(screenshots, 'receive-dark.png'), fullPage: true });
+
+  stage = 'invalid receive amounts cannot copy or display a stale QR';
+  for (const amount of ['0', '100000001', '100000000.0000000001']) {
+    await page.locator('#receive-amount').fill(amount);
+    await page.waitForFunction(() => document.querySelector('[data-action="copy-payment-request"]')?.disabled === true
+      && !document.querySelector('#receive-qr')?.getClientRects().length
+      && !document.querySelector('#receive-uri')?.value);
+    assert.equal(await page.locator('#receive-amount').inputValue(), amount);
+    assert.equal(await page.locator('[data-action="copy-address"]').isEnabled(), true, 'The raw public address remains independently usable.');
+  }
+  // An invalid draft also survives a state update instead of silently reverting
+  // to a valid request that might then be copied with the wrong amount.
+  await page.evaluate(() => window.connectwallet.invoke('refresh'));
+  await page.locator('[data-view="overview"]').first().click();
+  await page.locator('[data-view="receive"]').first().click();
+  assert.equal(await page.locator('#receive-amount').inputValue(), '100000000.0000000001');
+  assert.equal(await page.locator('[data-action="copy-payment-request"]').isDisabled(), true);
+  assert.equal(await page.locator('#receive-qr').isVisible(), false);
+  await page.locator('#receive-amount').fill(receiveDraft.amount);
+  await assertReceiveRequest(paymentUri);
+
+  stage = 'new receive address refreshes URI and QR together';
+  await page.locator('[data-action="new-address"]').click();
+  await page.waitForFunction(previous => document.querySelector('.address-box')?.textContent !== previous
+    && document.querySelector('#app')?.getAttribute('aria-busy') === 'false', address);
+  let nextAddress = await page.locator('.address-box').textContent();
+  assert.match(nextAddress, /^tcc1p[a-z0-9]+$/);
+  assert.notEqual(nextAddress, address);
+  for (const [field, value] of Object.entries(receiveDraft)) assert.equal(await page.locator(`#receive-${field}`).inputValue(), value);
+  let nextPaymentUri = `connectcoin:${nextAddress}${receiveQuery}`;
+  await assertReceiveRequest(nextPaymentUri);
+
+  stage = 'focused receive URI updates after a background address change';
+  await page.locator('#receive-uri').focus();
+  await page.evaluate(() => { window.receiveFocusedUri = document.querySelector('#receive-uri'); });
+  const changedWhileFocused = await page.evaluate(() => window.connectwallet.invoke('newAddress'));
+  assert.notEqual(changedWhileFocused.address, nextAddress);
+  nextAddress = changedWhileFocused.address;
+  nextPaymentUri = `connectcoin:${nextAddress}${receiveQuery}`;
+  await assertReceiveRequest(nextPaymentUri);
+  assert.deepEqual(await page.evaluate(() => ({
+    sameNode: window.receiveFocusedUri === document.querySelector('#receive-uri'),
+    focused: document.activeElement === window.receiveFocusedUri,
+    value: window.receiveFocusedUri.value,
+  })), { sameNode: true, focused: true, value: nextPaymentUri }, 'A focused read-only URI must update in place when the address changes.');
+
+  const beforeStaleCopy = await application.evaluate(() => globalThis.receiveClipboardWrites.length);
+  assert.equal(await page.evaluate(payload => window.connectwallet.invoke('copyPaymentRequest', payload).then(() => false, () => true),
+    { ...receiveDraft, expectedUri: paymentUri, expectedAddress: address }), true, 'The IPC boundary must reject a previously displayed request after the receive address changes.');
+  assert.equal(await application.evaluate(() => globalThis.receiveClipboardWrites.length), beforeStaleCopy);
+  await assertCopiedReceiveValue('copy-payment-request', nextPaymentUri);
+  await assertCopiedReceiveValue('copy-address', nextAddress);
+
+  stage = 'receive QR generation while a wallet refresh is pending';
+  await application.evaluate((_electron, moduleUrl) => {
+    const { WalletService } = process.getBuiltinModule('node:module').createRequire(moduleUrl)('./wallet-service.mjs');
+    const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.refresh, entered: false };
+    const gate = new Promise(resolve => { fixture.release = resolve; });
+    fixture.prototype.refresh = async function (...args) {
+      fixture.entered = true;
+      await gate;
+      return fixture.original.apply(this, args);
+    };
+    globalThis.receiveRefreshFixture = fixture;
+  }, pathToFileURL(path.join(root, 'src/core/wallet-service.mjs')).href);
+  try {
+    // Keep the real mutation IPC call in flight without making the renderer's
+    // controls busy. The read-only preview must bypass that main-process gate.
+    await page.evaluate(() => {
+      window.receiveDelayedRefreshStatus = 'pending';
+      window.receiveDelayedRefresh = window.connectwallet.invoke('refresh').then(
+        () => { window.receiveDelayedRefreshStatus = 'fulfilled'; },
+        () => { window.receiveDelayedRefreshStatus = 'rejected'; },
+      );
+    });
+    await expect.poll(() => application.evaluate(() => globalThis.receiveRefreshFixture.entered)).toBe(true);
+    const pendingAmount = '2.0000000001';
+    await page.locator('#receive-amount').fill(pendingAmount);
+    const pendingUri = `connectcoin:${nextAddress}?amount=${pendingAmount}&label=${encodeURIComponent(receiveDraft.label)}&message=${encodeURIComponent(receiveDraft.message)}`;
+    await assertReceiveRequest(pendingUri);
+    assert.equal(await page.evaluate(() => window.receiveDelayedRefreshStatus), 'pending', 'The new QR must render before the blocked refresh completes.');
+  } finally {
+    await application.evaluate(() => {
+      const fixture = globalThis.receiveRefreshFixture;
+      fixture.prototype.refresh = fixture.original;
+      fixture.release();
+      delete globalThis.receiveRefreshFixture;
+    });
+    await page.evaluate(() => window.receiveDelayedRefresh);
+  }
+  assert.equal(await page.evaluate(() => window.receiveDelayedRefreshStatus), 'fulfilled');
+  await page.locator('#receive-amount').fill(receiveDraft.amount);
+  await assertReceiveRequest(nextPaymentUri);
+  await application.evaluate(({ clipboard }) => {
+    clipboard.writeText = globalThis.receiveOriginalClipboardWriteText;
+    delete globalThis.receiveOriginalClipboardWriteText;
+    delete globalThis.receiveClipboardWrites;
+  });
+
   await page.locator('[data-view="send"]').first().click();
+  await assertPaymentLinkImport(nextAddress, address);
+  stage = 'send amount keyboard, paste and precision guard';
+  assert.equal(await page.locator('#send-address').getAttribute('data-text-limit'), '90');
+  assert.equal(await page.locator('#send-address').getAttribute('data-text-count'), 'utf16');
   assert.equal(await page.getByRole('button', { name: 'Review payment', exact: true }).isVisible(), true);
-  await page.getByRole('button', { name: 'Create a bounty', exact: true }).click();
+  await assertAmountInputGuard('#send-amount');
+  // Capture the real renderer/preload IPC payload inside the isolated process.
+  // The stub neither prepares a real transaction nor contacts a bounty domain.
+  await application.evaluate((_electron, moduleUrl) => {
+    const { WalletService } = process.getBuiltinModule('node:module').createRequire(moduleUrl)('./wallet-service.mjs');
+    const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.previewSend, calls: [] };
+    fixture.prototype.previewSend = async function (payload) {
+      fixture.calls.push(payload);
+      const bounty = payload.domain !== undefined;
+      return { previewId: 'isolated-trailing-period-preview', address: bounty ? payload.domain : payload.address,
+        amount: payload.amount, fee: '0.000001', total: '123.000001', type: bounty ? 'p2c' : 'payment',
+        ...(bounty ? { expectedConnections: payload.expectedConnections, signatureAlgorithmsMask: 7, rsaProbeStatus: 'unavailable' } : {}) };
+    };
+    globalThis.trailingPeriodPreviewFixture = fixture;
+  }, pathToFileURL(path.join(root, 'src/core/wallet-service.mjs')).href);
+  try {
+    stage = 'send trailing periods submit canonical numeric values';
+    await assertTrailingPeriodSendReview({ bounty: false, address: nextAddress });
+    await page.getByRole('button', { name: 'Create a bounty', exact: true }).click();
+    assert.equal(await page.locator('#send-domain').getAttribute('data-text-limit'), '1024');
+    assert.equal(await page.locator('#send-domain').getAttribute('data-text-count'), 'utf16');
+    stage = 'bounty amount keyboard, paste and precision guard';
+    await assertAmountInputGuard('#send-amount');
+    stage = 'bounty trailing periods submit canonical numeric values';
+    await assertTrailingPeriodSendReview({ bounty: true });
+    assert.equal(await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.length), 2);
+  } finally {
+    await application.evaluate(() => {
+      const fixture = globalThis.trailingPeriodPreviewFixture;
+      fixture.prototype.previewSend = fixture.original;
+      delete globalThis.trailingPeriodPreviewFixture;
+    });
+  }
+  stage = 'bounty form';
   await page.locator('#send-domain').fill('example.com');
   await page.locator('#send-amount').fill('1');
   await page.locator('#send-expected').fill('1000');
@@ -328,13 +1131,17 @@ try {
   assert.equal(await page.locator('#send-expected').inputValue(), '1000');
   await selectTheme('dark');
   assert.equal(await page.locator('#send-domain').inputValue(), 'example.com');
-  // No funds, no broadcast: verify the form only and do not create a preview.
+  // No real transaction was prepared, and the review fixture was never confirmed.
   await page.locator('[data-view="claims"]').first().click();
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0, 'Automatic claims should expose autosave without a manual Save button.');
   assert.equal(await page.locator('#claims-rate').inputValue(), '100');
   assert.equal(await page.locator('#claims-concurrent').inputValue(), '100');
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
   assert.equal(await page.locator('#claims-warning').isVisible(), false);
+  stage = 'claims trailing periods save integers and preserve editing';
+  await assertTrailingPeriodPreference('#claims-rate', 91, ['claims', 'maxConnectionsPerSecond']);
+  await assertTrailingPeriodPreference('#claims-concurrent', 92, ['claims', 'maxConcurrent']);
+  await assertTrailingPeriodPreference('#claims-lookback', 333, ['claims', 'lookbackBlocks']);
   stage = 'autosave acknowledgement preserves the native numeric caret';
   await page.locator('#claims-rate').fill('12');
   await page.keyboard.press('Home');
@@ -565,6 +1372,10 @@ try {
   await page.evaluate(() => window.connectwallet.invoke('refresh'));
 
   stage = 'lock and unlock';
+  await page.locator('[data-view="receive"]').first().click();
+  for (const [field, value] of Object.entries(receiveDraft)) await page.locator(`#receive-${field}`).fill(value);
+  await assertReceiveRequest(nextPaymentUri);
+  await page.locator('[data-view="claims"]').first().click();
   await page.locator('#claims-lookback').fill('344');
   await page.getByRole('button', { name: 'Lock wallet', exact: true }).click();
   await page.locator('#unlock-password').waitFor();
@@ -576,6 +1387,9 @@ try {
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.locator('#unlock-password').fill(password);
   await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+  await page.locator('[data-view="receive"]').first().click();
+  for (const field of ['amount', 'label', 'message']) assert.equal(await page.locator(`#receive-${field}`).inputValue(), '', 'Locking must discard every receive request draft.');
+  await assertReceiveRequest(`connectcoin:${nextAddress}`);
   await page.locator('[data-view="settings"]').first().waitFor();
   await page.locator('[data-view="settings"]').first().click();
   assert.equal(await page.locator('#theme-preference').inputValue(), 'light');
@@ -618,6 +1432,10 @@ try {
   console.error(`UI smoke test failed during ${stage} (${error.name ?? 'Error'}${sourceLine ? `, test line ${sourceLine}` : ''}). No recovery words were logged. Temporary profile preserved: ${profile}`);
   if (stage.includes('diagnostic')) console.error(`Diagnostic presentation fixture number: ${presentationSequence}.`);
   if (stage === 'system appearance and startup persistence') console.error(String(error.message).slice(0, 800));
+  if (stage.includes('amount keyboard, paste and precision guard')) console.error(String(error.message).slice(0, 1000));
+  if (stage.includes('trailing period')) console.error(String(error.message).slice(0, 1000));
+  if (stage.includes('receive text limits')) console.error(String(error.message).slice(0, 1000));
+  if (stage.includes('send payment link')) console.error(String(error.message).slice(0, 1000));
   if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || /^(?:Native appearance must match|Developer Mode persistence mismatch)/.test(String(error.message)))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;
 } finally {
@@ -634,4 +1452,4 @@ try {
     await rm(absolute, { recursive: true, force: true });
   }
 }
-if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, automatic preference persistence with native numeric caret and open details retained, atomic RPC edits, invalid-draft preservation, claims on/off persistence, lock/close flush, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive QR, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);
+if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, automatic preference persistence with native numeric caret and open details retained, atomic RPC edits, invalid-draft preservation, claims on/off persistence, lock/close flush, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive URI/QR, Unicode encoding, guarded clipboard copy, direct clipboard Send payment-link import with exact precision, Unicode metadata, atomic rejection, explicit review and draft-edit/lock race protection, Receive/Send/bounty amount keyboard and paste guards with exact precision and native selection editing, invalid amounts, receive draft persistence and lock erasure, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);

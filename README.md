@@ -10,7 +10,7 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 
 - Create or restore a wallet with **12, 18 or 24 BIP39 recovery words**; 24 is the default.
 - Protect the local wallet with a password before creating it, and verify your recovery backup.
-- Receive using a QR code; send native ConnectCoin payments with a recipient/amount/fee review before broadcast.
+- Receive using a copyable `connectcoin:` payment link and its QR code, with optional amount, label and message; send native ConnectCoin payments with a recipient/amount/fee review before broadcast.
 - Create Pay-to-Connect bounties with a domain, reward and hash target, expressed as an expected number of candidate evaluations—not a guaranteed count of physical connections.
 - Opt into **Automatic Claims**, with local TLS proof generation and local proof verification.
 - Browse balances and transaction history, create receive addresses, export an encrypted backup and lock your wallet.
@@ -27,6 +27,22 @@ Like Core, selection alternates domain round-robin turns with economic-priority 
 Economic domain scores also account for complete TLS captures per second, measured over the last 100 completed attempts per domain and signature-policy mask (including failed attempts' elapsed time). Untried policies start with a 5/s prior. Raw expected net return below 1,000 connects per second of TLS effort is ineligible, even after a random boost; actual payout and dust are checked again before TLS. The queue holds at most 20,000 jobs; capacity admission favors adjusted economic scores while preserving active and cooling-down jobs. Priority indexes are refreshed periodically, not sorted again for every connection.
 
 There is **no 1,000-attempt batch or 180-second bounty-search timeout** in Automatic Claims. As in Core, a bounty stops receiving new connections after its cumulative number of successful TLS captures exceeds twice the expected candidate count: `successes × (target + 1) > 2^257`. Failed DNS/TCP/TLS attempts do not consume that budget; a complete capture counts even if its hash misses the target. Connections already in progress may still produce a winning proof. Counters and random factors survive stop/start and catalog resynchronization while the bounty remains tracked in the same unlocked wallet session; they are not persisted across wallet locking or app restarts.
+
+## Payment requests
+
+In **Receive**, copy your public address or generate a new one as before. The optional amount (in CONN, up to 10 decimal places), label and message start empty. The payment URI and QR code update together; **Copy payment link** copies the complete `connectcoin:` URI. Invalid details disable copying the request and remove its QR code until corrected. **Copy address** remains available separately.
+
+In **Send → To an address**, the separate **Paste payment link** button reads a `connectcoin:` URI directly from the clipboard, without opening another dialog. The clipboard is read only on that action, never polled, logged or sent to a server; arbitrary clipboard text is not exposed to the renderer. It validates the address checksum and wallet network locally, then replaces the recipient, amount, label and message together. Missing fields are cleared, so a link without an amount never inherits an old amount. Import does not contact the recipient, change fees, sign or broadcast a transaction; use **Review payment** and confirm explicitly afterward. Empty clipboards or invalid links show an error without changing the current draft. Duplicate fields, unsupported required parameters and payment-protocol/fee/network instructions are rejected; unused optional fields are clearly reported. Core's uppercase addresses and percent-encoded Unicode metadata are supported. Late replies cannot overwrite edits made after clicking Paste.
+
+Send labels and messages remain editable, appear in the payment review and are saved by transaction ID inside the encrypted wallet before broadcasting. They appear as **Local payment notes** when that transaction is in Activity, and survive locking/reopening and encrypted backups, but are not recoverable from the recovery phrase alone. They are never included in transaction bytes or sent to the recipient. If local note storage is full, remove the new notes to send without adding more; existing notes are not silently discarded. Cancelled imports and late results from a locked/replaced wallet cannot repopulate the Send form.
+
+Amount fields in Receive and Send (including bounty rewards) accept digits and one decimal point or comma, with up to 10 decimal places. A decimal comma is converted to a point; do not use thousands separators. Invalid pasted amounts are rejected as a whole, not truncated or stripped into a different amount. Amount range and payment validation still run in the wallet backend.
+
+A final decimal separator is kept while editing but ignored when using the number: `123.` means `123`, and the payment URI/QR stays usable. This also applies to whole-number fields (fees, expected candidates, claim limits, TCP port and auto-lock minutes). Their integer/range constraints still apply; a fractional value is never rounded into a valid integer.
+
+Public text fields also prevent edits beyond their existing limits. Receive labels allow 100 Unicode code points and messages 200; wallet names, recipient addresses, RPC hostnames and raw bounty domains retain their existing length limits. Oversized pastes are rejected whole rather than silently shortened. These editing guards do not change password/recovery input or replace backend validation, including the combined encoded payment-URI size limit.
+
+Labels and messages are not written to the blockchain: a compatible sending wallet can store them locally. Anyone with the URI or QR can read these details, so do not include secrets. Request drafts stay in memory while navigating and are cleared when the wallet locks; they are not saved as preferences. ConnectCoin Core can open the URI through **File → Open URI** and requires the sender to confirm the payment. Generating a request does not monitor an invoice, guarantee payment or broadcast a transaction.
 
 ## Run from source
 

@@ -2,10 +2,11 @@ import { EventEmitter } from 'node:events';
 import { randomUUID, randomInt } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
-import QRCode from 'qrcode';
+import { buildPaymentUri, parsePaymentUri, validatePaymentDetails } from './payment-uri.mjs';
+import { paymentQrDataUrl } from './payment-qr.mjs';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
-import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, MAX_ADDRESS_INDEX } from './crypto.mjs';
+import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, MAX_ADDRESS_INDEX } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
 import { ClaimsEngine, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
@@ -23,6 +24,21 @@ const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
 const ADDRESS_GAP = 20;
 const ADDRESS_BUILD_BATCH = 32;
+// vault.mjs permits 131072 ciphertext hex characters, or 65536 plaintext bytes.
+// Keep every saved annotation; when full, the user can send without new notes.
+const WALLET_PLAINTEXT_LIMIT = 65536;
+const PAYMENT_DETAILS_HEADROOM = 512; // Future derivation indexes and recovery flags.
+function validateStoredPaymentDetails(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The saved payment details are invalid.');
+  const result = {};
+  for (const [txid, details] of Object.entries(value)) {
+    if (!HASH.test(txid) || !details || typeof details !== 'object' || Array.isArray(details)) throw new Error('The saved payment details are invalid.');
+    try { result[txid] = validatePaymentDetails(details); }
+    catch { throw new Error('The saved payment details are invalid.'); }
+  }
+  return result;
+}
 function amount(value) {
   if (typeof value !== 'string' || !MONEY.test(value) || BigInt(value) > 1000000000000000000n || BigInt(value) < -1000000000000000000n) throw new Error('RPC returned an invalid monetary amount.');
   return BigInt(value);
@@ -192,7 +208,7 @@ export class WalletService extends EventEmitter {
       wallet: this.session ? { name: this.session.data.name, address: current?.address ?? '', path: current?.path,
         qrDataUrl: this.qrDataUrl, balance: this.balance, recovering: Boolean(this.recovering), addressCount: this.accounts.length } : null,
       network: { ...this.network, host: this.config.rpc.host, port: this.config.rpc.port },
-      config: structuredClone(this.config), history: this.session ? this.history : [],
+      config: structuredClone(this.config), history: this.session ? this.history.map(row => ({ ...row, ...this.session.data.paymentDetails?.[row.txid] })) : [],
       claims: { ...this.claimInfo, enabled: Boolean(this.engine?.enabled), available: this.claimInfo.queued ?? 0,
         lastErrorDiagnostic: this.claimInfo.lastErrorDiagnostic === true,
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
@@ -311,6 +327,9 @@ export class WalletService extends EventEmitter {
     this.replacement = null; this.setup = null; this.epoch++;
     const epoch = this.epoch;
     await this.walletWrite?.catch(() => {});
+    // A lock can interrupt confirmation while its pre-broadcast encrypted save
+    // drains. Do not reopen an older snapshot before that save has settled.
+    await this.persisting.catch(() => {});
     if (this.closed || this.epoch !== epoch) throw new Error('Unlock was cancelled.');
     const data = await unlockVault(this.vaultFile, password);
     if (this.epoch !== epoch) throw new Error('Unlock was cancelled.');
@@ -324,6 +343,7 @@ export class WalletService extends EventEmitter {
       if (!Number.isSafeInteger(index) || index < -1 || index > MAX_ADDRESS_INDEX) throw new Error('Unsupported last-used wallet address index.');
     }
     walletName(data.name);
+    if (data.paymentDetails !== undefined) data.paymentDetails = validateStoredPaymentDetails(data.paymentDetails);
     this.replacement = null; this.setup = null;
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
     const epoch = this.epoch;
@@ -394,8 +414,37 @@ export class WalletService extends EventEmitter {
   async makeQR() {
     const epoch = this.epoch;
     const address = this.accounts.find(a => a.change === 0 && a.index === this.session?.data.receiveIndex)?.address;
-    const qrDataUrl = address ? await QRCode.toDataURL(address, { errorCorrectionLevel: 'M', margin: 2, width: 280, color: { dark: '#17211b', light: '#ffffff' } }) : null;
-    if (epoch === this.epoch && this.session) this.qrDataUrl = qrDataUrl;
+    const qrDataUrl = address ? await paymentQrDataUrl(buildPaymentUri({ address })) : null;
+    if (epoch === this.epoch && this.session && address === this.accounts.find(a => a.change === 0 && a.index === this.session.data.receiveIndex)?.address) this.qrDataUrl = qrDataUrl;
+  }
+  paymentRequestUri({ amount, label, message } = {}) {
+    this.assertSession();
+    const address = this.accounts.find(a => a.change === 0 && a.index === this.session.data.receiveIndex)?.address;
+    return { address, uri: buildPaymentUri({ address, amount, label, message }) };
+  }
+  async paymentRequest(payload = {}) {
+    const epoch = this.epoch;
+    const { address, uri } = this.paymentRequestUri(payload);
+    const qrDataUrl = await paymentQrDataUrl(uri);
+    this.assertSession(epoch);
+    if (address !== this.paymentRequestUri().address) throw new Error('The receive address changed. Create the payment request again.');
+    return { address, uri, qrDataUrl };
+  }
+  paymentRequestForCopy({ amount, label, message, expectedUri, expectedAddress } = {}) {
+    const request = this.paymentRequestUri({ amount, label, message });
+    // Clipboard writes must match exactly what the user reviewed. Keep this
+    // validation synchronous with the write in main.mjs.
+    if (expectedUri !== request.uri || expectedAddress !== request.address) throw new Error('The payment request changed. Review it before copying again.');
+    return request;
+  }
+  parsePaymentRequest({ uri } = {}) {
+    this.assertSession();
+    const request = parsePaymentUri(uri);
+    // Bech32 parsing libraries can quote their input in errors. Only return a
+    // fixed message to the renderer, never an untrusted URI or address fragment.
+    try { decodeAddress(request.address, this.config.network); }
+    catch { throw new Error('The payment address is invalid or belongs to a different network.'); }
+    return request;
   }
   async persist() {
     this.assertSession();
@@ -640,10 +689,15 @@ export class WalletService extends EventEmitter {
     this.sendPreparation = null;
     this.preview = null;
   }
-  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections } = {}) {
+  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections, label = '', message = '' } = {}) {
     this.assertSession(); const epoch = this.epoch;
     if (this.session.data.needsRecovery) throw new Error('Wait for recovery discovery to finish before sending.');
     this.cancelSendPreview();
+    const details = validatePaymentDetails({ label, message });
+    if (domain === undefined) {
+      try { decodeAddress(address, this.config.network); }
+      catch { throw new Error('The payment address is invalid or belongs to a different network.'); }
+    }
     const value = parseCoinAmount(coins); if (value <= 0n) throw new Error('Enter an amount greater than zero.');
     const preparation = new AbortController(), rpc = this.rpc;
     this.sendPreparation = preparation;
@@ -690,8 +744,8 @@ export class WalletService extends EventEmitter {
       }
       check();
       // The selected mask and signed bytes are frozen together for confirmation.
-      this.preview = { ...payment, ...policy, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: formatCoinAmount(value), changeIndex: change.index };
-      return { previewId: this.preview.previewId, address: this.preview.address, amount: formatCoinAmount(value), fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(value + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy };
+      this.preview = Object.freeze({ ...payment, ...policy, ...details, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: formatCoinAmount(value), changeIndex: change.index });
+      return { previewId: this.preview.previewId, address: this.preview.address, amount: formatCoinAmount(value), fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(value + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy, ...details };
     } finally {
       for (const key of keys) key.fill(0);
       if (this.sendPreparation === preparation) this.sendPreparation = null;
@@ -702,12 +756,34 @@ export class WalletService extends EventEmitter {
     if (!preview || preview.previewId !== previewId || preview.expires < Date.now()) throw new Error('Payment review expired. Review the payment again.');
     this.assertSession(preview.epoch);
     await this.ensureNetwork(); this.assertSession(preview.epoch);
-    // Persist the change path BEFORE broadcast; recovery must never rely on success responses.
+    // Save the review's local notes and change path BEFORE broadcast. A timeout,
+    // lock or lost reply must not discard metadata for a submitted transaction.
+    const session = this.session, previousChangeIndex = session.data.changeIndex, previousDetails = session.data.paymentDetails;
+    const hasDetails = Boolean(preview.label || preview.message);
+    let nextChangeIndex = previousChangeIndex;
     if (BigInt(preview.change) > 0n) {
       if (this.session.data.changeIndex >= MAX_ADDRESS_INDEX) throw new Error('The BIP32 change-address index range is exhausted.');
       if (this.session.data.changeIndex >= (this.session.data.lastUsedChange ?? -1) + ADDRESS_GAP) throw new Error('Too many unused change addresses. Wait for pending payments to appear before sending again.');
-      this.session.data.changeIndex = Math.max(this.session.data.changeIndex, preview.changeIndex + 1);
-      await this.persist(); this.assertSession(preview.epoch); await this.buildAccounts(); this.assertSession(preview.epoch);
+      nextChangeIndex = Math.max(previousChangeIndex, preview.changeIndex + 1);
+    }
+    const nextDetails = hasDetails ? { ...previousDetails, [preview.txid]: { label: preview.label, message: preview.message } } : previousDetails;
+    if (hasDetails && Buffer.byteLength(JSON.stringify({ ...session.data, changeIndex: nextChangeIndex, paymentDetails: nextDetails }), 'utf8') > WALLET_PLAINTEXT_LIMIT - PAYMENT_DETAILS_HEADROOM) {
+      throw new Error('Local payment details storage is full. Clear Label and Message and review again to send without saving new details. No transaction was sent.');
+    }
+    if (nextChangeIndex !== previousChangeIndex || hasDetails) {
+      session.data.changeIndex = nextChangeIndex;
+      if (hasDetails) session.data.paymentDetails = nextDetails;
+      try { await this.persist(); }
+      catch (error) {
+        if (this.session === session) {
+          session.data.changeIndex = previousChangeIndex;
+          if (previousDetails === undefined) delete session.data.paymentDetails;
+          else session.data.paymentDetails = previousDetails;
+        }
+        throw error;
+      }
+      this.assertSession(preview.epoch);
+      if (nextChangeIndex !== previousChangeIndex) { await this.buildAccounts(); this.assertSession(preview.epoch); }
     }
     for (const input of preview.selected) this.reserved.add(`${input.txid}:${input.vout}`);
     try {

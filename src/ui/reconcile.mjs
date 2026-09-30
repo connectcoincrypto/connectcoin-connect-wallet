@@ -18,7 +18,7 @@ function patchElement(current, next) {
   const textarea = current.localName === 'textarea';
   const details = current.localName === 'details';
   const keepAttribute = name => (details && name === 'open') ||
-    (focused && (input || textarea) && name === 'value');
+    (focused && !current.readOnly && (input || textarea) && name === 'value');
   for (const attribute of Array.from(current.attributes)) {
     if (!keepAttribute(attribute.name) && !next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
   }
@@ -30,7 +30,9 @@ function patchElement(current, next) {
   if (input || textarea) {
     // Avoid assigning even an equivalent value while typing: intermediate
     // numeric input (e.g. an exponent or a minus sign) can have an empty value.
-    if (!focused && current.value !== next.value) current.value = next.value;
+    // Read-only outputs (notably the payment URI) must follow their backing
+    // address even while selected; only editable controls have a typing caret.
+    if ((!focused || current.readOnly) && current.value !== next.value) current.value = next.value;
     if (input && current.checked !== next.checked) current.checked = next.checked;
     return;
   }

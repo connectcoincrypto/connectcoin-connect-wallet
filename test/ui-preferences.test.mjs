@@ -25,6 +25,33 @@ test('autosave allows only valid preferences and keeps RPC edits atomic until le
   }
 });
 
+test('trailing separators save integer preferences without changing raw acknowledgement or ranges', () => {
+  for (const separator of ['.', ',']) {
+    const edits = {
+      claims: { maxConnectionsPerSecond: `120${separator}`, maxConcurrent: `90${separator}`, lookbackBlocks: `500${separator}` },
+      settings: { autoLockMinutes: `30${separator}`, feeRate: `2200${separator}`, port: `12345${separator}`, host: 'local.example' },
+      send: {},
+    };
+    const batch = preferenceBatch(config(), edits, { rpcReady: true });
+    assert.deepEqual(batch.patch, { claims: { maxConnectionsPerSecond: 120, maxConcurrent: 90, lookbackBlocks: 500 }, autoLockMinutes: 30, feeRate: 2200, rpc: { host: 'local.example', port: 12345 } });
+    assert.equal(batch.entries.find(entry => entry.key === 'feeRate').raw, `2200${separator}`);
+    acknowledgePreferences(edits, batch);
+    assert.deepEqual(edits, { claims: {}, settings: {}, send: {} });
+  }
+  for (const value of ['257.', '1.5', '1.5.', '1..', '.', '1e2.', '0.']) {
+    const edits = draft(); edits.claims.maxConcurrent = value;
+    assert.deepEqual(preferenceBatch(config(), edits).patch, {});
+  }
+  const same = draft(); same.settings.feeRate = '1500.';
+  const acknowledged = preferenceBatch(config(), same);
+  assert.deepEqual(acknowledged.patch, {});
+  assert.equal(acknowledged.entries.length, 1);
+  acknowledgePreferences(same, acknowledged);
+  assert.deepEqual(preferenceBatch(config(), same), { patch: {}, entries: [] });
+  const host = draft(); host.settings = { host: '123.', port: '12345.' };
+  assert.deepEqual(preferenceBatch(config(), host, { rpcReady: true }).patch, {}, 'a hostname must not be interpreted as a numeric input');
+});
+
 test('an in-flight save acknowledges only its own draft, then saves the newer preference without overlap', async () => {
   let current = config();
   const edits = draft(), started = deferred(), release = deferred();

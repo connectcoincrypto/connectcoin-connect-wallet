@@ -1,5 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
-const METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','getRecoveryPhrase','exportWallet','saveConfig','setTheme','setDeveloperMode','setClaims','refresh','openExternal','openDiagnostics','copyAddress']);
+const METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','paymentRequest','pastePaymentRequest','getRecoveryPhrase','exportWallet','saveConfig','setTheme','setDeveloperMode','setClaims','refresh','openExternal','openDiagnostics','copyAddress','copyPaymentRequest']);
 let lastActivity = 0;
 for (const name of ['pointerdown', 'keydown']) window.addEventListener(name, () => {
   const now = Date.now();
