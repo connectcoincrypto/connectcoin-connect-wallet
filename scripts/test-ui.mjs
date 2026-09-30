@@ -62,12 +62,28 @@ let application;
 let page;
 const errors = [];
 const failedBrandRequests = [];
-let stage = 'launch';
+let stage = 'prepare Electron runtime';
+let stageStarted = performance.now();
+let stageIndex = 1;
 let passed = false;
 let seed = [];
 const password = 'UI-test-only-long-password';
 const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
 delete env.ELECTRON_RUN_AS_NODE;
+
+console.log(`UI stage ${stageIndex} started: ${stage}.`);
+function finishStage(outcome) {
+  console.log(`UI stage ${stageIndex} ${outcome}: ${stage} (${Math.round(performance.now() - stageStarted)} ms).`);
+}
+function nextStage(value) {
+  // Labels come only from the fixed test stages below, never from inputs,
+  // clipboard text, page contents, recovery words or exception messages.
+  finishStage('completed');
+  stage = value;
+  stageStarted = performance.now();
+  stageIndex++;
+  console.log(`UI stage ${stageIndex} started: ${stage}.`);
+}
 
 async function openApplication(executablePath) {
   // Disable Playwright's default forced-light emulation so this test observes
@@ -521,7 +537,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
       'Clipboard error text must not echo the rejected clipboard payload.');
   };
   try {
-    stage = 'send payment link import preserves precision and Unicode metadata';
+    nextStage('send payment link import preserves precision and Unicode metadata');
     await assertPasteErrorCleared();
     await page.locator('#send-address').fill(otherAddress);
     await page.locator('#send-amount').fill('12.34');
@@ -543,7 +559,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     await assertSendDraft(imported);
     await assertNoAutomaticSend();
 
-    stage = 'send payment link rejects invalid requests without partial changes';
+    nextStage('send payment link rejects invalid requests without partial changes');
     const wrongNetworkAddress = encodeAddress(decodeAddress(address), 'main');
     const invalidUris = [
       'private-clipboard-canary-DO-NOT-DISPLAY',
@@ -569,7 +585,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
       await assertNoAutomaticSend();
     }
 
-    stage = 'send payment link handles empty and asynchronously rejected clipboard reads without changing drafts';
+    nextStage('send payment link handles empty and asynchronously rejected clipboard reads without changing drafts');
     for (const [clipboardText, clipboardError] of [['', false], [' \n\t ', false], ['', true]]) {
       await usePaymentLink(clipboardText, { clipboardError });
       await assertPasteError(clipboardText);
@@ -578,7 +594,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     }
     await page.locator('.form-layout').screenshot({ path: path.join(screenshots, 'send-clipboard-error.png') });
 
-    stage = 'send clipboard error survives background rendering then fades and clears';
+    nextStage('send clipboard error survives background rendering then fades and clears');
     // Exercise the animation itself even on CI hosts with reduced motion;
     // restore the host preference after this focused transition assertion.
     await page.emulateMedia({ reducedMotion: 'no-preference' });
@@ -608,7 +624,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     await page.evaluate(() => { delete window.paymentPasteErrorNode; delete window.paymentPasteErrorText; });
     await page.emulateMedia({ reducedMotion: null });
 
-    stage = 'send clipboard error is discarded when leaving the view or payment mode';
+    nextStage('send clipboard error is discarded when leaving the view or payment mode');
     for (const changedContext of ['navigation', 'send-mode', 'security-epoch', 'lock']) {
       await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
       await assertPasteError('private-clipboard-canary-DO-NOT-DISPLAY');
@@ -641,14 +657,14 @@ async function assertPaymentLinkImport(address, otherAddress) {
       await assertPasteErrorCleared();
     }
 
-    stage = 'send payment link exposes unused optional fields';
+    nextStage('send payment link exposes unused optional fields');
     await usePaymentLink(`${uri}&unknown-field=ignored`);
     await assertSendDraft(imported);
     await assertPasteErrorCleared();
     await expect(page.locator('.notice.warning').filter({ hasText: 'unknown-field' })).toBeVisible();
     await assertNoAutomaticSend();
 
-    stage = 'send plain address preserves amount and fee while clearing imported notes';
+    nextStage('send plain address preserves amount and fee while clearing imported notes');
     const previousFee = await page.locator('#send-fee').inputValue();
     const feeWasOpen = await page.locator('.advanced-fee').evaluate(details => details.open);
     if (!feeWasOpen) await page.locator('.advanced-fee summary').click();
@@ -665,7 +681,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     await page.locator('#send-fee').fill(previousFee);
     if (!feeWasOpen) await page.locator('.advanced-fee summary').click();
 
-    stage = 'send payment link replaces absent amount and metadata';
+    nextStage('send payment link replaces absent amount and metadata');
     await usePaymentLink(`connectcoin:${otherAddress}`);
     await expect(page.locator('dialog[open]')).toHaveCount(0);
     await assertSendDraft({ address: otherAddress, amount: '', label: '', message: '' });
@@ -675,7 +691,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     await expect(page.locator('dialog[open]')).toHaveCount(0);
     await assertSendDraft(imported);
 
-    stage = 'send payment link metadata remains visible in explicit review';
+    nextStage('send payment link metadata remains visible in explicit review');
     await page.getByRole('button', { name: 'Review payment', exact: true }).click();
     await page.getByRole('heading', { name: 'One final look.', exact: true }).waitFor();
     const reviewPayload = await application.evaluate(() => globalThis.paymentLinkFixture.previews.at(-1));
@@ -689,10 +705,10 @@ async function assertPaymentLinkImport(address, otherAddress) {
 
     const composingLabel = '編集中 café';
     for (const changedContext of ['navigation', 'send-mode', 'focus', 'draft-edit', 'composition', 'lock']) {
-      stage = `send payment link repastes original details before ${changedContext}`;
+      nextStage(`send payment link repastes original details before ${changedContext}`);
       await usePaymentLink(uri);
       await assertSendDraft(imported);
-      stage = `send payment link protects a pending clipboard import during ${changedContext}`;
+      nextStage(`send payment link protects a pending clipboard import during ${changedContext}`);
       await application.evaluate(() => {
         const fixture = globalThis.paymentLinkFixture;
         fixture.entered = false;
@@ -763,7 +779,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     }
 
     for (const changedContext of ['draft-edit', 'lock']) {
-      stage = `send clipboard retry clears old errors and discards a late error after ${changedContext}`;
+      nextStage(`send clipboard retry clears old errors and discards a late error after ${changedContext}`);
       await usePaymentLink(uri);
       await assertSendDraft(imported);
       await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
@@ -801,7 +817,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
       await assertNoAutomaticSend(1);
     }
 
-    stage = 'send clipboard read resolving after lock must not reach the parser or revive an error';
+    nextStage('send clipboard read resolving after lock must not reach the parser or revive an error');
     await usePaymentLink(uri);
     await assertSendDraft(imported);
     const previousParses = await application.evaluate(() => {
@@ -861,6 +877,7 @@ try {
   // Electron 44 may download its runtime lazily. Resolve it before starting
   // Playwright's launch deadline, so a cold install is not a false UI timeout.
   const executablePath = createRequire(import.meta.url)('electron');
+  nextStage('launch');
   await openApplication(executablePath);
   // Screenshots are deliberately limited to screens with no recovery words.
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
@@ -868,7 +885,7 @@ try {
   assert.deepEqual(await page.evaluate(() => [typeof window.require, typeof window.process, Object.isFrozen(window.connectwallet)]), ['undefined', 'undefined', true]);
   assert.equal(await page.evaluate(() => window.connectwallet.invoke('getblocktemplate').then(() => false, () => true)), true);
 
-  stage = 'system appearance and startup persistence';
+  nextStage('system appearance and startup persistence');
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.theme, 'system');
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'system');
   assert.equal(await application.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'system');
@@ -897,7 +914,7 @@ try {
   assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.theme, 'dark');
   await selectTheme('system');
 
-  stage = 'create and backup';
+  nextStage('create and backup');
   await page.getByRole('button', { name: 'Create a new wallet' }).click();
   assert.equal(await page.locator('#setup-name').getAttribute('data-text-limit'), '40');
   assert.equal(await page.locator('#setup-name').getAttribute('data-text-count'), 'utf16');
@@ -960,7 +977,7 @@ try {
   await assertLoadedImage('.coin-mark img');
   await page.screenshot({ path: path.join(screenshots, 'overview.png') });
 
-  stage = 'automatic settings persistence and appearance preserve invalid drafts';
+  nextStage('automatic settings persistence and appearance preserve invalid drafts');
   await page.locator('[data-view="settings"]').first().click();
   assert.equal(await page.locator('#rpc-host').getAttribute('data-text-limit'), '253');
   assert.equal(await page.locator('#rpc-host').getAttribute('data-text-count'), 'utf16');
@@ -1007,7 +1024,7 @@ try {
   assert.equal(persistedSettings.autoLockMinutes, 30);
   assert.equal(persistedSettings.rpc.port, alternateFixture.address().port);
   assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1, 'RPC preferences save on leaving the fields while the Settings page stays open.');
-  stage = 'settings trailing periods save integers and preserve editing';
+  nextStage('settings trailing periods save integers and preserve editing');
   await assertTrailingPeriodPreference('#auto-lock', 31, ['autoLockMinutes']);
   await assertTrailingPeriodPreference('#rpc-port', fixture.address().port, ['rpc', 'port'], { endpoint: true });
   assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.1');
@@ -1015,7 +1032,7 @@ try {
   assert.equal(await page.locator('.seed-word').count(), 0);
   await page.screenshot({ path: path.join(screenshots, 'overview-dark.png') });
 
-  stage = 'receiving payment URI, QR and guarded copy';
+  nextStage('receiving payment URI, QR and guarded copy');
   await page.locator('[data-view="receive"]').first().click();
   const receiveAddressCard = page.locator('.receive-address-card');
   assert.equal(await receiveAddressCard.locator('.address-box').count(), 1);
@@ -1044,7 +1061,7 @@ try {
   assert.match(address, /^tcc1p[a-z0-9]+$/);
   for (const field of ['amount', 'label', 'message']) assert.equal(await page.locator(`#receive-${field}`).inputValue(), '');
   await assertReceiveRequest(`connectcoin:${address}`);
-  stage = 'receive panel alignment and responsive content heights';
+  nextStage('receive panel alignment and responsive content heights');
   const receiveViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
   const receivePanelBounds = () => page.locator('.receive-details, .payment-request').evaluateAll(panels => panels.map(panel => {
     const bounds = panel.getBoundingClientRect();
@@ -1069,10 +1086,10 @@ try {
   } finally {
     await page.setViewportSize(receiveViewport);
   }
-  stage = 'receive amount keyboard, paste and precision guard';
+  nextStage('receive amount keyboard, paste and precision guard');
   await assertAmountInputGuard('#receive-amount');
   await assertReceiveRequest(`connectcoin:${address}`);
-  stage = 'receiving payment URI, QR and guarded copy';
+  nextStage('receiving payment URI, QR and guarded copy');
   await assertLoadedImage('.sidebar .brand-mark img');
   // Intercept the real IPC copy endpoint inside this isolated Electron process;
   // no test reads or writes the user's operating-system clipboard.
@@ -1087,7 +1104,7 @@ try {
   });
   await assertCopiedReceiveValue('copy-payment-request', `connectcoin:${address}`);
   await assertCopiedReceiveValue('copy-address', address);
-  stage = 'receive text limits preserve Unicode, native editing and drafts';
+  nextStage('receive text limits preserve Unicode, native editing and drafts');
   await assertTextInputLimit('#receive-label', 100);
   await assertTextInputLimit('#receive-message', 200);
   const limitedLabel = `${'L'.repeat(80)}${'🚀'.repeat(10)}`;
@@ -1118,7 +1135,7 @@ try {
   await page.locator('#receive-label').fill('');
   await page.locator('#receive-message').fill('');
   await assertReceiveRequest(`connectcoin:${address}`);
-  stage = 'receive trailing period preserves URI, QR and copied request';
+  nextStage('receive trailing period preserves URI, QR and copied request');
   await page.locator('#receive-amount').fill('123');
   await assertReceiveRequest(`connectcoin:${address}?amount=123`);
   const wholeAmountQr = await page.locator('#receive-qr').getAttribute('src');
@@ -1135,7 +1152,7 @@ try {
   await assertReceiveRequest(`connectcoin:${address}?amount=123.4`);
   await page.locator('#receive-amount').fill('');
   await assertReceiveRequest(`connectcoin:${address}`);
-  stage = 'receiving payment URI, QR and guarded copy';
+  nextStage('receiving payment URI, QR and guarded copy');
   const receiveDraft = { amount: '1.2345678901', label: 'Café + amigos & família', message: 'Olá, João? = 50% # conexão / 東京 🚀' };
   for (const [field, value] of Object.entries(receiveDraft)) await page.locator(`#receive-${field}`).fill(value);
   const receiveQuery = `?amount=${receiveDraft.amount}&label=${encodeURIComponent(receiveDraft.label)}&message=${encodeURIComponent(receiveDraft.message)}`;
@@ -1145,7 +1162,7 @@ try {
   assert.ok(paymentUri.includes('%20') && paymentUri.includes('%2B') && paymentUri.includes('%26') && paymentUri.includes('%F0%9F%9A%80'));
   await assertCopiedReceiveValue('copy-payment-request', paymentUri);
 
-  stage = 'receive draft survives navigation, background state and appearance';
+  nextStage('receive draft survives navigation, background state and appearance');
   await page.locator('[data-view="activity"]').first().click();
   await page.evaluate(() => window.connectwallet.invoke('refresh'));
   await page.locator('[data-view="receive"]').first().click();
@@ -1163,7 +1180,7 @@ try {
   await assertReceiveRequest(paymentUri);
   await page.screenshot({ path: path.join(screenshots, 'receive-dark.png'), fullPage: true });
 
-  stage = 'invalid receive amounts cannot copy or display a stale QR';
+  nextStage('invalid receive amounts cannot copy or display a stale QR');
   for (const amount of ['0', '100000001', '100000000.0000000001']) {
     await page.locator('#receive-amount').fill(amount);
     await page.waitForFunction(() => document.querySelector('[data-action="copy-payment-request"]')?.disabled === true
@@ -1183,7 +1200,7 @@ try {
   await page.locator('#receive-amount').fill(receiveDraft.amount);
   await assertReceiveRequest(paymentUri);
 
-  stage = 'new receive address refreshes URI and QR together';
+  nextStage('new receive address refreshes URI and QR together');
   await page.locator('[data-action="new-address"]').click();
   await page.waitForFunction(previous => document.querySelector('.address-box')?.textContent !== previous
     && document.querySelector('#app')?.getAttribute('aria-busy') === 'false', address);
@@ -1194,7 +1211,7 @@ try {
   let nextPaymentUri = `connectcoin:${nextAddress}${receiveQuery}`;
   await assertReceiveRequest(nextPaymentUri);
 
-  stage = 'focused receive URI updates after a background address change';
+  nextStage('focused receive URI updates after a background address change');
   await page.locator('#receive-uri').focus();
   await page.evaluate(() => { window.receiveFocusedUri = document.querySelector('#receive-uri'); });
   const changedWhileFocused = await page.evaluate(() => window.connectwallet.invoke('newAddress'));
@@ -1215,7 +1232,7 @@ try {
   await assertCopiedReceiveValue('copy-payment-request', nextPaymentUri);
   await assertCopiedReceiveValue('copy-address', nextAddress);
 
-  stage = 'receive QR generation while a wallet refresh is pending';
+  nextStage('receive QR generation while a wallet refresh is pending');
   await application.evaluate((_electron, moduleUrl) => {
     const { WalletService } = process.getBuiltinModule('node:module').createRequire(moduleUrl)('./wallet-service.mjs');
     const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.refresh, entered: false };
@@ -1263,7 +1280,7 @@ try {
 
   await page.locator('[data-view="send"]').first().click();
   await assertPaymentLinkImport(nextAddress, address);
-  stage = 'send amount keyboard, paste and precision guard';
+  nextStage('send amount keyboard, paste and precision guard');
   assert.equal(await page.locator('#send-address').getAttribute('data-text-limit'), '90');
   assert.equal(await page.locator('#send-address').getAttribute('data-text-count'), 'utf16');
   assert.equal(await page.getByRole('button', { name: 'Review payment', exact: true }).isVisible(), true);
@@ -1283,14 +1300,14 @@ try {
     globalThis.trailingPeriodPreviewFixture = fixture;
   }, pathToFileURL(path.join(root, 'src/core/wallet-service.mjs')).href);
   try {
-    stage = 'send trailing periods submit canonical numeric values';
+    nextStage('send trailing periods submit canonical numeric values');
     await assertTrailingPeriodSendReview({ bounty: false, address: nextAddress });
     await page.getByRole('button', { name: 'Create a bounty', exact: true }).click();
     assert.equal(await page.locator('#send-domain').getAttribute('data-text-limit'), '1024');
     assert.equal(await page.locator('#send-domain').getAttribute('data-text-count'), 'utf16');
-    stage = 'bounty amount keyboard, paste and precision guard';
+    nextStage('bounty amount keyboard, paste and precision guard');
     await assertAmountInputGuard('#send-amount');
-    stage = 'bounty trailing periods submit canonical numeric values';
+    nextStage('bounty trailing periods submit canonical numeric values');
     await assertTrailingPeriodSendReview({ bounty: true });
     assert.equal(await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.length), 2);
   } finally {
@@ -1300,7 +1317,7 @@ try {
       delete globalThis.trailingPeriodPreviewFixture;
     });
   }
-  stage = 'bounty form';
+  nextStage('bounty form');
   await page.locator('#send-domain').fill('example.com');
   await page.locator('#send-amount').fill('1');
   await page.locator('#send-expected').fill('1000');
@@ -1331,11 +1348,11 @@ try {
   assert.equal(await page.locator('#claims-concurrent').inputValue(), '100');
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
   assert.equal(await page.locator('#claims-warning').isVisible(), false);
-  stage = 'claims trailing periods save integers and preserve editing';
+  nextStage('claims trailing periods save integers and preserve editing');
   await assertTrailingPeriodPreference('#claims-rate', 91, ['claims', 'maxConnectionsPerSecond']);
   await assertTrailingPeriodPreference('#claims-concurrent', 92, ['claims', 'maxConcurrent']);
   await assertTrailingPeriodPreference('#claims-lookback', 333, ['claims', 'lookbackBlocks']);
-  stage = 'autosave acknowledgement preserves the native numeric caret';
+  nextStage('autosave acknowledgement preserves the native numeric caret');
   await page.locator('#claims-rate').fill('12');
   await page.keyboard.press(inputStartKey);
   await page.keyboard.press('ArrowRight');
@@ -1362,7 +1379,7 @@ try {
     ...window.claimEditingEvents,
   })), { value: '1132', sameNode: true, focused: true, focus: 0, blur: 0 }, 'A successful autosave must preserve number-input identity and insert the next digit at the original caret.');
 
-  stage = 'autosave errors survive updates and clear only after a successful retry';
+  nextStage('autosave errors survive updates and clear only after a successful retry');
   await application.evaluate((_electron, moduleUrl) => {
     const modulePath = process.getBuiltinModule('url').fileURLToPath(moduleUrl);
     const { WalletService } = process.getBuiltinModule('module').createRequire(moduleUrl)(modulePath);
@@ -1384,7 +1401,7 @@ try {
   await page.locator('#claims-rate').fill('111');
   await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.maxConnectionsPerSecond === 111 && document.querySelector('#view-error').classList.contains('hidden'));
 
-  stage = 'successful autosave keeps unrelated action errors visible';
+  nextStage('successful autosave keeps unrelated action errors visible');
   failNextHistory = true;
   await page.getByRole('button', { name: 'Refresh wallet', exact: true }).click();
   await page.waitForFunction(() => !document.querySelector('#view-error').classList.contains('hidden') && document.querySelector('#app').getAttribute('aria-busy') === 'false');
@@ -1398,7 +1415,7 @@ try {
   await page.getByRole('button', { name: 'Refresh wallet', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('#view-error').classList.contains('hidden') && document.querySelector('#app').getAttribute('aria-busy') === 'false');
 
-  stage = 'automatic claim limits and invalid drafts';
+  nextStage('automatic claim limits and invalid drafts');
   await page.locator('#claims-rate').fill('101');
   assert.equal(await page.locator('#claims-warning').isVisible(), true);
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
@@ -1429,7 +1446,7 @@ try {
   await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.enabled === false && document.querySelector('#app').getAttribute('aria-busy') !== 'true');
   assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).claims.enabled, false);
 
-  stage = 'persistent diagnostic history';
+  nextStage('persistent diagnostic history');
   // The toggle's persisted response can precede the last coalesced stop-state
   // publication. Drain that known 200 ms UI window before injecting isolated
   // renderer snapshots, which must not race real main-process state updates.
@@ -1504,7 +1521,7 @@ try {
   await page.getByRole('button', { name: 'Open log folder' }).click();
   assert.equal(await application.evaluate(() => globalThis.diagnosticOpenedPath), path.join(profile, 'logs'));
   await page.locator('.diagnostics-card').screenshot({ path: path.join(screenshots, 'claims-diagnostics.png') });
-  stage = 'precise TLS diagnostic history and transient inline presentation';
+  nextStage('precise TLS diagnostic history and transient inline presentation');
   await showClaimPresentation({ message: tlsTimeout.message, diagnostic: false, enabled: true,
     category: 'tls-timeout', transient: true, diagnosticRows });
   assert.equal(await page.locator('.diagnostics-card h2').textContent(), 'Recent diagnostic events');
@@ -1564,7 +1581,7 @@ try {
   await page.screenshot({ path: path.join(screenshots, 'claims-normal-mode.png'), fullPage: true });
   await page.evaluate(() => window.connectwallet.invoke('refresh'));
 
-  stage = 'lock and unlock';
+  nextStage('lock and unlock');
   await page.locator('[data-view="receive"]').first().click();
   for (const [field, value] of Object.entries(receiveDraft)) await page.locator(`#receive-${field}`).fill(value);
   await assertReceiveRequest(nextPaymentUri);
@@ -1606,7 +1623,7 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
   assert.deepEqual(failedBrandRequests, [], 'ConnectWallet artwork must remain allowed by the renderer resource policy.');
-  stage = 'close flushes valid numeric and endpoint drafts';
+  nextStage('close flushes valid numeric and endpoint drafts');
   await page.locator('#unlock-password').fill(password);
   await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
   await page.locator('[data-view="settings"]').first().click();
@@ -1632,6 +1649,7 @@ try {
   if (error.code === 'ERR_ASSERTION' && (stage === 'appearance settings preserve wallet and drafts' || /^(?:Native appearance must match|Developer Mode persistence mismatch)/.test(String(error.message)))) console.error(String(error.message).slice(0, 500));
   process.exitCode = 1;
 } finally {
+  finishStage(passed ? 'completed' : 'failed');
   seed.fill(''); seed = [];
   try { console.log(`UI shutdown: ${JSON.stringify(await closeElectronTest(application))}`); }
   catch { passed = false; process.exitCode = 1; console.error('UI graceful shutdown failed.'); }

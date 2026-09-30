@@ -36,6 +36,21 @@ jobs:
           # On Windows `py -3` can select a different installed Python than
           # setup-python. Build and test the helper with the selected runtime.
           PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Cache verified Electron downloads
+        # Cache archives only, never an extracted executable or wallet profile.
+        # Electron rechecks archives against its bundled SHA-256 manifest.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 3
+        with:
+          path: ${{ runner.temp }}/connectwallet-electron-cache
+          key: electron-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+      - name: Prepare Electron runtime separately from UI tests
+        timeout-minutes: 5
+        env:
+          electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache
+        run: node -e "require('electron')"
       - name: Install Linux Electron test dependencies
         if: runner.os == 'Linux'
         timeout-minutes: 5
