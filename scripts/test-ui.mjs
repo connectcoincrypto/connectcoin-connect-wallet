@@ -436,39 +436,47 @@ async function assertSendDraft(expected) {
   ))).toEqual(expected);
 }
 
-async function usePaymentLink(uri, { clipboardError = false } = {}) {
+async function usePaymentLink(text, { clipboardError = false } = {}) {
   // This replaces only the test application's clipboard reader. Neither the
   // real clipboard contents nor other applications are read or modified.
   const previousReads = await application.evaluate((_electron, value) => {
     const fixture = globalThis.paymentLinkFixture;
-    fixture.clipboardText = value.uri; fixture.clipboardError = value.clipboardError;
+    fixture.clipboardText = value.text; fixture.clipboardError = value.clipboardError;
     return fixture.clipboardReads;
-  }, { uri, clipboardError });
+  }, { text, clipboardError });
   await page.locator('[data-action="import-payment-link"]').click();
   await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.clipboardReads)).toBe(previousReads + 1);
-  assert.equal(await page.locator('dialog[open]').count(), 0, 'Paste payment link must use the clipboard directly, without opening a dialog.');
+  assert.equal(await page.locator('dialog[open]').count(), 0, 'Paste must use the clipboard directly, without opening a dialog.');
 }
 
 async function assertPaymentLinkImport(address, otherAddress) {
   // Parsing uses the real main-process implementation. Clipboard input is
-  // synthetic, and the delay is applied after successful parsing so the
+  // synthetic, and the delay follows parsing (including rejection) so the
   // renderer must not overwrite an edited draft or revive one after locking.
   await application.evaluate(({ clipboard }, moduleUrl) => {
     const { WalletService } = process.getBuiltinModule('node:module').createRequire(moduleUrl)('./wallet-service.mjs');
     const prototype = WalletService.prototype;
     const fixture = { prototype, originals: {}, parseCalls: [], previews: [], confirmations: [], entered: false, completed: 0,
       clipboard, originalClipboardReadText: clipboard.readText, clipboardReads: 0, clipboardText: '', clipboardError: false };
-    clipboard.readText = () => {
+    // Electron 44 reads asynchronously; a synchronous stub hides missing await
+    // bugs and changes a rejected Promise into an unrelated synchronous throw.
+    clipboard.readText = async () => {
+      await Promise.resolve();
       fixture.clipboardReads++;
-      if (fixture.clipboardError) throw new Error('Isolated clipboard failure.');
-      return fixture.clipboardText;
+      const { clipboardText, clipboardError, readGate } = fixture;
+      if (readGate) { fixture.readEntered = true; await readGate; }
+      if (clipboardError) throw new Error('Isolated clipboard failure.');
+      return clipboardText;
     };
-    for (const method of ['parsePaymentRequest', 'previewSend', 'confirmSend']) fixture.originals[method] = prototype[method];
-    prototype.parsePaymentRequest = async function (payload) {
+    for (const method of ['parseClipboardPaymentRequest', 'previewSend', 'confirmSend']) fixture.originals[method] = prototype[method];
+    prototype.parseClipboardPaymentRequest = async function (payload) {
       fixture.parseCalls.push(payload);
-      const result = await fixture.originals.parsePaymentRequest.call(this, payload);
+      let result, error;
+      try { result = await fixture.originals.parseClipboardPaymentRequest.call(this, payload); }
+      catch (cause) { error = cause; }
       if (fixture.gate) { fixture.entered = true; await fixture.gate; }
       fixture.completed++;
+      if (error) throw error;
       return result;
     };
     prototype.previewSend = async function (payload) {
@@ -491,8 +499,30 @@ async function assertPaymentLinkImport(address, otherAddress) {
     })), { previews: expectedPreviews, confirmations: 0 }, 'Importing a payment link must never automatically review or send a payment.');
     assert.ok(!requests.includes('sendrawtransaction'));
   };
+  const assertPasteErrorCleared = async () => {
+    await expect(page.locator('#payment-paste-error')).toHaveCount(1);
+    await expect(page.locator('#payment-paste-error')).toHaveText('');
+    assert.equal(await page.locator('#payment-paste-error').getAttribute('role'), 'status');
+    assert.equal(await page.locator('#payment-paste-error').evaluate(node => node.tagName), 'P');
+    assert.equal(await page.locator('#payment-paste-error').evaluate(node => node.classList.contains('is-fading')), false);
+    assert.equal(await page.locator('#view-error').isVisible(), false);
+  };
+  const assertPasteError = async rawText => {
+    const error = page.locator('#payment-paste-error');
+    await expect(error).toHaveText(/\S/);
+    await expect(error).toBeVisible();
+    await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') === 'false');
+    assert.equal(await error.getAttribute('role'), 'status');
+    assert.equal(await error.evaluate(node => node.previousElementSibling?.dataset.action), 'import-payment-link',
+      'Clipboard validation errors must stay directly below the paste button.');
+    assert.equal(await page.locator('#view-error').isVisible(), false, 'A clipboard error must not become a global page error.');
+    assert.equal(await page.locator('dialog[open]').count(), 0, 'A clipboard error must not open a dialog.');
+    if (rawText?.trim()) assert.equal((await error.textContent()).includes(rawText.trim()), false,
+      'Clipboard error text must not echo the rejected clipboard payload.');
+  };
   try {
     stage = 'send payment link import preserves precision and Unicode metadata';
+    await assertPasteErrorCleared();
     await page.locator('#send-address').fill(otherAddress);
     await page.locator('#send-amount').fill('12.34');
     await usePaymentLink(uri);
@@ -501,7 +531,8 @@ async function assertPaymentLinkImport(address, otherAddress) {
     assert.equal(await page.locator('#send-metadata').evaluate(details => details.open), true,
       'Imported metadata must be visible for the user to review.');
     await page.screenshot({ path: path.join(screenshots, 'send-imported.png'), fullPage: true });
-    assert.deepEqual(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.at(-1)), { uri });
+    assert.deepEqual(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.at(-1)), { text: uri });
+    await assertPasteErrorCleared();
     for (const [field, limit] of [['label', 100], ['message', 200]]) {
       assert.equal(await page.locator(`#send-${field}`).getAttribute('data-draft'), `send.${field}`);
       await assertTextInputLimit(`#send-${field}`, limit);
@@ -515,6 +546,8 @@ async function assertPaymentLinkImport(address, otherAddress) {
     stage = 'send payment link rejects invalid requests without partial changes';
     const wrongNetworkAddress = encodeAddress(decodeAddress(address), 'main');
     const invalidUris = [
+      'private-clipboard-canary-DO-NOT-DISPLAY',
+      wrongNetworkAddress,
       `https://example.com/${otherAddress}?amount=2`,
       `connectcoin:${wrongNetworkAddress}?amount=2&label=replacement`,
       `connectcoin:${otherAddress}?amount=2&amount=3`,
@@ -528,34 +561,115 @@ async function assertPaymentLinkImport(address, otherAddress) {
     for (const invalidUri of invalidUris) {
       const previousCalls = await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length);
       await usePaymentLink(invalidUri);
-      await expect(page.locator('#view-error')).toBeVisible();
-      assert.ok((await page.locator('#view-error').textContent()).trim());
-      assert.equal(await page.locator('dialog[open]').count(), 0);
+      await assertPasteError(invalidUri);
+      assert.equal((await page.locator('body').textContent()).includes('private-clipboard-canary-DO-NOT-DISPLAY'), false);
       assert.equal(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length), previousCalls + 1,
         'Payment link validation must reach the main-process service.');
       await assertSendDraft(imported);
       await assertNoAutomaticSend();
     }
 
-    stage = 'send payment link handles empty and unavailable clipboard without changing drafts';
+    stage = 'send payment link handles empty and asynchronously rejected clipboard reads without changing drafts';
     for (const [clipboardText, clipboardError] of [['', false], [' \n\t ', false], ['', true]]) {
       await usePaymentLink(clipboardText, { clipboardError });
-      await expect(page.locator('#view-error')).toBeVisible();
-      assert.ok((await page.locator('#view-error').textContent()).trim());
+      await assertPasteError(clipboardText);
       await assertSendDraft(imported);
       await assertNoAutomaticSend();
+    }
+    await page.locator('.form-layout').screenshot({ path: path.join(screenshots, 'send-clipboard-error.png') });
+
+    stage = 'send clipboard error survives background rendering then fades and clears';
+    // Exercise the animation itself even on CI hosts with reduced motion;
+    // restore the host preference after this focused transition assertion.
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
+    await assertPasteError('private-clipboard-canary-DO-NOT-DISPLAY');
+    const refreshSnapshot = await page.evaluate(async () => {
+      window.paymentPasteErrorNode = document.querySelector('#payment-paste-error');
+      window.paymentPasteErrorText = window.paymentPasteErrorNode.textContent;
+      return window.connectwallet.invoke('getState');
+    });
+    assert.equal(await page.locator('#payment-paste-error').evaluate(node => getComputedStyle(node).opacity), '1');
+    const changedSnapshot = { ...refreshSnapshot, network: { ...refreshSnapshot.network, status: 'clipboard-error-refresh-fixture' } };
+    await application.evaluate(({ BrowserWindow }, snapshot) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', snapshot), changedSnapshot);
+    await page.waitForFunction(() => document.querySelector('.network-pill')?.textContent.includes('clipboard-error-refresh-fixture'));
+    assert.deepEqual(await page.locator('#payment-paste-error').evaluate(node => ({
+      sameNode: node === window.paymentPasteErrorNode, sameText: node.textContent === window.paymentPasteErrorText,
+    })), { sameNode: true, sameText: true }, 'Background rendering must preserve the active inline error node and text.');
+    await application.evaluate(({ BrowserWindow }, snapshot) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', snapshot), refreshSnapshot);
+    await page.waitForFunction(() => {
+      const node = document.querySelector('#payment-paste-error');
+      const opacity = node && Number(getComputedStyle(node).opacity);
+      return node?.classList.contains('is-fading') && node.textContent.trim() && opacity > 0 && opacity < 1;
+    }, null, { timeout: 6000 });
+    await expect(page.locator('#payment-paste-error')).toHaveText('', { timeout: 3000 });
+    await assertPasteErrorCleared();
+    await assertSendDraft(imported);
+    await page.evaluate(() => { delete window.paymentPasteErrorNode; delete window.paymentPasteErrorText; });
+    await page.emulateMedia({ reducedMotion: null });
+
+    stage = 'send clipboard error is discarded when leaving the view or payment mode';
+    for (const changedContext of ['navigation', 'send-mode', 'security-epoch', 'lock']) {
+      await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
+      await assertPasteError('private-clipboard-canary-DO-NOT-DISPLAY');
+      if (changedContext === 'navigation') {
+        await page.locator('[data-view="activity"]').first().click();
+        await expect(page.locator('#payment-paste-error')).toHaveCount(0);
+        await page.locator('[data-view="send"]').first().click();
+      } else if (changedContext === 'send-mode') {
+        await page.locator('[data-send-mode="bounty"]').click();
+        await expect(page.locator('#payment-paste-error')).toHaveCount(0);
+        await page.locator('[data-send-mode="address"]').click();
+      } else if (changedContext === 'security-epoch') {
+        // Advance only the isolated renderer snapshot, without changing the
+        // real wallet/network configuration, then restore its real snapshot.
+        const snapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
+        await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value),
+          { ...snapshot, securityEpoch: snapshot.securityEpoch + 1 });
+        await assertPasteErrorCleared();
+        await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), snapshot);
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      } else {
+        await page.keyboard.press('ControlOrMeta+L');
+        await page.locator('#unlock-password').fill(password);
+        await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+        await page.locator('[data-view="send"]').first().click();
+      }
+      await assertPasteErrorCleared();
+      await usePaymentLink(uri);
+      await assertSendDraft(imported);
+      await assertPasteErrorCleared();
     }
 
     stage = 'send payment link exposes unused optional fields';
     await usePaymentLink(`${uri}&unknown-field=ignored`);
     await assertSendDraft(imported);
+    await assertPasteErrorCleared();
     await expect(page.locator('.notice.warning').filter({ hasText: 'unknown-field' })).toBeVisible();
     await assertNoAutomaticSend();
+
+    stage = 'send plain address preserves amount and fee while clearing imported notes';
+    const previousFee = await page.locator('#send-fee').inputValue();
+    const feeWasOpen = await page.locator('.advanced-fee').evaluate(details => details.open);
+    if (!feeWasOpen) await page.locator('.advanced-fee summary').click();
+    await page.locator('#send-fee').fill('2300');
+    await page.locator('#send-amount').fill('12.3400000001');
+    await usePaymentLink(otherAddress);
+    await assertSendDraft({ address: otherAddress, amount: '12.3400000001', label: '', message: '' });
+    assert.equal(await page.locator('#send-fee').inputValue(), '2300', 'A plain address paste must preserve the selected fee rate.');
+    assert.equal(await page.locator('#send-metadata').evaluate(details => details.open), false);
+    await expect(page.locator('.notice.warning').filter({ hasText: 'unknown-field' })).toHaveCount(0);
+    assert.deepEqual(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.at(-1)), { text: otherAddress });
+    await assertPasteErrorCleared();
+    await assertNoAutomaticSend();
+    await page.locator('#send-fee').fill(previousFee);
+    if (!feeWasOpen) await page.locator('.advanced-fee summary').click();
 
     stage = 'send payment link replaces absent amount and metadata';
     await usePaymentLink(`connectcoin:${otherAddress}`);
     await expect(page.locator('dialog[open]')).toHaveCount(0);
     await assertSendDraft({ address: otherAddress, amount: '', label: '', message: '' });
+    await assertPasteErrorCleared();
     await assertNoAutomaticSend();
     await usePaymentLink(uri);
     await expect(page.locator('dialog[open]')).toHaveCount(0);
@@ -644,14 +758,86 @@ async function assertPaymentLinkImport(address, otherAddress) {
         await assertSendDraft({ ...imported, label: composingLabel });
       }
       else await assertSendDraft({ address: otherAddress, amount: '9', label: 'Late result', message: 'Must be discarded' });
+      await assertPasteErrorCleared();
       await assertNoAutomaticSend(1);
     }
+
+    for (const changedContext of ['draft-edit', 'lock']) {
+      stage = `send clipboard retry clears old errors and discards a late error after ${changedContext}`;
+      await usePaymentLink(uri);
+      await assertSendDraft(imported);
+      await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
+      await assertPasteError('private-clipboard-canary-DO-NOT-DISPLAY');
+      await application.evaluate(() => {
+        const fixture = globalThis.paymentLinkFixture;
+        fixture.entered = false;
+        fixture.gate = new Promise(resolve => { fixture.release = resolve; });
+      });
+      const previousCompletions = await application.evaluate(() => globalThis.paymentLinkFixture.completed);
+      await usePaymentLink('private-clipboard-canary-DO-NOT-DISPLAY');
+      await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.entered)).toBe(true);
+      await assertPasteErrorCleared();
+      if (changedContext === 'draft-edit') await page.locator('#send-amount').fill('7.5');
+      else {
+        await page.keyboard.press('ControlOrMeta+L');
+        await page.locator('#unlock-password').waitFor();
+      }
+      await application.evaluate(() => {
+        const fixture = globalThis.paymentLinkFixture;
+        fixture.gate = null;
+        fixture.release();
+        fixture.release = null;
+      });
+      await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.completed)).toBe(previousCompletions + 1);
+      await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') === 'false');
+      if (changedContext === 'lock') {
+        await page.locator('#unlock-password').fill(password);
+        await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+        await page.locator('[data-view="send"]').first().click();
+        await assertSendDraft({ address: '', amount: '', label: '', message: '' });
+      } else await assertSendDraft({ ...imported, amount: '7.5' });
+      await assertPasteErrorCleared();
+      assert.equal(await page.locator('dialog[open]').count(), 0, 'A stale clipboard rejection must not open an error dialog.');
+      await assertNoAutomaticSend(1);
+    }
+
+    stage = 'send clipboard read resolving after lock must not reach the parser or revive an error';
+    await usePaymentLink(uri);
+    await assertSendDraft(imported);
+    const previousParses = await application.evaluate(() => {
+      const fixture = globalThis.paymentLinkFixture;
+      fixture.readEntered = false;
+      fixture.readGate = new Promise(resolve => { fixture.releaseRead = resolve; });
+      return fixture.parseCalls.length;
+    });
+    await usePaymentLink(otherAddress);
+    await expect.poll(() => application.evaluate(() => globalThis.paymentLinkFixture.readEntered)).toBe(true);
+    assert.equal(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length), previousParses);
+    await page.keyboard.press('ControlOrMeta+L');
+    await page.locator('#unlock-password').waitFor();
+    await application.evaluate(() => {
+      const fixture = globalThis.paymentLinkFixture;
+      fixture.readGate = null;
+      fixture.releaseRead();
+      fixture.releaseRead = null;
+    });
+    await page.waitForFunction(() => document.querySelector('#app')?.getAttribute('aria-busy') === 'false');
+    assert.equal(await application.evaluate(() => globalThis.paymentLinkFixture.parseCalls.length), previousParses,
+      'A clipboard read completed in an obsolete security context must be rejected before parsing.');
+    assert.equal(await page.locator('dialog[open]').count(), 0);
+    await page.locator('#unlock-password').fill(password);
+    await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+    await page.locator('[data-view="send"]').first().click();
+    await assertSendDraft({ address: '', amount: '', label: '', message: '' });
+    await assertPasteErrorCleared();
+    await assertNoAutomaticSend(1);
   } finally {
     await application.evaluate(() => {
       const fixture = globalThis.paymentLinkFixture;
       for (const [method, original] of Object.entries(fixture.originals)) fixture.prototype[method] = original;
       fixture.clipboard.readText = fixture.originalClipboardReadText;
       fixture.release?.();
+      fixture.releaseRead?.();
       delete globalThis.paymentLinkFixture;
     });
   }
@@ -893,7 +1079,11 @@ try {
   await application.evaluate(({ clipboard }) => {
     globalThis.receiveOriginalClipboardWriteText = clipboard.writeText;
     globalThis.receiveClipboardWrites = [];
-    clipboard.writeText = value => { globalThis.receiveClipboardWrites.push(value); };
+    // Match Electron's Promise<void> contract without touching the OS clipboard.
+    clipboard.writeText = async value => {
+      await Promise.resolve();
+      globalThis.receiveClipboardWrites.push(value);
+    };
   });
   await assertCopiedReceiveValue('copy-payment-request', `connectcoin:${address}`);
   await assertCopiedReceiveValue('copy-address', address);
@@ -1455,4 +1645,4 @@ try {
     await rm(absolute, { recursive: true, force: true });
   }
 }
-if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, automatic preference persistence with native numeric caret and open details retained, atomic RPC edits, invalid-draft preservation, claims on/off persistence, lock/close flush, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive URI/QR, Unicode encoding, guarded clipboard copy, direct clipboard Send payment-link import with exact precision, Unicode metadata, atomic rejection, explicit review and draft-edit/lock race protection, Receive/Send/bounty amount keyboard and paste guards with exact precision and native selection editing, invalid amounts, receive draft persistence and lock erasure, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);
+if (passed) console.log(`PASS: real Electron isolation, ConnectWallet title and decoded artwork, appearance, Developer Mode visibility and critical alerts, automatic preference persistence with native numeric caret and open details retained, atomic RPC edits, invalid-draft preservation, claims on/off persistence, lock/close flush, BIP39 backup, encrypted wallet, zero-balance RPC fixture, receive URI/QR, Unicode encoding, guarded clipboard copy, direct clipboard Send link/address import with exact precision, preserved address-only amount/fee, cleared stale notes, atomic rejection, local error fade/background/context cleanup, explicit review and late success/error draft-edit/lock race protection, Receive/Send/bounty amount keyboard and paste guards with exact precision and native selection editing, invalid amounts, receive draft persistence and lock erasure, bounty form, >100 warning, lock/unlock, recovery erasure and graceful shutdown. Screenshots: ${screenshots}`);

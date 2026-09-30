@@ -53,9 +53,10 @@ export function parsePaymentUri(uri) {
   const queryStart = body.indexOf('?');
   let address = queryStart < 0 ? body : body.slice(0, queryStart);
   // Core tolerates one slash appended by the OS. Authority-style URLs, paths,
-  // percent-encoded addresses and mixed-case bech32 remain invalid.
+  // percent-encoded addresses and mixed-case bech32 remain invalid. Bech32 is
+  // ASCII: Unicode case folding (such as Kelvin sign to k) must not repair it.
   if (address.endsWith('/')) address = address.slice(0, -1);
-  if ((address !== address.toLowerCase() && address !== address.toUpperCase()) || !ADDRESS.test(address.toLowerCase())) throw new Error('The payment link does not contain a supported ConnectCoin address.');
+  if (/[^\x00-\x7f]/.test(address) || (address !== address.toLowerCase() && address !== address.toUpperCase()) || !ADDRESS.test(address.toLowerCase())) throw new Error('The payment link does not contain a supported ConnectCoin address.');
   address = address.toLowerCase();
   const result = { address, amount: '', label: '', message: '', ignoredParameters: [] };
   const seen = new Set();
@@ -86,6 +87,18 @@ export function parsePaymentUri(uri) {
     }
   }
   return result;
+}
+
+// Clipboard import is deliberately separate: a plain address is not a URI,
+// and a malformed URI must never fall back to an address-only interpretation.
+// As with parsePaymentUri, the service must verify checksum and wallet network.
+export function parseClipboardPaymentText(text) {
+  if (typeof text !== 'string' || text.length > PAYMENT_URI_MAX_LENGTH) throw new Error('Copy a ConnectCoin address or payment link of no more than 1024 characters.');
+  if (/[\p{Cc}\p{Cs}]/u.test(text)) throw new Error('The clipboard contains an unsupported control character or Unicode.');
+  text = text.trim();
+  if (/^connectcoin:/i.test(text)) return { ...parsePaymentUri(text), kind: 'uri' };
+  if (/[^\x00-\x7f]/.test(text) || (text !== text.toLowerCase() && text !== text.toUpperCase()) || !ADDRESS.test(text.toLowerCase())) throw new Error('Copy a valid ConnectCoin address or "connectcoin:" payment link.');
+  return { address: text.toLowerCase(), amount: '', label: '', message: '', ignoredParameters: [], kind: 'address' };
 }
 
 export function buildPaymentUri({ address, amount = '', label = '', message = '' } = {}) {

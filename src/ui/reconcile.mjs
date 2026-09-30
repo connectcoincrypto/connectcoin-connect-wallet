@@ -10,9 +10,9 @@ function sameKind(current, next) {
 }
 
 function patchElement(current, next) {
-  // Inline errors are managed by showError/run, not by state snapshots. A
-  // progress update must not silently dismiss an autosave error.
-  if (current.id === 'view-error') return;
+  // Inline errors are managed by their action handlers, not state snapshots.
+  // Progress must neither dismiss an autosave error nor restart a paste fade.
+  if (current.id === 'view-error' || current.id === 'payment-paste-error') return;
   const focused = current === current.ownerDocument.activeElement;
   const input = current.localName === 'input';
   const textarea = current.localName === 'textarea';

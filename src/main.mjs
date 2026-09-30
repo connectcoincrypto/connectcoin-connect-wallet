@@ -131,11 +131,15 @@ else {
           // to the renderer, poll it, log it, or send it to a remote service.
           service.assertSession();
           const epoch = service.epoch;
-          let uri;
-          try { uri = clipboard.readText(); }
-          catch { throw new Error('Could not read the clipboard. Copy a connectcoin: payment link and try again.'); }
-          if (!uri.trim()) throw new Error('The clipboard has no text. Copy a connectcoin: payment link first.');
-          const value = await service.parsePaymentRequest({ uri });
+          let text;
+          try { text = await clipboard.readText(); }
+          catch { throw new Error('Could not read the clipboard. Copy a ConnectCoin address or payment link and try again.'); }
+          // Clipboard access is asynchronous in Electron. A lock or wallet
+          // replacement while waiting must discard the result before parsing.
+          service.assertSession(epoch);
+          if (typeof text !== 'string') throw new Error('The clipboard does not contain readable text. Copy a ConnectCoin address or payment link first.');
+          if (!text.trim()) throw new Error('The clipboard has no text. Copy a ConnectCoin address or payment link first.');
+          const value = await service.parseClipboardPaymentRequest({ text });
           service.assertSession(epoch);
           return { ok:true,value };
         }
@@ -149,12 +153,20 @@ else {
           let value;
           if (SERVICE_METHODS.has(method)) value = await service[method](payload);
           else if (method === 'copyAddress') {
-            service.assertSession(); const address = service.getState().wallet.address;
+            service.assertSession(); const epoch = service.epoch;
+            const address = service.getState().wallet.address;
             if (!address) throw new Error('No receive address is available.');
-            clipboard.writeText(address); value = { copied:true };
+            try { await clipboard.writeText(address); }
+            catch { throw new Error('Could not copy the address. Please try again.'); }
+            service.assertSession(epoch);
+            value = { copied:true };
           } else if (method === 'copyPaymentRequest') {
             const { uri } = service.paymentRequestForCopy(payload);
-            clipboard.writeText(uri); value = { copied: true };
+            const epoch = service.epoch;
+            try { await clipboard.writeText(uri); }
+            catch { throw new Error('Could not copy the payment link. Please try again.'); }
+            service.assertSession(epoch);
+            value = { copied: true };
           } else if (method === 'openDiagnostics') {
             service.assertSession();
             if (!service.config.developerMode) throw new Error('Enable Developer Mode to open diagnostic logs.');

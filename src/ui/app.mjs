@@ -89,7 +89,7 @@ const preferences = createPreferenceSaver({
   blocked: () => busy || locking || compositionActive,
 });
 let historyFilter = 'all';
-let toastTimer, secretTimer;
+let toastTimer, secretTimer, paymentPasteErrorTimer;
 let currentPreview;
 let modalKind;
 let unsubscribe;
@@ -118,6 +118,24 @@ function toast(message) {
   toastTimer = setTimeout(() => target.classList.remove('show'), 4000);
 }
 function errorMessage(error) { return error?.message || 'Something went wrong. Please try again.'; }
+function clearPaymentPasteError() {
+  clearTimeout(paymentPasteErrorTimer);
+  paymentPasteErrorTimer = undefined;
+  const target = $('#payment-paste-error');
+  if (target) { target.textContent = ''; target.classList.remove('is-fading'); }
+}
+function showPaymentPasteError(error) {
+  clearPaymentPasteError();
+  const target = $('#payment-paste-error');
+  if (!target) return;
+  target.textContent = errorMessage(error);
+  // Update just this feedback node: no form redraw, focus change or modal.
+  paymentPasteErrorTimer = setTimeout(() => {
+    if (!target.isConnected) return;
+    target.classList.add('is-fading');
+    paymentPasteErrorTimer = setTimeout(clearPaymentPasteError, 1000);
+  }, 3000);
+}
 function showError(error, source = '') {
   const message = errorMessage(error);
   const container = dialog.open ? $('#modal-error') : $('#view-error');
@@ -144,7 +162,7 @@ async function lockWallet() {
   // Security actions must reach main even while a normal RPC/review action is
   // pending. Keep that action's busy state and independently guard repeat locks.
   if (locking || state.phase !== 'unlocked') return;
-  locking = true; closeModal(); setBusy(busy);
+  locking = true; clearPaymentPasteError(); closeModal(); setBusy(busy);
   try { await invoke('lock'); rpcDraftReady = true; await preferences.flush(); await reload(); }
   catch (error) { showError(error); }
   finally { locking = false; setBusy(busy); }
@@ -167,6 +185,7 @@ function acceptState(next, { background = false } = {}) {
   // wallet, even if both snapshots happen to report an unlocked phase.
   if (securityChanged) { lastShellMarkup = null; lastShellView = null; }
   if (securityChanged || next.phase !== 'unlocked') {
+    clearPaymentPasteError();
     draft.receive = emptyReceive(); receivePreview.clear();
   }
   const replacementEnded = Boolean(replacement && (next.replacementActive !== true || next.phase !== 'locked' || securityChanged));
@@ -249,10 +268,13 @@ function activityTable(items) {
     return `<div class="activity-row"><div class="activity-type"><div class="round-icon ${incoming ? 'receive' : ''}">${icon(incoming ? 'receive' : 'send')}</div><div><strong>${direction}</strong><small>${pending ? 'Awaiting confirmation' : `${e(item.confirmations ?? '—')} confirmations`}</small>${item.label || item.message ? `<details class="activity-notes"><summary>Local payment notes</summary>${item.label ? `<p class="payment-note"><strong>Label:</strong> ${e(item.label)}</p>` : ''}${item.message ? `<p class="payment-note"><strong>Message:</strong> ${e(item.message)}</p>` : ''}</details>` : ''}</div></div><div class="transaction-hash" title="${e(item.txid)}">${e(compactHash(item.txid))}</div><div class="amount ${incoming ? 'positive' : ''}">${incoming && !String(item.amount).startsWith('-') ? '+' : item.direction === 'sent' && !String(item.amount).startsWith('-') ? '−' : ''}${e(cc(item.amount))}</div><span class="status-badge ${pending ? 'pending' : ''}">${pending ? 'Pending' : 'Confirmed'}</span></div>`;
   }).join('')}</section>`;
 }
+function paymentPasteControl() {
+  return `<button class="button secondary import-payment-link" type="button" data-action="import-payment-link" aria-describedby="payment-paste-error" data-busy>${icon('file')} Paste link or address</button><p id="payment-paste-error" class="payment-paste-error" role="status" aria-live="polite" aria-atomic="true"></p>`;
+}
 function sendPage() {
   const values = { ...draft.send, feeRate: draft.settings.feeRate ?? state.config?.feeRate ?? 1500 };
   const bounty = sendMode === 'bounty';
-  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : 'Make sure the destination is a ConnectCoin testnet address.'}</p>${bounty ? '' : `<button class="button secondary import-payment-link" type="button" data-action="import-payment-link" data-busy>${icon('file')} Paste payment link</button>${values.ignoredParameters?.length ? notice(`The link includes optional fields this wallet does not use: ${e(values.ignoredParameters.join(', '))}. Confirm the payment details with the recipient if needed.`, 'warning') : ''}`}<form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-text-limit="1024" data-text-count="utf16" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-text-limit="90" data-text-count="utf16" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}<label class="field"><span class="field-label">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></span><div class="input-row"><input class="input" id="send-amount" data-numeric="amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div></label>${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-numeric="integer" data-integer-digits="77" min="1" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}${bounty ? '' : sendMetadataFields(values)}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="settings.feeRate" name="feeRate" value="${e(values.feeRate)}" type="text" data-numeric="integer" inputmode="numeric" min="1201" max="100000" step="1" required><p class="field-help">Saved automatically for future payments. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using testnet</strong><p>Only send to compatible ConnectCoin testnet addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
+  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : 'Make sure the destination is a ConnectCoin testnet address.'}</p>${bounty ? '' : `${paymentPasteControl()}${values.ignoredParameters?.length ? notice(`The link includes optional fields this wallet does not use: ${e(values.ignoredParameters.join(', '))}. Confirm the payment details with the recipient if needed.`, 'warning') : ''}`}<form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-text-limit="1024" data-text-count="utf16" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-text-limit="90" data-text-count="utf16" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}<label class="field"><span class="field-label">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></span><div class="input-row"><input class="input" id="send-amount" data-numeric="amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div></label>${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-numeric="integer" data-integer-digits="77" min="1" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}${bounty ? '' : sendMetadataFields(values)}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="settings.feeRate" name="feeRate" value="${e(values.feeRate)}" type="text" data-numeric="integer" inputmode="numeric" min="1201" max="100000" step="1" required><p class="field-help">Saved automatically for future payments. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using testnet</strong><p>Only send to compatible ConnectCoin testnet addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
 }
 function sendMetadataFields(values) {
   return `<details class="send-metadata" id="send-metadata" ${values.label || values.message ? 'open' : ''}>
@@ -263,6 +285,7 @@ function sendMetadataFields(values) {
   </details>`;
 }
 function pastePaymentLink() {
+  clearPaymentPasteError();
   const sequence = ++sendReviewSequence;
   const securityEpoch = state.securityEpoch;
   const originalDraft = JSON.stringify(draft.send);
@@ -275,21 +298,21 @@ function pastePaymentLink() {
       const payment = await invoke('pastePaymentRequest');
       // A lock or edits made while waiting must not be overwritten by a late reply.
       if (!active()) return;
-      draft.send = { ...draft.send, address: payment.address, amount: payment.amount,
+      draft.send = { ...draft.send, address: payment.address, amount: payment.kind === 'address' ? draft.send.amount : payment.amount,
         label: payment.label, message: payment.message, ignoredParameters: payment.ignoredParameters ?? [] };
       // Typing changes live controls without changing the cached shell markup.
       // Re-pasting an earlier link must still replace those values, including a
       // focused field, while preserving other disclosures and fee settings.
-      for (const field of ['address', 'amount', 'label', 'message']) $(`#send-${field}`).value = payment[field];
+      for (const field of ['address', 'amount', 'label', 'message']) $(`#send-${field}`).value = draft.send[field];
       lastShellMarkup = '';
       render();
       // Reconciliation preserves disclosure state during background refreshes;
       // an explicit paste must reveal any newly imported notes.
       $('#send-metadata').open = Boolean(payment.label || payment.message);
-      $(payment.amount ? '#send-address' : '#send-amount').focus();
-      toast('Payment link pasted. Check the recipient and amount before reviewing.');
+      $(draft.send.amount ? '#send-address' : '#send-amount').focus();
+      toast(`${payment.kind === 'address' ? 'Address' : 'Payment link'} pasted. Check the recipient and amount before reviewing.`);
     } catch (error) {
-      if (active()) throw error;
+      if (active()) showPaymentPasteError(error);
     }
   });
 }
@@ -461,8 +484,8 @@ document.addEventListener('click', event => {
   if (button?.dataset.action === 'lock') { void lockWallet(); return; }
   if (button && modalKind === 'send-preparing' && ['close-modal', 'cancel-send-review'].includes(button.dataset.action)) { cancelSendReview(); return; }
   if (!button || busy || locking) return;
-  if (button.dataset.view && state.phase === 'unlocked') { rpcDraftReady = true; preferences.schedule(0); if (view === 'receive') receivePreview.clear(); view = button.dataset.view; render(); return; }
-  if (button.dataset.sendMode) { sendMode = button.dataset.sendMode; render(); return; }
+  if (button.dataset.view && state.phase === 'unlocked') { clearPaymentPasteError(); rpcDraftReady = true; preferences.schedule(0); if (view === 'receive') receivePreview.clear(); view = button.dataset.view; render(); return; }
+  if (button.dataset.sendMode) { clearPaymentPasteError(); sendMode = button.dataset.sendMode; render(); return; }
   if (button.dataset.filter) { historyFilter = button.dataset.filter; render(); return; }
   const action = button.dataset.action;
   if (!action) return;
@@ -625,7 +648,7 @@ document.addEventListener('compositionstart', () => { compositionActive = true; 
 document.addEventListener('compositionend', () => { compositionActive = false; });
 window.addEventListener('blur', () => { pointerActive = false; actionKeyActive = false; compositionActive = false; });
 document.addEventListener('visibilitychange', () => { if (document.hidden && modalKind === 'secret') closeModal(); });
-window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; replacement = null; currentPreview = null; clearTimeout(secretTimer); clearTimeout(renderTimer); });
+window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; replacement = null; currentPreview = null; clearTimeout(secretTimer); clearTimeout(renderTimer); clearPaymentPasteError(); });
 
 render();
 if (bridge?.onState) unsubscribe = bridge.onState(next => acceptState(next, { background: true }));

@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID, randomInt } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
-import { buildPaymentUri, parsePaymentUri, validatePaymentDetails } from './payment-uri.mjs';
+import { buildPaymentUri, parsePaymentUri, parseClipboardPaymentText, validatePaymentDetails } from './payment-uri.mjs';
 import { paymentQrDataUrl } from './payment-qr.mjs';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
@@ -432,8 +432,8 @@ export class WalletService extends EventEmitter {
   }
   paymentRequestForCopy({ amount, label, message, expectedUri, expectedAddress } = {}) {
     const request = this.paymentRequestUri({ amount, label, message });
-    // Clipboard writes must match exactly what the user reviewed. Keep this
-    // validation synchronous with the write in main.mjs.
+    // Clipboard writes must match exactly what the user reviewed. Do not yield
+    // between this validation and starting the asynchronous write in main.mjs.
     if (expectedUri !== request.uri || expectedAddress !== request.address) throw new Error('The payment request changed. Review it before copying again.');
     return request;
   }
@@ -442,6 +442,15 @@ export class WalletService extends EventEmitter {
     const request = parsePaymentUri(uri);
     // Bech32 parsing libraries can quote their input in errors. Only return a
     // fixed message to the renderer, never an untrusted URI or address fragment.
+    try { decodeAddress(request.address, this.config.network); }
+    catch { throw new Error('The payment address is invalid or belongs to a different network.'); }
+    return request;
+  }
+  parseClipboardPaymentRequest({ text } = {}) {
+    this.assertSession();
+    const request = parseClipboardPaymentText(text);
+    // Keep the same local checksum/network checks and fixed errors as URI-only
+    // imports. Neither successful parsing nor rejection may perform RPC calls.
     try { decodeAddress(request.address, this.config.network); }
     catch { throw new Error('The payment address is invalid or belongs to a different network.'); }
     return request;

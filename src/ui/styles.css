@@ -17,3 +17,7 @@
 
 /* The same ConnectWallet mark is used at startup, in navigation and receive. */
 .boot-mark{background:transparent}.boot-mark img{display:block;width:100%;height:100%;object-fit:contain}
+
+/* Reserve a small feedback line so a clipboard error does not move the form. */
+.payment-paste-error{min-height:1.5em;margin:0 0 12px;color:var(--danger-ink);font-size:11px;line-height:1.5;overflow-wrap:anywhere;opacity:1;transition:opacity 1s ease}
+.payment-paste-error.is-fading{opacity:0}
