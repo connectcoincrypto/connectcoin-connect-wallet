@@ -16,6 +16,9 @@ import { waitForUiCondition } from './ui-wait.mjs';
 import { closeElectronTest } from './ui-close.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// macOS Home/End scroll the document instead of moving the input caret.
+const inputStartKey = process.platform === 'darwin' ? 'Meta+ArrowLeft' : 'Home';
+const inputEndKey = process.platform === 'darwin' ? 'Meta+ArrowRight' : 'End';
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-test-'));
 const screenshots = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-screens-'));
 const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash: GENESIS.testnet4, mediantime: 1780000000 };
@@ -357,7 +360,7 @@ async function assertTrailingPeriodPreference(selector, value, configPath, { end
     input.focus();
   });
   await field.fill(String(value));
-  await page.keyboard.press('End');
+  await page.keyboard.press(inputEndKey);
   await page.keyboard.type('.');
   await field.evaluate(input => {
     window.trailingPeriodEditingField = input;
@@ -715,7 +718,7 @@ try {
   assert.equal(await page.locator('input[type="password"][data-text-limit], textarea[name="mnemonic"][data-text-limit]').count(), 0,
     'The public text guard must not apply to password or recovery phrase fields.');
   await page.locator('#setup-name').fill('n'.repeat(40));
-  await page.keyboard.press('End');
+  await page.keyboard.press(inputEndKey);
   await page.keyboard.type('x');
   assert.equal(await page.locator('#setup-name').inputValue(), 'n'.repeat(40));
   await page.keyboard.press('ControlOrMeta+A');
@@ -929,14 +932,14 @@ try {
   await page.locator('#receive-amount').fill('123');
   await assertReceiveRequest(`connectcoin:${address}?amount=123`);
   const wholeAmountQr = await page.locator('#receive-qr').getAttribute('src');
-  await page.keyboard.press('End');
+  await page.keyboard.press(inputEndKey);
   await page.keyboard.type('.');
   assert.equal(await page.locator('#receive-amount').inputValue(), '123.');
   await assertReceiveRequest(`connectcoin:${address}?amount=123`);
   assert.equal(await page.locator('#receive-qr').getAttribute('src'), wholeAmountQr);
   await assertCopiedReceiveValue('copy-payment-request', `connectcoin:${address}?amount=123`);
   await page.locator('#receive-amount').focus();
-  await page.keyboard.press('End');
+  await page.keyboard.press(inputEndKey);
   await page.keyboard.type('4');
   assert.equal(await page.locator('#receive-amount').inputValue(), '123.4');
   await assertReceiveRequest(`connectcoin:${address}?amount=123.4`);
@@ -1144,7 +1147,7 @@ try {
   await assertTrailingPeriodPreference('#claims-lookback', 333, ['claims', 'lookbackBlocks']);
   stage = 'autosave acknowledgement preserves the native numeric caret';
   await page.locator('#claims-rate').fill('12');
-  await page.keyboard.press('Home');
+  await page.keyboard.press(inputStartKey);
   await page.keyboard.press('ArrowRight');
   await page.keyboard.press('1');
   assert.equal(await page.locator('#claims-rate').inputValue(), '112');
