@@ -90,7 +90,8 @@ class ServiceTests(unittest.TestCase):
         payload = [{"type": "start", "protocol": 3, "options": {"connectionsPerSecond": 100, "concurrency": 100}}, {"type": "shutdown"}]
         stream = io.BytesIO(b"".join(json.dumps(frame).encode() + b"\n" for frame in payload))
         self.assertEqual(service.run_service(stream, frames.append, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem"), 0)
-        self.assertEqual(frames, [{"type": "ready", "protocol": 3, "roots": 1}])
+        self.assertEqual(frames, [{"type": "ready", "protocol": 3, "roots": 1,
+                                   "security": {"rsaPublicExponentMaxBits": 64}}])
 
     def test_frames_options_and_secret_fields_fail_closed(self):
         for raw in (b"{}", b"x" * 16385 + b"\n", b'{"x":NaN}\n', b'{"x":Infinity}\n', b'{"type":"cancel","type":"attempt"}\n'):

@@ -123,6 +123,8 @@ Up to 256 prepared public transactions are cached in memory, preserving the payo
 
 The helper uses a hash-pinned consensus root bundle, validates the TLS signature and certificate path, rejects private/local destinations and bounds concurrency/time/output. Claims reserve a conservative fee for the maximum supported proof size; this can cost more than the minimum for a smaller actual proof. The full node remains the final consensus validator. See [helper provenance](helpers/PROVENANCE.md).
 
+Like Core, the helper permits RSA public exponents of at most 64 bits in every supplied certificate and trust root, including RSA-PSS keys and unused chain entries. This limits the public exponent, not the RSA modulus/key size. The check precedes certificate-path and TLS signature verification. The desktop refuses older helpers instead of silently reusing them after a source update; run `npm run build:claims` to rebuild the native helper.
+
 Fresh proofs and retries share a maximum of four concurrent submissions. Stopping Automatic Claims cancels broadcasts still waiting for RPC quota or a connection. A transaction already transmitted cannot be recalled: the wallet retains its confirmation or reports an unknown outcome without automatically resending it.
 
 Stopping also releases claim preparation from shared funding lookups without cancelling other consumers. If bounty discovery is interrupted, its partial snapshot is discarded and the remaining stream is drained under the existing protocol, size and time limits; unrelated RPC requests keep their connection. Malformed streams and real transport failures still fail closed.

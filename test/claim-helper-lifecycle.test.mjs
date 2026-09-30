@@ -26,7 +26,7 @@ function fixture(t, { failAtStart = false } = {}) {
             const message = JSON.parse(frame.toString());
             if (message.type === 'start') queueMicrotask(() => failAtStart
               ? child.emit('close', 1, null)
-              : child.stdout.write('{"type":"ready","protocol":3,"roots":1}\n'));
+              : child.stdout.write('{"type":"ready","protocol":3,"roots":1,"security":{"rsaPublicExponentMaxBits":64}}\n'));
             if (message.type === 'shutdown') queueMicrotask(() => child.emit('close', 0, null));
           });
           return child;

@@ -5,6 +5,7 @@ import { pinnedCryptographyVersion, validateHelperSecurity } from '../scripts/he
 const current = () => ({ type: 'ready', protocol: 3, roots: 1, security: {
   cryptographyVersion: '50.0.1', minimumCryptographyVersion: '50.0.1',
   opensslVersion: 'OpenSSL 4.0.2 11 Aug 2026',
+  rsaPublicExponentMaxBits: 64,
 } });
 
 test('packaging reads one exact provider pin on Windows and Unix', () => {
@@ -27,7 +28,9 @@ test('packaging rejects stale, mismatched or unidentifiable native helpers', () 
     { ...current(), protocol: 2 }, { ...current(), roots: 2 }];
   for (const [field, value] of [['cryptographyVersion', '47.0.0'], ['cryptographyVersion', '50.0.0'],
     ['cryptographyVersion', '50.0.1rc1'], ['cryptographyVersion', '51.0.0'],
-    ['minimumCryptographyVersion', '47.0.0'], ['opensslVersion', ''], ['opensslVersion', null]]) {
+    ['minimumCryptographyVersion', '47.0.0'], ['opensslVersion', ''], ['opensslVersion', null],
+    ['rsaPublicExponentMaxBits', undefined], ['rsaPublicExponentMaxBits', 63],
+    ['rsaPublicExponentMaxBits', 65], ['rsaPublicExponentMaxBits', '64']]) {
     const report = current(); report.security[field] = value; reports.push(report);
   }
   for (const output of [...reports.map(JSON.stringify), 'invalid', JSON.stringify(current()) + '\n{}']) {

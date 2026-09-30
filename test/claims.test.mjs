@@ -97,6 +97,7 @@ test('proof runner sends only public context via stdin, no shell; requires verif
   });
   const runner = createProofRunner({ ...fixture, helper: { command: '/private/helper', args: [] } });
   assert.equal(await runner(context()), '020100');
+  assert.deepEqual(fixture.capture.args, ['--require-rsa-exponent-64']);
   assert.equal(fixture.capture.options.shell, false);
   assert.equal(fixture.capture.options.env.PYTHONPATH, undefined);
   assert.equal(fixture.capture.options.env.CONNECTCOIN_RPC_PASSWORD, undefined);
@@ -104,6 +105,32 @@ test('proof runner sends only public context via stdin, no shell; requires verif
   assert.equal(fixture.capture.request.context.txid, context().txid);
   assert.equal(fixture.capture.request.options.connectionsPerSecond, 100);
   assert.equal(fixture.capture.request.options.concurrency, 100);
+});
+
+test('proof runner appends the required RSA policy after source-helper arguments', async () => {
+  const fixture = fakeSpawn((child, request) => {
+    child.stdout.write(`${JSON.stringify(validProgress)}\n${JSON.stringify(validResult(request))}\n`);
+    child.emit('close', 0);
+  });
+  const args = ['-I', 'claims_bridge.py'];
+  assert.equal(await createProofRunner({ ...fixture, helper: { command: 'python', args } })(context()), '020100');
+  assert.deepEqual(fixture.capture.args, ['-I', 'claims_bridge.py', '--require-rsa-exponent-64']);
+  assert.deepEqual(args, ['-I', 'claims_bridge.py'], 'do not mutate shared helper arguments');
+});
+
+test('proof runner rejects legacy helper flag errors with rebuild guidance and no fallback', async () => {
+  let calls = 0;
+  let progress = 0;
+  const fixture = fakeSpawn(child => {
+    calls++;
+    child.stdout.write('{"type":"error","message":"unknown helper arguments"}\n');
+    child.emit('close', 1);
+  });
+  const runner = createProofRunner({ ...fixture, helper: { command: 'legacy-helper' } });
+  await assert.rejects(runner(context(), { onProgress: () => { progress++; } }), /RSA public-exponent limit.*npm run build:claims/);
+  assert.deepEqual(fixture.capture.args, ['--require-rsa-exponent-64']);
+  assert.equal(calls, 1);
+  assert.equal(progress, 0);
 });
 
 test('proof runner rejects tampered contexts, oversized frames, unknown messages, partial output, and nonzero exit', async () => {

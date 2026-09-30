@@ -42,7 +42,8 @@ class IsolatedRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
-                         [{"type": "ready", "protocol": 3, "roots": 1}])
+                         [{"type": "ready", "protocol": 3, "roots": 1,
+                           "security": {"rsaPublicExponentMaxBits": 64}}])
 
     def test_isolated_self_test_uses_trusted_dependencies(self):
         result = self.invoke(["--self-test"])
@@ -52,7 +53,8 @@ class IsolatedRuntimeTests(unittest.TestCase):
             "type": "ready", "protocol": 3, "roots": 1,
             "security": {"cryptographyVersion": cryptography.__version__,
                          "minimumCryptographyVersion": "50.0.1",
-                         "opensslVersion": backend.openssl_version_text()},
+                         "opensslVersion": backend.openssl_version_text(),
+                         "rsaPublicExponentMaxBits": 64},
         })
 
     def test_self_test_exits_with_error_for_vulnerable_loaded_dependency(self):
@@ -94,6 +96,20 @@ class IsolatedRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr, "")
         self.assertEqual(json.loads(result.stdout)["type"], "error")
+
+    def test_required_exponent_capability_works_in_isolated_modes(self):
+        required = "--require-rsa-exponent-64"
+        result = self.invoke(["--self-test", required])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["security"]["rsaPublicExponentMaxBits"], 64)
+        result = self.invoke(["--probe-rsa", required], "{}\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "type": "error", "message": "Invalid or incomplete RSA probe request."})
+        result = self.invoke([required], "{}\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout), {
+            "type": "error", "message": "request must contain only context and options"})
 
 
 if __name__ == "__main__":

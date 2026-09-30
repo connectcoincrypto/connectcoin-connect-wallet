@@ -31,7 +31,7 @@ finally { await pool.close(); }
 // An older protocol-3 helper lacks RSA probing. Exercise the new mode with an
 // invalid request so packaging cannot silently ship it; no DNS/TLS is attempted.
 await new Promise((accept, reject) => {
-  const child = spawn(helper, ['--probe-rsa'], { cwd: root, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
+  const child = spawn(helper, ['--probe-rsa', '--require-rsa-exponent-64'], { cwd: root, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
   let output = '', bytes = 0, failed = false;
   const fail = () => { failed = true; child.kill(); reject(new Error('Bundled helper lacks the RSA probe. Run npm run build:claims.')); };
   child.once('error', fail);

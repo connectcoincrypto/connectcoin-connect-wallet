@@ -125,6 +125,7 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
           if (typeof message.proof !== 'string' || !/^02(?:[0-9a-f]{2})+$/.test(message.proof) || message.proof.length > 131072) throw new Error('Invalid proof encoding');
           result = message;
         } else if (message.type === 'error') {
+          if (message.message === 'unknown helper arguments') throw new Error('Incompatible claims helper: RSA public-exponent limit must be 64 bits. Update the app or run npm run build:claims.');
           throw new Error(typeof message.message === 'string' ? message.message.slice(0, 500) : 'TLS proof generation failed');
         } else throw new Error('Unknown claims helper response');
       };
@@ -133,7 +134,9 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
         const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => environmentNames.has(key.toLowerCase())));
         // Do not inherit RPC credentials, developer tokens, Python module overrides,
         // or any application-private environment into the network-facing helper.
-        child = spawnProcess(runtime.command, runtime.args ?? [], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
+        // Older helpers reject this unknown suffix before reading input or
+        // opening sockets; never retry without the required RSA policy.
+        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--require-rsa-exponent-64'], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
         child.once('error', (error) => finish(new Error(`Claims helper could not start: ${error.message}`)));
         child.stdout.on('data', (chunk) => {
           if (failure || settled) return;

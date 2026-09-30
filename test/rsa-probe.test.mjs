@@ -40,7 +40,7 @@ test('RSA probe sends only the public input with a sanitized subprocess environm
   const result = probe({ ...INPUT, domain: 'EXAMPLE.COM', privateKey: 'must-not-cross' });
   assert.deepEqual(JSON.parse(children[0].input), INPUT);
   assert.equal(calls[0].command, 'fake-python');
-  assert.deepEqual(calls[0].args, ['-I', 'claims_bridge.py', '--probe-rsa']);
+  assert.deepEqual(calls[0].args, ['-I', 'claims_bridge.py', '--probe-rsa', '--require-rsa-exponent-64']);
   assert.equal(calls[0].options.shell, false);
   assert.equal(calls[0].options.windowsHide, true);
   assert.deepEqual(calls[0].options.stdio, ['pipe', 'pipe', 'pipe']);
@@ -50,6 +50,16 @@ test('RSA probe sends only the public input with a sanitized subprocess environm
   children[0].stdout.write(frame().slice(25));
   children[0].close();
   assert.deepEqual(await result, VERIFIED);
+});
+
+test('RSA probe fails closed on a legacy helper without retrying its unsupported policy flag', async t => {
+  const { probe, children, calls } = fixture(t, { helper: { command: 'legacy-helper' } });
+  const result = probe(INPUT);
+  assert.deepEqual(calls[0].args, ['--probe-rsa', '--require-rsa-exponent-64']);
+  children[0].stdout.write('{"type":"error","message":"unknown helper arguments"}\n');
+  children[0].close(1);
+  assert.deepEqual(await result, FAILED);
+  assert.equal(calls.length, 1);
 });
 
 test('RSA probe requires a complete successful process exit, not just a success frame', async t => {

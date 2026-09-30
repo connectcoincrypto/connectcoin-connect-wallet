@@ -25,7 +25,7 @@ function fixture(t, onCommand = () => {}, options = {}) {
         const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
         commands.push(message);
         if (message.type === 'start') {
-          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 3, roots: 1 }));
+          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64 } }));
         }
         else if (message.type === 'shutdown') setImmediate(() => child.emit('close', 0));
         else onCommand(message, child);
@@ -53,6 +53,19 @@ test('connection-only settings reject lifetime batch options and invalid global 
   assert.deepEqual(validateConnectionOptions(), { connectionsPerSecond: 100, concurrency: 100 });
   for (const input of [null, [], { maxAttempts: 1 }, { overallTimeout: 1 }, { concurrency: 0 }, { concurrency: 257 }, { connectionsPerSecond: NaN }, { concurrency: 1.5 }]) assert.throws(() => validateConnectionOptions(input));
 });
+
+for (const security of [undefined, null, {}, { rsaPublicExponentMaxBits: '64' }, { rsaPublicExponentMaxBits: 63 }, { rsaPublicExponentMaxBits: 65 }]) {
+  test(`persistent helper rejects missing or incompatible RSA policy ${JSON.stringify(security)}`, async t => {
+    const { pool, children, commands } = fixture(t, () => {}, { autoReady: false });
+    const starting = assert.rejects(pool.start({}), error => error.helperFatal === true && /npm run build:claims/.test(error.message));
+    children[0].send({ type: 'ready', protocol: 3, roots: 1, security });
+    await starting;
+    await assert.rejects(pool.resolve('example.com'), /npm run build:claims/);
+    assert.equal(pool.started, undefined);
+    assert.equal(children[0].killed, true);
+    assert.deepEqual(commands.map(command => command.type), ['start'], 'no DNS or TLS request reaches a stale helper');
+  });
+}
 
 test('one persistent helper serves several domains and proofs with monotonic request identities', async t => {
   const { pool, commands, spawns } = fixture(t, (command, child) => {

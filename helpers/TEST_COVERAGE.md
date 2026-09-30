@@ -16,6 +16,15 @@ duplicate-chain cases run in killable subprocesses with five-second deadlines.
 No external endpoint or production trust-anchor substitution is involved.
 Self-test regressions reject obsolete/prerelease providers; desktop packaging
 also rejects legacy self-test output or a provider different from the source pin.
+Packaging also rejects helpers that do not report the 64-bit RSA public-exponent
+limit, even if their cryptography provider is otherwise current.
+RSA regressions cover ordinary and restricted PSS keys, 1,024/2,048-bit moduli,
+the inclusive 64-bit boundary (including DER sign padding), 65/256-bit rejection,
+all supplied certificate positions, unused certificates/roots, and the direct
+TLS-signature helper. Controlled capture tests reject oversized exponents at
+the Certificate message without waiting for CertificateVerify, in both claim
+and completed-probe modes. Runtime tests reject legacy helper capabilities and
+enforce the one-shot/probe compatibility flag before any network work.
 
 Offline telemetry tests cover completion order under concurrency, rolling
 100-entry snapshots and monotonic completion counts, successful captures that

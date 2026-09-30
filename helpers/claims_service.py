@@ -16,7 +16,11 @@ from connectcoin_p2c_tools.generator import resolve_endpoints
 from connectcoin_p2c_tools.hashes import meets_work_target
 from connectcoin_p2c_tools.protocol import parse_proof
 from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, TLSGenerationError, capture_tls13_proof
-from connectcoin_p2c_tools.verify import validate_root_bundle, verify_connection_proof
+from connectcoin_p2c_tools.verify import (
+    MAX_RSA_PUBLIC_EXPONENT_BITS,
+    validate_root_bundle,
+    verify_connection_proof,
+)
 
 MAX_PENDING = 512
 MAX_DNS_CACHE = 4096
@@ -377,7 +381,8 @@ def run_service(stream, emit, parse_context, roots_path: str | Path):
         raise ValueError("protocol 3 start command required")
     service = ClaimsService(start["options"], emit, parse_context, roots_path)
     try:
-        service.emit({"type": "ready", "protocol": 3, "roots": 1})
+        service.emit({"type": "ready", "protocol": 3, "roots": 1,
+                      "security": {"rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}})
         while True:
             command = read_frame(stream)
             if command is None: break

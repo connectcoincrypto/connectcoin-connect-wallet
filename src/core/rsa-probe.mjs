@@ -90,7 +90,9 @@ export function createRsaProbe({ resourcesPath, helper, basePath, spawnProcess =
       try {
         if (signal?.aborted) { onAbort(); release(); return; }
         const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => ENVIRONMENT_NAMES.has(key.toLowerCase())));
-        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--probe-rsa'], {
+        // A stale helper rejects the required-policy suffix before any DNS/TLS.
+        // Keep one process and the existing end-to-end deadline; no fallback.
+        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--probe-rsa', '--require-rsa-exponent-64'], {
           shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' },
         });

@@ -104,7 +104,9 @@ export class ConnectionPool {
   receive(message) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Malformed claims helper response');
     if (message.type === 'ready') {
-      if (this.started || message.protocol !== 3 || message.roots !== 1) throw new Error('Incompatible claims helper; update or rebuild it');
+      if (this.started || message.protocol !== 3 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64) {
+        throw new Error('Incompatible claims helper: RSA public-exponent limit must be 64 bits. Update the app or run npm run build:claims.');
+      }
       this.started = true; clearTimeout(this.startTimer); this.readyResolve(); return;
     }
     if (message.type === 'error') throw new Error('Claims helper failed');

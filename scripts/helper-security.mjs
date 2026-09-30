@@ -12,6 +12,7 @@ export function validateHelperSecurity(output, expectedVersion) {
   if (report?.type !== 'ready' || report.protocol !== 3 || report.roots !== 1 ||
       report.security?.cryptographyVersion !== expectedVersion ||
       report.security?.minimumCryptographyVersion !== '50.0.1' ||
+      report.security?.rsaPublicExponentMaxBits !== 64 ||
       typeof report.security?.opensslVersion !== 'string' ||
       !/^OpenSSL [0-9]+\.[0-9]+\.[0-9]+(?: |$)/.test(report.security.opensslVersion)) {
     throw new Error('Bundled helper has missing or outdated security metadata. Run npm run build:claims.');

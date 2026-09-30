@@ -22,7 +22,10 @@ from connectcoin_p2c_tools.generator import (  # noqa: E402
     GenerationProgress,
     generate_connection_proof,
 )
-from connectcoin_p2c_tools.verify import verify_connection_proof  # noqa: E402
+from connectcoin_p2c_tools.verify import (  # noqa: E402
+    MAX_RSA_PUBLIC_EXPONENT_BITS,
+    verify_connection_proof,
+)
 
 CONTEXT_KEYS = {
     "domain", "txid", "input_index", "connection_work_target",
@@ -32,7 +35,7 @@ OPTION_KEYS = {"connectionsPerSecond", "concurrency", "overallTimeout", "maxAtte
 MINIMUM_CRYPTOGRAPHY_VERSION = (50, 0, 1)
 
 
-def security_provider_versions() -> dict[str, str]:
+def security_provider_versions() -> dict[str, str | int]:
     """Report the loaded certificate provider and reject unsupported builds.
 
     This release floor includes the fixes for GHSA-jwv3-5hgf-82ww and
@@ -53,7 +56,8 @@ def security_provider_versions() -> dict[str, str]:
     from cryptography.hazmat.backends.openssl.backend import backend
 
     return {"cryptographyVersion": version, "minimumCryptographyVersion": minimum,
-            "opensslVersion": backend.openssl_version_text()}
+            "opensslVersion": backend.openssl_version_text(),
+            "rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}
 
 
 def emit(value: dict) -> None:
@@ -121,22 +125,36 @@ class ProgressReporter:
                                    "recent": update.attempt_stats.recent}})
 
 
+def helper_mode(arguments: list[str]) -> str:
+    # Older helpers reject this unknown suffix before reading a request or
+    # accessing the network. Require it from the one-shot/probe launchers so
+    # a stale native helper cannot silently bypass the source verifier update.
+    if arguments[-1:] == ["--require-rsa-exponent-64"]:
+        if MAX_RSA_PUBLIC_EXPONENT_BITS != 64:
+            raise ValueError("Automatic Claims helper must enforce the 64-bit RSA exponent limit; rebuild it")
+        arguments = arguments[:-1]
+    if not arguments:
+        return "generate"
+    if len(arguments) == 1 and arguments[0] in {"--probe-rsa", "--service", "--self-test"}:
+        return arguments[0]
+    raise ValueError("unknown helper arguments")
+
+
 def main() -> int:
-    if sys.argv[1:] == ["--probe-rsa"]:
+    mode = helper_mode(sys.argv[1:])
+    if mode == "--probe-rsa":
         deadline = time.monotonic() + 3.0
         from rsa_probe import run_probe
         return run_probe(sys.stdin.buffer, emit, ROOT / "p2c_roots_v1.pem", deadline=deadline)
-    if sys.argv[1:] == ["--service"]:
+    if mode == "--service":
         from claims_service import run_service
         return run_service(sys.stdin.buffer, emit, parse_context, ROOT / "p2c_roots_v1.pem")
-    if sys.argv[1:] == ["--self-test"]:
+    if mode == "--self-test":
         from connectcoin_p2c_tools.verify import validate_root_bundle
         security = security_provider_versions()
         validate_root_bundle(ROOT / "p2c_roots_v1.pem", 1)
         emit({"type": "ready", "protocol": 3, "roots": 1, "security": security})
         return 0
-    if sys.argv[1:]:
-        raise ValueError("unknown helper arguments")
     line = sys.stdin.buffer.readline(16385)
     if len(line) > 16384 or not line.endswith(b"\n"):
         raise ValueError("request exceeds the 16 KiB limit or is incomplete")

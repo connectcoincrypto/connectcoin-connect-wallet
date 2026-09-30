@@ -14,7 +14,21 @@ verification, then one terminal result per request. The main process retains
 the last 100 completed observations per domain and exact signature-policy mask.
 DNS failures and cancelled queued attempts do not create TLS observations.
 The legacy one-shot generator retains bounded snapshots for development tooling;
-it is not the desktop scheduling path. Proof encoding and verification are unchanged.
+it is not the desktop scheduling path. Proof encoding is unchanged.
+
+The RSA public-exponent limit is backported from P2C Tools commit
+`2dbb42ba93ad194b3166ed455a0b2a95e8a05000`, aligned with Core commit
+`a32fb95618f058a79125f1c5b98d95ad972445da`. This is a targeted backport;
+the remaining vendored files retain the base and local patches described above.
+The vendored verifier and capture path enforce Core's RSA public-exponent limit:
+`e.bit_length() <= 64` (`e <= 2^64 - 1`), for every RSA modulus size. This is
+not a 64-bit RSA key size: supported modulus sizes remain unchanged. Both
+`rsaEncryption` and restricted RSA-PSS keys are covered, including every
+supplied intermediate or unused certificate and every trusted root. Capture
+checks the received Certificate message before proceeding to CertificateVerify;
+proof verification checks keys before certificate-path or TLS signature work.
+This tightens accepted proofs to match Core, without changing proof encoding,
+root versions or the immutable root bundle.
 
 The local `--probe-rsa` mode follows Core's `ProbeP2CRsaForTest` in
 `src/wallet/p2c_tls.cpp`: one public endpoint on port 443, RSA mask 6, the pinned
@@ -89,9 +103,14 @@ GHSA-537c-gmf6-5ccf and GHSA-g6cj-pr64-35w5. The first two affect certificate
 path verification; listing the latter advisories does not imply their affected
 APIs were reachable from this helper. `--self-test` reports the actual provider
 and its OpenSSL backend and rejects obsolete or prerelease providers. Desktop
-packaging requires that report to match the source pin, preventing reuse of an
-old helper after a source-only dependency upgrade. Existing distributed apps
+packaging requires that report to match the source pin and declare
+`rsaPublicExponentMaxBits: 64`, preventing reuse of an old helper after a
+source-only dependency or verification-policy update. Existing distributed apps
 must be rebuilt/replaced; there is no remote runtime dependency download.
+At runtime the persistent service must advertise that exponent limit before
+the desktop sends any DNS/claim jobs. One-shot claim and RSA-probe launchers
+pass `--require-rsa-exponent-64`; older helpers reject this unknown argument
+before starting network work, so a source update cannot silently reuse them.
 
 The build copies original Python, provider, CFFI, parser and bootloader notices
 into `_internal/licenses/dependencies`. It includes the installed provider's
