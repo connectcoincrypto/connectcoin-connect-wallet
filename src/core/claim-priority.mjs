@@ -79,7 +79,7 @@ export class P2CDomainStats {
 }
 
 export function validateAttemptStats(stats, maxAttempts) {
-  if (!stats || !Number.isSafeInteger(stats.completed) || stats.completed < 0 || stats.completed > maxAttempts ||
+  if (!stats || stats.validation !== 'certificate-proof-v1' || !Number.isSafeInteger(stats.completed) || stats.completed < 0 || stats.completed > maxAttempts ||
       !Array.isArray(stats.recent) || stats.recent.length !== Math.min(100, stats.completed)) throw new Error('Invalid helper attempt statistics');
   for (const sample of stats.recent) {
     if (!Array.isArray(sample) || sample.length !== 2 || typeof sample[0] !== 'boolean' ||

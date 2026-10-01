@@ -35,14 +35,14 @@ class IsolatedRuntimeTests(unittest.TestCase):
 
     def test_service_starts_and_shuts_down_from_untrusted_directory(self):
         frames = "\n".join(json.dumps(frame) for frame in (
-            {"type": "start", "protocol": 3, "options": {"connectionsPerSecond": 100, "concurrency": 100}},
+            {"type": "start", "protocol": 4, "options": {"connectionsPerSecond": 100, "concurrency": 100}},
             {"type": "shutdown"},
         )) + "\n"
         result = self.invoke(["--service"], frames)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
-                         [{"type": "ready", "protocol": 3, "roots": 1,
+                         [{"type": "ready", "protocol": 4, "roots": 1,
                            "security": {"rsaPublicExponentMaxBits": 64}}])
 
     def test_isolated_self_test_uses_trusted_dependencies(self):
@@ -50,7 +50,7 @@ class IsolatedRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(json.loads(result.stdout), {
-            "type": "ready", "protocol": 3, "roots": 1,
+            "type": "ready", "protocol": 4, "roots": 1,
             "security": {"cryptographyVersion": cryptography.__version__,
                          "minimumCryptographyVersion": "50.0.1",
                          "opensslVersion": backend.openssl_version_text(),
@@ -77,12 +77,16 @@ class IsolatedRuntimeTests(unittest.TestCase):
         self.assertIn("loaded 47.0.0", frame["message"])
 
     def test_service_rejects_wrong_protocol_without_starting_work(self):
-        result = self.invoke(["--service"], '{"type":"start","protocol":2,"options":{}}\n')
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stderr, "")
-        frames = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0]["type"], "error")
+        for protocol in (1, 2, 3):
+            with self.subTest(protocol=protocol):
+                frame = {"type": "start", "protocol": protocol, "options": {}}
+                result = self.invoke(["--service"], json.dumps(frame) + "\n")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, "")
+                frames = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual(len(frames), 1)
+                self.assertEqual(frames[0]["type"], "error")
+                self.assertIn("protocol 4", frames[0]["message"])
 
     def test_rsa_probe_uses_trusted_import_and_sanitizes_invalid_input(self):
         result = self.invoke(["--probe-rsa"], '{"domain":"private.local","rootVersion":1,"validationTime":1800000000}\n')

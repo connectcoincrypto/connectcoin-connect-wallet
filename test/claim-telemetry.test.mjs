@@ -13,7 +13,7 @@ const bounty = (vout = 0, extra = {}) => ({ txid: '02'.repeat(32), vout, amount:
   domain: 'example.com', status: 'available', connection_work_target: 'ff'.repeat(32),
   root_certificates_version: 1, signature_algorithms_mask: 7, ...extra });
 const progress = (completed, recent, extra = {}) => ({ type: 'progress', attempts: completed,
-  elapsed: 1, attemptStats: { completed, recent }, ...extra });
+  elapsed: 1, attemptStats: { validation: 'certificate-proof-v1', completed, recent }, ...extra });
 // Closed-form weighted sum, independent of the production accumulator updates.
 function expectedRate(samples) {
   const priorWeight = 0.999 ** samples.length;
@@ -60,7 +60,7 @@ function engineFixture(t) {
 function persistentPoolFixture(t) {
   let child;
   const commands = [];
-  const pool = new ConnectionPool({ helper: { command: 'isolated-protocol3-helper' }, spawnProcess: () => {
+  const pool = new ConnectionPool({ helper: { command: 'isolated-protocol4-helper' }, spawnProcess: () => {
     child = new EventEmitter();
     child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
     child.killed = false;
@@ -68,7 +68,7 @@ function persistentPoolFixture(t) {
     child.stdin.on('data', data => {
       const command = JSON.parse(data.toString());
       if (command.type === 'start') queueMicrotask(() => child.stdout.write(JSON.stringify({
-        type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64 },
+        type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 },
       }) + '\n'));
       else if (command.type === 'shutdown') setImmediate(() => child.emit('close', 0));
       else commands.push(command);
@@ -98,17 +98,17 @@ test('legacy proof generation accepts high-rate bounded progress without importi
 
 test('statistics validator rejects malformed or oversized completion records', () => {
   const invalid = [
-    null, false, [], {}, { completed: -1, recent: [] }, { completed: 1.5, recent: [] },
-    { completed: NaN, recent: [] }, { completed: Infinity, recent: [] },
-    { completed: 1001, recent: Array(100).fill([false, 0]) },
-    { completed: 0, recent: [[true, 0]] }, { completed: 1, recent: [] },
-    { completed: 2, recent: [[true, 1]] }, { completed: 1, recent: [null] },
-    { completed: 1, recent: [[true]] }, { completed: 1, recent: [[true, 1, 2]] },
-    { completed: 1, recent: [[1, 0]] }, { completed: 1, recent: [['true', 0]] },
-    { completed: 1, recent: [[true, -1]] }, { completed: 1, recent: [[true, Infinity]] },
-    { completed: 1, recent: [[true, NaN]] }, { completed: 1, recent: [[true, '1']] },
-    { completed: 1, recent: [[true, 3600.000001]] },
-    { completed: 101, recent: Array(101).fill([true, 0]) },
+    null, false, [], {}, { validation: 'certificate-proof-v1', completed: -1, recent: [] }, { validation: 'certificate-proof-v1', completed: 1.5, recent: [] },
+    { validation: 'certificate-proof-v1', completed: NaN, recent: [] }, { validation: 'certificate-proof-v1', completed: Infinity, recent: [] },
+    { validation: 'certificate-proof-v1', completed: 1001, recent: Array(100).fill([false, 0]) },
+    { validation: 'certificate-proof-v1', completed: 0, recent: [[true, 0]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [] },
+    { validation: 'certificate-proof-v1', completed: 2, recent: [[true, 1]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [null] },
+    { validation: 'certificate-proof-v1', completed: 1, recent: [[true]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 1, 2]] },
+    { validation: 'certificate-proof-v1', completed: 1, recent: [[1, 0]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [['true', 0]] },
+    { validation: 'certificate-proof-v1', completed: 1, recent: [[true, -1]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, Infinity]] },
+    { validation: 'certificate-proof-v1', completed: 1, recent: [[true, NaN]] }, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, '1']] },
+    { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 3600.000001]] },
+    { validation: 'certificate-proof-v1', completed: 101, recent: Array(101).fill([true, 0]) },
   ];
   for (const value of invalid) assert.throws(() => validateAttemptStats(value, 1000), /statistics/);
 });
@@ -128,85 +128,101 @@ for (const [name, messages] of [
 test('duplicate cumulative snapshots count each completed connection once and never combine exact masks', t => {
   const engine = engineFixture(t);
   const job = engine.queue.get(bounty().txid + ':0');
-  let completed = engine.recordAttemptStats(job, { completed: 2, recent: [[true, 0.1], [false, 0.2]] }, 0);
-  completed = engine.recordAttemptStats(job, { completed: 2, recent: [[true, 0.1], [false, 0.2]] }, completed);
-  completed = engine.recordAttemptStats(job, { completed: 3, recent: [[true, 0.1], [false, 0.2], [true, 0.3]] }, completed);
+  let completed = engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 2, recent: [[true, 0.1], [false, 0.2]] }, 0);
+  completed = engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 2, recent: [[true, 0.1], [false, 0.2]] }, completed);
+  completed = engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 3, recent: [[true, 0.1], [false, 0.2], [true, 0.3]] }, completed);
   assert.equal(completed, 3);
   const stats = engine.domainStats.get('example.com:7');
   const samples = [[true, 0.1], [false, 0.2], [true, 0.3]];
   assertRate(stats, samples);
   assert.equal(engine.domainStats.has('example.com:1'), false);
-  assert.throws(() => engine.recordAttemptStats(job, { completed: 1, recent: [[true, 1]] }, completed), /sequence/);
+  assert.throws(() => engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 1]] }, completed), /sequence/);
   assertRate(stats, samples);
 });
 
 test('a telemetry gap larger than the window fails before changing the EMA', t => {
   const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
-  engine.recordAttemptStats(job, { completed: 1, recent: [[false, 300]] }, 0);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[false, 300]] }, 0);
   const samples = Array.from({ length: 100 }, (_, index) => [index % 2 === 0, index / 1000]);
-  assert.throws(() => engine.recordAttemptStats(job, { completed: 150, recent: samples }, 1), /statistics|sequence|gap/);
+  assert.throws(() => engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 150, recent: samples }, 1), /statistics|sequence|gap/);
   assertRate(engine.domainStats.get('example.com:7'), [[false, 300]]);
-  engine.recordAttemptStats(job, { completed: 101, recent: samples }, 1);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 101, recent: samples }, 1);
   assertRate(engine.domainStats.get('example.com:7'), [[false, 300], ...samples]);
   const next = [...samples.slice(1), [true, 0.5]];
-  engine.recordAttemptStats(job, { completed: 102, recent: next }, 101);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 102, recent: next }, 101);
   assertRate(engine.domainStats.get('example.com:7'), [[false, 300], ...samples, [true, 0.5]]);
 });
 
 test('a new helper run restarts its local completion counter without resetting shared domain history', t => {
   const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
-  engine.recordAttemptStats(job, { completed: 2, recent: [[true, 0.1], [false, 0.2]] }, 0);
-  engine.recordAttemptStats(job, { completed: 1, recent: [[true, 0.3]] }, 0);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 2, recent: [[true, 0.1], [false, 0.2]] }, 0);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.3]] }, 0);
   assertRate(engine.domainStats.get('example.com:7'), [[true, 0.1], [false, 0.2], [true, 0.3]]);
 });
 
-test('coalesced protocol-3 output retains every completion beyond 100 and terminals cannot count twice', async t => {
+test('coalesced protocol-4 output records all validated outcomes in terminal order, never raw captures twice', async t => {
   const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
   const { pool, commands, write } = persistentPoolFixture(t);
   await pool.start({ connectionsPerSecond: 256, concurrency: 256 });
-  const samples = Array.from({ length: 180 }, (_, index) => [index < 2, index < 80 ? 0.2 : 0.005]);
+  const samples = Array.from({ length: 180 }, (_, index) => [index === 0, index < 80 ? 0.2 : 0.005]);
   const pending = samples.map(() => {
     const request = { job, observed: false };
-    return pool.attempt(context, { bountyId: `${bounty().txid}:0`, onCapture: value => engine.observe(request, value) });
+    return pool.attempt(context, { bountyId: `${bounty().txid}:0`, onCapture: value => engine.observe(request, value),
+      onResult: value => engine.observeResult(request, value) });
   });
   const captures = commands.map((command, index) => ({ type: 'capture', id: command.id, context,
-    started: true, captured: samples[index][0], seconds: samples[index][1], cancelled: false,
+    started: true, captured: index < 2, seconds: samples[index][1], cancelled: false,
     successfulConnections: String(Math.min(index + 1, 2)) }));
   // Real pipe chunks may contain many complete frames. All observations arrive
   // together, followed by verification results in a different completion order.
   write(captures.flatMap(frame => [{ type: 'started', id: frame.id }, frame]));
-  const stats = engine.domainStats.get('example.com:7');
-  assertRate(stats, samples);
-  assert.notEqual(stats.connectionRate(), expectedRate(samples.slice(-100)), 'early captures still influence the EMA');
-  write([...captures].reverse().map(frame => ({ ...frame, type: 'attempt', proof: null, verified: false })));
+  assert.equal(engine.domainStats.has('example.com:7'), false, 'capture alone must not improve the EMA');
+  const terminals = captures.map((frame, index) => ({ ...frame, type: 'attempt', proof: null, verified: false, validationPassed: samples[index][0] }));
+  write(terminals.reverse());
   await Promise.all(pending);
-  assertRate(stats, samples);
+  const stats = engine.domainStats.get('example.com:7'), completionOrder = [...samples].reverse();
+  assertRate(stats, completionOrder);
+  assert.equal(stats.completed, 180);
+  assert.notEqual(stats.connectionRate(), expectedRate(completionOrder.slice(-100)), 'older observations still influence the EMA');
   assert.equal(engine.domainStats.has('example.com:1'), false);
   assert.equal(engine.successCounts.get(`${bounty().txid}:0`), 2n);
   write([captures[0]]);
   assert.match(pool.failure.message, /duplicate|Unexpected/);
+  assertRate(stats, completionOrder);
+});
+
+test('EMA distinguishes invalid proofs from valid target misses and excludes unfinished validation cancellation', t => {
+  const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
+  const observe = value => {
+    const request = { job, observed: false }, result = { started: true, ...value };
+    engine.observe(request, result); engine.observeResult(request, result);
+  };
+  observe({ captured: false, seconds: 10, cancelled: true, validationPassed: null });
+  observe({ captured: true, seconds: 0.1, cancelled: true, validationPassed: null });
+  assert.equal(engine.domainStats.has('example.com:7'), false);
+  observe({ captured: false, seconds: 10, cancelled: false, validationPassed: false });
+  observe({ captured: true, seconds: 0.2, cancelled: false, proof: null, verified: false, validationPassed: false });
+  observe({ captured: true, seconds: 0.05, cancelled: false, proof: null, verified: false, validationPassed: true });
+  observe({ captured: true, seconds: 0.08, cancelled: true, proof: null, verified: false, validationPassed: true });
+  observe({ captured: true, seconds: 0.3, cancelled: true, proof: null, verified: false, validationPassed: false });
+  const stats = engine.domainStats.get('example.com:7');
+  const samples = [[false, 10], [false, 0.2], [true, 0.05], [true, 0.08], [false, 0.3]];
+  assertRate(stats, samples);
+  const duplicate = { job, observed: true };
+  assert.throws(() => engine.observe(duplicate, { captured: true, seconds: 1, cancelled: false }), /Duplicate/);
+  assert.throws(() => engine.observeResult({ job, resultObserved: true }, { started: true, captured: true, seconds: 1, validationPassed: true }), /Duplicate/);
   assertRate(stats, samples);
 });
 
-test('unfinished cancellation creates no observation while completed captures remain successes', t => {
-  const engine = engineFixture(t), job = engine.queue.get(bounty().txid + ':0');
-  const observe = value => engine.observe({ job, observed: false }, { started: true, ...value });
-  observe({ captured: false, seconds: 10, cancelled: true });
-  assert.equal(engine.domainStats.has('example.com:7'), false);
-  observe({ captured: false, seconds: 10, cancelled: false });
-  observe({ captured: true, seconds: 0.05, cancelled: false, proof: null, verified: false });
-  observe({ captured: true, seconds: 0.08, cancelled: true, proof: null, verified: false });
-  const stats = engine.domainStats.get('example.com:7');
-  assertRate(stats, [[false, 10], [true, 0.05], [true, 0.08]]);
-  const duplicate = { job, observed: true };
-  assert.throws(() => engine.observe(duplicate, { captured: true, seconds: 1, cancelled: false }), /Duplicate/);
-  assertRate(stats, [[false, 10], [true, 0.05], [true, 0.08]]);
+test('legacy capture-only statistics cannot be imported as cryptographically valid history', () => {
+  assert.throws(() => validateAttemptStats({ completed: 1, recent: [[true, 0.2]] }, 10), /statistics/);
+  assert.throws(() => validateAttemptStats({ validation: 'capture-only', completed: 1, recent: [[true, 0.2]] }, 10), /statistics/);
 });
 
 test('catalog retirement bounds local factors and statistics but retains an active out-of-window attempt', t => {
   const engine = engineFixture(t), first = bounty(), second = bounty(1, { signature_algorithms_mask: 1 });
   const active = engine.queue.get(first.txid + ':0');
-  engine.recordAttemptStats(active, { completed: 1, recent: [[true, 0.1]] }, 0);
+  engine.recordAttemptStats(active, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] }, 0);
   const factor = active.factor;
   engine.activeKey = first.txid + ':0';
   engine.retainCatalog([second]);
@@ -222,7 +238,7 @@ test('catalog retirement bounds local factors and statistics but retains an acti
 test('selection-preserving discovery reset keeps factors, stats and cursors; normal clear erases them', t => {
   const engine = engineFixture(t), row = bounty(), id = row.txid + ':0';
   const job = engine.queue.get(id), factor = job.factor;
-  engine.recordAttemptStats(job, { completed: 1, recent: [[true, 0.1]] }, 0);
+  engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] }, 0);
   engine.markAssigned(job);
   const cursor = engine.domainCursors.get('example.com');
   engine.clear({ preserveSelection: true });

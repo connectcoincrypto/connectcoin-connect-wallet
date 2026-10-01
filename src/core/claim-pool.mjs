@@ -24,7 +24,7 @@ function counter(value) {
 export class ConnectionPool {
   constructor({ helper, resourcesPath, basePath, spawnProcess = spawn, onDiagnostic = () => {}, onFailure = () => {} } = {}) {
     Object.assign(this, { helper, resourcesPath, basePath, spawnProcess, onDiagnostic, onFailure });
-    this.pacesStarts = true; // Protocol 3 enforces one global clock at socket start.
+    this.pacesStarts = true; // Protocol 4 enforces one global clock at socket start.
     this.requests = new Map(); this.sequence = 0; this.closing = false;
   }
   async start(options) {
@@ -44,7 +44,7 @@ export class ConnectionPool {
       this.child.once('error', error => { this.fail(new Error('Claims helper could not start', { cause: error })); this.closedResolve(); });
       this.child.stdin.on('error', error => { if (!this.closing) this.fail(new Error(`Claims helper input failed: ${error.message}`)); });
       this.child.stdout.on('data', data => {
-        if (this.failure || this.closing || this.processClosed) return;
+        if (this.failure || this.drainFailed || this.processClosed) return;
         try {
           this.buffer += data.toString('utf8');
           let end;
@@ -68,7 +68,7 @@ export class ConnectionPool {
         this.readyReject(claimAborted()); this.closedResolve();
       });
       this.startTimer = setTimeout(() => this.fail(new Error('Claims helper startup timed out; update or rebuild the helper')), 15000);
-      this.send({ type: 'start', protocol: 3, options: this.options });
+      this.send({ type: 'start', protocol: 4, options: this.options });
     } catch (error) { this.fail(error); this.closedResolve(); }
     return this.ready;
   }
@@ -80,13 +80,13 @@ export class ConnectionPool {
     if ((this.child?.stdin.writableLength ?? 0) > 1024 * 1024) throw new Error('Claims helper input backpressure exceeded');
     this.child.stdin.write(line);
   }
-  request(kind, body, { signal, onStarted, onCapture } = {}) {
+  request(kind, body, { signal, onStarted, onCapture, onResult } = {}) {
     if (this.failure) return Promise.reject(this.failure);
     if (!this.started || this.closing || signal?.aborted) return Promise.reject(claimAborted());
     if (this.requests.size >= 512 || this.sequence >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('Claims helper request capacity exceeded'));
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
-      const request = { id, kind, body, signal, onStarted, onCapture, resolve, reject, started: false, capture: null };
+      const request = { id, kind, body, signal, onStarted, onCapture, onResult, resolve, reject, started: false, capture: null };
       request.abort = () => { try { this.send({ type: 'cancel', id }); } catch { /* A closing helper is already cancelled. */ } };
       // Bounds one DNS/capture/verification, never a whole bounty's search.
       request.timer = setTimeout(() => this.fail(new Error('Claims helper request exceeded its deadline')), 45000);
@@ -104,14 +104,15 @@ export class ConnectionPool {
   receive(message) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Malformed claims helper response');
     if (message.type === 'ready') {
-      if (this.started || message.protocol !== 3 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64) {
-        throw new Error('Incompatible claims helper: RSA public-exponent limit must be 64 bits. Update the app or run npm run build:claims.');
+      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64) {
+        throw new Error('Incompatible claims helper: validated observations require protocol 4 and a 64-bit RSA public-exponent limit. Update the app or run npm run build:claims.');
       }
-      this.started = true; clearTimeout(this.startTimer); this.readyResolve(); return;
+      this.started = true; clearTimeout(this.startTimer);
+      if (this.closing) this.readyReject(claimAborted()); else this.readyResolve();
+      return;
     }
     if (message.type === 'error') throw new Error('Claims helper failed');
-    // Protocol 3 keeps its optional message field, but only fixed descriptions
-    // may reach the claims engine/UI. Older helpers' generic failures still work.
+    // Only fixed descriptions may reach the claims engine/UI.
     if (Object.hasOwn(message, 'message')) message = { ...message,
       message: ATTEMPT_MESSAGES.has(message.message) ? message.message : 'TLS capture or proof validation failed' };
     if (!Number.isSafeInteger(message.id)) throw new Error('Invalid helper request identity');
@@ -142,18 +143,39 @@ export class ConnectionPool {
     if (request.started && !request.capture) throw new Error('Missing helper capture observation');
     if (request.capture && (request.capture.captured !== message.captured || request.capture.seconds !== message.seconds ||
         request.capture.successfulConnections !== message.successfulConnections)) throw new Error('Conflicting helper capture observation');
+    if (![true, false, null].includes(message.validationPassed) ||
+        (message.validationPassed !== null && !message.started) ||
+        (message.validationPassed === true && !message.captured) ||
+        (message.validationPassed === null && message.started && !message.cancelled)) {
+      throw new Error('Invalid helper validation observation');
+    }
     if (message.proof !== null) {
-      if (!message.captured || message.verified !== true || message.cancelled || typeof message.proof !== 'string' || !/^02(?:[0-9a-f]{2})+$/.test(message.proof) || message.proof.length > 131072) throw new Error('Invalid verified proof result');
+      if (!message.captured || message.validationPassed !== true || message.verified !== true || message.cancelled || typeof message.proof !== 'string' || !/^02(?:[0-9a-f]{2})+$/.test(message.proof) || message.proof.length > 131072) throw new Error('Invalid verified proof result');
     } else if (message.verified !== false) throw new Error('Invalid proof verification status');
+    // Preserve a completed validation observation even if cancellation arrived
+    // before its acknowledgement. Never turn an unvalidated capture into success.
+    request.onResult?.(this.closing ? { ...message, proof: null, verified: false, cancelled: true } : message);
     this.finish(request, request.signal?.aborted ? claimAborted() : null, message);
   }
   finish(request, error, result) {
     if (!this.requests.delete(request.id)) return;
     clearTimeout(request.timer); request.signal?.removeEventListener('abort', request.abort);
+    // Closing cancels every request, including callers without an AbortSignal.
+    // Result callbacks above may retain validated observations, never a proof.
+    if (this.closing) error = claimAborted();
     if (error) request.reject(error); else request.resolve(result);
   }
   fail(error, exit = {}) {
-    if (this.failure || this.closing) return;
+    if (this.failure || this.drainFailed) return;
+    if (this.closing) {
+      // Shutdown still parses bounded, validated result frames. A bad frame
+      // ends draining immediately without turning requested shutdown into a crash.
+      this.drainFailed = true; this.buffer = '';
+      this.readyReject?.(claimAborted());
+      for (const request of [...this.requests.values()]) this.finish(request, claimAborted());
+      if (this.child && !this.processClosed && !this.child.killed) this.child.kill('SIGKILL');
+      return;
+    }
     this.failure = Object.assign(error, { helperFatal: true });
     clearTimeout(this.startTimer); this.readyReject?.(this.failure);
     for (const request of [...this.requests.values()]) this.finish(request, this.failure);
@@ -171,6 +193,7 @@ export class ConnectionPool {
     if (this.closing) return this.closed;
     this.closing = true;
     clearTimeout(this.startTimer);
+    this.readyReject?.(claimAborted());
     if (!this.child || this.processClosed) { this.closedResolve?.(); return; }
     try { this.send({ type: 'shutdown' }); this.child.stdin.end(); } catch { this.child.kill('SIGKILL'); }
     this.killTimer = setTimeout(() => { if (!this.child.killed) this.child.kill('SIGKILL'); }, 2000);

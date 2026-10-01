@@ -25,18 +25,22 @@ const validBounty = b => b && typeof b.txid === 'string' && b.txid.length === 64
 function injectedPool(generateProof) {
   return {
     async start() {}, async resolve() {}, async close() {},
-    async attempt(context, { signal, onStarted, onCapture }) {
+    async attempt(context, { signal, onStarted, onCapture, onResult }) {
       if (signal.aborted) throw claimAborted();
       onStarted(); const started = performance.now();
+      let proof;
       try {
-        const proof = await generateProof(context, { signal, options: { connectionsPerSecond: 1, concurrency: 1 }, onProgress() {} });
+        proof = await generateProof(context, { signal, options: { connectionsPerSecond: 1, concurrency: 1 }, onProgress() {} });
         if (signal.aborted) throw claimAborted();
-        const result = { started: true, captured: true, seconds: (performance.now() - started) / 1000, cancelled: false, proof, verified: true };
-        onCapture(result); return result;
       } catch (error) {
-        if (error.name !== 'AbortError') onCapture({ started: true, captured: false, seconds: (performance.now() - started) / 1000, cancelled: false });
+        if (error.name !== 'AbortError') {
+          const result = { started: true, captured: false, seconds: (performance.now() - started) / 1000, cancelled: false, validationPassed: false };
+          onCapture(result); onResult(result);
+        }
         throw error;
       }
+      const result = { started: true, captured: true, seconds: (performance.now() - started) / 1000, cancelled: false, proof, verified: true, validationPassed: true };
+      onCapture(result); onResult(result); return result;
     },
   };
 }
@@ -223,7 +227,7 @@ export class ClaimsEngine {
     for (const domain of this.waitingDns) if (!domains.has(domain)) this.waitingDns.delete(domain);
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
-    // Legacy tooling only. Production observes every protocol-3 capture.
+    // Legacy tooling only. Production observes every protocol-4 validation result.
     // A truncated snapshot cannot reconstruct an EMA: never silently drop
     // missing observations as the former last-100 window permitted.
     validateAttemptStats(snapshot, Number.MAX_SAFE_INTEGER);
@@ -436,15 +440,10 @@ export class ClaimsEngine {
     if (request.observed) throw new Error('Duplicate connection observation');
     request.observed = true;
     const { job } = request, key = keyOf(job.bounty);
-    if (observation.captured || !observation.cancelled) {
-      const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
-      const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
-      stats.record(observation.captured, observation.seconds);
-    }
     if (observation.captured) {
       this.countDiagnostic('captures');
       const count = this.successCounts.get(key) ?? 0n;
-      // Protocol 3 reports the cumulative count at capture completion. Replies
+      // The raw-capture budget is independent of the validated domain EMA. Replies
       // from parallel workers may arrive out of order, so never add it twice.
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
@@ -453,6 +452,24 @@ export class ClaimsEngine {
       job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(key));
       if (job.budgetExceeded) this.scheduler.remove(key); // Keep already-running attempts alive.
     }
+  }
+  observeResult(request, result) {
+    if (request.resultObserved) throw new Error('Duplicate connection validation observation');
+    request.resultObserved = true;
+    if (![true, false, null].includes(result.validationPassed) ||
+        typeof result.seconds !== 'number' || !Number.isFinite(result.seconds) || result.seconds < 0 || result.seconds > 3600 ||
+        (result.validationPassed !== null && !result.started) ||
+        (result.validationPassed === true && !result.captured) ||
+        (result.validationPassed === null && result.started && !result.cancelled)) {
+      throw new Error('Invalid connection validation observation');
+    }
+    // Null means no conclusive observation, e.g. cancellation before validation.
+    // A target miss is still true: work probability already enters rawPriority.
+    if (result.validationPassed === null) return;
+    const { job } = request;
+    const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
+    const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
+    stats.record(result.validationPassed, result.seconds);
   }
   dispatch(selection, generation) {
     const [key, job] = selection, controller = new AbortController(), token = ++this.nextToken;
@@ -477,7 +494,10 @@ export class ClaimsEngine {
             ? { status: 'searching', domain: context.domain, lastError: null } : {}) }); this.kick();
       },
       onCapture: observation => this.observe(request, observation),
+      onResult: result => this.observeResult(request, result),
     })).then(async result => {
+      // Offline/custom adapters may return the terminal result without a callback.
+      if (!request.resultObserved) this.observeResult(request, result);
       this.finishOperation(operation, !valid() || result.cancelled ? 'cancelled' : result.message ? 'failed' : 'completed');
       if (!valid()) return;
       if (result.blocked === 'budget') { job.budgetExceeded = true; this.scheduler.remove(key); return; }

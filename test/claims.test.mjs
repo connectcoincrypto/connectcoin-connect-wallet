@@ -87,7 +87,7 @@ function fakeSpawn(send) {
   } };
 }
 const validResult = (request) => ({ type: 'result', context: request.context, proof: '020100', verified: true, attempts: 1 });
-const validProgress = { type: 'progress', attempts: 1, elapsed: 0.1, attemptStats: { completed: 1, recent: [[true, 0.1]] } };
+const validProgress = { type: 'progress', attempts: 1, elapsed: 0.1, attemptStats: { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] } };
 
 test('proof runner sends only public context via stdin, no shell; requires verified matching result and clean exit', async () => {
   const fixture = fakeSpawn((child, request) => {

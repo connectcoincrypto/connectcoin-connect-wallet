@@ -32,7 +32,7 @@ await run(python, ['-I', resolve(base, 'helpers/claims_bridge.py'), '--self-test
 const sourcePool = new ConnectionPool({ helper: { command: python, args: ['-I', resolve(base, 'helpers/claims_bridge.py')] } });
 try { await sourcePool.start({}); }
 finally { await sourcePool.close(); }
-console.log('Isolated source protocol-3 startup and shutdown verified.');
+console.log('Isolated source protocol-4 startup and shutdown verified.');
 await run(python, ['-m', 'unittest', 'discover', '-s', resolve(base, 'helpers/tests'), '-v']);
 if (build) {
   await run(python, [resolve(base, 'helpers/collect_licenses.py')]);

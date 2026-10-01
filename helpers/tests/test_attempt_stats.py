@@ -92,8 +92,9 @@ class AttemptStatsTests(unittest.TestCase):
                 raise OSError("controlled connection failure")
             return capture()
 
-        with patch.object(generator, "_capture", side_effect=fake_capture), ThreadPoolExecutor(3) as executor:
-            futures = [executor.submit(generator._capture_observed, i, context(), 1, recorder)
+        with patch.object(generator, "_capture", side_effect=fake_capture), patch.object(
+                generator, "verify_connection_proof"), ThreadPoolExecutor(3) as executor:
+            futures = [executor.submit(generator._capture_observed, i, context(), 1, recorder, "unused")
                        for i in range(3)]
             try:
                 self.assertTrue(all(item.wait(3) for item in entered))
@@ -113,8 +114,8 @@ class AttemptStatsTests(unittest.TestCase):
     def test_duration_measures_only_the_capture_call(self):
         recorder = generator._AttemptRecorder()
         with patch.object(generator.time, "monotonic", side_effect=[100.0, 100.125]), patch.object(
-                generator, "_capture", return_value=capture()):
-            generator._capture_observed(None, context(), 10, recorder)
+                generator, "_capture", return_value=capture()), patch.object(generator, "verify_connection_proof"):
+            generator._capture_observed(None, context(), 10, recorder, "unused")
         self.assertEqual(recorder.snapshot().recent, ((True, 0.125),))
 
     def test_queued_cancelled_capture_does_not_create_failure(self):
@@ -126,10 +127,11 @@ class AttemptStatsTests(unittest.TestCase):
             if not release.wait(3): raise RuntimeError("test synchronization timeout")
             return capture()
 
-        with patch.object(generator, "_capture", side_effect=fake_capture), ThreadPoolExecutor(1) as executor:
-            active = executor.submit(generator._capture_observed, None, context(), 1, recorder)
+        with patch.object(generator, "_capture", side_effect=fake_capture), patch.object(
+                generator, "verify_connection_proof"), ThreadPoolExecutor(1) as executor:
+            active = executor.submit(generator._capture_observed, None, context(), 1, recorder, "unused")
             self.assertTrue(entered.wait(3))
-            queued = executor.submit(generator._capture_observed, None, context(), 1, recorder)
+            queued = executor.submit(generator._capture_observed, None, context(), 1, recorder, "unused")
             try:
                 self.assertTrue(queued.cancel())
                 self.assertEqual(recorder.snapshot().completed, 0)
@@ -142,10 +144,13 @@ class AttemptStatsTests(unittest.TestCase):
     def test_successful_capture_counts_when_work_target_misses(self):
         updates = []
         with ExitStack() as stack:
-            self.fake_network(stack, [capture(), OSError("TLS failed"), capture()])
+            verifier = self.fake_network(stack, [capture(), OSError("TLS failed"), capture()])
             with self.assertRaisesRegex(generator.GenerationError, "no proof met the target"):
                 generator.generate_connection_proof(context(), "unused", generator.GenerationOptions(
                     connections_per_second=-1, concurrency=1, max_attempts=3), updates.append)
+            self.assertEqual(verifier.call_count, 2)
+            self.assertTrue(all(call.args[0].connection_work_target == "f" * 64
+                                for call in verifier.call_args_list))
         self.assertEqual(sum(update.finished for update in updates), 1)
         self.assertTrue(updates[-1].finished)
         self.assertEqual(updates[-1].attempts, 3)
@@ -153,7 +158,7 @@ class AttemptStatsTests(unittest.TestCase):
         counts = [item.attempt_stats.completed for item in updates]
         self.assertEqual(counts, sorted(counts))
 
-    def test_capture_success_precedes_certificate_verification(self):
+    def test_invalid_certificate_is_recorded_as_failed_validation(self):
         updates = []
         with ExitStack() as stack:
             verify = self.fake_network(stack, [capture()])
@@ -161,7 +166,18 @@ class AttemptStatsTests(unittest.TestCase):
             with self.assertRaises(generator.GenerationError):
                 generator.generate_connection_proof(context(), "unused", generator.GenerationOptions(
                     connections_per_second=-1, concurrency=1, max_attempts=1), updates.append)
-        self.assertTrue(updates[-1].attempt_stats.recent[0][0])
+        self.assertFalse(updates[-1].attempt_stats.recent[0][0])
+
+    def test_later_target_misses_are_also_cryptographically_verified(self):
+        updates = []
+        with ExitStack() as stack:
+            verifier = self.fake_network(stack, [capture(), capture(), capture()])
+            verifier.side_effect = [None, ProofVerificationError("bad CertificateVerify"), None]
+            with self.assertRaises(generator.GenerationError):
+                generator.generate_connection_proof(context(), "unused", generator.GenerationOptions(
+                    connections_per_second=-1, concurrency=1, max_attempts=3), updates.append)
+        self.assertEqual(verifier.call_count, 3)
+        self.assertEqual([item[0] for item in updates[-1].attempt_stats.recent], [True, False, True])
 
     def test_final_snapshot_includes_inflight_completion_after_winning_proof(self):
         updates = []
@@ -205,6 +221,43 @@ class AttemptStatsTests(unittest.TestCase):
         self.assertTrue(updates[0].finished)
         self.assertEqual(updates[0].attempt_stats, generator.AttemptStats())
 
+    def test_inflight_capture_after_winning_proof_still_verifies_and_records_once(self):
+        updates = []
+        second_started, winner_selected = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        started = 0
+
+        def capture_inflight(*_):
+            nonlocal started
+            with lock:
+                started += 1
+                index = started
+            if index == 1:
+                if not second_started.wait(3): raise RuntimeError("second capture did not start")
+                return capture()
+            second_started.set()
+            if not winner_selected.wait(3): raise RuntimeError("winning proof was not selected")
+            return SimpleNamespace(encoded_proof=b"invalid signature", peer_ip="8.8.8.8")
+
+        def verify(candidate, *_args, **_kwargs):
+            if candidate.proof == b"invalid signature":
+                raise ProofVerificationError("invalid CertificateVerify")
+
+        with ExitStack() as stack:
+            verifier = self.fake_network(stack, capture_inflight, met_target=True)
+            verifier.side_effect = verify
+            stack.enter_context(patch.object(generator, "meets_work_target",
+                side_effect=lambda *_: winner_selected.set() or True))
+            try:
+                result = generator.generate_connection_proof(context(), "unused", generator.GenerationOptions(
+                    connections_per_second=-1, concurrency=2, max_attempts=2), updates.append)
+            finally:
+                winner_selected.set()
+        self.assertEqual(verifier.call_count, 2)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual([item[0] for item in updates[-1].attempt_stats.recent], [True, False])
+        self.assertEqual(updates[-1].attempt_stats.completed, 2)
+
     def test_bridge_final_stats_precede_result_or_verification_error(self):
         for succeeds in (True, False):
             with self.subTest(succeeds=succeeds), ExitStack() as stack:
@@ -244,6 +297,7 @@ class AttemptStatsTests(unittest.TestCase):
         for call in emit.call_args_list:
             frame = json.loads(json.dumps(call.args[0]))
             self.assertEqual(frame["attempts"], frame["attemptStats"]["completed"])
+            self.assertEqual(frame["attemptStats"]["validation"], "certificate-proof-v1")
             self.assertEqual(frame["attemptStats"]["recent"], [[True, 0.25]])
 
     def test_one_hundred_thousand_attempts_cannot_expand_progress_payload(self):

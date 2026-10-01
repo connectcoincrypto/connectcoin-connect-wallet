@@ -23,12 +23,12 @@ if (selfTest.error || selfTest.status !== 0) throw new Error('Bundled Automatic 
 const security = validateHelperSecurity(selfTest.stdout, expectedVersion);
 console.log(`Bundled cryptography ${security.cryptographyVersion}; ${security.opensslVersion}.`);
 // A legacy one-shot executable can pass its own self-test but still be
-// incompatible with the wallet. Exercise the real protocol-3 handshake too;
+// incompatible with the wallet. Exercise the real protocol-4 handshake too;
 // this sends no DNS requests, TLS connections, RPC calls or wallet data.
 const pool = new ConnectionPool({ helper: { command: helper, args: [] } });
 try { await pool.start({}); }
 finally { await pool.close(); }
-// An older protocol-3 helper lacks RSA probing. Exercise the new mode with an
+// An older helper may lack RSA probing. Exercise the new mode with an
 // invalid request so packaging cannot silently ship it; no DNS/TLS is attempted.
 await new Promise((accept, reject) => {
   const child = spawn(helper, ['--probe-rsa', '--require-rsa-exponent-64'], { cwd: root, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
@@ -48,4 +48,4 @@ await new Promise((accept, reject) => {
   });
   child.stdin.end('{}\n');
 });
-console.log('Native protocol-3 helper, RSA probe and desktop assets verified for packaging.');
+console.log('Native protocol-4 helper, RSA probe and desktop assets verified for packaging.');

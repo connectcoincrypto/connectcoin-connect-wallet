@@ -275,7 +275,7 @@ test('a complete discovery rescan keeps each surviving bounty factor and domain 
   service.engine.randomIndex = () => ++draws;
   service.engine.enqueue([bounty]);
   const job = service.engine.queue.get(bountyKey(bounty)), factor = job.factor;
-  service.engine.recordAttemptStats(job, { completed: 1, recent: [[true, 0.1]] }, 0);
+  service.engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] }, 0);
   service.claimCursor = null; // An expired cursor requires the same full-rescan path.
   mockDiscovery(service, { height: 600, rows: [bounty] });
   await service.syncBountiesInternal(service.epoch);

@@ -108,10 +108,10 @@ for (const failureMode of ['capture-result', 'proof-error']) test(`one ${failure
       if (attempts === 1) {
         onCapture({ started: true, captured: false, cancelled: false, seconds: 10 });
         if (failureMode === 'proof-error') throw new Error('TLS connection timed out');
-        return { started: true, captured: false, cancelled: false, message: 'TLS connection timed out' };
+        return { started: true, captured: false, validationPassed: false, cancelled: false, seconds: 10, message: 'TLS connection timed out' };
       }
       await secondCapture.promise;
-      const result = { started: true, captured: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
+      const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
       onCapture(result); return result;
     },
   };

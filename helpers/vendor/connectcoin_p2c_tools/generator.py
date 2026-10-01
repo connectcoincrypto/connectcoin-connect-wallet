@@ -39,7 +39,7 @@ class GenerationOptions:
 
 @dataclass(frozen=True, slots=True)
 class AttemptStats:
-    """Last 100 capture outcomes, oldest first, with a per-run sequence count."""
+    """Last 100 validated outcomes, oldest first, with a per-run sequence count."""
 
     completed: int = 0
     recent: tuple[tuple[bool, float], ...] = ()
@@ -52,8 +52,8 @@ class _AttemptRecorder:
         self._recent: deque[tuple[bool, float]] = deque(maxlen=100)
 
     def record(self, success: bool, seconds: float) -> None:
-        # Match Core's treatment of invalid clock observations. A successful
-        # capture is counted before certificate verification or the work test.
+        # Ignore invalid clock observations. Success requires certificate and
+        # proof-signature validation; the work-target test is independent.
         if type(success) is not bool or not math.isfinite(seconds) or seconds < 0:
             return
         with self._lock:
@@ -216,18 +216,28 @@ def _capture_observed(
     context: ConnectionProof,
     timeout: float,
     recorder: _AttemptRecorder,
+    roots_path: str | Path,
+    *,
+    enforce_root_pin: bool = True,
 ) -> TLSProofMessages:
     # Begin inside the worker: executor queue time is not connection latency.
     started_at = time.monotonic()
     success = False
+    seconds = None
     try:
         captured = _capture(endpoint, context, timeout)
+        seconds = time.monotonic() - started_at
+        preflight = replace(context, proof=captured.encoded_proof, connection_work_target="f" * 64)
+        verify_connection_proof(preflight, roots_path, enforce_root_pin=enforce_root_pin)
         success = True
         return captured
     finally:
-        # Recording here, under one lock, preserves completion order instead of
-        # the arbitrary iteration order of concurrent.futures.wait's done set.
-        recorder.record(success, time.monotonic() - started_at)
+        # Verification may finish after a different connection wins. Keep that
+        # real outcome once, in validation-completion order, while latency still
+        # measures only TCP/TLS rather than local cryptographic work.
+        if seconds is None:
+            seconds = time.monotonic() - started_at
+        recorder.record(success, seconds)
 
 
 def _generate_connection_proof(
@@ -265,7 +275,6 @@ def _generate_connection_proof(
     best_value: int | None = None
     best_hash: str | None = None
     last_error: str | None = None
-    preflight_complete = False
     pending: dict[Future[TLSProofMessages], int] = {}
 
     executor = ThreadPoolExecutor(max_workers=options.concurrency, thread_name_prefix="p2c-tls")
@@ -298,7 +307,8 @@ def _generate_connection_proof(
                         attempt_timeout,
                         options.overall_timeout - (now - started_at),
                     )
-                future = executor.submit(_capture_observed, endpoint, context, attempt_timeout, recorder)
+                future = executor.submit(_capture_observed, endpoint, context, attempt_timeout, recorder,
+                                         roots_path, enforce_root_pin=options.enforce_root_pin)
                 pending[future] = attempts_started
                 if options.connections_per_second != -1:
                     interval = 1.0 / options.connections_per_second
@@ -325,26 +335,9 @@ def _generate_connection_proof(
                         best_value = numeric_work
                         best_hash = internal_hash_to_display(parsed.connection_work_hash)
 
-                    candidate_verified = False
-                    if not preflight_complete:
-                        preflight = replace(candidate, connection_work_target="f" * 64)
-                        verify_connection_proof(
-                            preflight,
-                            roots_path,
-                            enforce_root_pin=options.enforce_root_pin,
-                        )
-                        preflight_complete = True
-                        candidate_verified = True
-
                     if meets_work_target(
                         parsed.connection_work_hash, candidate.connection_work_target
                     ):
-                        if not candidate_verified:
-                            verify_connection_proof(
-                                candidate,
-                                roots_path,
-                                enforce_root_pin=options.enforce_root_pin,
-                            )
                         elapsed = time.monotonic() - started_at
                         return GenerationResult(
                             candidate, attempts_completed, elapsed, capture.peer_ip

@@ -26,7 +26,7 @@ function fixture(t, { failAtStart = false } = {}) {
             const message = JSON.parse(frame.toString());
             if (message.type === 'start') queueMicrotask(() => failAtStart
               ? child.emit('close', 1, null)
-              : child.stdout.write('{"type":"ready","protocol":3,"roots":1,"security":{"rsaPublicExponentMaxBits":64}}\n'));
+              : child.stdout.write('{"type":"ready","protocol":4,"roots":1,"security":{"rsaPublicExponentMaxBits":64}}\n'));
             if (message.type === 'shutdown') queueMicrotask(() => child.emit('close', 0, null));
           });
           return child;
@@ -87,7 +87,7 @@ test('helper failure cannot hide an unknown in-flight broadcast outcome discover
       failHelper = onFailure;
       return { async start() {}, async close() {}, async resolve() {},
         async attempt(_context, { onStarted, onCapture }) {
-          onStarted(); const result = { started: true, captured: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
+          onStarted(); const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
           onCapture(result); return result;
         },
       };
@@ -122,7 +122,7 @@ for (const lateOutcome of ['success', 'rejection']) test(`another submission's l
     onDiagnostic: (event, details) => events.push({ event, details }),
     poolFactory: () => ({ pacesStarts: true, async start() {}, async close() {}, async resolve() {},
       async attempt(_context, { onStarted, onCapture }) {
-        onStarted(); const result = { started: true, captured: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
+        onStarted(); const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, verified: true, proof: '020100' };
         onCapture(result); return result;
       },
     }),

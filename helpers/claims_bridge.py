@@ -121,7 +121,8 @@ class ProgressReporter:
             emit({"type": "progress", "attempts": update.attempt_stats.completed,
                   "elapsed": round(update.elapsed, 3),
                   "bestWorkHash": update.best_work_hash,
-                  "attemptStats": {"completed": update.attempt_stats.completed,
+                  "attemptStats": {"validation": "certificate-proof-v1",
+                                   "completed": update.attempt_stats.completed,
                                    "recent": update.attempt_stats.recent}})
 
 
@@ -153,7 +154,7 @@ def main() -> int:
         from connectcoin_p2c_tools.verify import validate_root_bundle
         security = security_provider_versions()
         validate_root_bundle(ROOT / "p2c_roots_v1.pem", 1)
-        emit({"type": "ready", "protocol": 3, "roots": 1, "security": security})
+        emit({"type": "ready", "protocol": 4, "roots": 1, "security": security})
         return 0
     line = sys.stdin.buffer.readline(16385)
     if len(line) > 16384 or not line.endswith(b"\n"):

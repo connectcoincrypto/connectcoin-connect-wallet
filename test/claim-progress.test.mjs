@@ -24,7 +24,7 @@ function fixture(t, overrides = {}) {
   const events = [], { pool: poolOverrides, ...options } = overrides;
   const pool = { pacesStarts: true, async start() {}, async close() {}, async resolve() {},
     async attempt(_context, { onStarted, onCapture }) {
-      onStarted(); const result = { started: true, captured: true, cancelled: false, seconds: 0.1, proof: '020100', verified: true };
+      onStarted(); const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, proof: '020100', verified: true };
       onCapture(result); return result;
     }, ...poolOverrides };
   const engine = new ClaimsEngine({ isUnlocked: () => true, randomIndex: () => 0,
@@ -86,7 +86,7 @@ test('success duration measures submit only while progress aggregates completed 
     prepare: async item => { now += 100; return { context: context(item) }; },
     pool: { async attempt(_ctx, { onStarted, onCapture }) {
       onStarted(); now += 150;
-      const result = { started: true, captured: true, cancelled: false, seconds: 0.15, proof: '020100', verified: true };
+      const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.15, proof: '020100', verified: true };
       onCapture(result); return result;
     } },
     submit: async prepared => { now += 50; return prepared.context.txid; },
@@ -164,7 +164,7 @@ test('a winning proof aggregates sibling cancellation separately from stop', asy
         const abort = () => reject(aborted()); signal.addEventListener('abort', abort, { once: true });
         attempts.push(() => {
           signal.removeEventListener('abort', abort);
-          const result = { started: true, captured: true, cancelled: false, seconds: 0.1, proof: '020100', verified: true };
+          const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, proof: '020100', verified: true };
           onCapture(result); resolve(result);
         });
         onStarted();

@@ -27,13 +27,14 @@ and completed-probe modes. Runtime tests reject legacy helper capabilities and
 enforce the one-shot/probe compatibility flag before any network work.
 
 Offline telemetry tests cover completion order under concurrency, rolling
-100-entry snapshots and monotonic completion counts, successful captures that
-miss the work target or fail later certificate verification, queued cancellation,
+100-entry snapshots and monotonic completion counts, validated captures that
+miss the work target, failed certificate/signature validation, queued cancellation,
 DNS failure, and in-flight completions after a winning proof. A 100,000-attempt
 simulation verifies the once-per-second output limit and bounded NDJSON size.
 These scheduler tests mock public capture calls and send no public traffic.
 
-Persistent protocol-3 tests cover startup/shutdown, strict framing/IDs/options,
+Persistent protocol-4 tests cover startup/shutdown and rejection of earlier
+protocols, strict framing/IDs/options,
 DNS caching/expiry and endpoint rotation, global start-rate/concurrency limits,
 per-attempt cancellation, completion-before-verification ordering, exact uint64
 successful-capture budgets and their strict two-expected-value boundary, and
@@ -41,6 +42,13 @@ bounded pending/DNS/counter caches. A 1,100-capture simulation verifies that one
 executor survives across all bounties without a 1,000-attempt lifetime cap. A
 second loopback fixture verifies that cancellation interrupts a real blocked
 socket receive rather than waiting for the handshake deadline.
+Terminal validation tests use fully signed fixture proofs to distinguish a
+cryptographically valid hash miss from invalid certificate names and invalid
+CertificateVerify signatures. They also cover malformed proofs, known results
+preserved through cancellation during/after verification, null outcomes when
+cancelled before verification, unchanged capture duration, and one terminal
+validated observation per request. Fixture roots are substituted only within
+the test verifier call; the production service has no custom-root bypass.
 
 The independent native Core regtest checks ConnectWallet's typed transaction wire
 encoding, native Schnorr payments, P2C funding and the spending transaction's

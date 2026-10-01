@@ -33,11 +33,12 @@ function fixture(t, overrides = {}) {
             if (attempt.settled) return;
             attempt.settled = true;
             options.signal?.removeEventListener('abort', abort);
-            const value = { started: true, captured: false, seconds: 0.01, proof: null, verified: false, cancelled: false, ...extra };
+            const value = { started: true, captured: false, validationPassed: false, seconds: 0.01, proof: null, verified: false, cancelled: false, ...extra };
             if (!value.cancelled) options.onCapture?.(value);
+            options.onResult?.(value);
             resolve(value);
           };
-          const abort = () => finish({ started: true, cancelled: true });
+          const abort = () => finish({ started: true, validationPassed: null, cancelled: true });
           attempt.finish = finish; attempt.reject = reject;
           attempts.push(attempt);
           options.signal?.addEventListener('abort', abort, { once: true });
@@ -78,7 +79,7 @@ test('simultaneous fresh winners and queued proofs share the four-submission lim
   engine.dns.set('example.com', { ok: true, expires: Date.now() + 60000 });
   engine.start();
   await until(() => new Set(attempts.map(item => item.bountyId)).size === 12);
-  for (const attempt of attempts) attempt.finish({ captured: true, proof: '020100', verified: true });
+  for (const attempt of attempts) attempt.finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => sent.length >= 4);
   await tick(); await tick();
   assert.equal(active, 4); assert.equal(sent.length, 4);
@@ -129,7 +130,7 @@ test('successful captures, not hash wins, enforce strict 2E cutoff and survive s
   for (let i = 0; i < 3; i++) {
     await until(() => attempts.length === i + 1);
     assert.equal(attempts[i].successfulConnections, BigInt(i));
-    attempts[i].finish({ captured: true });
+    attempts[i].finish({ captured: true, validationPassed: true });
   }
   await until(() => !engine.hasActive(key(bounty)));
   assert.equal(engine.successCounts.get(key(bounty)), 3n);
@@ -144,11 +145,11 @@ test('failed TCP/TLS captures do not consume the successful-connection budget', 
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 } });
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 1);
-  attempts[0].finish({ captured: false, message: 'isolated TLS capture failed' });
+  attempts[0].finish({ captured: false, validationPassed: false, message: 'isolated TLS capture failed' });
   await until(() => attempts.length === 2, 'worker failure pause and next connection');
   assert.equal(attempts[1].successfulConnections, 0n);
   assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
-  attempts[1].finish({ captured: true });
+  attempts[1].finish({ captured: true, validationPassed: true });
   await until(() => (engine.successCounts.get(key(bounty)) ?? 0n) === 1n);
 });
 
@@ -156,10 +157,10 @@ test('a proof already in flight remains eligible after other captures cross the 
   const { engine, attempts, submissions } = fixture(t);
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 4);
-  for (let i = 0; i < 3; i++) attempts[i].finish({ captured: true });
+  for (let i = 0; i < 3; i++) attempts[i].finish({ captured: true, validationPassed: true });
   await until(() => engine.successCounts.get(key(bounty)) === 3n);
   assert.equal(attempts[3].signal.aborted, false);
-  attempts[3].finish({ captured: true, proof: '020100', verified: true });
+  attempts[3].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => submissions.length === 1);
   assert.deepEqual(submissions, [key(bounty)]); assert.equal(attempts.length, 4);
 });
@@ -171,11 +172,11 @@ test('the first verified proof cancels only same-bounty siblings and submits onc
   const siblings = attempts.filter(value => value.bountyId === key(alpha));
   const other = attempts.find(value => value.bountyId === key(beta));
   assert.ok(siblings.length >= 2); assert.ok(other);
-  siblings[0].finish({ captured: true, proof: '020100', verified: true });
+  siblings[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => submissions.includes(key(alpha)));
   assert.ok(siblings.slice(1).every(value => value.signal.aborted));
   assert.equal(other.signal.aborted, false);
-  other.finish({ captured: true, proof: '020100', verified: true });
+  other.finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => submissions.length === 2);
   assert.deepEqual(submissions.sort(), [key(alpha), key(beta)].sort());
 });
@@ -187,7 +188,7 @@ test('prepared public transaction is reused across individual connections while 
   });
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 1); const first = attempts[0].context;
-  validationTime++; attempts[0].finish({ captured: true });
+  validationTime++; attempts[0].finish({ captured: true, validationPassed: true });
   await until(() => attempts.length === 2);
   assert.equal(preparations.length, 1); assert.equal(engine.proposals.size, 1);
   assert.equal(attempts[1].context.txid, first.txid);
@@ -200,7 +201,7 @@ test('an unknown broadcast outcome closes the global gate and cancels unrelated 
   const { engine, attempts } = fixture(t, { submit: async () => { submitted++; throw Object.assign(new Error('unknown mocked broadcast'), { unknownOutcome: true }); } });
   engine.enqueue([row(1, 'alpha.example'), row(2, 'beta.example')]); engine.start();
   await until(() => attempts.length === 4);
-  attempts[0].finish({ captured: true, proof: '020100', verified: true });
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => !engine.enabled && !engine.activeKeys().size);
   assert.equal(submitted, 1); assert.equal(attempts.length, 4);
   assert.ok(attempts.slice(1).every(value => value.signal.aborted));
@@ -214,7 +215,7 @@ test('the public proposal cache stays at 256 and never evicts a held active chal
   assert.ok(heldProposal);
   for (let index = 1; new Set(preparations).size < 257; index++) {
     await until(() => attempts.length > index, 'next public proposal');
-    attempts[index].finish({ captured: true });
+    attempts[index].finish({ captured: true, validationPassed: true });
     assert.ok(engine.proposals.size <= 256);
     assert.strictEqual(engine.proposals.get(held.bountyId), heldProposal);
     assert.equal(held.signal.aborted, false);
@@ -228,7 +229,7 @@ test('catalog resync preserves successful budget, factor and fixed public propos
   const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 } });
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 1);
-  attempts[0].finish({ captured: true });
+  attempts[0].finish({ captured: true, validationPassed: true });
   await until(() => engine.successCounts.get(key(bounty)) === 1n);
   await engine.suspend();
   const factor = engine.factors.get(key(bounty)), prepared = engine.proposals.get(key(bounty));
@@ -255,7 +256,7 @@ test('a recoverably rejected proof retries the same transaction after 2E cutoff 
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   for (let i = 0; i < 3; i++) {
     await until(() => attempts.length === i + 1);
-    attempts[i].finish({ captured: true, ...(i === 2 ? { proof: '020100', verified: true } : {}) });
+    attempts[i].finish({ captured: true, validationPassed: true, ...(i === 2 ? { proof: '020100', verified: true } : {}) });
   }
   await until(() => engine.snapshot().completed === 1);
   assert.equal(attempts.length, 3); assert.equal(submitted.length, 2);
@@ -268,10 +269,10 @@ test('authoritative helper success totals never regress when capture observation
   const { engine, attempts } = fixture(t);
   const bounty = row(); engine.enqueue([bounty]); engine.start();
   await until(() => attempts.length === 4);
-  attempts[2].finish({ captured: true, successfulConnections: '3' });
+  attempts[2].finish({ captured: true, validationPassed: true, successfulConnections: '3' });
   await until(() => engine.successCounts.get(key(bounty)) === 3n);
-  attempts[0].finish({ captured: true, successfulConnections: '1' });
-  attempts[1].finish({ captured: true, successfulConnections: '2' });
+  attempts[0].finish({ captured: true, validationPassed: true, successfulConnections: '1' });
+  attempts[1].finish({ captured: true, validationPassed: true, successfulConnections: '2' });
   await tick();
   assert.equal(engine.successCounts.get(key(bounty)), 3n);
   assert.equal(attempts[3].signal.aborted, false, 'out-of-order totals cannot cancel work already started');
@@ -319,7 +320,7 @@ test('a late TCP-start acknowledgement after stop counts the attempt without rev
   const { engine } = fixture(t, {
     transformPool: pool => ({ ...pool, attempt(ctx, options) { request = { ctx, ...options }; return new Promise(resolve => { finish = resolve; }); } }),
   });
-  const cancelled = { started: true, captured: false, cancelled: true, seconds: 0, proof: null, verified: false };
+  const cancelled = { started: true, captured: false, validationPassed: null, cancelled: true, seconds: 0, proof: null, verified: false };
   try {
     engine.enqueue([row()]); engine.start(); await until(() => request);
     const stopping = engine.stop();
@@ -346,7 +347,7 @@ test('outpoint invalidation aborts an active retry submission, not only its orig
     },
   });
   const bounty = row(); engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
-  attempts[0].finish({ captured: true, proof: '020100', verified: true });
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
   await until(() => retrySignal);
   assert.equal(engine.hasActive(key(bounty)), true);
   engine.remove(bounty.txid, bounty.vout);
@@ -369,7 +370,7 @@ test('a verified pending proof retains the only queue slot after resync even bey
   engine.enqueue([bounty]); engine.start();
   for (let i = 0; i < 3; i++) {
     await until(() => attempts.length === i + 1);
-    attempts[i].finish({ captured: true, ...(i === 2 ? { proof: '020100', verified: true } : {}) });
+    attempts[i].finish({ captured: true, validationPassed: true, ...(i === 2 ? { proof: '020100', verified: true } : {}) });
   }
   await until(() => engine.pendingProofs.has(key(bounty)) && !engine.hasActive(key(bounty)));
   await engine.suspend();

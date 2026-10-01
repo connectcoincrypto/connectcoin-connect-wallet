@@ -123,7 +123,7 @@ test('failed domain EMA excludes new assignments and survives catalog refresh wi
   engine.enqueue([failed, fresh]);
   const job = engine.queue.get(key(failed));
   for (let i = 0; i < 20000; i++) {
-    engine.observe({ job, observed: false }, { captured: false, cancelled: false, seconds: 0.1 });
+    engine.observeResult({ job, started: true, observed: false }, { started: true, captured: false, validationPassed: false, cancelled: false, seconds: 0.1 });
   }
   const stats = engine.domainStats.get('failed.example:7'), rate = stats.connectionRate();
   assert.equal(isWorthAttempting(job.rawPriority, rate), false);
@@ -389,10 +389,10 @@ test('a retry keeps the prepared payout and per-bounty factor despite a changed 
       async attempt(_context, { signal, onStarted, onCapture }) {
         attempts++; onStarted();
         if (attempts === 1) {
-          const result = { started: true, captured: true, cancelled: false, seconds: 0.1, proof: null, verified: false };
+          const result = { started: true, captured: true, validationPassed: true, cancelled: false, seconds: 0.1, proof: null, verified: false };
           onCapture(result); return result;
         }
-        return new Promise(resolve => signal.addEventListener('abort', () => resolve({ started: true, captured: false, cancelled: true, seconds: 0, proof: null, verified: false }), { once: true }));
+        return new Promise(resolve => signal.addEventListener('abort', () => resolve({ started: true, captured: false, validationPassed: null, cancelled: true, seconds: 0, proof: null, verified: false }), { once: true }));
       },
     }),
   });
@@ -434,7 +434,7 @@ test('verified funding policy replaces discovery policy before TLS and is resele
     },
     generateProof: async (verified, { onProgress }) => {
       proofDomains.push(verified.domain);
-      onProgress({ attempts: 1, elapsed: 0.1, attemptStats: { completed: 1, recent: [[true, 0.1]] } });
+      onProgress({ attempts: 1, elapsed: 0.1, attemptStats: { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] } });
       return '020100';
     },
   });
@@ -495,7 +495,7 @@ test('a real failed TLS capture consumes exactly one turn at its TCP start', asy
   const { engine } = fixture(t, {
     poolFactory: () => ({ async start() {}, async resolve() {}, async close() {},
       async attempt(_context, { onStarted, onCapture }) {
-        onStarted(); const result = { started: true, captured: false, cancelled: false, seconds: 0.1, proof: null, verified: false };
+        onStarted(); const result = { started: true, captured: false, validationPassed: false, cancelled: false, seconds: 0.1, proof: null, verified: false };
         onCapture(result); return result;
       },
     }),

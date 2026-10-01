@@ -1,4 +1,4 @@
-"""Persistent protocol-3 tests: mocked public captures and loopback cancellation."""
+"""Persistent protocol-4 tests: validated outcomes and loopback cancellation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,9 @@ sys.path.insert(0, str(HELPERS))
 import claims_bridge
 import claims_service as service
 from connectcoin_p2c_tools.errors import ProofVerificationError
+from connectcoin_p2c_tools.protocol import parse_proof
 from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, Endpoint, TLSGenerationError, capture_tls13_proof
+from test_verifier_security import certificate, signed_proof, verify_fixture
 
 
 def public_context(**changes):
@@ -87,11 +90,20 @@ class Fixture:
 class ServiceTests(unittest.TestCase):
     def test_protocol_start_frame_and_clean_shutdown(self):
         frames = []
-        payload = [{"type": "start", "protocol": 3, "options": {"connectionsPerSecond": 100, "concurrency": 100}}, {"type": "shutdown"}]
+        payload = [{"type": "start", "protocol": 4, "options": {"connectionsPerSecond": 100, "concurrency": 100}}, {"type": "shutdown"}]
         stream = io.BytesIO(b"".join(json.dumps(frame).encode() + b"\n" for frame in payload))
         self.assertEqual(service.run_service(stream, frames.append, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem"), 0)
-        self.assertEqual(frames, [{"type": "ready", "protocol": 3, "roots": 1,
+        self.assertEqual(frames, [{"type": "ready", "protocol": 4, "roots": 1,
                                    "security": {"rsaPublicExponentMaxBits": 64}}])
+
+    def test_earlier_protocols_are_rejected_before_creating_service(self):
+        for protocol in (1, 2, 3, True, "4"):
+            with self.subTest(protocol=protocol), patch.object(service, "ClaimsService") as constructor:
+                frame = {"type": "start", "protocol": protocol, "options": {}}
+                with self.assertRaisesRegex(ValueError, "protocol 4"):
+                    service.run_service(io.BytesIO(json.dumps(frame).encode() + b"\n"),
+                                        lambda _: None, claims_bridge.parse_context, "unused")
+                constructor.assert_not_called()
 
     def test_frames_options_and_secret_fields_fail_closed(self):
         for raw in (b"{}", b"x" * 16385 + b"\n", b'{"x":NaN}\n', b'{"x":Infinity}\n', b'{"type":"cancel","type":"attempt"}\n'):
@@ -123,6 +135,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([frame["type"] for frame in h.frames if frame.get("id") == 2], ["started", "capture", "attempt"])
             self.assertEqual(result["context"], public_context())
             self.assertTrue(result["started"] and result["captured"] and result["verified"])
+            self.assertIs(result["validationPassed"], True)
             self.assertEqual(result["proof"], "0201")
             self.assertEqual(result["successfulConnections"], "1")
             self.assertFalse(result["cancelled"])
@@ -140,7 +153,115 @@ class ServiceTests(unittest.TestCase):
                 self.assertFalse(result["verified"])
                 self.assertIsNone(result["proof"])
                 self.assertEqual(result["successfulConnections"], "1")
+                self.assertIs(result["validationPassed"], reason == "work")
+                h.verify.assert_called_once()
+                self.assertEqual(h.verify.call_args.args[0].connection_work_target, "f" * 64)
                 self.assertNotIn("secret", json.dumps(h.frames))
+
+    def test_real_certificate_and_signature_validation_including_target_misses(self):
+        root = certificate(80, "Outcome test root", ca=True)
+        leaf = certificate(81, "Outcome test leaf", issuer=root, dns_name="example.com")
+        wrong_name = certificate(82, "Wrong domain leaf", issuer=root, dns_name="wrong.example")
+        valid = signed_proof("example.com", leaf, [])
+        wrong_signature = replace(valid, proof=valid.proof[:-1] + bytes([valid.proof[-1] ^ 1]))
+        invalid_certificate = signed_proof("example.com", wrong_name, [])
+        cases = ((valid, True), (wrong_signature, False), (invalid_certificate, False))
+        for envelope, expected in cases:
+            with self.subTest(expected=expected, proof=envelope.proof[-8:]), Fixture() as h:
+                h.resolve_domain()
+                def capture(*args, **kwargs):
+                    fake_capture(*args, **kwargs)
+                    return SimpleNamespace(encoded_proof=envelope.proof)
+                h.capture.side_effect = capture
+                h.parse.side_effect = parse_proof
+                h.meets.side_effect = None
+                h.meets.return_value = False
+                # This fixture alone substitutes its generated test trust root;
+                # all path, name, proof, and cryptographic checks remain real.
+                h.verify.side_effect = lambda candidate, _roots: verify_fixture(candidate, root[1])
+                h.attempt(2, connection_work_target="00" * 32)
+                result = h.wait("attempt", 2)
+                self.assertIs(result["validationPassed"], expected)
+                self.assertTrue(result["captured"])
+                self.assertFalse(result["verified"])
+                self.assertIsNone(result["proof"])
+                self.assertEqual(result["successfulConnections"], "1")
+                h.verify.assert_called_once()
+                if expected:
+                    h.meets.assert_called_once()
+                else:
+                    h.meets.assert_not_called()
+
+    def test_malformed_proof_is_validation_failure_after_full_capture(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            h.parse.side_effect = ValueError("invalid encoded proof")
+            h.attempt(2)
+            result = h.wait("attempt", 2)
+            self.assertTrue(result["captured"])
+            self.assertIs(result["validationPassed"], False)
+            h.verify.assert_not_called()
+
+    def test_cancellation_before_verification_has_no_validated_observation(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            original_emit = h.service.emit_callback
+            def emit(frame):
+                if frame["type"] == "capture":
+                    h.service.command({"type": "cancel", "id": frame["id"]})
+                original_emit(frame)
+            h.service.emit_callback = emit
+            h.attempt(2)
+            result = h.wait("attempt", 2)
+            self.assertTrue(result["captured"] and result["cancelled"])
+            self.assertIsNone(result["validationPassed"])
+            self.assertEqual(result["successfulConnections"], "1")
+            h.verify.assert_not_called()
+
+    def test_conclusive_connection_failure_survives_late_cancellation(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            def fails(*args, **kwargs):
+                fake_capture(*args, **kwargs)
+                raise OSError("connection failed")
+            h.capture.side_effect = fails
+            original_emit = h.service.emit_callback
+            def emit(frame):
+                if frame["type"] == "capture":
+                    h.service.command({"type": "cancel", "id": frame["id"]})
+                original_emit(frame)
+            h.service.emit_callback = emit
+            h.attempt(2)
+            result = h.wait("attempt", 2)
+            self.assertIs(result["validationPassed"], False)
+            self.assertTrue(result["started"] and result["cancelled"])
+            self.assertFalse(result["captured"])
+
+    def test_cancellation_during_verification_preserves_known_outcome_once(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid), Fixture() as h:
+                h.resolve_domain()
+                entered, release = threading.Event(), threading.Event()
+                def verify(*_):
+                    entered.set()
+                    if not release.wait(3): raise AssertionError("verification release timed out")
+                    if not valid: raise ProofVerificationError("invalid proof signature")
+                h.verify.side_effect = verify
+                h.attempt(2)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    h.service.command({"type": "cancel", "id": 2})
+                    h.service.command({"type": "cancel", "id": 2})
+                finally:
+                    release.set()
+                result = h.wait("attempt", 2)
+                self.assertIs(result["validationPassed"], valid)
+                self.assertTrue(result["cancelled"])
+                self.assertFalse(result["verified"])
+                self.assertIsNone(result["proof"])
+                self.assertEqual(result["seconds"], h.wait("capture", 2)["seconds"])
+                terminal = [frame for frame in h.frames if "validationPassed" in frame]
+                self.assertEqual(terminal, [result])
 
     def test_cancellation_racing_verified_result_cannot_emit_cancelled_proof(self):
         with Fixture() as h:
@@ -155,6 +276,7 @@ class ServiceTests(unittest.TestCase):
             result = h.wait("attempt", 2)
             self.assertTrue(result["captured"])
             self.assertTrue(result["cancelled"])
+            self.assertIs(result["validationPassed"], True)
             self.assertFalse(result["verified"])
             self.assertIsNone(result["proof"])
 
@@ -177,7 +299,8 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual([frame["id"] for frame in h.frames if frame["type"] == "capture"], [2, 3])
             finally:
                 release.set()
-            h.wait("attempt", 2); h.wait("attempt", 3)
+            self.assertEqual(h.wait("attempt", 2)["seconds"], first["seconds"])
+            h.wait("attempt", 3)
 
     def test_terminal_repeats_own_capture_count_despite_later_completions(self):
         release, verifying = threading.Event(), threading.Event()
@@ -207,6 +330,7 @@ class ServiceTests(unittest.TestCase):
             h.attempt(2)
             result = h.wait("attempt", 2)
             self.assertFalse(result["started"] or result["captured"])
+            self.assertIsNone(result["validationPassed"])
             self.assertEqual(result["seconds"], 0)
             self.assertFalse(any(frame["type"] == "capture" for frame in h.frames))
             h.capture.assert_not_called()
@@ -277,6 +401,7 @@ class ServiceTests(unittest.TestCase):
                 result = h.wait("attempt", identifier)
                 self.assertTrue(result["started"])
                 self.assertFalse(result["captured"])
+                self.assertIs(result["validationPassed"], False)
                 self.assertEqual(result["successfulConnections"], "0")
 
     def test_capture_failure_messages_are_fixed_and_timeouts_preserve_budget(self):
@@ -297,6 +422,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(result["message"], expected)
                 self.assertTrue(result["started"])
                 self.assertFalse(result["captured"] or result["cancelled"] or result["verified"])
+                self.assertIs(result["validationPassed"], False)
                 self.assertIsNone(result["proof"])
                 self.assertEqual(result["successfulConnections"], "2")
                 self.assertNotIn("private", json.dumps(h.frames))
@@ -435,6 +561,7 @@ class ServiceTests(unittest.TestCase):
             cancelled = h.wait("attempt", 3)
             self.assertTrue(cancelled["cancelled"])
             self.assertFalse(cancelled["started"])
+            self.assertIsNone(cancelled["validationPassed"])
             self.assertEqual(h.capture.call_count, 1)
             h.service.command({"type": "cancel", "id": 2})
             self.assertTrue(h.wait("attempt", 2)["cancelled"])

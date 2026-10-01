@@ -25,22 +25,24 @@ function fixture(t, onCommand = () => {}, options = {}) {
         const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
         commands.push(message);
         if (message.type === 'start') {
-          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64 } }));
+          if (options.autoReady !== false) queueMicrotask(() => child.send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 } }));
         }
-        else if (message.type === 'shutdown') setImmediate(() => child.emit('close', 0));
+        else if (message.type === 'shutdown') { if (options.autoClose !== false) setImmediate(() => child.emit('close', 0)); }
         else onCommand(message, child);
       }
     });
     children.push(child); return child;
   };
-  const pool = new ConnectionPool({ helper: { command: 'isolated-protocol3-helper', args: ['mock'] }, spawnProcess, ...options });
+  const pool = new ConnectionPool({ helper: { command: 'isolated-protocol4-helper', args: ['mock'] }, spawnProcess, ...options });
   t.after(() => pool.close());
   return { pool, commands, children, spawns };
 }
 
 function observation(command, overrides = {}) {
-  return { id: command.id, context: command.context, started: true, captured: true, seconds: 0.1,
+  const value = { id: command.id, context: command.context, started: true, captured: true, seconds: 0.1,
     cancelled: false, successfulConnections: (BigInt(command.successfulConnections) + 1n).toString(), ...overrides };
+  // Test captures are valid unless explicitly overridden by a validation test.
+  return { ...value, validationPassed: value.started && !value.cancelled ? value.captured : null, ...overrides };
 }
 function complete(command, child, overrides = {}) {
   const value = observation(command, overrides);
@@ -58,7 +60,7 @@ for (const security of [undefined, null, {}, { rsaPublicExponentMaxBits: '64' },
   test(`persistent helper rejects missing or incompatible RSA policy ${JSON.stringify(security)}`, async t => {
     const { pool, children, commands } = fixture(t, () => {}, { autoReady: false });
     const starting = assert.rejects(pool.start({}), error => error.helperFatal === true && /npm run build:claims/.test(error.message));
-    children[0].send({ type: 'ready', protocol: 3, roots: 1, security });
+    children[0].send({ type: 'ready', protocol: 4, roots: 1, security });
     await starting;
     await assert.rejects(pool.resolve('example.com'), /npm run build:claims/);
     assert.equal(pool.started, undefined);
@@ -73,7 +75,7 @@ test('one persistent helper serves several domains and proofs with monotonic req
     if (command.type === 'attempt') complete(command, child);
   });
   await pool.start({ connectionsPerSecond: 20, concurrency: 3 });
-  assert.equal(pool.pacesStarts, true, 'protocol 3 paces actual TCP starts in the persistent helper');
+  assert.equal(pool.pacesStarts, true, 'protocol 4 paces actual TCP starts in the persistent helper');
   await pool.start({ connectionsPerSecond: 20, concurrency: 3 });
   await Promise.all(['example.com', 'other.example'].map(domain => pool.resolve(domain)));
   const events = [];
@@ -93,16 +95,44 @@ test('one persistent helper serves several domains and proofs with monotonic req
   assert.equal(pool.requests.size, 0);
 });
 
-test('capture observation is delivered before delayed verification and hash misses remain successful captures', async t => {
+test('capture is delivered early but a valid hash miss is observed only after verification', async t => {
   let pending, child, captures = 0, settled = false;
+  const validations = [];
   const { pool } = fixture(t, (command, current) => { pending = command; child = current; });
   await pool.start({});
-  const result = pool.attempt(context(), { bountyId, onCapture: value => { assert.equal(value.captured, true); captures++; } }).then(value => { settled = true; return value; });
+  const result = pool.attempt(context(), { bountyId, onCapture: value => { assert.equal(value.captured, true); captures++; },
+    onResult: value => validations.push(value.validationPassed) }).then(value => { settled = true; return value; });
   child.send({ type: 'started', id: pending.id });
   child.send({ type: 'capture', ...observation(pending) });
   await tick(); assert.equal(captures, 1); assert.equal(settled, false);
+  assert.deepEqual(validations, []);
   child.send({ type: 'attempt', ...observation(pending), proof: null, verified: false });
   assert.equal((await result).captured, true); assert.equal(captures, 1);
+  assert.deepEqual(validations, [true]);
+});
+
+test('protocol 3 helpers fail closed before attempting DNS or TLS', async t => {
+  const { pool, children, commands } = fixture(t, () => {}, { autoReady: false });
+  const rejected = assert.rejects(pool.start({}), /protocol 4/);
+  children[0].send({ type: 'ready', protocol: 3, roots: 1, security: { rsaPublicExponentMaxBits: 64 } });
+  await rejected;
+  assert.deepEqual(commands.map(value => value.type), ['start']);
+});
+
+for (const validationPassed of [true, false, null]) test(`late cancellation preserves the conclusive validation outcome ${validationPassed}`, async t => {
+  let pending, child;
+  const { pool } = fixture(t, (command, current) => { if (command.type === 'attempt') { pending = command; child = current; } });
+  await pool.start({});
+  const abort = new AbortController(), observed = [];
+  const rejected = assert.rejects(pool.attempt(context(), { bountyId, signal: abort.signal,
+    onResult: value => observed.push(value.validationPassed) }), error => error.name === 'AbortError');
+  child.send({ type: 'started', id: pending.id });
+  child.send({ type: 'capture', ...observation(pending) });
+  abort.abort();
+  child.send({ type: 'attempt', ...observation(pending, { cancelled: true, validationPassed }), proof: null, verified: false });
+  await rejected;
+  assert.deepEqual(observed, [validationPassed]);
+  assert.equal(pool.failure, undefined);
 });
 
 test('budget rejection before TCP does not invent a capture or start notification', async t => {
@@ -167,7 +197,7 @@ test('cancellation sends only its request ID and waits for the terminal acknowle
   complete(pending.get(2), children[0]); assert.equal((await other).verified, true);
 });
 
-for (const scenario of ['wrong-context', 'unknown-id', 'duplicate-start', 'missing-capture', 'false-verified', 'string-verified', 'missing-verified', 'conflicting-capture', 'missing-counter', 'regressing-counter', 'conflicting-counter', 'nonfinite-duration', 'oversized-proof']) {
+for (const scenario of ['wrong-context', 'unknown-id', 'duplicate-start', 'missing-capture', 'false-verified', 'string-verified', 'missing-verified', 'conflicting-capture', 'missing-counter', 'regressing-counter', 'conflicting-counter', 'nonfinite-duration', 'oversized-proof', 'missing-validation', 'string-validation', 'false-validation', 'null-validation']) {
   test(`persistent helper fails closed for ${scenario}`, async t => {
     const { pool, children } = fixture(t, (command, child) => {
       const value = observation(command);
@@ -186,6 +216,10 @@ for (const scenario of ['wrong-context', 'unknown-id', 'duplicate-start', 'missi
       if (scenario === 'conflicting-counter') result.successfulConnections = '2';
       if (scenario === 'nonfinite-duration') result.seconds = Infinity;
       if (scenario === 'oversized-proof') result.proof = '02' + '11'.repeat(65536);
+      if (scenario === 'missing-validation') delete result.validationPassed;
+      if (scenario === 'string-validation') result.validationPassed = 'true';
+      if (scenario === 'false-validation') result.validationPassed = false;
+      if (scenario === 'null-validation') result.validationPassed = null;
       child.send(result);
     });
     await pool.start({});
@@ -265,7 +299,7 @@ test('unexpected helper exit rejects all requests with the same first failure an
   await assert.rejects(pool.resolve('example.com'), error => error === pool.failure);
 });
 
-test('shutdown before ready cancels startup without classifying late pipe or output events as failure', async t => {
+test('shutdown before ready cancels startup and terminates malformed output without reporting a crash', async t => {
   const events = [], failures = [];
   const { pool, children } = fixture(t, () => {}, {
     autoReady: false, onDiagnostic: (event, details) => events.push({ event, details }), onFailure: error => failures.push(error),
@@ -277,8 +311,119 @@ test('shutdown before ready cancels startup without classifying late pipe or out
   children[0].stdin.emit('error', new Error('late EPIPE'));
   await Promise.all([starting, stopping]);
   assert.equal(pool.failure, undefined);
+  assert.equal(children[0].killed, true);
   assert.deepEqual(events, []);
   assert.deepEqual(failures, []);
+});
+
+test('a valid ready response racing shutdown cannot revive startup or accept new requests', async t => {
+  const { pool, children } = fixture(t, () => {}, { autoReady: false, autoClose: false });
+  const starting = assert.rejects(pool.start({}), error => error.name === 'AbortError');
+  const stopping = pool.close();
+  children[0].send({ type: 'ready', protocol: 4, roots: 1, security: { rsaPublicExponentMaxBits: 64 } });
+  await starting;
+  await assert.rejects(pool.resolve('example.com'), error => error.name === 'AbortError');
+  assert.equal(children[0].killed, false);
+  children[0].emit('close', 0); await stopping;
+  assert.equal(pool.failure, undefined);
+});
+
+test('a successful DNS response after shutdown rejects its request even without a signal', async t => {
+  let command;
+  const { pool, children } = fixture(t, value => { command = value; }, { autoClose: false });
+  await pool.start({});
+  const pending = assert.rejects(pool.resolve('example.com'), error => error.name === 'AbortError');
+  const stopping = pool.close();
+  children[0].send({ type: 'resolved', id: command.id, ok: true });
+  await pending;
+  assert.equal(pool.requests.size, 0);
+  children[0].emit('close', 0); await stopping;
+});
+
+for (const validationPassed of [true, false, null]) for (const withSignal of [false, true]) {
+  test(`shutdown drains validation ${validationPassed} with ${withSignal ? 'an aborted signal' : 'no signal'}`, async t => {
+    let command;
+    const { pool, children } = fixture(t, value => { if (value.type === 'attempt') command = value; }, { autoClose: false });
+    await pool.start({});
+    const abort = new AbortController(), observed = [], captures = [];
+    const pending = assert.rejects(pool.attempt(context(), { bountyId,
+      ...(withSignal ? { signal: abort.signal } : {}),
+      onCapture: value => captures.push(value), onResult: value => observed.push(value),
+    }), error => error.name === 'AbortError');
+    const child = children[0];
+    child.send({ type: 'started', id: command.id });
+    child.send({ type: 'capture', ...observation(command) });
+    if (withSignal) abort.abort();
+    const stopping = pool.close();
+    child.send({ type: 'attempt', ...observation(command, { cancelled: true, validationPassed }), proof: null, verified: false });
+    await pending;
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].validationPassed, validationPassed);
+    assert.equal(observed[0].seconds, captures[0].seconds);
+    assert.equal(pool.requests.size, 0);
+    assert.equal(child.killed, false);
+    child.emit('close', 0); await stopping;
+    assert.equal(pool.failure, undefined);
+  });
+}
+
+test('shutdown drains late start and capture frames but never returns a winning proof without a signal', async t => {
+  let command, starts = 0, captures = 0;
+  const observed = [];
+  const { pool, children } = fixture(t, value => { command = value; }, { autoClose: false });
+  await pool.start({});
+  const pending = assert.rejects(pool.attempt(context(), { bountyId, onStarted: () => starts++,
+    onCapture: () => captures++, onResult: value => observed.push(value),
+  }), error => error.name === 'AbortError');
+  const stopping = pool.close(), child = children[0];
+  complete(command, child);
+  await pending;
+  assert.equal(starts, 1); assert.equal(captures, 1);
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].validationPassed, true);
+  assert.equal(observed[0].cancelled, true);
+  assert.equal(observed[0].proof, null);
+  assert.equal(observed[0].verified, false);
+  child.emit('close', 0); await stopping;
+});
+
+for (const scenario of ['malformed', 'oversized', 'invalid-validation']) {
+  test(`shutdown terminates ${scenario} output and discards later validation observations`, async t => {
+    let command;
+    const observed = [], events = [], failures = [];
+    const { pool, children } = fixture(t, value => { command = value; }, {
+      autoClose: false, onDiagnostic: (...args) => events.push(args), onFailure: error => failures.push(error),
+    });
+    await pool.start({});
+    const pending = assert.rejects(pool.attempt(context(), { bountyId, onResult: value => observed.push(value) }),
+      error => error.name === 'AbortError');
+    const child = children[0];
+    child.send({ type: 'started', id: command.id });
+    child.send({ type: 'capture', ...observation(command) });
+    const stopping = pool.close();
+    if (scenario === 'malformed') child.stdout.write('{invalid-json}\n' + JSON.stringify({
+      type: 'attempt', ...observation(command), proof: null, verified: false,
+    }) + '\n');
+    else if (scenario === 'oversized') child.stdout.write('x'.repeat(160 * 1024 + 1));
+    else child.send({ type: 'attempt', ...observation(command), validationPassed: 'true', proof: null, verified: false });
+    assert.equal(child.killed, true);
+    child.send({ type: 'attempt', ...observation(command), proof: null, verified: false });
+    await Promise.all([pending, stopping]);
+    assert.equal(pool.requests.size, 0);
+    assert.deepEqual(observed, []); assert.deepEqual(events, []); assert.deepEqual(failures, []);
+  });
+}
+
+test('shutdown retains its two-second termination deadline while draining outstanding results', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { pool, children } = fixture(t, () => {}, { autoClose: false });
+  await pool.start({});
+  const pending = assert.rejects(pool.attempt(context(), { bountyId }), error => error.name === 'AbortError');
+  const stopping = pool.close();
+  t.mock.timers.tick(1999); assert.equal(children[0].killed, false);
+  t.mock.timers.tick(1); assert.equal(children[0].killed, true);
+  await Promise.all([pending, stopping]);
+  assert.equal(pool.requests.size, 0);
 });
 
 test('shutdown after ready cancels pending work without reporting a crash', async t => {

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { pinnedCryptographyVersion, validateHelperSecurity } from '../scripts/helper-security.mjs';
 
-const current = () => ({ type: 'ready', protocol: 3, roots: 1, security: {
+const current = () => ({ type: 'ready', protocol: 4, roots: 1, security: {
   cryptographyVersion: '50.0.1', minimumCryptographyVersion: '50.0.1',
   opensslVersion: 'OpenSSL 4.0.2 11 Aug 2026',
   rsaPublicExponentMaxBits: 64,
@@ -24,8 +24,8 @@ test('packaging accepts the provider bundled at the source pin', () => {
 });
 
 test('packaging rejects stale, mismatched or unidentifiable native helpers', () => {
-  const reports = [{ type: 'ready', protocol: 3, roots: 1 }, null, {},
-    { ...current(), protocol: 2 }, { ...current(), roots: 2 }];
+  const reports = [{ type: 'ready', protocol: 4, roots: 1 }, null, {},
+    { ...current(), protocol: 2 }, { ...current(), protocol: 3 }, { ...current(), roots: 2 }];
   for (const [field, value] of [['cryptographyVersion', '47.0.0'], ['cryptographyVersion', '50.0.0'],
     ['cryptographyVersion', '50.0.1rc1'], ['cryptographyVersion', '51.0.0'],
     ['minimumCryptographyVersion', '47.0.0'], ['opensslVersion', ''], ['opensslVersion', null],

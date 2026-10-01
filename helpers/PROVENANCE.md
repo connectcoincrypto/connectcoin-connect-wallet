@@ -7,24 +7,36 @@ are not required at runtime. The upstream license is retained alongside it.
 ConnectWallet's local hardening in `generator.py` also rejects multicast,
 reserved and IPv6 translation/tunnel destinations: `is_global` by itself is
 not a sufficient SSRF boundary. Local patches also add independently cancellable
-capture sockets and completion telemetry. Capture success means completion
+capture sockets and completion telemetry. Raw capture success means completion
 through CertificateVerify before certificate verification and the hash-target
-test, as in Core. The protocol-3 desktop service emits a capture event before
-verification, then one terminal result per request. For each domain and exact
+test; it still governs the existing successful-connection budget. The protocol-4
+desktop service emits a raw capture event before verification, then one terminal
+result per request with a required tri-state `validationPassed`. For each domain and exact
 signature-policy mask, the main process keeps two exponential moving averages:
-capture success starts at `0.1`, capture time at `0.02` seconds, and every
+validated success starts at `0.1`, capture time at `0.02` seconds, and every
 completed attempt applies `new = 0.999 * old + 0.001 * observation`. Success is
-`1` for a completed CertificateVerify capture and `0` for a TCP/TLS failure;
-the rate is the success average divided by the time average. Every capture frame
-is consumed once, even when many frames arrive in one pipe chunk. Hash misses
-and certificate-verification failures still count as successful captures.
-DNS failures and cancelled unfinished attempts do not create TLS observations;
-a capture already completed before cancellation retains its observation.
+`1` only after certificate-path and CertificateVerify signature verification,
+and `0` for a TCP/TLS, proof-format, certificate or signature failure. Verification
+relaxes only the work target to its maximum; a cryptographically valid hash miss
+is a successful observation. The rate is the success average divided by the time
+average. Every terminal validated outcome is consumed once, even when many
+frames arrive in one pipe chunk; its elapsed time remains the original TCP/TLS
+duration and excludes verification. Early raw capture frames do not update EMA.
+DNS failures and locally cancelled unfinished attempts have `validationPassed:
+null` and do not create TLS observations. Cancellation before validation begins
+also has no validated observation. Once validation completes, its `true` or
+`false` outcome is retained even if cancellation suppresses proof delivery,
+including cancellation while synchronous validation is running. Raw captures
+still consume the successful-connection budget even when validation fails.
 The legacy one-shot generator retains bounded snapshots for development tooling;
-it is not the desktop scheduling path. Importing a snapshot into the EMA rejects
-a gap larger than the retained 100 samples, because omitted completions cannot
+it is not the desktop scheduling path. Every worker verifies its capture before
+recording an outcome, including in-flight work completed after another proof
+wins. Snapshots identify these semantics with `validation: "certificate-proof-v1"`.
+Importing a snapshot into the EMA rejects an absent/different marker or a gap
+larger than the retained 100 samples, because omitted completions cannot
 reconstruct the exact EMA. Legacy proof generation may still expose bounded
-progress with such gaps. The desktop needs no helper protocol change for this policy.
+progress with such gaps. Persistent service and self-test require protocol 4;
+earlier helpers must be rebuilt before the desktop accepts their outcomes.
 Proof encoding is unchanged.
 
 The RSA public-exponent limit is backported from P2C Tools commit
@@ -119,7 +131,8 @@ packaging requires that report to match the source pin and declare
 source-only dependency or verification-policy update. Existing distributed apps
 must be rebuilt/replaced; there is no remote runtime dependency download.
 At runtime the persistent service must advertise that exponent limit before
-the desktop sends any DNS/claim jobs. One-shot claim and RSA-probe launchers
+the desktop sends any DNS/claim jobs, together with protocol 4 for validated
+attempt observations. One-shot claim and RSA-probe launchers
 pass `--require-rsa-exponent-64`; older helpers reject this unknown argument
 before starting network work, so a source update cannot silently reuse them.
 

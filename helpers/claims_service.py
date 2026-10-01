@@ -1,4 +1,4 @@
-"""Persistent, key-free protocol-3 TLS worker; no public network access at import."""
+"""Persistent, key-free protocol-4 TLS worker; no public network access at import."""
 
 from __future__ import annotations
 
@@ -282,6 +282,8 @@ class ClaimsService:
         proof = None
         message = None
         blocked = None
+        validation_passed = None
+        validation_started = False
         try:
             if job.control.cancelled():
                 raise CaptureCancelled("TLS capture cancelled")
@@ -298,11 +300,20 @@ class ClaimsService:
                     timeout=CONNECTION_TIMEOUT, control=job.control,
                     before_start=lambda: self._before_start(job), on_started=lambda: self._started(job))
                 job.captured = True
+            except CaptureCancelled:
+                raise
+            except Exception:
+                # Snapshot a conclusive connection failure before emitting the
+                # capture frame: cancellation afterwards must not erase it.
+                if job.started and not job.control.cancelled():
+                    validation_passed = False
+                raise
             finally:
                 if job.started:
                     elapsed = time.monotonic() - job.started_at
                     # Capture order is independent of potentially slow certificate
-                    # verification. The capture frame is authoritative for stats.
+                    # verification. This frame measures raw captures and the
+                    # successful-connection budget, not validated EMA outcomes.
                     with self.capture_lock:
                         job.seconds = round(max(0.0, elapsed), 6)
                         with self.condition:
@@ -312,16 +323,24 @@ class ClaimsService:
                             job.successful_connections = self.budgets[job.bounty_id].successes
                         self.emit({"type": "capture", **self._fields(job)})
             if not job.control.cancelled():
+                validation_started = True
                 candidate = replace(job.context, proof=captured.encoded_proof)
                 parsed = parse_proof(candidate.proof, candidate.domain, candidate.challenge)
+                # A hash miss is still a validated TLS connection. Verify every
+                # certificate path and CertificateVerify signature with only
+                # the work threshold relaxed, then apply the real target.
+                preflight = replace(candidate, connection_work_target="f" * 64)
+                verify_connection_proof(preflight, self.roots_path)
+                validation_passed = True
                 if meets_work_target(parsed.connection_work_hash, candidate.connection_work_target):
-                    verify_connection_proof(candidate, self.roots_path)
                     if not job.control.cancelled(): proof = candidate.proof.hex()
         except BudgetExhausted:
             blocked = "budget"
         except CaptureCancelled:
             message = "TLS capture cancelled"
         except (TimeoutError, TLSGenerationError) as error:
+            if validation_started and validation_passed is None:
+                validation_passed = False
             # Socket timeouts and the capture's absolute deadline share one safe
             # description. Match only the provider's fixed local deadline error;
             # never forward arbitrary TLS/peer exception text to the desktop.
@@ -331,6 +350,10 @@ class ClaimsService:
             else:
                 message = "TLS connection timed out" if timed_out else "TLS capture or proof validation failed"
         except Exception:
+            # Once synchronous proof validation starts, it produces a known
+            # result even if cancellation arrives while it is running.
+            if validation_started and validation_passed is None:
+                validation_passed = False
             # Never echo certificates, raw socket errors, remote data or proof
             # contents in operational messages.
             message = "TLS capture or proof validation failed" if job.started else "Public DNS resolution is required"
@@ -340,7 +363,7 @@ class ClaimsService:
         if fields["cancelled"]:
             proof = None
         self.emit({"type": "attempt", **fields, "proof": proof,
-                   "verified": proof is not None,
+                   "verified": proof is not None, "validationPassed": validation_passed,
                    **({"message": message} if message else {}), **({"blocked": blocked} if blocked else {})})
 
     def _cancel(self, job):
@@ -354,7 +377,7 @@ class ClaimsService:
         if queued:
             if job.kind == "attempt":
                 self.emit({"type": "attempt", **self._fields(job), "proof": None,
-                           "verified": False, "message": "TLS capture cancelled"})
+                           "verified": False, "validationPassed": None, "message": "TLS capture cancelled"})
                 with self.condition:
                     self.budgets[job.bounty_id].users -= 1
             else:
@@ -377,11 +400,11 @@ class ClaimsService:
 def run_service(stream, emit, parse_context, roots_path: str | Path):
     start = read_frame(stream)
     _keys(start, ("type", "protocol", "options"))
-    if start["type"] != "start" or type(start["protocol"]) is not int or start["protocol"] != 3:
-        raise ValueError("protocol 3 start command required")
+    if start["type"] != "start" or type(start["protocol"]) is not int or start["protocol"] != 4:
+        raise ValueError("protocol 4 start command required")
     service = ClaimsService(start["options"], emit, parse_context, roots_path)
     try:
-        service.emit({"type": "ready", "protocol": 3, "roots": 1,
+        service.emit({"type": "ready", "protocol": 4, "roots": 1,
                       "security": {"rsaPublicExponentMaxBits": MAX_RSA_PUBLIC_EXPONENT_BITS}})
         while True:
             command = read_frame(stream)
