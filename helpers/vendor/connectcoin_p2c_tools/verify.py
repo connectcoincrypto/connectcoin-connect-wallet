@@ -5,6 +5,7 @@ import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 from cryptography import x509
@@ -105,6 +106,14 @@ def _load_roots(path: str | Path, version: int, enforce_root_pin: bool) -> list[
         raise ProofVerificationError(
             "root bundle version 1 does not match its consensus SHA-256 pin"
         )
+    # Always read and authenticate the current file before reusing parsed roots.
+    # Each caller owns its list; only immutable certificate objects are shared.
+    return list(_parse_roots(encoded))
+
+
+@lru_cache(maxsize=1)
+def _parse_roots(encoded: bytes) -> tuple[x509.Certificate, ...]:
+    """Reuse only root parsing/key checks, keyed by exact bytes, never proof validity."""
     try:
         # The immutable Mozilla-derived bundle contains legacy trust anchors
         # that modern WebPKI would not issue today. They remain parseable in
@@ -117,7 +126,7 @@ def _load_roots(path: str | Path, version: int, enforce_root_pin: bool) -> list[
     if not roots:
         raise ProofVerificationError("trusted root bundle contains no certificates")
     _check_rsa_public_exponents(roots)
-    return roots
+    return tuple(roots)
 
 
 def validate_root_bundle(

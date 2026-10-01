@@ -69,9 +69,13 @@ is emitted; network and certificate error text is suppressed.
 `p2c_roots_v1.pem` is the immutable Mozilla-derived consensus trust bundle from
 ConnectCoin Core. Its SHA-256 is
 `f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9`.
-The provider verifies this pin before connecting. Do not refresh it with the
-operating system's current roots: a new consensus bundle requires a new version.
-The bundle's source and attribution are in its header.
+The provider verifies this pin before connecting and re-reads and checks the
+current bundle on every proof verification. A one-entry cache keyed by exact
+bundle bytes reuses only parsed, immutable root certificates and their RSA
+exponent checks; each caller receives its own list. Peer certificate, time,
+domain, path, policy and proof-signature checks still run for every proof.
+Do not refresh the bundle with the operating system's current roots: a new
+consensus bundle requires a new version. Its source and attribution are in its header.
 
 The bridge accepts only a prepared claim's public context. It never accepts a
 mnemonic, private key, wallet password, cookie, or RPC credentials. A proof is

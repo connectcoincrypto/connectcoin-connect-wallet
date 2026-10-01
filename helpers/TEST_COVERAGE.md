@@ -25,6 +25,11 @@ TLS-signature helper. Controlled capture tests reject oversized exponents at
 the Certificate message without waiting for CertificateVerify, in both claim
 and completed-probe modes. Runtime tests reject legacy helper capabilities and
 enforce the one-shot/probe compatibility flag before any network work.
+Root-cache regressions check file replacement, exact pin enforcement after
+warmup, distinct root paths and unpinned test fixtures, bounded cache size,
+concurrent callers and returned-list mutation. Fully signed proofs continue
+to reject altered signatures, names, challenges, times, policies and targets;
+oversized RSA roots remain rejected after cache warmup.
 
 Offline telemetry tests cover completion order under concurrency, rolling
 100-entry snapshots and monotonic completion counts, validated captures that
