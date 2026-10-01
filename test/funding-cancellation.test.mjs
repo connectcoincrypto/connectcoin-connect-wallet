@@ -35,7 +35,7 @@ function serviceFixture(t, rpc) {
   const raw = serializeTransaction(transaction).toString('hex');
   const bounty = { txid: transactionId(transaction), vout: 0, amount: '1000000000', status: 'available' };
   const service = new WalletService({ directory: '/unused-funding-cancellation-test' });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.epoch = 7; service.session = { data: {} }; service.rpc = rpc;
   service.tip = { chain: 'testnet4', genesis_hash: GENESIS.testnet4, height: 1, hash: '01'.repeat(32), mediantime: 1800000000 };
   service.engine = { enabled: true };

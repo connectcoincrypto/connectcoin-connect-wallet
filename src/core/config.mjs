@@ -4,11 +4,12 @@ import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 
 export const GENESIS = Object.freeze({
+  main: '30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e',
   testnet4: '710dc5910cbef40216bd82ccfb66af2273b2b1d336b034c5794966904cb603bf',
   regtest: '53c5145452f6957a2674ab904726afc2d7643c4a4fb9c2beab193ea983e500f0',
 });
 export const DEFAULT_CONFIG = Object.freeze({
-  version: 1, network: 'testnet4', rpc: Object.freeze({ host: 'connectcoin4.com', port: 48190 }),
+  version: 1, network: 'main', rpc: Object.freeze({ host: 'connectcoin4.com', port: 48190 }),
   claims: Object.freeze({ enabled: false, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }),
   autoLockMinutes: 15, feeRate: 1500, theme: 'system', developerMode: false,
 });
@@ -38,13 +39,17 @@ export function validateRpcEndpoint(input) {
   }
   return { host: host.toLowerCase(), port: integer(port, 1, 65535, 'RPC port') };
 }
-export function validateConfig(input, { allowRegtest = false } = {}) {
+export function validateConfig(input, { allowRegtest = false, network } = {}) {
   dataObject(input);
   if (Object.hasOwn(input, 'rpc')) dataObject(input.rpc);
   if (Object.hasOwn(input, 'claims')) dataObject(input.claims);
-  const merged = { ...DEFAULT_CONFIG, ...input, rpc: { ...DEFAULT_CONFIG.rpc, ...input.rpc }, claims: { ...DEFAULT_CONFIG.claims, ...input.claims } };
+  const selectedNetwork = network ?? input.network ?? DEFAULT_CONFIG.network;
+  // Development networks must not accidentally query the public mainnet service.
+  const rpcDefaults = selectedNetwork === 'main' ? DEFAULT_CONFIG.rpc : { host: '127.0.0.1', port: 48190 };
+  const merged = { ...DEFAULT_CONFIG, network: selectedNetwork, ...input, rpc: { ...rpcDefaults, ...input.rpc }, claims: { ...DEFAULT_CONFIG.claims, ...input.claims } };
   if (merged.version !== 1) throw new Error('Unsupported configuration version.');
-  if (merged.network !== 'testnet4' && !(allowRegtest && merged.network === 'regtest')) throw new Error('This release supports ConnectCoin testnet4 only.');
+  if (!['main', 'testnet4'].includes(merged.network) && !(allowRegtest && merged.network === 'regtest')) throw new Error('Unsupported ConnectCoin network. Regtest requires development mode.');
+  if (network !== undefined && merged.network !== network) throw new Error('Configuration belongs to a different network than this wallet profile.');
   return {
     version: 1, network: merged.network, theme: validateTheme(merged.theme),
     developerMode: validateDeveloperMode(merged.developerMode),
@@ -89,11 +94,11 @@ export async function readConfig(directory, options) {
     return validateConfig(JSON.parse(text), options);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    return writeConfig(directory, DEFAULT_CONFIG, options);
+    return writeConfig(directory, {}, options);
   } finally { await handle?.close(); }
 }
 
-export function validateTip(tip, network = 'testnet4') {
+export function validateTip(tip, network = 'main') {
   if (!Object.hasOwn(GENESIS, network) || !plain(tip) || tip.chain !== network || tip.genesis_hash !== GENESIS[network] ||
       !Number.isSafeInteger(tip.height) || tip.height < 0 || !/^[0-9a-f]{64}$/.test(tip.hash) ||
       !Number.isSafeInteger(tip.mediantime) || tip.mediantime < 0 || (tip.height === 0 && tip.hash !== GENESIS[network])) {

@@ -72,5 +72,5 @@ that spending transaction's ID and input index.
 A positive daemon-level test requires an authorized TLS endpoint with a
 certificate chaining to the pinned public roots, or an explicitly separate
 test-only consensus harness. Neither production root enforcement nor the Core
-daemon was modified to manufacture a passing test. These checks are not an
-independent security audit or evidence of mainnet readiness.
+daemon was modified to manufacture a passing test. These checks alone do not
+establish mainnet readiness.

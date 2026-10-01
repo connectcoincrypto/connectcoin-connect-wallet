@@ -19,7 +19,7 @@ const deferred = () => { let resolve; const promise = new Promise(done => { reso
 async function fixture(t, rsaProbe) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-rsa-service-'));
   const broadcasts = [];
-  const service = new WalletService({ directory, rsaProbe, clientFactory: () => {
+  const service = new WalletService({ directory, network: 'testnet4', rsaProbe, clientFactory: () => {
     const rpc = new EventEmitter(); rpc.close = () => {};
     rpc.request = async (method, params) => {
       assert.equal(method, 'sendrawtransaction'); broadcasts.push(params.transaction_hex);

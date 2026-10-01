@@ -42,7 +42,7 @@ class Backend extends EventEmitter {
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-recovery-history-'));
   const backend = new Backend();
-  const service = new WalletService({ directory, clientFactory: () => backend, proofRunner: async () => '020100' });
+  const service = new WalletService({ directory, network: 'testnet4', clientFactory: () => backend, proofRunner: async () => '020100' });
   await service.initialize();
   clearInterval(service.timer);
   // Exercise the real discovery/refresh state machine without unrelated KDF IO.

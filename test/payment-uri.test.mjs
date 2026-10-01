@@ -20,7 +20,7 @@ const baseUri = `connectcoin:${address}`;
 
 function serviceFixture(t) {
   const service = new WalletService({ directory: process.cwd() });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: { receiveIndex: 0, name: 'Payment request test' } };
   service.walletExists = true;
   service.accounts = accounts;

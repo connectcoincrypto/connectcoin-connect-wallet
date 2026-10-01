@@ -6,12 +6,12 @@ import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { PROFILE_NAME, VAULT_NAME, selectProfileDirectory, selectVaultFile } from '../src/core/profile-paths.mjs';
+import { PROFILE_NAME, VAULT_NAME, selectProfileDirectory, selectStartupNetwork, selectVaultFile } from '../src/core/profile-paths.mjs';
 import { encryptVault, updateVault, unlockVault } from '../src/core/vault.mjs';
 import { WalletService } from '../src/core/wallet-service.mjs';
 
 const PASSWORD = 'Current format test password';
-const DATA = { mnemonic: `${'abandon '.repeat(11)}about`, network: 'testnet4', name: 'Isolated ConnectWallet test', passphrase: '', receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1 };
+const DATA = { mnemonic: `${'abandon '.repeat(11)}about`, network: 'main', name: 'Isolated ConnectWallet test', passphrase: '', receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1 };
 class OfflineBackend extends EventEmitter { close() {} request() { throw new Error('Profile tests must not use the network.'); } }
 
 async function fixture(t) {
@@ -24,13 +24,75 @@ async function fixture(t) {
   return directory;
 }
 
-test('fresh profiles use only ConnectWallet and selection never creates files', async t => {
+test('fresh profiles default to isolated mainnet and selection never creates files', async t => {
   const directory = await fixture(t);
-  assert.equal(PROFILE_NAME, 'ConnectWallet');
+  assert.equal(PROFILE_NAME, 'ConnectWallet-mainnet');
   assert.equal(VAULT_NAME, 'wallet.connectwallet.json');
   assert.equal(selectProfileDirectory(directory), join(directory, PROFILE_NAME));
   assert.equal(selectVaultFile(join(directory, PROFILE_NAME)), join(directory, PROFILE_NAME, VAULT_NAME));
+  assert.equal(selectProfileDirectory(directory, 'testnet4'), join(directory, 'ConnectWallet'));
+  assert.equal(selectProfileDirectory(directory, 'regtest'), join(directory, 'ConnectWallet-regtest'));
+  for (const network of ['__proto__', '../ConnectWallet', '', 'mainnet']) assert.throws(() => selectProfileDirectory(directory, network), /network/);
   assert.deepEqual(await readdir(directory), []);
+});
+
+test('installed builds use mainnet and test networks require explicit development selection', () => {
+  assert.equal(selectStartupNetwork(), 'main');
+  for (const network of ['main', 'testnet4', 'regtest']) {
+    assert.equal(selectStartupNetwork({ requestedNetwork: network }), network);
+    assert.equal(selectStartupNetwork({ isPackaged: true, requestedNetwork: network }), 'main');
+  }
+  for (const requestedNetwork of ['', 'mainnet', '__proto__']) assert.throws(() => selectStartupNetwork({ requestedNetwork }), /network/);
+});
+
+test('fresh mainnet never reads or inherits testnet wallet data and claims consent', async t => {
+  const directory = await fixture(t), legacy = join(directory, 'ConnectWallet');
+  await mkdir(legacy);
+  const config = '{"version":1,"network":"testnet4","claims":{"enabled":true}}';
+  const wallet = 'legacy encrypted wallet sentinel: must remain untouched';
+  await writeFile(join(legacy, 'config.json'), config);
+  await writeFile(join(legacy, VAULT_NAME), wallet);
+  const profile = selectProfileDirectory(directory);
+  const service = new WalletService({ directory: profile, clientFactory: () => new OfflineBackend() });
+  try {
+    await service.initialize();
+    assert.equal(service.config.network, 'main');
+    assert.equal(service.config.rpc.host, 'connectcoin4.com');
+    assert.equal(service.config.rpc.port, 48190);
+    assert.equal(service.config.claims.enabled, false);
+    assert.equal(service.walletExists, false);
+    assert.equal(service.getState().phase, 'welcome');
+    assert.equal(await readFile(join(legacy, 'config.json'), 'utf8'), config);
+    assert.equal(await readFile(join(legacy, VAULT_NAME), 'utf8'), wallet);
+  } finally { await service.close(); }
+});
+
+test('wrong-network configuration is rejected before RPC creation and never rewritten', async t => {
+  const directory = await fixture(t), file = join(directory, 'config.json');
+  const bytes = '{"version":1,"network":"testnet4","claims":{"enabled":true}}';
+  await writeFile(file, bytes);
+  let created = false;
+  const service = new WalletService({ directory, clientFactory: () => { created = true; return new OfflineBackend(); } });
+  await assert.rejects(service.initialize(), /different network/);
+  service.statePublisher.close();
+  assert.equal(created, false);
+  assert.equal(await readFile(file, 'utf8'), bytes);
+});
+
+test('a testnet vault cannot unlock in mainnet or be converted by changing endpoint settings', async t => {
+  const directory = await fixture(t), file = join(directory, VAULT_NAME);
+  const bytes = JSON.stringify(await encryptVault({ ...DATA, network: 'testnet4' }, PASSWORD));
+  await writeFile(file, bytes);
+  const service = new WalletService({ directory, clientFactory: () => new OfflineBackend() });
+  try {
+    await service.initialize();
+    await service.saveConfig({ network: 'testnet4', rpc: { host: '127.0.0.1', port: 48190 } });
+    assert.equal(service.config.network, 'main');
+    await assert.rejects(service.unlock({ password: PASSWORD }), /different networks/);
+    assert.equal(service.session, null);
+    assert.equal(service.config.claims.enabled, false);
+    assert.equal(await readFile(file, 'utf8'), bytes);
+  } finally { await service.close(); }
 });
 
 test('selection inspects only the current directory and filename, without probing siblings', async t => {
@@ -119,6 +181,10 @@ test('current-format vault opens and updates without creating alternate wallet f
     await service.initialize(); service.refresh = async () => service.getState();
     await service.unlock({ password: PASSWORD });
     assert.equal(service.session.data.mnemonic, DATA.mnemonic);
+    assert.match(service.getState().wallet.address, /^cc1/);
+    const backup = await service.getRecoveryPhrase({ password: PASSWORD });
+    assert.equal(backup.network, 'main');
+    assert.equal(backup.path, "m/44'/0'/0'/change/index");
     await service.lock();
     await updateVault(file, { ...DATA, name: 'Updated ConnectWallet' }, PASSWORD);
     assert.equal((await unlockVault(file, PASSWORD)).name, 'Updated ConnectWallet');

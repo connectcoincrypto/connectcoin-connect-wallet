@@ -23,7 +23,7 @@ class OfflineBackend extends EventEmitter {
 async function fixture(t, existing = true) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-replacement-test-'));
   if (existing) await writeFile(join(directory, 'wallet.connectwallet.json'), originalBytes);
-  const service = new WalletService({ directory, clientFactory: () => new OfflineBackend() });
+  const service = new WalletService({ directory, network: 'testnet4', clientFactory: () => new OfflineBackend() });
   await service.initialize();
   service.refresh = async () => service.getState();
   t.after(async () => {

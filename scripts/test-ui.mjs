@@ -21,7 +21,7 @@ const inputStartKey = process.platform === 'darwin' ? 'Meta+ArrowLeft' : 'Home';
 const inputEndKey = process.platform === 'darwin' ? 'Meta+ArrowRight' : 'End';
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-test-'));
 const screenshots = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-screens-'));
-const tip = { chain: 'testnet4', height: 0, hash: GENESIS.testnet4, genesis_hash: GENESIS.testnet4, mediantime: 1780000000 };
+const tip = { chain: 'main', height: 0, hash: GENESIS.main, genesis_hash: GENESIS.main, mediantime: 1780000000 };
 const requests = [];
 const sockets = new Set();
 let connectionCount = 0;
@@ -57,7 +57,7 @@ const fixture = net.createServer(serve);
 const alternateFixture = net.createServer(serve);
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 await new Promise(resolve => alternateFixture.listen(0, '127.0.0.1', resolve));
-await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
+await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'main', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
 let application;
 let page;
 const errors = [];
@@ -68,7 +68,7 @@ let stageIndex = 1;
 let passed = false;
 let seed = [];
 const password = 'UI-test-only-long-password';
-const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile, CONNECTWALLET_NETWORK: 'main' };
 delete env.ELECTRON_RUN_AS_NODE;
 
 console.log(`UI stage ${stageIndex} started: ${stage}.`);
@@ -560,7 +560,7 @@ async function assertPaymentLinkImport(address, otherAddress) {
     await assertNoAutomaticSend();
 
     nextStage('send payment link rejects invalid requests without partial changes');
-    const wrongNetworkAddress = encodeAddress(decodeAddress(address), 'main');
+    const wrongNetworkAddress = encodeAddress(decodeAddress(address, 'main'), 'testnet4');
     const invalidUris = [
       'private-clipboard-canary-DO-NOT-DISPLAY',
       wrongNetworkAddress,
@@ -1058,7 +1058,7 @@ try {
       `The ${field} field must expose the shared off-chain storage and privacy warning.`);
   }
   const address = await page.locator('.address-box').textContent();
-  assert.match(address, /^tcc1p[a-z0-9]+$/);
+  assert.match(address, /^cc1p[a-z0-9]+$/);
   for (const field of ['amount', 'label', 'message']) assert.equal(await page.locator(`#receive-${field}`).inputValue(), '');
   await assertReceiveRequest(`connectcoin:${address}`);
   nextStage('receive panel alignment and responsive content heights');
@@ -1205,7 +1205,7 @@ try {
   await page.waitForFunction(previous => document.querySelector('.address-box')?.textContent !== previous
     && document.querySelector('#app')?.getAttribute('aria-busy') === 'false', address);
   let nextAddress = await page.locator('.address-box').textContent();
-  assert.match(nextAddress, /^tcc1p[a-z0-9]+$/);
+  assert.match(nextAddress, /^cc1p[a-z0-9]+$/);
   assert.notEqual(nextAddress, address);
   for (const [field, value] of Object.entries(receiveDraft)) assert.equal(await page.locator(`#receive-${field}`).inputValue(), value);
   let nextPaymentUri = `connectcoin:${nextAddress}${receiveQuery}`;

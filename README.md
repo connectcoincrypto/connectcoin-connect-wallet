@@ -4,7 +4,7 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 
 [ConnectCoin](https://connectcoincrypto.com/) · [Community](https://discord.gg/JYWbz5PsPp) · [Explorer](https://explorer.connectcoincrypto.com/) · [Whitepaper](https://connectcoincrypto.com/whitepaper.pdf)
 
-**Initial testnet release. This application has not received an independent security audit. Use test coins, not valuable funds.** Mainnet is deliberately unavailable in the UI.
+**ConnectCoin mainnet wallet.** It relies on an unencrypted RPC connection and a trusted server for chain state; it does not independently validate consensus.
 
 ## What you can do
 
@@ -58,6 +58,8 @@ npm start
 
 On Windows, use `npm.cmd` if PowerShell blocks `npm.ps1`. `setup:claims` creates an isolated `.claims-venv`, installs pinned proof-helper dependencies and runs its local TLS tests. It does not install or start a blockchain node. The wallet remains usable for ordinary payments if the optional claims helper is absent; enabling claims then displays an explicit installation error.
 
+Source launches default to mainnet. For development, set `CONNECTWALLET_NETWORK=testnet4` or `CONNECTWALLET_NETWORK=regtest` before starting the app and configure an endpoint for that network. A new development profile defaults to `127.0.0.1:48190`; existing profiles keep their saved endpoint. PowerShell example: `$env:CONNECTWALLET_NETWORK = 'testnet4'`, then `npm.cmd start`. Packaged applications use mainnet only. The network is fixed for each launch and cannot be changed by editing the RPC hostname or the profile's `config.json`.
+
 ## Build a desktop package
 
 Build on the operating system you intend to distribute for. The helper must be built **on that same OS and architecture**.
@@ -76,15 +78,17 @@ The claims helper pins `cryptography==50.0.1`, including fixes for duplicate-cer
 
 ## RPC configuration
 
-On first launch, a `config.json` is created alongside the encrypted wallet in the application's data folder:
+On first mainnet launch, a `config.json` is created alongside the encrypted wallet in the application's data folder:
 
-- Windows: `%APPDATA%/ConnectWallet/`
-- Linux: `$XDG_CONFIG_HOME/ConnectWallet/` (normally `~/.config/ConnectWallet/`)
-- macOS: `~/Library/Application Support/ConnectWallet/`
+- Windows: `%APPDATA%/ConnectWallet-mainnet/`
+- Linux: `$XDG_CONFIG_HOME/ConnectWallet-mainnet/` (normally `~/.config/ConnectWallet-mainnet/`)
+- macOS: `~/Library/Application Support/ConnectWallet-mainnet/`
 
-ConnectWallet uses only its own data folder and `wallet.connectwallet.json`. It does not search other application profiles, use alternate wallet filenames or automatically import or migrate existing data.
+Profiles are isolated by network. Development testnet4 uses the legacy `ConnectWallet` folder under the same OS data directory; regtest uses `ConnectWallet-regtest`. Mainnet uses the new `ConnectWallet-mainnet` folder and starts with Automatic Claims off. Testnet wallets, settings, claims consent and backups are not copied or migrated to mainnet. Existing testnet data remains available through an explicit testnet4 source launch with a compatible testnet endpoint.
 
-The defaults are **`connectcoin4.com`, TCP port `48190`, testnet4**. Change hostname and port in Settings or edit the file while the app is closed. See [config.example.json](config.example.json).
+ConnectWallet uses only the selected network's data folder and `wallet.connectwallet.json`. It does not search other application profiles, use alternate wallet filenames or automatically import or migrate existing data. Do not move an encrypted wallet between network profiles: the wallet's stored network must match the selected network.
+
+The defaults are **`connectcoin4.com`, TCP port `48190`, mainnet (`main`)**. Mainnet pins genesis hash `30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e`. Change hostname and port in Settings or edit the file while the app is closed; the endpoint must serve the profile's selected network and expected genesis. See [config.example.json](config.example.json).
 
 Valid preferences are saved automatically, including appearance, Developer Mode, the RPC endpoint, inactivity timeout, default fee rate and Automatic Claims limits; no Save button is needed. Payment drafts, passwords and recovery words are not saved as preferences. Hostname and port are applied together when you leave both endpoint fields; changing other preferences does not reconnect RPC unnecessarily. Save failures are shown without discarding your edits; edit the setting again to retry.
 
@@ -102,12 +106,16 @@ Private keys, passwords and recovery words are never sent to RPC. Before signing
 
 Recovery uses the English **BIP39 word list and checksum**, backed by the OS cryptographic random generator through `node:crypto.randomBytes`. There is **no clock-derived seed, `Math.random`, handwritten-phrase generator or weak fallback**. The entropy sizes are 128, 192 and 256 bits for 12, 18 and 24 words respectively.
 
-Keys use BIP32 with this documented ConnectWallet convention on testnet:
+Keys use BIP32 with these documented ConnectWallet conventions:
 
 ```text
-m/44'/1'/0'/0/index    receive addresses
-m/44'/1'/0'/1/index    change addresses
+m/44'/0'/0'/0/index    mainnet receive addresses
+m/44'/0'/0'/1/index    mainnet change addresses
+m/44'/1'/0'/0/index    testnet4/regtest receive addresses
+m/44'/1'/0'/1/index    testnet4/regtest change addresses
 ```
+
+Mainnet's coin type `0` is a provisional ConnectWallet convention, **not a registered ConnectCoin SLIP-44 coin type**. Keep the network and full derivation path with the recovery phrase. The same phrase derives different keys and addresses on mainnet and testnet because their coin types differ; restoring on mainnet does not recover testnet coins or transfer funds across networks.
 
 The child key is used as a **native ConnectCoin x-only P2PK key**, with no Bitcoin Taproot/BIP86 key tweak. Amounts use 10 decimal places: **1 CONN = 10,000,000,000 connects**. Bitcoin transaction libraries cannot be substituted for ConnectCoin's typed-output serialization.
 
@@ -121,13 +129,13 @@ The recovery phrase bypasses the local password: anyone with it controls the key
 
 **Use another wallet** lets you create or import another wallet without unlocking the current one. Both flows require an explicit acknowledgment. The active file stays untouched until a valid restoration completes or you verify the backup words for a newly generated wallet. Cancelling beforehand keeps the current wallet. On completion, the exact previous encrypted file is preserved under `wallet-backups/` in the data folder before the active wallet file is replaced. Creating another wallet does not transfer or recover the old funds. A backup in the same data folder does not protect against loss of the device; keep an independent offline backup too.
 
-Every encrypted-file backup, including these preserved copies, still needs its original password. To restore a supported backup, close the application and preserve any existing wallet elsewhere first, then place the backup at `wallet.connectwallet.json` in the ConnectWallet data folder. Only encrypted files with the `connectcoin-connect-wallet` format identifier are supported. Earlier testnet file formats are not accepted or automatically converted, even if the file is renamed. Restore those wallets using their original BIP39 recovery phrase through **Forgot password?** or the initial restoration screen. Do not edit an encrypted file's format identifier: it is authenticated, so changing it invalidates the file. Existing files are not deleted automatically.
+Every encrypted-file backup, including these preserved copies, still needs its original password. To restore a supported backup, close the application and preserve any existing wallet elsewhere first, then place the backup at `wallet.connectwallet.json` in the matching network's data folder. Only encrypted files with the `connectcoin-connect-wallet` format identifier are supported. Earlier testnet file formats are not accepted or automatically converted, even if the file is renamed. Restore those wallets on testnet4 using their original BIP39 recovery phrase through **Forgot password?** or the initial restoration screen. Do not edit an encrypted file's format identifier: it is authenticated, so changing it invalidates the file. Existing files are not deleted automatically.
 
 Locking drops the decrypted session, invalidates payment reviews and stops claims. The default inactivity lock is 15 minutes, configurable from 1–60. OS lock/suspend also locks the application. **JavaScript cannot guarantee physical erasure of all string copies from memory**, and no software wallet protects against malware controlling your unlocked computer.
 
 ## Automatic Claims architecture
 
-Automatic Claims is off on a new installation. Its on/off preference is saved in `config.json` as `claims.enabled`, together with the connection limits and lookback window. Locking or closing the wallet stops the worker without disabling that preference. After a successful unlock, a saved enabled preference resumes claiming once the helper and RPC network checks succeed. No claims run while the wallet is locked. An unavailable helper or offline RPC does not discard the saved limits or preference. An uncertain broadcast disables Automatic Claims for safety; inspect the reported transaction before enabling it again.
+Automatic Claims is off in every new network profile, including the new mainnet profile when a legacy testnet wallet exists. Its on/off preference is saved in that profile's `config.json` as `claims.enabled`, together with the connection limits and lookback window; preferences are not inherited across networks. Locking or closing the wallet stops the worker without disabling that preference. After a successful unlock, a saved enabled preference resumes claiming once the helper and RPC network checks succeed. No claims run while the wallet is locked. An unavailable helper or offline RPC does not discard the saved limits or preference. An uncertain broadcast disables Automatic Claims for safety; inspect the reported transaction before enabling it again.
 
 The main process requests recent block hashes and complete bounty streams, reading the oldest required blocks first to reduce window-expiry retries while the chain advances. Partial streams are rejected; journal updates and reorganizations are reconciled. Metadata is limited to the server's recent window, but address history is chain-wide.
 

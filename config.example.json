@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "network": "testnet4",
+  "network": "main",
   "rpc": { "host": "connectcoin4.com", "port": 48190 },
   "claims": { "enabled": false, "maxConnectionsPerSecond": 100, "maxConcurrent": 100, "lookbackBlocks": 600 },
   "autoLockMinutes": 15,

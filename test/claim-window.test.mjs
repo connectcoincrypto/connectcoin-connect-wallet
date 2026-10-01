@@ -36,7 +36,7 @@ function serviceFixture({ height = 600, bountyHeight = 1 } = {}) {
     throw new Error(`Unexpected RPC request: ${method}`);
   };
   const service = new WalletService({ directory: '/unused-claim-window-unit-test', clientFactory: () => new EventEmitter() });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.config.claims.maxConcurrent = 1;
   // Never start the installed network helper from unit tests. The callback is
   // injected before createEngine; individual scenarios supply an offline result.

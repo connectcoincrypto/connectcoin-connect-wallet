@@ -193,7 +193,7 @@ test('real discovery of thousands of mostly spent bounties publishes bounded sna
   }))]));
   const f = fixture({ height: 620, rows });
   const service = new WalletService({ directory: '/unused-unit-test', proofRunner: async () => '020100' });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.walletExists = true; service.session = { data: { name: 'Fixture', receiveIndex: 0 } }; service.epoch = 1;
   service.rpc = f.rpc;
   service.createEngine(); service.engine.enabled = true;
@@ -247,7 +247,7 @@ function serviceFixture() {
   const raw = serializeTransaction(funding).toString('hex');
   const bounty = row(1, { txid: transactionId(funding) });
   const service = new WalletService({ directory: '/unused-unit-test' });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: {} }; service.epoch = 7;
   // This fixture is memory-only. Real durable safety stops are exercised by
   // claims-preferences.test.mjs using an isolated temporary profile.

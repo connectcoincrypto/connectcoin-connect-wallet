@@ -58,7 +58,7 @@ const fixture = net.createServer(socket => {
 });
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'testnet4', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
-const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile, CONNECTWALLET_NETWORK: 'testnet4' };
 delete env.ELECTRON_RUN_AS_NODE;
 let application;
 let page;

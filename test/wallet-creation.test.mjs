@@ -29,7 +29,7 @@ async function directory(t, beforeCleanup = () => {}) {
 async function fixture(t) {
   let service;
   const location = await directory(t, () => service?.close());
-  service = new WalletService({ directory: location, clientFactory: () => new OfflineBackend() });
+  service = new WalletService({ directory: location, network: 'testnet4', clientFactory: () => new OfflineBackend() });
   await service.initialize();
   service.refresh = async () => service.getState();
   return service;

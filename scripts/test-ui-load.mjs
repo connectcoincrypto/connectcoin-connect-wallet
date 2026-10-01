@@ -14,12 +14,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-load-'));
 const config = { ...DEFAULT_CONFIG, theme: 'dark', rpc: { host: '127.0.0.1', port: 1 } };
 await writeFile(path.join(profile, 'config.json'), JSON.stringify(config));
-const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile, CONNECTWALLET_NETWORK: 'main' };
 delete env.ELECTRON_RUN_AS_NODE;
 const fixture = {
   phase: 'unlocked', setupActive: false, securityEpoch: 1,
   wallet: { name: 'Presentation fixture', address: 'test-fixture-not-an-address', balance: { available: '1.0000000001', confirmed: '1', pending: '0.0000000001' } },
-  network: { chain: 'testnet4', host: '127.0.0.1', port: 1, status: 'connected', height: 60000 },
+  network: { chain: 'main', host: '127.0.0.1', port: 1, status: 'connected', height: 60000 },
   config,
   history: Array.from({ length: 500 }, (_, index) => ({ txid: index.toString(16).padStart(64, '0'), direction: 'received', amount: index === 0 ? '0.0000000001' : '1', confirmations: 1, status: 'confirmed' })),
   claims: { enabled: true, available: 1000, sent: 0, completed: 0, attempts: 0, status: 'searching', helperAvailable: true, lastError: null },
@@ -60,6 +60,8 @@ try {
   page.setDefaultTimeout(5000);
   page.on('pageerror', error => errors.push(error.message));
   await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
+  assert.doesNotMatch(await page.locator('#app').textContent(), /independent security audit/i);
+  assert.match(await page.locator('#app').textContent(), /Keep your recovery phrase safe and never share it\./);
   await application.evaluate(({ BrowserWindow }, snapshot) => {
     const window = BrowserWindow.getAllWindows()[0];
     window.setSize(1080, 720);
@@ -68,6 +70,7 @@ try {
 
   stage = 'CONN monetary displays and exact precision';
   await page.getByRole('heading', { name: 'A little more connected.' }).waitFor();
+  assert.doesNotMatch(await page.locator('#app').textContent(), /independent security audit/i);
   assert.equal(await page.locator('.balance-number').textContent(), '1.0000000001CONN');
   assert.deepEqual(await page.locator('.balance-detail strong').allTextContents(), ['1 CONN', '0.0000000001 CONN']);
   assert.equal(await page.locator('.activity-row .amount').first().textContent(), '+0.0000000001 CONN');
@@ -163,6 +166,8 @@ try {
   assert.equal(await page.evaluate(() => window.loadTestPressedButton.isConnected), true, 'Background state detached the pressed navigation button before pointerup.');
   await page.mouse.up();
   await page.getByRole('heading', { name: 'Make yourself at home.' }).waitFor();
+  assert.doesNotMatch(await page.locator('#app').textContent(), /independent security audit/i);
+  assert.match(await page.locator('#app').textContent(), /This connection is not encrypted\./);
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0);
   await waitForLatest();
 

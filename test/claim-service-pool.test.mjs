@@ -13,7 +13,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function fixture() {
   const service = new WalletService({ directory: '/unused-service-pool-unit-test' });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: {} }; service.epoch = 5; service.tip = tip(600);
   service.emitState = () => {};
   const rpc = new EventEmitter(); rpc.close = () => {};

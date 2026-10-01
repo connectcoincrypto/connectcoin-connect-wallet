@@ -16,11 +16,11 @@ const profile = await mkdtemp(path.join(tmpdir(), 'connectwallet-ui-rsa-'));
 const screenshots = await mkdtemp(path.join(tmpdir(), 'connectwallet-rsa-screens-'));
 const config = { ...DEFAULT_CONFIG, theme: 'dark', rpc: { host: '127.0.0.1', port: 1 } };
 await writeFile(path.join(profile, 'config.json'), JSON.stringify(config));
-const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile };
+const env = { ...process.env, CONNECTWALLET_TEST_PROFILE: profile, CONNECTWALLET_NETWORK: 'main' };
 delete env.ELECTRON_RUN_AS_NODE;
 const snapshot = { phase: 'unlocked', securityEpoch: 1, config, setupActive: false, error: null,
   wallet: { name: 'RSA presentation fixture', address: 'not-a-real-address', balance: { available: '10' } },
-  network: { chain: 'testnet4', status: 'connected', height: 100 }, claims: { enabled: false }, history: [] };
+  network: { chain: 'main', status: 'connected', height: 100 }, claims: { enabled: false }, history: [] };
 const baseReview = { previewId: 'isolated-preview', type: 'p2c', address: 'example.com', amount: '1', fee: '0.0001', total: '1.0001', expectedConnections: '1024' };
 let app, page, stage = 'launch';
 let passed = false;

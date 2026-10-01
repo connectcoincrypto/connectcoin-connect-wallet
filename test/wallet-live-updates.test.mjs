@@ -93,7 +93,7 @@ async function settled(service) {
 async function fixture(t, { beforeOpen, waitForSettle = true } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-live-updates-test-'));
   const clients = [], releases = [];
-  const service = new WalletService({ directory,
+  const service = new WalletService({ directory, network: 'testnet4',
     clientFactory: () => { const client = new Backend(); clients.push(client); return client; },
     proofRunner: async () => { throw new Error('Live update tests must never perform TLS work'); },
   });

@@ -23,8 +23,8 @@ const tip = { chain: 'testnet4', height: 5, hash: 'ab'.repeat(32), mediantime: 1
 async function fixture(t, { durable = false, uncertain = false } = {}) {
   const directory = durable ? await mkdtemp(join(tmpdir(), 'connectwallet-send-details-')) : process.cwd();
   const broadcasts = [], saves = [];
-  const service = new WalletService({ directory });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  const service = new WalletService({ directory, network: 'testnet4' });
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: { mnemonic, name: 'Public test wallet', network: 'testnet4', receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1 }, password };
   service.walletExists = true;
   service.connectClient = () => {};

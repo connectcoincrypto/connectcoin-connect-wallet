@@ -128,7 +128,7 @@ test('address normalization never repairs a non-ASCII Unicode lookalike', t => {
 
 function fixture(t) {
   const service = new WalletService({ directory: process.cwd() });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: {} };
   t.after(() => service.statePublisher.close());
   return service;

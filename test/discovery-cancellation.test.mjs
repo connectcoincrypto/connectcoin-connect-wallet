@@ -186,8 +186,8 @@ for (const kind of ['untyped abort', 'uncertain abort']) test(`a ${kind} from a 
 });
 
 function serviceFixture(t, directory = '/unused-discovery-cancellation-test') {
-  const service = new WalletService({ directory });
-  service.config = structuredClone(DEFAULT_CONFIG);
+  const service = new WalletService({ directory, network: 'testnet4' });
+  service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.epoch = 7; service.session = { data: {} }; service.rpc = {};
   service.engine = { enabled: true, stopped: 0, async stop() { this.enabled = false; this.stopped++; } };
   service.emitState = () => {};

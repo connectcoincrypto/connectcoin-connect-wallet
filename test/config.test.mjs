@@ -8,7 +8,7 @@ import { DEFAULT_CONFIG, GENESIS, readConfig, validateConfig, validateDeveloperM
 test('config defaults use plaintext ConnectCoin4 TCP and strip unrelated/secret fields', () => {
   assert.deepEqual(validateConfig({}), DEFAULT_CONFIG);
   assert.deepEqual(validateConfig({ rpc: { host: 'CONNECTCOIN4.COM', password: 'secret' }, mnemonic: 'never save this' }), DEFAULT_CONFIG);
-  assert.equal(validateConfig(JSON.parse('{"__proto__":{"network":"main"}}')).network, 'testnet4');
+  assert.equal(validateConfig(JSON.parse('{"__proto__":{"network":"testnet4"}}')).network, 'main');
   assert.equal(Object.prototype.network, undefined);
   assert.throws(() => validateConfig(Object.create({ rpc: { host: 'evil' } })), /plain/);
   assert.throws(() => validateConfig({ get rpc() { throw new Error('executed'); } }), /plain/);
@@ -72,9 +72,15 @@ test('Automatic Claims preference accepts only booleans and migrates legacy limi
     await rm(directory, { recursive: true, force: true });
   }
 });
-test('network, claims, fee and lock bounds are explicit and testnet only by default', () => {
-  assert.throws(() => validateConfig({ network: 'main' }), /testnet4/);
-  assert.throws(() => validateConfig({ network: 'regtest' }), /testnet4/);
+test('mainnet is the default, test networks require explicit selection and profiles cannot switch network', () => {
+  assert.equal(validateConfig({}).network, 'main');
+  assert.equal(validateConfig({ network: 'main' }).rpc.host, 'connectcoin4.com');
+  assert.equal(validateConfig({}, { network: 'testnet4' }).network, 'testnet4');
+  assert.equal(validateConfig({ network: 'testnet4' }).rpc.host, '127.0.0.1');
+  assert.throws(() => validateConfig({ network: 'testnet4' }, { network: 'main' }), /different network/);
+  assert.throws(() => validateConfig({ network: 'main' }, { network: 'testnet4' }), /different network/);
+  for (const network of ['mainnet', '', '__proto__', null, 1]) assert.throws(() => validateConfig({ network }), /network/);
+  assert.throws(() => validateConfig({ network: 'regtest' }), /development/);
   assert.equal(validateConfig({ network: 'regtest' }, { allowRegtest: true }).network, 'regtest');
   for (const input of [{ version: 2 }, { autoLockMinutes: 0 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 257 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
 });
@@ -149,12 +155,21 @@ test('legacy configurations default Developer Mode off and persist either prefer
   }
 });
 test('chain tip validates network and pinned genesis, including height-zero consistency', () => {
-  const tip = { chain: 'testnet4', genesis_hash: GENESIS.testnet4, height: 12, hash: 'a'.repeat(64), mediantime: 1789136800 };
+  const tip = { chain: 'main', genesis_hash: GENESIS.main, height: 12, hash: 'a'.repeat(64), mediantime: 1789136800 };
   assert.deepEqual(validateTip(tip), tip);
-  for (const changed of [{ chain: 'main' }, { genesis_hash: 'b'.repeat(64) }, { height: -1 }, { height: '12' }, { hash: 'q'.repeat(64) }, { mediantime: Infinity }, { height: 0 }]) assert.throws(() => validateTip({ ...tip, ...changed }));
+  assert.equal(GENESIS.main, '30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e');
+  for (const changed of [{ chain: 'testnet4' }, { genesis_hash: GENESIS.testnet4 }, { genesis_hash: 'b'.repeat(64) }, { height: -1 }, { height: '12' }, { hash: 'q'.repeat(64) }, { mediantime: Infinity }, { height: 0 }]) assert.throws(() => validateTip({ ...tip, ...changed }));
   assert.throws(() => validateTip(tip, '__proto__'));
   assert.throws(() => validateTip(Object.create(tip)));
-  assert.deepEqual(validateTip({ ...tip, height: 0, hash: GENESIS.testnet4 }).hash, GENESIS.testnet4);
+  assert.deepEqual(validateTip({ ...tip, height: 0, hash: GENESIS.main }).hash, GENESIS.main);
+  for (const network of ['main', 'testnet4', 'regtest']) {
+    const other = { ...tip, chain: network, genesis_hash: GENESIS[network] };
+    assert.deepEqual(validateTip(other, network), other);
+    for (const wrong of Object.keys(GENESIS).filter(value => value !== network)) {
+      assert.throws(() => validateTip({ ...other, chain: wrong }, network), /unexpected network/);
+      assert.throws(() => validateTip({ ...other, genesis_hash: GENESIS[wrong] }, network), /unexpected network/);
+    }
+  }
 });
 test('config file creation is bounded, atomic, sanitized and rejects malformed UTF8', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-config-test-'));

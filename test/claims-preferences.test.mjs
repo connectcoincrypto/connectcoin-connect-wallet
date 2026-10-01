@@ -67,14 +67,14 @@ async function fixture(t, { online = true, validChain = true, config = {} } = {}
     assert.ok(basename(absolute).startsWith('connectwallet-claims-preference-test-'));
     await rm(absolute, { recursive: true, force: true });
   });
-  await writeConfig(directory, config);
+  await writeConfig(directory, { network: 'testnet4', ...config });
   await createVault(join(directory, VAULT_NAME), {
     name: 'Isolated preference fixture', mnemonic, network: 'testnet4', passphrase: '',
     receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1,
     needsRecovery: false, createdAt: '2026-01-01T00:00:00.000Z',
   }, password);
   const open = async () => {
-    const service = new WalletService({ directory,
+    const service = new WalletService({ directory, network: 'testnet4',
       clientFactory: options => { const client = new Backend(options, control); clients.push(client); return client; },
       proofRunner: async () => { throw new Error('Empty test chain must never generate a proof.'); },
     });

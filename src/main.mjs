@@ -3,7 +3,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { copyFile, chmod, constants, realpath } from 'node:fs/promises';
 import { WalletService } from './core/wallet-service.mjs';
-import { selectProfileDirectory } from './core/profile-paths.mjs';
+import { selectProfileDirectory, selectStartupNetwork } from './core/profile-paths.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const INDEX = join(ROOT, 'ui', 'index.html');
@@ -52,11 +52,12 @@ async function quitAfterSavingPreferences() {
 }
 
 // Development UI tests use isolated temporary profiles; installed builds ignore this override.
-let profileError;
+let profileError, startupNetwork;
 try {
+  startupNetwork = selectStartupNetwork({ isPackaged: app.isPackaged, requestedNetwork: process.env.CONNECTWALLET_NETWORK });
   app.setPath('userData', !app.isPackaged && process.env.CONNECTWALLET_TEST_PROFILE
     ? resolve(process.env.CONNECTWALLET_TEST_PROFILE)
-    : selectProfileDirectory(app.getPath('appData')));
+    : selectProfileDirectory(app.getPath('appData'), startupNetwork));
 } catch (error) { profileError = error; }
 app.setName('ConnectWallet');
 if (profileError) {
@@ -77,7 +78,8 @@ else {
   void app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
   try {
-    service = new WalletService({ directory: app.getPath('userData'), resourcesPath: process.resourcesPath });
+    service = new WalletService({ directory: app.getPath('userData'), resourcesPath: process.resourcesPath,
+      network: startupNetwork, allowRegtest: !app.isPackaged && startupNetwork === 'regtest' });
     await service.initialize();
     // Set the saved override before the first paint; 'system' follows OS changes
     // through Chromium's prefers-color-scheme without changing the OS setting.

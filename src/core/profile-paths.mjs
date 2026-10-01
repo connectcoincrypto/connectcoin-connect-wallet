@@ -1,8 +1,15 @@
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 
-export const PROFILE_NAME = 'ConnectWallet';
+export const PROFILE_NAME = 'ConnectWallet-mainnet';
 export const VAULT_NAME = 'wallet.connectwallet.json';
+const PROFILES = Object.freeze({ main: PROFILE_NAME, testnet4: 'ConnectWallet', regtest: 'ConnectWallet-regtest' });
+
+export function selectStartupNetwork({ isPackaged = false, requestedNetwork } = {}) {
+  if (isPackaged || requestedNetwork === undefined) return 'main';
+  if (!Object.hasOwn(PROFILES, requestedNetwork)) throw new Error('Unsupported ConnectCoin startup network.');
+  return requestedNetwork;
+}
 
 function inspect(path, kind) {
   try {
@@ -17,9 +24,10 @@ function inspect(path, kind) {
     throw error;
   }
 }
-/** Only the ConnectWallet profile is inspected; no discovery or migration. */
-export function selectProfileDirectory(appData) {
-  const directory = join(appData, PROFILE_NAME);
+/** Inspect only the selected network profile, without discovery or migration. */
+export function selectProfileDirectory(appData, network = 'main') {
+  if (!Object.hasOwn(PROFILES, network)) throw new Error('Unsupported ConnectCoin profile network.');
+  const directory = join(appData, PROFILES[network]);
   selectVaultFile(directory);
   return directory;
 }

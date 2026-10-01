@@ -6,7 +6,7 @@ import { buildPaymentUri, parsePaymentUri, parseClipboardPaymentText, validatePa
 import { paymentQrDataUrl } from './payment-qr.mjs';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
-import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, MAX_ADDRESS_INDEX } from './crypto.mjs';
+import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, networkParameters, MAX_ADDRESS_INDEX } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
 import { ClaimsEngine, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
@@ -63,8 +63,9 @@ function validateRow(row) {
   return row;
 }
 export class WalletService extends EventEmitter {
-  constructor({ directory, resourcesPath, allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner, connectionPoolFactory, rsaProbe } = {}) {
+  constructor({ directory, resourcesPath, network = 'main', allowRegtest = false, clientFactory = options => new RpcClient(options), proofRunner, connectionPoolFactory, rsaProbe } = {}) {
     super(); Object.assign(this, { directory, resourcesPath, allowRegtest, clientFactory, proofRunner, connectionPoolFactory });
+    this.configOptions = { allowRegtest, network };
     this.vaultFile = join(directory, VAULT_NAME);
     this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
@@ -73,7 +74,7 @@ export class WalletService extends EventEmitter {
     this.replacement = null; this.walletWrite = null; this.closed = false;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
-    this.network = { status: 'offline', chain: 'testnet4', height: null };
+    this.network = { status: 'offline', chain: network, height: null };
     this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {}; this.retiredClaims = new Map(); this.tip = null;
     this.reserved = new Set(); this.fundingCache = new Map(); this.fundingPending = new Map(); this.lastActivity = Date.now(); this.persisting = Promise.resolve();
     this.statePublisher = new StatePublisher({ publish: () => this.emit('state', this.getState()) });
@@ -84,7 +85,7 @@ export class WalletService extends EventEmitter {
   }
   async initialize() {
     this.vaultFile = selectVaultFile(this.directory);
-    this.config = await readConfig(this.directory, { allowRegtest: this.allowRegtest });
+    this.config = await readConfig(this.directory, this.configOptions);
     this.walletExists = await access(this.vaultFile).then(() => true, () => false);
     this.diagnostics = new DiagnosticLog({ directory: this.directory });
     this.recordDiagnostic('wallet.started', { stage: 'lifecycle' });
@@ -495,7 +496,7 @@ export class WalletService extends EventEmitter {
   async getRecoveryPhrase({ password } = {}) {
     this.assertSession(); const epoch = this.epoch;
     const verified = await unlockVault(this.vaultFile, password); this.assertSession(epoch);
-    return { mnemonic: verified.mnemonic, path: "m/44'/1'/0'/change/index", network: verified.network };
+    return { mnemonic: verified.mnemonic, path: `m/44'/${networkParameters(verified.network).coin}'/0'/change/index`, network: verified.network };
   }
   async ensureNetwork() {
     const epoch = this.epoch, rpc = this.rpc;
@@ -816,13 +817,13 @@ export class WalletService extends EventEmitter {
     // appearance while a limits write is pending must not restore old limits.
     const previous = this.config;
     const config = validateConfig({ ...previous, ...input, network: previous.network,
-      rpc: { ...previous.rpc, ...input.rpc }, claims: { ...previous.claims, ...input.claims } }, { allowRegtest: this.allowRegtest });
+      rpc: { ...previous.rpc, ...input.rpc }, claims: { ...previous.claims, ...input.claims } }, this.configOptions);
     if (this.claimsReviewRequired) config.claims.enabled = false;
     const reconnect = config.rpc.host !== previous.rpc.host || config.rpc.port !== previous.rpc.port;
     const claimsChanged = Object.keys(config.claims).some(key => config.claims[key] !== previous.claims[key]);
     // Preferences are durable even if locked, offline, or the helper is absent.
     // A failed disk write must not stop workers or switch to an unsaved server.
-    this.config = await writeConfig(this.directory, config, { allowRegtest: this.allowRegtest });
+    this.config = await writeConfig(this.directory, config, this.configOptions);
     if (this.closed) return this.getState();
     if (reconnect || claimsChanged || retryClaims) {
       this.claimsResumePending = false;

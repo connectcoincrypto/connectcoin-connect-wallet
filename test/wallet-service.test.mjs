@@ -28,7 +28,7 @@ class Backend extends EventEmitter {
 }
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(),'connectwallet-service-test-'));
-  const service = new WalletService({directory,clientFactory:()=>new Backend(),proofRunner:async()=> '020100'});
+  const service = new WalletService({directory,network:'testnet4',clientFactory:()=>new Backend(),proofRunner:async()=> '020100'});
   await service.initialize();
   t.after(async()=>{await service.close();assert.ok(resolve(directory).startsWith(resolve(tmpdir())+ '\\connectwallet-service-test-') || resolve(directory).startsWith(resolve(tmpdir())+'/connectwallet-service-test-'));await rm(directory,{recursive:true,force:true});});
   return service;
