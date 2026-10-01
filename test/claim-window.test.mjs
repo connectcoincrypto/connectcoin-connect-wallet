@@ -280,7 +280,7 @@ test('a complete discovery rescan keeps each surviving bounty factor and domain 
   mockDiscovery(service, { height: 600, rows: [bounty] });
   await service.syncBountiesInternal(service.epoch);
   assert.equal(service.engine.queue.get(bountyKey(bounty)).factor, factor);
-  assert.equal(service.engine.domainStats.get('example.com:7').attempts.length, 1);
+  assert.equal(service.engine.domainStats.get('example.com:7').completed, 1);
   assert.equal(draws, 1, 'resynchronizing discovery must not reroll a surviving bounty');
 });
 

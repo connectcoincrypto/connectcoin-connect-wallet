@@ -223,9 +223,14 @@ export class ClaimsEngine {
     for (const domain of this.waitingDns) if (!domains.has(domain)) this.waitingDns.delete(domain);
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
-    // Compatibility for importing bounded observation snapshots, not search budgets.
+    // Legacy tooling only. Production observes every protocol-3 capture.
+    // A truncated snapshot cannot reconstruct an EMA: never silently drop
+    // missing observations as the former last-100 window permitted.
     validateAttemptStats(snapshot, Number.MAX_SAFE_INTEGER);
-    if (snapshot.completed < previousCompleted) throw new Error('Invalid helper attempt sequence');
+    if (!Number.isSafeInteger(previousCompleted) || previousCompleted < 0 ||
+        snapshot.completed < previousCompleted || snapshot.completed - previousCompleted > snapshot.recent.length) {
+      throw new Error('Invalid helper attempt sequence');
+    }
     const key = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
     const stats = this.domainStats.get(key) ?? new P2CDomainStats(); this.domainStats.set(key, stats);
     const first = snapshot.completed - snapshot.recent.length;

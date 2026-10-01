@@ -10,11 +10,22 @@ not a sufficient SSRF boundary. Local patches also add independently cancellable
 capture sockets and completion telemetry. Capture success means completion
 through CertificateVerify before certificate verification and the hash-target
 test, as in Core. The protocol-3 desktop service emits a capture event before
-verification, then one terminal result per request. The main process retains
-the last 100 completed observations per domain and exact signature-policy mask.
-DNS failures and cancelled queued attempts do not create TLS observations.
+verification, then one terminal result per request. For each domain and exact
+signature-policy mask, the main process keeps two exponential moving averages:
+capture success starts at `0.1`, capture time at `0.02` seconds, and every
+completed attempt applies `new = 0.999 * old + 0.001 * observation`. Success is
+`1` for a completed CertificateVerify capture and `0` for a TCP/TLS failure;
+the rate is the success average divided by the time average. Every capture frame
+is consumed once, even when many frames arrive in one pipe chunk. Hash misses
+and certificate-verification failures still count as successful captures.
+DNS failures and cancelled unfinished attempts do not create TLS observations;
+a capture already completed before cancellation retains its observation.
 The legacy one-shot generator retains bounded snapshots for development tooling;
-it is not the desktop scheduling path. Proof encoding is unchanged.
+it is not the desktop scheduling path. Importing a snapshot into the EMA rejects
+a gap larger than the retained 100 samples, because omitted completions cannot
+reconstruct the exact EMA. Legacy proof generation may still expose bounded
+progress with such gaps. The desktop needs no helper protocol change for this policy.
+Proof encoding is unchanged.
 
 The RSA public-exponent limit is backported from P2C Tools commit
 `2dbb42ba93ad194b3166ed455a0b2a95e8a05000`, aligned with Core commit

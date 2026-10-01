@@ -37,7 +37,12 @@ export function domainPriority(priority, rate, scale = 1) {
   // Domain performance is approximate; the bounty/tie key remains exact.
   let numerator = 0;
   for (let shift = 320n; shift >= 0n; shift -= 32n) numerator = numerator * 4294967296 + Number((priority >> shift) & 0xffffffffn);
-  return (numerator / HASH_SPACE) * rate / scale;
+  const expected = numerator / HASH_SPACE;
+  const score = expected * rate / scale;
+  // EMA rates have no fixed maximum. Avoid poisoning scheduler ordering with
+  // infinity after an extreme run of zero-duration captures. Divide first on
+  // overflow so a finite scaled result is not needlessly saturated.
+  return score === Infinity ? Math.min(Number.MAX_VALUE, (expected / scale) * rate) : score;
 }
 
 export function isWorthAttempting(raw, rate) {
@@ -53,16 +58,23 @@ export function compareClaimPriority(a, b) {
 }
 
 export class P2CDomainStats {
-  constructor() { this.attempts = []; }
+  constructor() {
+    this.connections = 0.1;
+    this.totalTime = 0.02;
+    this.completed = 0;
+  }
   record(success, seconds) {
     if (typeof success !== 'boolean' || !Number.isFinite(seconds) || seconds < 0) return;
-    this.attempts.push([success, seconds]);
-    if (this.attempts.length > 100) this.attempts.shift();
+    // Only the initial observation supplies the 5/s prior; it decays along
+    // with the entire history rather than being added back on every query.
+    this.connections = 0.999 * this.connections + 0.001 * Number(success);
+    this.totalTime = 0.999 * this.totalTime + 0.001 * seconds;
+    this.completed = Math.min(Number.MAX_SAFE_INTEGER, this.completed + 1);
   }
   connectionRate() {
-    let successes = 0, seconds = 0;
-    for (const [success, elapsed] of this.attempts) { successes += Number(success); seconds += elapsed; }
-    return (0.1 + successes) / (0.02 + seconds);
+    // Preserve a positive, finite rate even at the limits of IEEE doubles.
+    // These representational bounds are not a scheduling/profitability floor.
+    return Math.max(Number.MIN_VALUE, Math.min(Number.MAX_VALUE, this.connections / this.totalTime));
   }
 }
 

@@ -51,7 +51,11 @@ function take(engine, now = Date.now()) {
   if (next) engine.markAssigned(next[1]);
   return next?.[0];
 }
-const stat = (success, seconds) => { const result = new P2CDomainStats(); result.record(success, seconds); return result; };
+const stat = (success, seconds, count = 1) => {
+  const result = new P2CDomainStats();
+  for (let i = 0; i < count; i++) result.record(success, seconds);
+  return result;
+};
 
 test('economic numerator includes target+1 and positive net payout with exact maximum arithmetic', () => {
   assert.equal(claimPriority(MAX_TARGET, 1000000000000000000n), SPACE * 1000000000000000000n);
@@ -74,19 +78,79 @@ test('raw expected return floor is inclusive and independent of random factor', 
   for (const rate of [NaN, Infinity, -Infinity, -1, 0]) assert.equal(isWorthAttempting(SPACE, rate), false);
 });
 
-test('last-100 domain statistics include failures, exclude invalid duration, and retain the 5/s prior', () => {
+test('domain statistics use the requested EMA with a decaying initial 5/s prior', () => {
   const stats = new P2CDomainStats();
   assert.equal(stats.connectionRate(), 5);
+  assert.equal(stats.connections, 0.1); assert.equal(stats.totalTime, 0.02);
   stats.record(true, 0.2); stats.record(false, 0.8);
-  assert.ok(Math.abs(stats.connectionRate() - 1.1 / 1.02) < 1e-12);
+  const connections = 0.1 * 0.999 ** 2 + 0.001 * 0.999;
+  const seconds = 0.02 * 0.999 ** 2 + 0.001 * (0.2 * 0.999 + 0.8);
+  assert.ok(Math.abs(stats.connections - connections) < 1e-15);
+  assert.ok(Math.abs(stats.totalTime - seconds) < 1e-15);
+  assert.ok(Math.abs(stats.connectionRate() - connections / seconds) < 1e-12);
+  const before = { ...stats };
   for (const seconds of [-1, NaN, Infinity, -Infinity]) stats.record(true, seconds);
-  assert.equal(stats.attempts.length, 2);
-  for (let index = 0; index < 100; index++) stats.record(true, 0);
-  assert.equal(stats.attempts.length, 100);
-  assert.equal(stats.connectionRate(), 5005);
-  stats.record(false, 1);
-  assert.equal(stats.attempts.length, 100);
-  assert.ok(Math.abs(stats.connectionRate() - 99.1 / 1.02) < 1e-12);
+  for (const success of [0, 1, null, undefined, 'true']) stats.record(success, 0.1);
+  assert.deepEqual({ ...stats }, before);
+  assert.equal(stats.completed, 2);
+});
+
+test('persistent failures keep decaying beyond 100 observations and cross the profitability floor', () => {
+  const stats = new P2CDomainStats(), priority = claimPriority(MAX_TARGET, 1000000n);
+  let previous = stats.connectionRate();
+  for (let n = 1; n <= 20000; n++) {
+    stats.record(false, 0.1);
+    const rate = stats.connectionRate();
+    assert.ok(rate > 0 && rate < previous);
+    previous = rate;
+    if ([100, 1000, 10000, 20000].includes(n)) {
+      const weight = 0.999 ** n;
+      const expected = (0.1 * weight) / (0.02 * weight + 0.1 * (1 - weight));
+      assert.ok(Math.abs(rate / expected - 1) < 1e-11);
+    }
+  }
+  assert.equal(stats.completed, 20000);
+  assert.equal(isWorthAttempting(priority, stats.connectionRate()), false);
+  assert.equal(isWorthAttempting(priority, 0.1 / (0.02 + 100 * 0.1)), true, 'old permanent prior incorrectly stays eligible');
+  for (let n = 0; n < 20000; n++) stats.record(true, 0.1);
+  assert.ok(Math.abs(stats.connectionRate() - 10) < 1e-6, 'real later successes can recover an observed policy');
+});
+
+test('failed domain EMA excludes new assignments and survives catalog refresh without restoring the prior', t => {
+  const { engine, starts } = fixture(t);
+  const failed = bounty(1, '1000000', 0, { domain: 'failed.example' });
+  const fresh = bounty(2, '1000000', 0, { domain: 'fresh.example' });
+  engine.enqueue([failed, fresh]);
+  const job = engine.queue.get(key(failed));
+  for (let i = 0; i < 20000; i++) {
+    engine.observe({ job, observed: false }, { captured: false, cancelled: false, seconds: 0.1 });
+  }
+  const stats = engine.domainStats.get('failed.example:7'), rate = stats.connectionRate();
+  assert.equal(isWorthAttempting(job.rawPriority, rate), false);
+  engine.rebuild();
+  for (let i = 0; i < 4; i++) assert.equal(take(engine), key(fresh));
+  engine.retainCatalog([failed, fresh]);
+  engine.enqueue([failed, fresh]);
+  assert.strictEqual(engine.domainStats.get('failed.example:7'), stats);
+  assert.equal(stats.connectionRate(), rate);
+  assert.equal(take(engine, Date.now() + 86400000), key(fresh), 'idle time does not reintroduce failed policies');
+  assert.deepEqual(starts, [], 'the test must not open connections');
+});
+
+test('EMA preserves older observations, zero durations, and finite positive extremes', () => {
+  const old = stat(false, 10), fresh = new P2CDomainStats();
+  for (let n = 0; n < 101; n++) { old.record(true, 0.1); fresh.record(true, 0.1); }
+  assert.ok(old.connectionRate() < fresh.connectionRate(), 'older observations decay but do not fall out at 100');
+  const failed = new P2CDomainStats(), instant = new P2CDomainStats();
+  for (let n = 0; n < 800000; n++) { failed.record(false, Number.MAX_VALUE); instant.record(true, 0); }
+  assert.ok(Number.isFinite(failed.connectionRate()) && failed.connectionRate() > 0);
+  assert.ok(Number.isFinite(instant.connectionRate()) && instant.connectionRate() > 5005);
+  const priority = claimPriority(MAX_TARGET, 1000000000000000000n);
+  assert.equal(isWorthAttempting(priority, failed.connectionRate()), false);
+  assert.equal(isWorthAttempting(priority, instant.connectionRate()), true);
+  assert.ok(Number.isFinite(domainPriority(selectionPriority(priority, PRIORITY_FACTOR_MAX), instant.connectionRate(), PRIORITY_FACTOR_SCALE)));
+  assert.ok(Number.isFinite(domainPriority(SPACE * 2n, Number.MAX_VALUE, 4)), 'scaled finite products survive intermediate overflow');
+  assert.equal(domainPriority(SPACE * 2n, Number.MAX_VALUE, 4), Number.MAX_VALUE / 2);
 });
 
 test('exact ties use Core outpoint order: reversed TXID bytes then numeric vout, never a tie lottery', () => {
@@ -165,7 +229,7 @@ test('economic domain ranking uses measured TLS throughput, not only the nominal
   const { engine } = fixture(t);
   const alpha = bounty(1, '10000', 0, { domain: 'alpha.example' });
   const beta = bounty(2, '2000', 0, { domain: 'beta.example' });
-  engine.domainStats.set('beta.example:7', stat(true, 0.01));
+  engine.domainStats.set('beta.example:7', stat(true, 0.01, 1000));
   engine.enqueue([beta, alpha]);
   assert.equal(take(engine), key(alpha), 'first assignment is fair, not economic');
   assert.equal(take(engine), key(beta), 'faster beta outranks larger but slower alpha economically');
@@ -176,11 +240,11 @@ test('TLS statistics are separate for each exact signature mask; untried masks r
   const blocked = bounty(1, '1000', 0, { domain: 'alpha.example', signature_algorithms_mask: 1 });
   const fresh = bounty(2, '1000', 0, { domain: 'alpha.example', signature_algorithms_mask: 2 });
   const beta = bounty(3, '500', 0, { domain: 'beta.example' });
-  engine.domainStats.set('alpha.example:1', stat(false, 10));
+  engine.domainStats.set('alpha.example:1', stat(false, 10, 100));
   engine.enqueue([blocked, fresh, beta]);
   assert.equal(take(engine), key(fresh));
   assert.equal(take(engine), key(fresh));
-  assert.equal(engine.domainStats.get('alpha.example:1').attempts.length, 1);
+  assert.equal(engine.domainStats.get('alpha.example:1').completed, 100);
 });
 
 test('a domain economic rank uses its best rate-weighted mask leader, not its rotating next bounty', t => {
@@ -188,7 +252,7 @@ test('a domain economic rank uses its best rate-weighted mask leader, not its ro
   const slowLeader = bounty(1, '100000', 0, { domain: 'alpha.example', signature_algorithms_mask: 1 });
   const fastLower = bounty(2, '5000', 0, { domain: 'alpha.example', signature_algorithms_mask: 2 });
   const beta = bounty(3, '8000', 0, { domain: 'beta.example' });
-  engine.domainStats.set('alpha.example:1', stat(false, 9.98)); // 0.01 captures/s
+  engine.domainStats.set('alpha.example:1', stat(false, 5, 1000)); // About 0.012 captures/s; still eligible.
   engine.enqueue([slowLeader, fastLower, beta]);
   assert.equal(take(engine), key(slowLeader));
   assert.equal(take(engine), key(beta));
@@ -348,7 +412,7 @@ test('an unprotected old bounty below the raw floor cannot occupy capacity using
   const old = bounty(1, '200', 0, { domain: 'alpha.example' });
   const fresh = bounty(2, '200', 0, { domain: 'beta.example' });
   engine.enqueue([old]);
-  engine.domainStats.set('alpha.example:7', stat(true, 1.1 / 4.95 - 0.02));
+  engine.domainStats.set('alpha.example:7', stat(false, 0.1));
   assert.equal(engine.enqueue([fresh]), 1);
   assert.equal(engine.queue.has(key(old)), false);
   assert.equal(engine.queue.has(key(fresh)), true);
@@ -379,7 +443,7 @@ test('verified funding policy replaces discovery policy before TLS and is resele
   assert.deepEqual(preparedDomains, ['alpha.example', 'beta.example']);
   assert.deepEqual(proofDomains, ['beta.example', 'zeta.example']);
   assert.equal(engine.domainStats.has('alpha.example:7'), false);
-  assert.equal(engine.domainStats.get('zeta.example:1').attempts.length, 1);
+  assert.equal(engine.domainStats.get('zeta.example:1').completed, 1);
   assert.equal(engine.snapshot().lastError, null);
   assert.deepEqual(draws, [100001, 100001]);
 });
@@ -440,11 +504,12 @@ test('a real failed TLS capture consumes exactly one turn at its TCP start', asy
   const mark = engine.scheduler.commit.bind(engine.scheduler);
   engine.scheduler.commit = selection => { assignments++; return mark(selection); };
   engine.enqueue([bounty(1)]); engine.start();
-  await until(() => engine.domainStats.get('example.com:7')?.attempts.length === 1);
+  await until(() => engine.domainStats.get('example.com:7')?.completed === 1);
   await engine.stop();
   assert.equal(assignments, 1); assert.equal(engine.preferReward, true);
   assert.equal(engine.scheduler.domainAfter, 'example.com'); assert.equal(engine.domainCursors.size, 1);
-  assert.deepEqual(engine.domainStats.get('example.com:7').attempts, [[false, 0.1]]);
+  assert.equal(engine.domainStats.get('example.com:7').completed, 1);
+  assert.equal(engine.domainStats.get('example.com:7').connectionRate(), (0.999 * 0.1) / (0.999 * 0.02 + 0.001 * 0.1));
 });
 
 test('a verified proof from an injected runner without progress still consumes exactly one turn', async t => {
