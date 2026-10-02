@@ -36,8 +36,12 @@ the lockfiles, builder toolchains and original third-party license files.
 End users do not need Node.js or Python: the native helper includes its runtime.
 
 The pinned cryptography 50.0.1 release has no macOS Intel wheel, so Intel builds
-also need the native C/Rust compiler toolchain and OpenSSL development libraries.
-The macOS Intel Actions runner supplies these build dependencies. License
+also need the native C/Rust compiler toolchain and OpenSSL static libraries and
+headers. Packaging rebuilds that provider with static OpenSSL linkage to avoid
+colliding with CPython's bundled OpenSSL library, and checks the result with
+`otool` before bundling. Set `OPENSSL_DIR` to the development prefix, or the build
+uses `brew --prefix openssl@3`. The macOS Intel Actions runner supplies these
+build dependencies. License
 collection supports both binary wheels and source builds: the latter uses the
 reviewed SHA-256 of the exact cryptography source archive and its locked Rust
 dependency checksums, and includes notices for the actual OpenSSL providers.
