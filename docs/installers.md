@@ -94,6 +94,17 @@ The repository changes must first reach GitHub before the new workflow can be
 selected. Publishing tested artifacts to a GitHub Release remains an explicit,
 separate maintainer action.
 
+To publish, first wait for **Wallet installers** and **Wallet tests** to succeed
+on the current `main` commit. Then manually run **Publish wallet release** on
+`main`, supplying that installer run's numeric ID. It downloads artifacts within
+GitHub Actions, verifies all four target manifests and SHA-256 hashes, uploads
+ten installers plus four manifests and a combined `SHA256SUMS` to a draft, and
+publishes only after verifying the complete uploaded set and version tag. It
+requires the build and publishing checkout to use the same clean source commit;
+if `main` advances, build the new commit first. A wrong existing tag or an already
+published release is never overwritten. This separate manual workflow needs
+`contents: write`; neither a normal push nor the build workflow publishes a release.
+
 ## Verification and limits
 
 - Unit tests enforce English-only Windows configuration, stable upgrade IDs,

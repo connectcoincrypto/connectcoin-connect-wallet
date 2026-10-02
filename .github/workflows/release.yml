@@ -1,0 +1,36 @@
+name: Publish wallet release
+
+# Publication is an explicit manual action, never a consequence of a push/tag.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Wallet installers run ID for the current main commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: wallet-release-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'connectcoincrypto/connectcoin-connect-wallet' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Verify artifacts and publish the versioned release
+        run: node scripts/publish-release.mjs --run-id="$INSTALLER_RUN_ID"
+        env:
+          INSTALLER_RUN_ID: ${{ inputs.run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
