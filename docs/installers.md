@@ -3,7 +3,7 @@
 These build recipes package ConnectWallet, not ConnectCoin Core. They do not
 install a blockchain node, configure Huge Pages, open firewall ports, enable
 claims, or handle a user's recovery words. The version comes from `package.json`
-(currently **0.1.0**); Core's version is independent.
+(currently **1.0.0**); Core's version is independent.
 
 ## Outputs
 

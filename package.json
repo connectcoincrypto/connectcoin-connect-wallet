@@ -2,7 +2,7 @@
   "name": "connectcoin-connect-wallet",
   "productName": "ConnectWallet",
   "desktopName": "com.connectcoincrypto.connectwallet.desktop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A local-key, light ConnectCoin wallet with BIP39 recovery and Automatic Claims",
   "private": true,
   "type": "module",

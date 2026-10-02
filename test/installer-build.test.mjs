@@ -7,6 +7,19 @@ import { validateConfiguration } from 'app-builder-lib/out/util/config/config.js
 import { buildPlan, prepareOutput } from '../scripts/build-installers.mjs';
 
 const metadata = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
+test('product version stays synchronized across lockfile, installer documentation and builder metadata', async () => {
+  const lock = JSON.parse(await readFile(new URL('../package-lock.json', import.meta.url), 'utf8'));
+  const documentation = await readFile(new URL('../docs/installers.md', import.meta.url), 'utf8');
+  assert.equal(lock.version, metadata.version);
+  assert.equal(lock.packages[''].version, metadata.version);
+  assert.ok(documentation.includes(`(currently **${metadata.version}**)`));
+  assert.equal(metadata.build.extraMetadata?.version, undefined, 'Do not override the application version during packaging');
+  for (const platform of ['win', 'linux', 'mac']) {
+    assert.ok(metadata.build[platform].artifactName.includes('${version}'), platform);
+  }
+  assert.ok(metadata.build.dmg.title.includes('${version}'));
+});
+
 test('installer workflow only uses runner cache context inside steps', async () => {
   const workflow = await readFile(new URL('../.github/workflows/installers.yml', import.meta.url), 'utf8');
   const jobEnvironment = workflow.match(/^    env:\r?\n([\s\S]*?)^    steps:/m)?.[1];

@@ -9,6 +9,7 @@ import { DOMParser } from '@xmldom/xmldom';
 import msiProjectCreated, { applyMsiPolicy } from '../scripts/msi-project.mjs';
 
 const namespace = 'http://wixtoolset.org/schemas/v4/wxs';
+const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const require = createRequire(import.meta.url);
 // Initialize builder's public entry before its targets (their imports are cyclic).
 require('app-builder-lib');
@@ -18,7 +19,7 @@ const { Arch } = require('builder-util');
 
 const synthetic = `<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="${namespace}">
-  <Product Id="*" Name="ConnectWallet" UpgradeCode="D88D5A21-77B9-537E-98D1-01560F964433" Version="0.1.0" Language="1046" Codepage="65001" Manufacturer="ConnectCoin contributors">
+  <Product Id="*" Name="ConnectWallet" UpgradeCode="D88D5A21-77B9-537E-98D1-01560F964433" Version="${version}" Language="1046" Codepage="65001" Manufacturer="ConnectCoin contributors">
     <Package Compressed="yes" InstallerVersion="500"/>
     <Condition Message="Windows 7 and above is required"><![CDATA[Installed OR VersionNT >= 601]]></Condition>
     <Icon Id="ConnectWalletIcon.exe" SourceFile="C:\\wallet\\assets\\icon.ico"/>
@@ -48,6 +49,7 @@ test('MSI hook enforces English, a real Windows 10 check and both shortcut ident
   const updated = applyMsiPolicy(synthetic);
   const document = parse(updated);
   assert.equal(all(document, 'Product')[0].getAttribute('Language'), '1033');
+  assert.equal(all(document, 'Product')[0].getAttribute('Version'), version);
   const condition = all(document, 'Condition')[0];
   assert.equal(condition.textContent, 'Installed OR (CONNECTWALLET_WINDOWS_BUILD >= 10240)');
   assert.equal(condition.getAttribute('Message'), 'Windows 10 or later is required to install ConnectWallet.');
@@ -118,7 +120,7 @@ test('pinned electron-builder generated manifest remains compatible with MSI pol
     appInfo: {
       productName: 'ConnectWallet', productFilename: 'ConnectWallet', sanitizedProductName: 'ConnectWallet',
       sanitizedName: 'ConnectWallet', id: 'com.connectcoincrypto.connectwallet', companyName: 'ConnectCoin contributors',
-      description: 'ConnectWallet', getVersionInWeirdWindowsForm: () => '0.1.0',
+      description: 'ConnectWallet', getVersionInWeirdWindowsForm: () => version,
     },
     getIconPath: async () => fileURLToPath(new URL('../assets/icon.ico', import.meta.url)),
   };
@@ -128,6 +130,7 @@ test('pinned electron-builder generated manifest remains compatible with MSI pol
   assert.match(manifest, /Windows 7 and above is required/);
   const result = applyMsiPolicy(manifest);
   assert.match(result, /Language="1033"/);
+  assert.equal(all(parse(result), 'Product')[0].getAttribute('Version'), version);
   assert.match(result, /CurrentBuildNumber/);
   assert.doesNotMatch(result, /Windows 7/);
   assert.equal(all(parse(result), 'ShortcutProperty').length, 2);
