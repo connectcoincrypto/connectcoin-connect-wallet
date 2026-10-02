@@ -56,7 +56,9 @@ class LicenseInventoryTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="connectwallet-licenses-")
         self.addCleanup(self.directory.cleanup)
-        self.output = Path(self.directory.name)
+        # Match the collector's canonical PROJECT path. CI temp roots can be
+        # aliases/junctions (notably /var -> /private/var on macOS).
+        self.output = Path(self.directory.name).resolve()
         self.enterContext(patch.object(licenses, "OUTPUT", self.output))
         self.enterContext(patch.object(licenses, "CACHE", self.output))
         self.enterContext(patch.object(licenses, "MANIFEST", []))
