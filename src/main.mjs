@@ -60,6 +60,7 @@ try {
     : selectProfileDirectory(app.getPath('appData'), startupNetwork));
 } catch (error) { profileError = error; }
 app.setName('ConnectWallet');
+if (process.platform === 'win32') app.setAppUserModelId('com.connectcoincrypto.connectwallet');
 if (profileError) {
   void app.whenReady().then(() => {
     dialog.showErrorBox('ConnectWallet could not start', 'The wallet data folder could not be read safely. Check its permissions and keep any existing wallet files intact.');

@@ -1,12 +1,14 @@
 {
   "name": "connectcoin-connect-wallet",
   "productName": "ConnectWallet",
+  "desktopName": "com.connectcoincrypto.connectwallet.desktop",
   "version": "0.1.0",
   "description": "A local-key, light ConnectCoin wallet with BIP39 recovery and Automatic Claims",
   "private": true,
   "type": "module",
   "main": "src/main.mjs",
   "license": "MIT",
+  "homepage": "https://connectcoincrypto.com/",
   "author": "ConnectCoin contributors",
   "repository": {
     "type": "git",
@@ -28,9 +30,11 @@
     "build:claims": "node scripts/setup-claims.mjs --build",
     "build:icon": "node scripts/build-icon.mjs",
     "prepack": "node scripts/check-package.mjs",
-    "pack": "electron-builder --dir",
-    "predist": "node scripts/check-package.mjs",
-    "dist": "electron-builder"
+    "pack": "electron-builder --dir --publish never",
+    "dist": "node scripts/build-installers.mjs",
+    "dist:win": "node scripts/build-installers.mjs --platform=win32 --arch=x64",
+    "dist:mac": "node scripts/build-installers.mjs --platform=darwin",
+    "dist:linux": "node scripts/build-installers.mjs --platform=linux --arch=x64"
   },
   "dependencies": {
     "@noble/curves": "2.4.0",
@@ -40,13 +44,17 @@
     "qrcode": "1.5.4"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@playwright/test": "1.63.0",
     "@resvg/resvg-js": "2.6.2",
+    "@xmldom/xmldom": "0.8.15",
     "electron": "44.4.1",
     "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.connectcoincrypto.connectwallet",
+    "publish": null,
+    "msiProjectCreated": "scripts/msi-project.mjs",
     "asar": true,
     "files": [
       "src/**",
@@ -67,28 +75,83 @@
     "win": {
       "icon": "assets/icon.ico",
       "target": [
-        "nsis"
+        "nsis",
+        "msi"
       ],
-      "artifactName": "ConnectWallet-${version}-${arch}-Setup.${ext}"
+      "artifactName": "ConnectWallet-${version}-Windows-${arch}.${ext}"
     },
     "nsis": {
       "guid": "d88d5a21-77b9-537e-98d1-01560f964433",
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "installerLanguages": ["en_US"],
+      "language": "1033",
+      "multiLanguageInstaller": false,
+      "displayLanguageSelector": false,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "shortcutName": "ConnectWallet",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": false,
+      "deleteAppDataOnUninstall": false
+    },
+    "msi": {
+      "upgradeCode": "67F96C30-665A-4AF6-9A87-B741403A11A5",
+      "oneClick": false,
+      "perMachine": false,
+      "shortcutName": "ConnectWallet",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": false,
+      "additionalLightArgs": ["-cultures:en-us"]
     },
     "linux": {
       "icon": "assets/icon-512.png",
+      "executableName": "connectwallet",
+      "syncDesktopName": true,
       "target": [
-        "AppImage"
+        "AppImage",
+        "deb",
+        "rpm",
+        "tar.gz"
       ],
-      "category": "Finance"
+      "category": "Finance",
+      "maintainer": "ConnectCoin Crypto <connectcoincrypto@gmail.com>",
+      "vendor": "ConnectCoin Crypto",
+      "artifactName": "ConnectWallet-${version}-Linux-x64.${ext}",
+      "desktop": {
+        "entry": {
+          "Name": "ConnectWallet",
+          "Comment": "ConnectCoin light wallet",
+          "StartupWMClass": "com.connectcoincrypto.connectwallet"
+        }
+      }
+    },
+    "deb": {
+      "packageName": "connectwallet",
+      "recommends": []
+    },
+    "rpm": {
+      "packageName": "connectwallet"
     },
     "mac": {
       "icon": "assets/icon.png",
       "target": [
-        "dmg"
+        "dmg",
+        "zip"
       ],
-      "category": "public.app-category.finance"
+      "category": "public.app-category.finance",
+      "artifactName": "ConnectWallet-${version}-macOS-${arch}.${ext}",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "notarize": false,
+      "extendInfo": {
+        "CFBundleDevelopmentRegion": "en"
+      }
+    },
+    "dmg": {
+      "title": "ConnectWallet ${version}"
     }
   }
 }

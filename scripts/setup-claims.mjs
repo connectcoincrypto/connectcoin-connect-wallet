@@ -25,6 +25,8 @@ try { await access(python); } catch {
   await run(command, [...prefix, '-m', 'venv', resolve(base, '.claims-venv')]);
 }
 await run(python, ['-c', 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"']);
+if (build) await run(python, ['-c',
+  'import platform, struct, sys; expected = {"x64": ("amd64", "x86_64"), "arm64": ("arm64", "aarch64")}; assert struct.calcsize("P") == 8 and platform.machine().lower() in expected.get(sys.argv[1], ()), "Python architecture must match the native Node/Electron target"', process.arch]);
 await run(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '-r', resolve(base, 'helpers', build ? 'requirements-build.txt' : 'requirements.txt')]);
 await run(python, ['-I', resolve(base, 'helpers/claims_bridge.py'), '--self-test']);
 // Force the source runtime even if a previously built native helper exists.

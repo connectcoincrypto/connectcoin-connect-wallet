@@ -1,0 +1,107 @@
+name: Wallet installers
+
+# Deliberately manual: normal commits run test.yml, not four expensive package
+# builds. This workflow uploads Actions artifacts only, never GitHub Releases.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wallet-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: win32
+            arch: x64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          cache: npm
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.arch }}
+          cache: pip
+          cache-dependency-path: |
+            helpers/requirements.txt
+            helpers/requirements-build.txt
+      - name: Cache verified Electron archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 3
+        with:
+          path: ${{ runner.temp }}/connectwallet-electron-cache
+          key: electron-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+        timeout-minutes: 5
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm fakeroot dpkg-dev libarchive-tools libfuse2
+      - name: Check source and installer policies
+        run: npm run check
+      - name: Test wallet and packaging logic
+        run: npm test
+        timeout-minutes: 5
+      - name: Build and verify native installers
+        # Builds/tests fresh Python code and its pinned dependencies on each OS;
+        # binaries, venvs and signing credentials are never shared between jobs.
+        run: npm run dist -- --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Verify macOS bundle signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ '${{ matrix.arch }}' = arm64 ]; then folder=mac-arm64; else folder=mac; fi
+          codesign --verify --deep --strict --verbose=2 "dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/$folder/ConnectWallet.app"
+      - name: Upload verified installers and checksums
+        uses: actions/upload-artifact@v7
+        with:
+          name: ConnectWallet-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.exe
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.msi
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.dmg
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.zip
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.deb
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.rpm
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.AppImage
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/ConnectWallet-*.tar.gz
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/SHA256SUMS
+            dist/installers/${{ matrix.platform }}-${{ matrix.arch }}/manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

@@ -74,9 +74,11 @@ npm run build:claims
 npm run pack
 ```
 
-`build:claims` uses PyInstaller to include the Python runtime and verification dependencies. Packaged users do **not** need Python or a node. `npm run dist` produces an installer/package for the current platform: Windows NSIS, Linux AppImage or macOS DMG. Code signing/notarization requires the distributor's certificates; this repository does not claim its builds are signed. Generated installers are in `dist/` and are not committed.
+`build:claims` uses PyInstaller to include the Python runtime and verification dependencies. Packaged users do **not** need Python or a node. `npm run pack` creates the unpacked development distribution in `dist/`.
 
-Keep the Windows installer's explicit `build.nsis.guid` stable so upgrades recognize an existing ConnectWallet installation.
+For installers, run **`npm run dist:win`**, **`npm run dist:mac`** or **`npm run dist:linux`** on the corresponding native host, after `npm ci`. These commands rebuild and test the native claims helper, embed icons, build the installers, verify the packaged runtime, and write checksums. Windows produces English-only **MSI and NSIS EXE**, macOS produces **DMG and ZIP** separately for Intel and Apple Silicon, and Linux x86_64 produces **DEB, RPM, AppImage and tar.gz**. Outputs go to `dist/installers/<platform>-<arch>/`; move an earlier build aside before rebuilding. No installer is executed and no wallet is opened by the packaging command.
+
+The manual **Wallet installers** Actions workflow builds all four native OS/architecture combinations and uploads downloadable artifacts. It does **not** publish Releases or run on every ordinary commit. See [the installer guide](docs/installers.md) for requirements, exact commands, verification limits, signing, and safe upgrades. Keep both the Windows NSIS GUID and MSI upgrade code stable. Installer-managed text is English; operating-system dialogs may use the system language.
 
 The claims helper pins `cryptography==50.0.1`, including fixes for duplicate-certificate path construction and wildcard DNS name constraints. After changing helper dependencies, rebuild the native helper and the desktop package: updating the source environment alone does not update an existing executable. Packaging checks the **bundled** provider version against the pin and rejects older helpers without security metadata. The consensus root bundle and proof format are unchanged.
 
