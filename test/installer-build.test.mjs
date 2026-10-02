@@ -7,6 +7,16 @@ import { validateConfiguration } from 'app-builder-lib/out/util/config/config.js
 import { buildPlan, prepareOutput } from '../scripts/build-installers.mjs';
 
 const metadata = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
+test('installer workflow only uses runner cache context inside steps', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/installers.yml', import.meta.url), 'utf8');
+  const jobEnvironment = workflow.match(/^    env:\r?\n([\s\S]*?)^    steps:/m)?.[1];
+  assert.ok(jobEnvironment, 'Expected the installer job environment');
+  assert.doesNotMatch(jobEnvironment, /\$\{\{\s*runner\./);
+  for (const step of ['Install locked JavaScript dependencies', 'Build and verify native installers']) {
+    const block = workflow.split(`      - name: ${step}`)[1]?.split('      - name:')[0];
+    assert.ok(block?.includes('electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache'), step);
+  }
+});
 test('installer configuration satisfies the pinned electron-builder schema', async () => {
   await validateConfiguration(metadata.build, { isEnabled: false });
 });

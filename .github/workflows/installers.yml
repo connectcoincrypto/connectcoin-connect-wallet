@@ -35,7 +35,6 @@ jobs:
             arch: arm64
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-      electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -65,6 +64,8 @@ jobs:
       - name: Install locked JavaScript dependencies
         run: npm ci
         timeout-minutes: 5
+        env:
+          electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
         run: |
@@ -81,6 +82,7 @@ jobs:
         run: npm run dist -- --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
         env:
           PYTHON: ${{ steps.python.outputs.python-path }}
+          electron_config_cache: ${{ runner.temp }}/connectwallet-electron-cache
       - name: Verify macOS bundle signature
         if: runner.os == 'macOS'
         shell: bash
