@@ -3,11 +3,13 @@ import { performance } from 'node:perf_hooks';
 import { validateClaimContext, isKnownClaimRejection } from './claims.mjs';
 import { ConnectionPool, validateConnectionOptions, claimAborted } from './claim-pool.mjs';
 import { ClaimScheduler } from './claim-scheduler.mjs';
+import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES } from './claim-connection-policy.mjs';
 import { diagnosticError } from './diagnostics.mjs';
 import { claimPriority, selectionPriority, domainPriority, isWorthAttempting, compareClaimPriority, P2CDomainStats, validateAttemptStats,
   PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, isP2CClaimConnectionLimitExceeded, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
 
 const keyOf = bounty => `${bounty.txid}:${bounty.vout}`;
+const policyOf = job => `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
 const report = (callback, event, details) => { try { Promise.resolve(callback(event, details)).catch(() => {}); } catch { /* Diagnostics never control claims. */ } };
 const DIAGNOSTIC_INTERVAL_MS = 5000, DIAGNOSTIC_SAMPLES_PER_STAGE = 4;
 const CANCELLATIONS = Object.freeze({ stop: 'cancelledStop', locked: 'cancelledLocked', suspend: 'cancelledSuspend',
@@ -57,6 +59,8 @@ export class ClaimsEngine {
     this.queue = new Map(); this.completed = new Set(); this.factors = new Map(); this.successCounts = new Map();
     this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set();
     this.domainStats = new Map(); this.dns = new Map(); this.live = new Map(); this.connections = new Map();
+    this.connectionPolicy = new ClaimConnectionPolicy();
+    this.recoveryJobs = new Map();
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
     this.waitingPrepare = new Set(); this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
@@ -132,7 +136,6 @@ export class ClaimsEngine {
   get controller() { return this.compatController ?? this.controllers.values().next().value ?? null; }
   set controller(value) { this.compatController = value; }
   get preferReward() { return this.scheduler.preferReward; }
-  get domainCursors() { return this.scheduler.domainCursors; }
   activeKeys() { const keys = new Set(this.live.keys()); if (this.compatActiveKey) keys.add(this.compatActiveKey); return keys; }
   hasActive(key) { return this.live.has(key) || this.compatActiveKey === key; }
   snapshot() { return { ...this.state, enabled: this.enabled, queued: this.queue.size, active: this.connections.size, options: { ...this.options } }; }
@@ -172,7 +175,34 @@ export class ClaimsEngine {
     const rate = this.domainStats.get(key)?.connectionRate() ?? 5; cache?.set(key, rate); return rate;
   }
   economicScore(job, rates) { return domainPriority(job.priority, this.connectionRate(job, rates), PRIORITY_FACTOR_SCALE); }
-  rebuild() { this.scheduler.rebuild(this.queue); this.dirty = false; }
+  recoveryCandidates(candidates, rates) {
+    const healthy = new Set(), recovery = new Map();
+    for (const candidate of candidates) {
+      const { job } = candidate, policy = policyOf(job);
+      if (!this.eligible(job)) continue;
+      if (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates))) healthy.add(policy);
+      else if (isWorthAttempting(job.rawPriority, 5)) {
+        const previous = recovery.get(policy);
+        if (!previous || compareClaimPriority(job, previous.job) < 0) recovery.set(policy, candidate);
+      }
+    }
+    return [...recovery].filter(([key]) => !healthy.has(key)).map(([, candidate]) => candidate)
+      .sort((a, b) => compareClaimPriority(a.job, b.job)).slice(0, MAX_RECOVERY_POLICIES);
+  }
+  attemptable(job) { return isWorthAttempting(job.rawPriority, this.connectionRate(job)) || job.recoveryProbe === true; }
+  jobDue(job) { return Math.max(job.due ?? 0, job.recoveryProbe ? job.probeDue ?? 0 : 0); }
+  rebuild() {
+    this.recoveryJobs.clear();
+    for (const job of this.queue.values()) job.recoveryProbe = false;
+    const candidates = [...this.queue].map(([key, job]) => ({ key, job }));
+    for (const { job } of this.recoveryCandidates(candidates, new Map())) {
+      const policy = policyOf(job);
+      job.recoveryProbe = true; job.probeDue = this.connectionPolicy.probeDue(policy);
+      this.recoveryJobs.set(policy, job);
+    }
+    this.scheduler.rebuild(this.queue);
+    this.dirty = false;
+  }
   nextReady(now = Date.now()) { if (this.dirty) this.rebuild(); return this.scheduler.next(now); }
   markAssigned(jobOrSelection) { this.scheduler.commit(jobOrSelection); }
   enqueue(bounties) {
@@ -181,7 +211,7 @@ export class ClaimsEngine {
     for (const [key, job] of this.queue) {
       this.updatePriority(job);
       if (this.hasActive(key) || this.pendingProofs.has(key) || job.due > Date.now()) protectedKeys.add(key);
-      else if (this.eligible(job) && isWorthAttempting(job.rawPriority, this.connectionRate(job, rates))) candidates.push({ key, job });
+      else if (this.eligible(job) && (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)) || isWorthAttempting(job.rawPriority, 5))) candidates.push({ key, job });
     }
     let incoming = 0;
     for (const bounty of bounties) {
@@ -198,7 +228,7 @@ export class ClaimsEngine {
       const job = { bounty, factor, due: proof?.due ?? 0, failures: proof?.failures ?? 0,
         winner: Boolean(proof), diagnosticId: ++this.nextDiagnosticId, prepared: this.proposals.get(key) };
       this.updatePriority(job);
-      if (!proof && (job.budgetExceeded || !isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)))) continue;
+      if (!proof && (job.budgetExceeded || (!isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)) && !isWorthAttempting(job.rawPriority, 5)))) continue;
       candidates.push({ key, job, fresh: true }); incoming++;
     }
     let count = 0;
@@ -207,7 +237,15 @@ export class ClaimsEngine {
       // An already-verified proof keeps its admission slot across a coherent
       // catalog rebuild, even when higher-paying new TLS candidates arrive.
       candidates.sort((a, b) => Number(this.pendingProofs.has(b.key)) - Number(this.pendingProofs.has(a.key)) || b.score - a.score || compareClaimPriority(a.job, b.job));
-      const selected = candidates.slice(0, Math.max(0, this.maxQueue - protectedKeys.size));
+      const ordinary = candidates.filter(({ job }) => job.winner || isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)));
+      const recovery = this.recoveryCandidates([...candidates, ...[...protectedKeys].map(key => ({ key, job: this.queue.get(key) }))], rates)
+        .filter(({ key }) => !protectedKeys.has(key));
+      const slots = Math.max(0, this.maxQueue - protectedKeys.size);
+      // Reserve a small bounded part of admission for formerly viable domains;
+      // a full normal queue must not permanently prevent recovery observations.
+      const proofSlots = ordinary.filter(({ key }) => this.pendingProofs.has(key)).length;
+      const probeSlots = Math.min(recovery.length, MAX_RECOVERY_POLICIES, Math.max(1, Math.floor(this.maxQueue / 10)), Math.max(0, slots - Math.max(proofSlots, Number(ordinary.length > 0))));
+      const selected = [...ordinary.slice(0, slots - probeSlots), ...recovery.slice(0, probeSlots)];
       const retained = new Set([...protectedKeys, ...selected.map(item => item.key)]);
       for (const [key, job] of this.queue) if (!retained.has(key)) { this.queue.delete(key); this.waitingPrepare.delete(job); }
       for (const { key, job, fresh } of selected) if (fresh) { job.bounty = structuredClone(job.bounty); this.queue.set(key, job); count++; }
@@ -225,6 +263,7 @@ export class ClaimsEngine {
     for (const key of this.domainStats.keys()) if (!masks.has(key)) this.domainStats.delete(key);
     for (const domain of this.dns.keys()) if (!domains.has(domain)) this.dns.delete(domain);
     for (const domain of this.waitingDns) if (!domains.has(domain)) this.waitingDns.delete(domain);
+    this.connectionPolicy.retain(masks);
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
     // Legacy tooling only. Production observes every protocol-4 validation result.
@@ -263,11 +302,14 @@ export class ClaimsEngine {
   clear({ preserveSelection = false } = {}) {
     for (const job of this.queue.values()) job.unavailable = true;
     this.queue.clear(); this.completed.clear();
+    this.recoveryJobs.clear();
     this.waitingPrepare.clear(); this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
-    if (!preserveSelection) { this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); }
-    this.notify({ completed: 0 });
+    if (!preserveSelection) { this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
+    // A catalog resync keeps both activity totals. A full context reset must
+    // clear both together so the UI never compares counters from different periods.
+    this.notify(preserveSelection ? {} : { completed: 0, attempts: 0 });
   }
   setOptions(options) {
     if (this.enabled || this.running || this.stopping) throw new Error('Stop Automatic Claims before changing connection limits');
@@ -412,7 +454,7 @@ export class ClaimsEngine {
     }).finally(() => {
       this.finishOperation(operation);
       job.preparing = false; job.prepareController = null; this.preparing.delete(job); this.controllers.delete(controller);
-      if (this.queue.get(key) === job && this.ready(job) && isWorthAttempting(job.rawPriority, this.connectionRate(job))) this.scheduler.setReady(key, true, { due: job.due });
+      if (this.queue.get(key) === job && this.ready(job) && this.attemptable(job)) this.scheduler.setReady(key, true, { due: this.jobDue(job) });
       else this.scheduler.remove(key);
       this.releasePreparationSlot();
     });
@@ -472,9 +514,22 @@ export class ClaimsEngine {
     stats.record(result.validationPassed, result.seconds);
   }
   dispatch(selection, generation) {
-    const [key, job] = selection, controller = new AbortController(), token = ++this.nextToken;
+    const [key, job] = selection;
+    const recoveryProbe = !isWorthAttempting(job.rawPriority, this.connectionRate(job));
+    if (recoveryProbe) {
+      if (!job.recoveryProbe || !isWorthAttempting(job.rawPriority, 5)) { this.dirty = true; this.wakeRequested = true; return; }
+      // A delayed TCP-start acknowledgement may belong to a different bounty
+      // than the current probe representative. Consult policy state, not the
+      // representative's cached deadline, before spending another connection.
+      job.probeDue = this.connectionPolicy.probeDue(policyOf(job));
+      if (job.probeDue > Date.now()) {
+        this.scheduler.setReady(key, this.ready(job), { due: this.jobDue(job) });
+        this.wakeRequested = true; return;
+      }
+    }
+    const controller = new AbortController(), token = ++this.nextToken;
     const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime() } : {}) });
-    const request = { job, controller, token, started: false, observed: false };
+    const request = { job, controller, token, started: false, observed: false, recoveryProbe };
     const operation = this.beginOperation('capture', controller);
     this.connections.set(token, request); this.controllers.add(controller); this.awaitingStart = true;
     const pool = this.pool;
@@ -485,6 +540,15 @@ export class ClaimsEngine {
         if (request.started) throw new Error('Duplicate connection start');
         this.countDiagnostic('attempts');
         request.started = true; this.scheduler.commit(selection); this.awaitingStart = false;
+        if (request.recoveryProbe) {
+          const policy = policyOf(job), due = this.connectionPolicy.probeStarted(policy);
+          job.probeDue = due;
+          const representative = this.recoveryJobs.get(policy);
+          if (representative) {
+            representative.probeDue = due;
+            this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
+          }
+        }
         // The native pool gates actual TCP starts with a high-resolution timer.
         // Avoid a second Windows JS timer (~15 ms on some systems) capping it
         // near 65/s. Offline/custom adapters may delegate pacing to this fallback.
@@ -543,7 +607,7 @@ export class ClaimsEngine {
       this.waitingPrepare.delete(job); job.waitingPrepare = false;
       const key = keyOf(job.bounty);
       if (this.queue.get(key) !== job || !this.ready(job)) continue;
-      if (this.scheduler.setReady(key, true, { due: job.due }) && job.due <= Date.now()) break;
+      if (this.scheduler.setReady(key, true, { due: this.jobDue(job) }) && this.jobDue(job) <= Date.now()) break;
     }
   }
   releaseDnsSlot() {

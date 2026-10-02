@@ -64,7 +64,7 @@ test('simultaneous fresh winners and queued proofs share the four-submission lim
   const sent = [], releases = [];
   let active = 0, maximum = 0;
   const { engine, attempts } = fixture(t, {
-    options: { connectionsPerSecond: 256, concurrency: 12 },
+    options: { connectionsPerSecond: 256, concurrency: 24 },
     transformPool: pool => ({ ...pool, pacesStarts: true }),
     submit: async (prepared, _proof, { signal }) => {
       sent.push(key(prepared.bounty)); maximum = Math.max(maximum, ++active);
@@ -74,9 +74,13 @@ test('simultaneous fresh winners and queued proofs share the four-submission lim
   });
   // Release held mock RPCs even if an assertion fails, so cleanup cannot hang.
   t.after(() => { for (const release of releases) release(); });
-  engine.enqueue(Array.from({ length: 12 }, (_, i) => row(i + 1)));
-  for (const job of engine.queue.values()) job.prepared = { bounty: job.bounty, context: context(job.bounty) };
-  engine.dns.set('example.com', { ok: true, expires: Date.now() + 60000 });
+  // Domain fairness supplies twelve independent leaders; same-domain slots
+  // intentionally share one leader now. Extra slots accommodate economic turns.
+  engine.enqueue(Array.from({ length: 12 }, (_, i) => row(i + 1, `d${String(i).padStart(2, '0')}.example`)));
+  for (const job of engine.queue.values()) {
+    job.prepared = { bounty: job.bounty, context: context(job.bounty) };
+    engine.dns.set(job.bounty.domain, { ok: true, expires: Date.now() + 60000 });
+  }
   engine.start();
   await until(() => new Set(attempts.map(item => item.bountyId)).size === 12);
   for (const attempt of attempts) attempt.finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
@@ -208,7 +212,9 @@ test('an unknown broadcast outcome closes the global gate and cancels unrelated 
 });
 
 test('the public proposal cache stays at 256 and never evicts a held active challenge', { timeout: 15000 }, async t => {
-  const { engine, attempts, preparations } = fixture(t);
+  // This tests cache eviction, not pacing. Let the isolated adapter own starts
+  // so exhausting each leader's budget does not multiply real timer waits.
+  const { engine, attempts, preparations } = fixture(t, { transformPool: pool => ({ ...pool, pacesStarts: true }) });
   const bounties = Array.from({ length: 257 }, (_, index) => row(index + 1));
   engine.enqueue(bounties); engine.start(); await until(() => attempts.length >= 2);
   const held = attempts[0], heldProposal = engine.proposals.get(held.bountyId);
@@ -312,7 +318,7 @@ test('two blocked DNS lookups cannot block a third unresolved domain ahead of a 
   assert.deepEqual(resolutions, ['alpha.example', 'beta.example']);
   assert.equal(attempts[0].context.domain, 'zeta.example');
   assert.equal(engine.scheduler.domainAfter, 'zeta.example');
-  assert.deepEqual([...engine.domainCursors.keys()], ['zeta.example'], 'DNS scheduling consumed no connection turns');
+  assert.equal(engine.preferReward, true, 'only the single TCP assignment consumed a domain turn');
 });
 
 test('a late TCP-start acknowledgement after stop counts the attempt without reviving searching UI', async t => {
@@ -433,5 +439,6 @@ test('releasing a DNS slot skips a removed parked domain and wakes the next vali
   assert.equal(lookups.has('delta.example'), false);
   assert.notEqual(engine.scheduler.domainGates.get('delta.example')?.ready, false, 'a removed candidate leaves no closed domain gate');
   assert.equal(attempts.length, 0, 'DNS-only decisions consume no TCP attempt');
-  assert.equal(engine.domainCursors.size, 0);
+  assert.equal(engine.scheduler.domainAfter, null);
+  assert.equal(engine.preferReward, false);
 });

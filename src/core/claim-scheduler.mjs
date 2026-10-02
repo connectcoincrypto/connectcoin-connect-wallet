@@ -98,7 +98,8 @@ const deadline = value => {
   return value;
 };
 
-/** Core-style per-connection rotation. No RNG, network, keys or mutable rank comparator.
+/** Core-style domain rotation, always using each domain's best ready bounty.
+ * No RNG, network, keys or mutable rank comparator.
  * Rebuild (normally every five seconds) snapshots each job's exact adjusted priority
  * and each domain/mask's observed rate. The hot path uses indexed ready sets, not
  * queue scans/sorts. Call setReady/remove when a job changes outside a refresh.
@@ -109,7 +110,6 @@ export class ClaimScheduler {
     if (typeof connectionRate !== 'function' || typeof isReady !== 'function') throw new Error('Invalid claim scheduler callbacks');
     this.connectionRate = connectionRate;
     this.isReady = isReady;
-    this.domainCursors = new Map();
     this.domainAfter = null;
     this.preferReward = false;
     this.domainGates = new Map();
@@ -124,7 +124,7 @@ export class ClaimScheduler {
     this.pending = null;
     if (!preserveSelection) {
       this.serial++;
-      this.domainCursors.clear(); this.domainGates.clear();
+      this.domainGates.clear();
       this.domainAfter = null; this.preferReward = false;
     }
   }
@@ -140,7 +140,7 @@ export class ClaimScheduler {
       const policy = `${name}:${job.bounty.signature_algorithms_mask}`;
       if (!rates.has(policy)) rates.set(policy, this.connectionRate(job));
       const rate = rates.get(policy);
-      if (!eligible(job) || !isWorthAttempting(job.rawPriority, rate)) continue;
+      if (!eligible(job) || (!isWorthAttempting(job.rawPriority, rate) && !job.recoveryProbe)) continue;
       if (this.entries.has(key)) throw new Error('Duplicate bounty in claim schedule');
       const rank = rankSnapshot(job), score = domainPriority(rank.priority, rate, PRIORITY_FACTOR_SCALE);
       if (!Number.isFinite(score)) continue;
@@ -149,11 +149,10 @@ export class ClaimScheduler {
         group = { name, entries: [], masks: new Map(), active: false, gate: this.domainGates.get(name) ?? { ready: true, due: 0 } };
         this.groups.set(name, group);
       }
-      const due = deadline(job.due ?? 0), allowed = Boolean(isReady(job));
+      const due = deadline(Math.max(job.due ?? 0, job.recoveryProbe ? job.probeDue ?? 0 : 0)), allowed = Boolean(isReady(job));
       const entry = { key, job, ...rank, score, due, allowed, active: allowed && due <= now, group };
       this.entries.set(key, entry); group.entries.push(entry);
     }
-    for (const name of this.domainCursors.keys()) if (!trackedDomains.has(name)) this.domainCursors.delete(name);
     for (const name of this.domainGates.keys()) if (!trackedDomains.has(name)) this.domainGates.delete(name);
     this.names = [...this.groups.keys()].sort(compareText);
     this.readyDomains = new ReadyIndex(this.names.map(() => 0));
@@ -188,6 +187,7 @@ export class ClaimScheduler {
       if (!leader || candidate.score > leader.score || (candidate.score === leader.score && compareClaimPriority(candidate, leader) < 0)) leader = candidate;
     }
     const active = Boolean(leader);
+    group.leader = leader;
     if (group.active !== active) { this.readyDomains.add(group.index, active ? 1 : -1); group.active = active; }
     if (active) this.economic.set(group.name, { name: group.name, score: leader.score, leader, group });
     else this.economic.remove(group.name);
@@ -246,17 +246,16 @@ export class ClaimScheduler {
       const before = this.readyDomains.before(index);
       group = this.groups.get(this.names[this.readyDomains.at(before < this.readyDomains.total ? before : 0)]);
     }
-    const cursor = this.domainCursors.get(group.name);
-    const start = cursor ? upperBound(group.entries, cursor, compareClaimPriority) : 0;
-    const before = group.ready.before(start);
-    const entry = group.entries[group.ready.at(before < group.ready.total ? before : 0)];
-    const token = { serial: this.serial, job: entry.job, key: entry.key, domain: group.name, rank: rankSnapshot(entry), economic: this.preferReward, committed: false };
+    // Fair and economic turns both use the leader whose mask-adjusted score
+    // ranks this domain. In-flight attempts do not rotate to worse bounties.
+    const entry = group.leader;
+    const token = { serial: this.serial, job: entry.job, key: entry.key, domain: group.name, economic: this.preferReward, committed: false };
     const result = [entry.key, entry.job];
     Object.defineProperty(result, selectionToken, { value: token });
     this.pending = token;
     return result;
   }
-  /** Prefer commit(selection) so delayed acknowledgements retain the exact rank.
+  /** Prefer commit(selection) so delayed acknowledgements retain the selected domain turn.
    * A caller using commit(job) must serialize next/commit. A second outstanding
    * selection cannot consume an extra turn after another selection committed.
    */
@@ -264,7 +263,6 @@ export class ClaimScheduler {
     const token = selectionOrJob?.[selectionToken] ?? (this.pending?.job === selectionOrJob ? this.pending : null);
     if (!token || token.committed || token.serial !== this.serial) return false;
     token.committed = true;
-    this.domainCursors.set(token.domain, token.rank);
     if (!token.economic) this.domainAfter = token.domain;
     this.preferReward = !token.economic;
     this.serial++; this.pending = null;

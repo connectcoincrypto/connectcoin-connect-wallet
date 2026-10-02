@@ -26,27 +26,56 @@ test('domains alternate lexicographic fair turns and best economic turns', () =>
     'alpha.example', 'alpha.example', 'beta.example', 'alpha.example', 'gamma.example', 'alpha.example']);
 });
 
-test('each domain rotates all bounties by stable exact factor-adjusted priority, never monopolized by its leader', () => {
+test('each domain keeps selecting its best stable factor-adjusted bounty until the leader changes', () => {
   const jobs = [job(1, 'alpha.example', 1000n, { factor: 1_100_000 }), job(2, 'alpha.example', 1099n), job(3, 'alpha.example', 800n)];
   const scheduler = new ClaimScheduler(); scheduler.rebuild(queue(jobs), { now: 0 });
-  assert.deepEqual(Array.from({ length: 9 }, () => keyOf(take(scheduler))), [1, 2, 3, 1, 2, 3, 1, 2, 3].map(id => keyOf(jobs[id - 1])));
+  assert.deepEqual(Array.from({ length: 9 }, () => take(scheduler)), Array(9).fill(jobs[0]));
   // A 10% factor cannot reverse a greater-than-10% economic difference.
   jobs[1].rawPriority = claimPriority(maximum, 1101n); jobs[1].priority = selectionPriority(jobs[1].rawPriority, jobs[1].factor);
   scheduler.clear({ preserveSelection: false }); scheduler.rebuild(queue(jobs), { now: 0 });
   assert.equal(take(scheduler), jobs[1]);
 });
 
-test('immutable cursor survives refresh and rank changes, using strict upper_bound', () => {
+test('a refreshed domain immediately selects its new highest score without rotating through lower ranks', () => {
   const first = job(1, 'alpha.example', 3000n), second = job(2, 'alpha.example', 2000n), third = job(3, 'alpha.example', 1000n);
   const scheduler = new ClaimScheduler(); scheduler.rebuild(queue([first, second, third]), { now: 0 });
   assert.equal(take(scheduler), first);
-  // The cursor is 3000, not a live reference to this altered job (now 500).
   first.rawPriority = claimPriority(maximum, 500n); first.priority = selectionPriority(first.rawPriority, first.factor);
   scheduler.rebuild(queue([first, second, third]), { now: 0 });
-  assert.equal(take(scheduler), second);
-  assert.equal(take(scheduler), third);
-  assert.equal(take(scheduler), first);
+  assert.deepEqual(Array.from({ length: 4 }, () => take(scheduler)), Array(4).fill(second));
+  const higher = job(4, 'alpha.example', 4000n);
+  scheduler.rebuild(queue([first, second, third, higher]), { now: 0 });
+  assert.deepEqual(Array.from({ length: 4 }, () => take(scheduler)), Array(4).fill(higher));
 });
+
+test('same-domain equal payouts consistently prefer difficulty 10 over difficulty 15', () => {
+  const target = bits => ((1n << (256n - bits)) - 1n).toString(16).padStart(64, '0');
+  const easier = job(1, 'alpha.example', 100_000_000n, { target: target(10n) });
+  const harder = job(2, 'alpha.example', 100_000_000n, { target: target(15n), factor: 1_100_000 });
+  const scheduler = new ClaimScheduler(); scheduler.rebuild(queue([harder, easier]), { now: 0 });
+  assert.equal(scheduler.entries.size, 2, 'both targets exceed the raw profitability floor');
+  assert.deepEqual(Array.from({ length: 12 }, () => take(scheduler)), Array(12).fill(easier));
+});
+
+for (const reason of ['removed', 'not ready', 'cooling', 'proof winner', 'budget exceeded']) {
+  test(`the next-best same-domain bounty takes over when the leader is ${reason}`, () => {
+    const best = job(1, 'alpha.example', 3000n), next = job(2, 'alpha.example', 2000n), last = job(3, 'alpha.example', 1000n);
+    const scheduler = new ClaimScheduler(); scheduler.rebuild(queue([last, next, best]), { now: 0 });
+    assert.equal(take(scheduler), best);
+    if (reason === 'removed') scheduler.remove(keyOf(best), { now: 0 });
+    else if (reason === 'not ready') scheduler.setReady(keyOf(best), false, { now: 0 });
+    else if (reason === 'cooling') scheduler.setReady(keyOf(best), true, { due: 100, now: 0 });
+    else {
+      best[reason === 'proof winner' ? 'winner' : 'budgetExceeded'] = true;
+      scheduler.rebuild(queue([last, next, best]), { now: 0 });
+    }
+    assert.deepEqual(Array.from({ length: 4 }, () => take(scheduler)), Array(4).fill(next));
+    if (reason === 'not ready') {
+      scheduler.setReady(keyOf(best), true, { now: 0 });
+      assert.equal(take(scheduler), best);
+    } else if (reason === 'cooling') assert.equal(take(scheduler, 100), best);
+  });
+}
 
 test('peek, failed DNS and removed candidates do not consume connection turns', () => {
   const a = job(1, 'alpha.example', 3000n), b = job(2, 'beta.example');
@@ -61,7 +90,7 @@ test('peek, failed DNS and removed candidates do not consume connection turns', 
   assert.equal(take(scheduler), b);
 });
 
-test('connection ACK retains exact selected rank across refresh or deletion and cannot commit twice', () => {
+test('connection ACK retains its domain turn across refresh or deletion and cannot commit twice', () => {
   const a = job(1, 'alpha.example', 3000n), b = job(2, 'alpha.example', 2000n);
   const scheduler = new ClaimScheduler(); scheduler.rebuild(queue([a, b]), { now: 0 });
   const selected = scheduler.next(0);
@@ -75,14 +104,14 @@ test('connection ACK retains exact selected rank across refresh or deletion and 
   assert.equal(scheduler.commit(pending), false);
 });
 
-test('mask-specific rate weights economic leader but does not change within-domain rotation', () => {
+test('mask-specific rate selects the same best bounty on both fair and economic domain turns', () => {
   const a1 = job(1, 'alpha.example', 3000n, { mask: 1, rate: 1 });
   const a2 = job(2, 'alpha.example', 1000n, { mask: 2, rate: 20 });
   const b = job(3, 'beta.example', 2000n, { rate: 5 });
   const scheduler = new ClaimScheduler({ connectionRate: item => item.rate });
   scheduler.rebuild(queue([a1, a2, b]), { now: 0 });
-  assert.equal(take(scheduler), a1); assert.equal(take(scheduler), a2);
-  assert.equal(take(scheduler), b); assert.equal(take(scheduler), a1);
+  assert.equal(take(scheduler), a2); assert.equal(take(scheduler), a2);
+  assert.equal(take(scheduler), b); assert.equal(take(scheduler), a2);
   scheduler.setReady(keyOf(a2), false, { now: 0 });
   assert.equal(take(scheduler), a1); assert.equal(take(scheduler), b);
 });
@@ -124,15 +153,19 @@ test('exact ties follow Core outpoint storage-byte order, not transport order or
   const expected = [...jobs].sort(compareClaimPriority);
   assert.notEqual(expected[0], jobs[0]);
   const scheduler = new ClaimScheduler(); scheduler.rebuild(queue(jobs), { now: 0 });
-  assert.deepEqual(Array.from({ length: 6 }, () => take(scheduler)), [...expected, ...expected]);
+  for (const best of expected) {
+    assert.deepEqual(Array.from({ length: 3 }, () => take(scheduler)), Array(3).fill(best));
+    scheduler.remove(keyOf(best), { now: 0 });
+  }
+  assert.equal(scheduler.next(0), undefined);
 });
 
 test('indexed scheduler matches an independent scan/sort oracle through dynamic readiness, DNS, cooldown and rebuilds', () => {
   let seed = 0x31415926;
   const random = max => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % max; };
   const jobs = Array.from({ length: 350 }, (_, id) => job(id + 1, `domain${String(id % 35).padStart(2, '0')}.example`,
-    200n + BigInt(random(10000)), { factor: 1_000_000 + random(100001), mask: 1 + id % 7, ready: true }));
-  const items = queue(jobs), gates = new Map(), cursors = new Map();
+    200n + BigInt(random(10000)), { factor: 1_000_000 + random(100001), mask: 1 + Math.floor(id / 35) % 7, ready: true }));
+  const items = queue(jobs), gates = new Map();
   const rate = item => 1 + item.bounty.signature_algorithms_mask;
   const scheduler = new ClaimScheduler({ connectionRate: rate, isReady: item => item.ready });
   scheduler.rebuild(items, { now: 0 });
@@ -173,14 +206,13 @@ test('indexed scheduler matches an independent scan/sort oracle through dynamic 
       } else {
         const names = [...groups.keys()].sort(); name = names.find(domain => after === null || domain > after) ?? names[0];
       }
-      const entries = groups.get(name).sort(compareClaimPriority), cursor = cursors.get(name);
-      expected = (cursor && entries.find(item => compareClaimPriority(item, cursor) > 0)) || entries[0];
+      expected = groups.get(name).sort((a, b) =>
+        domainPriority(b.priority, rate(b), 1_000_000) - domainPriority(a.priority, rate(a), 1_000_000) || compareClaimPriority(a, b))[0];
     }
     const selection = scheduler.next(now);
     assert.equal(selection?.[1], expected, `Different selected bounty at tick ${now}`);
     if (!selection) continue;
     assert.equal(scheduler.commit(selection), true);
-    cursors.set(expected.bounty.domain, { priority: expected.priority, bounty: { txid: expected.bounty.txid, vout: expected.bounty.vout } });
     if (!economic) after = expected.bounty.domain;
     economic = !economic;
   }

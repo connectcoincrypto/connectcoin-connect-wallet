@@ -233,7 +233,7 @@ try {
   process.exitCode = 1;
 } finally {
   try { Object.assign(measurements, await closeElectronTest(application)); }
-  catch { passed = false; process.exitCode = 1; console.error('Load UI graceful shutdown failed.'); }
+  catch (error) { passed = false; process.exitCode = 1; console.error(`Load UI graceful shutdown failed: ${error.stack ?? error}`); }
   // Only remove the exact temporary profile created above, never user data.
   const absolute = path.resolve(profile);
   assert.equal(path.dirname(absolute), path.resolve(tmpdir()));

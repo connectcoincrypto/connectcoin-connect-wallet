@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 HELPERS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HELPERS))
@@ -17,6 +17,122 @@ from connectcoin_p2c_tools import tls13
 
 
 class TLSCancellationTests(unittest.TestCase):
+    def test_blocked_start_reporting_does_not_consume_network_deadline(self):
+        now = [100.0]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.connect.side_effect = OSError("reached actual TCP connect")
+        endpoint = tls13.Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                                  ("192.0.2.1", 443), "192.0.2.1")
+        connecting = []
+
+        def report_started():
+            now[0] += 11.0  # Longer than the entire configured network budget.
+
+        with patch.object(tls13.socket, "socket", return_value=connection), \
+                patch.object(tls13.time, "monotonic", side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(OSError, "actual TCP connect"):
+                tls13.capture_tls13_proof(endpoint, "example.com", b"\x11" * 32,
+                    signature_algorithms_mask=1, timeout=10, control=tls13.CaptureControl(),
+                    on_started=report_started, on_connecting=lambda: connecting.append(now[0]))
+        self.assertEqual(connecting, [111.0])
+        connection.settimeout.assert_called_once_with(10.0)
+        connection.connect.assert_called_once_with(endpoint.address)
+        connection.__exit__.assert_called_once()
+
+    def test_cancellation_can_close_socket_while_start_reporting_is_blocked(self):
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        endpoint = tls13.Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                                  ("192.0.2.1", 443), "192.0.2.1")
+        control = tls13.CaptureControl()
+        reporting, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def report_started():
+            reporting.set()
+            if not release.wait(3):
+                raise RuntimeError("reporting test did not release")
+
+        def capture():
+            try:
+                tls13.capture_tls13_proof(endpoint, "example.com", b"\x11" * 32,
+                    signature_algorithms_mask=1, control=control, on_started=report_started)
+            except Exception as error:
+                errors.append(error)
+
+        def cancel():
+            control.cancel()
+            cancelled.set()
+
+        with patch.object(tls13.socket, "socket", return_value=connection):
+            worker = threading.Thread(target=capture)
+            canceller = threading.Thread(target=cancel)
+            worker.start()
+            try:
+                self.assertTrue(reporting.wait(2))
+                canceller.start()
+                self.assertTrue(cancelled.wait(1), "cancel must not wait for start reporting")
+                connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+                connection.close.assert_called_once()
+            finally:
+                release.set()
+                worker.join(4)
+                if canceller.ident is not None:
+                    canceller.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], tls13.CaptureCancelled)
+        connection.connect.assert_not_called()
+
+    def test_cancellation_at_connecting_hook_never_uses_closed_socket(self):
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        endpoint = tls13.Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                                  ("192.0.2.1", 443), "192.0.2.1")
+        control = tls13.CaptureControl()
+        with patch.object(tls13.socket, "socket", return_value=connection):
+            with self.assertRaises(tls13.CaptureCancelled):
+                tls13.capture_tls13_proof(endpoint, "example.com", b"\x11" * 32,
+                    signature_algorithms_mask=1, control=control, on_connecting=control.cancel)
+        connection.connect.assert_not_called()
+        connection.sendall.assert_not_called()
+
+    def test_completed_handshake_close_has_a_bounded_independent_deadline(self):
+        now = [100.0]
+        connection = Mock()
+        requested = []
+        connection.settimeout.side_effect = requested.append
+
+        def receive(_size):
+            now[0] += requested[-1]
+            raise TimeoutError("close response did not arrive")
+
+        connection.recv.side_effect = receive
+        with patch.object(tls13.time, "monotonic", side_effect=lambda: now[0]):
+            # A close timeout is swallowed after a successful handshake.
+            tls13._close_completed_handshake(connection, b"close", None)
+        self.assertAlmostEqual(now[0], 100.0 + tls13.CLOSE_DRAIN_SECONDS)
+        connection.sendall.assert_called_once_with(b"close")
+        self.assertLessEqual(connection.recv.call_count, 3)
+
+    def test_completed_handshake_close_bounds_bytes_and_preserves_cancellation(self):
+        connection = Mock()
+        connection.recv.side_effect = lambda size: b"x" * size
+        with patch.object(tls13.time, "monotonic", return_value=100.0):
+            tls13._close_completed_handshake(connection, b"close", None)
+        self.assertEqual(sum(call.args[0] for call in connection.recv.call_args_list),
+                         tls13.MAX_CLOSE_DRAIN_BYTES)
+
+        control = tls13.CaptureControl()
+        connection = Mock()
+        def cancel_during_read(_size):
+            control.cancel()
+            return b""
+        connection.recv.side_effect = cancel_during_read
+        with self.assertRaises(tls13.CaptureCancelled):
+            tls13._close_completed_handshake(connection, b"close", control)
+
     def test_cancelled_receive_never_reads_or_changes_socket_timeout(self):
         control = tls13.CaptureControl()
         control.cancel()

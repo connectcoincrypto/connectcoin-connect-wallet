@@ -137,10 +137,16 @@ export class ConnectionPool {
     const minimum = BigInt(request.body.successfulConnections) + (message.captured ? 1n : 0n);
     if (BigInt(message.successfulConnections) < (minimum > MAX_COUNTER ? MAX_COUNTER : minimum)) throw new Error('Helper connection counter moved backwards');
     if (message.type === 'capture') {
+      if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs')) throw new Error('Invalid blocked capture observation');
       if (!request.started || request.capture) throw new Error('Unexpected or duplicate capture');
       request.capture = message; request.onCapture?.(message); return;
     }
     if (request.started && !request.capture) throw new Error('Missing helper capture observation');
+    if (Object.hasOwn(message, 'blocked')) {
+      if (message.blocked !== 'budget' || message.started || message.captured || message.proof !== null ||
+          message.verified !== false || message.validationPassed !== null || message.seconds !== 0) throw new Error('Invalid blocked helper result');
+    }
+    if (Object.hasOwn(message, 'retryAfterMs')) throw new Error('Unexpected endpoint retry delay');
     if (request.capture && (request.capture.captured !== message.captured || request.capture.seconds !== message.seconds ||
         request.capture.successfulConnections !== message.successfulConnections)) throw new Error('Conflicting helper capture observation');
     if (![true, false, null].includes(message.validationPassed) ||

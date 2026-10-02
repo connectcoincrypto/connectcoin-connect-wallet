@@ -116,7 +116,7 @@ test('persistent failures keep decaying beyond 100 observations and cross the pr
   assert.ok(Math.abs(stats.connectionRate() - 10) < 1e-6, 'real later successes can recover an observed policy');
 });
 
-test('failed domain EMA excludes new assignments and survives catalog refresh without restoring the prior', t => {
+test('failed domain EMA survives catalog refresh and admits only a delayed recovery probe without restoring the prior', t => {
   const { engine, starts } = fixture(t);
   const failed = bounty(1, '1000000', 0, { domain: 'failed.example' });
   const fresh = bounty(2, '1000000', 0, { domain: 'fresh.example' });
@@ -133,7 +133,13 @@ test('failed domain EMA excludes new assignments and survives catalog refresh wi
   engine.enqueue([failed, fresh]);
   assert.strictEqual(engine.domainStats.get('failed.example:7'), stats);
   assert.equal(stats.connectionRate(), rate);
-  assert.equal(take(engine, Date.now() + 86400000), key(fresh), 'idle time does not reintroduce failed policies');
+  const due = engine.connectionPolicy.probes.get('failed.example:7');
+  assert.ok(due >= Date.now() + 59000);
+  for (let i = 0; i < 4; i++) assert.equal(take(engine, due - 1), key(fresh), 'the failed policy stays gated before the probe deadline');
+  assert.equal(take(engine, due), key(failed), 'one representative becomes eligible for a recovery observation after one minute');
+  assert.strictEqual(engine.domainStats.get('failed.example:7'), stats);
+  assert.equal(stats.connectionRate(), rate, 'probe admission does not reset or rewrite the EMA');
+  assert.equal(stats.completed, 20000);
   assert.deepEqual(starts, [], 'the test must not open connections');
 });
 
@@ -180,7 +186,9 @@ test('bounded random factor can reverse close expected values but never a gap gr
   const entries = [bounty(1, '10000'), bounty(2, '10999'), bounty(3, '11001')];
   engine.enqueue(entries);
   assert.deepEqual(entries.map(item => engine.queue.get(key(item)).factor), [1100000, 1000000, 1000000]);
-  assert.deepEqual([take(engine), take(engine), take(engine)], [entries[2], entries[0], entries[1]].map(key));
+  assert.deepEqual(Array.from({ length: 3 }, () => take(engine)), Array(3).fill(key(entries[2])));
+  engine.scheduler.setReady(key(entries[2]), false);
+  assert.deepEqual(Array.from({ length: 3 }, () => take(engine)), Array(3).fill(key(entries[0])));
   assert.deepEqual(draws, [100001, 100001, 100001]);
 });
 
@@ -199,7 +207,11 @@ for (const permutation of [[0, 1, 2], [2, 1, 0], [1, 2, 0]]) {
     const entries = [bounty(1, '1000', 10), bounty(256, '1000'), bounty(1, '1000', 2)];
     engine.enqueue(permutation.map(index => entries[index]));
     const expected = [entries[1], entries[2], entries[0]].map(key);
-    assert.deepEqual([take(engine), take(engine), take(engine), take(engine)], [...expected, expected[0]]);
+    for (const best of expected) {
+      assert.deepEqual(Array.from({ length: 3 }, () => take(engine)), Array(3).fill(best));
+      engine.scheduler.remove(best);
+    }
+    assert.equal(take(engine), undefined);
     assert.deepEqual(draws, [100001, 100001, 100001], 'selection never redraws or shuffles ties');
   });
 }
@@ -210,11 +222,11 @@ test('nextReady is pure until an assignment is committed after preparation', t =
   engine.enqueue(entries);
   for (let index = 0; index < 5; index++) assert.equal(engine.nextReady(Date.now())[0], key(entries[1]));
   engine.markAssigned(engine.nextReady(Date.now())[1]);
-  assert.equal(engine.nextReady(Date.now())[0], key(entries[0]));
+  assert.equal(engine.nextReady(Date.now())[0], key(entries[1]), 'committing a connection does not rotate away from the best bounty');
   assert.deepEqual(draws, [100001, 100001]);
 });
 
-test('fair domain turns alternate with economic domain turns, while both rotate scored bounties', t => {
+test('fair domain turns alternate with economic domain turns and both select the domain best bounty', t => {
   const { engine } = fixture(t);
   const a1 = bounty(1, '2000', 0, { domain: 'alpha.example' });
   const a2 = bounty(2, '1000', 0, { domain: 'alpha.example' });
@@ -222,7 +234,7 @@ test('fair domain turns alternate with economic domain turns, while both rotate 
   const b2 = bounty(4, '8000', 0, { domain: 'beta.example' });
   const c1 = bounty(5, '5000', 0, { domain: 'gamma.example' });
   engine.enqueue([c1, b2, a2, b1, a1]);
-  assert.deepEqual(Array.from({ length: 8 }, () => take(engine)), [a1, b1, b2, b1, c1, b2, a2, b1].map(key));
+  assert.deepEqual(Array.from({ length: 8 }, () => take(engine)), [a1, b1, b1, b1, c1, b1, a1, b1].map(key));
 });
 
 test('economic domain ranking uses measured TLS throughput, not only the nominal domain leader', t => {
@@ -247,14 +259,14 @@ test('TLS statistics are separate for each exact signature mask; untried masks r
   assert.equal(engine.domainStats.get('alpha.example:1').completed, 100);
 });
 
-test('a domain economic rank uses its best rate-weighted mask leader, not its rotating next bounty', t => {
+test('a domain selects its best rate-weighted exact-mask leader on fair turns too', t => {
   const { engine } = fixture(t);
   const slowLeader = bounty(1, '100000', 0, { domain: 'alpha.example', signature_algorithms_mask: 1 });
   const fastLower = bounty(2, '5000', 0, { domain: 'alpha.example', signature_algorithms_mask: 2 });
   const beta = bounty(3, '8000', 0, { domain: 'beta.example' });
   engine.domainStats.set('alpha.example:1', stat(false, 5, 1000)); // About 0.012 captures/s; still eligible.
   engine.enqueue([slowLeader, fastLower, beta]);
-  assert.equal(take(engine), key(slowLeader));
+  assert.equal(take(engine), key(fastLower));
   assert.equal(take(engine), key(beta));
 });
 
@@ -319,7 +331,7 @@ test('admission protects active and cooling work while replacing only unstarted 
   assert.equal(coolingJob.failures, 3); assert.equal(engine.controller.signal.aborted, false);
 });
 
-test('new higher scores do not preempt live work or restart the existing within-domain cursor', async t => {
+test('new prepared higher scores leave live work running and win the next same-domain assignment', async t => {
   const gate = deferred(); let activeSignal;
   t.after(() => gate.resolve());
   const { engine, starts, submissions } = fixture(t, {
@@ -327,11 +339,34 @@ test('new higher scores do not preempt live work or restart the existing within-
   });
   const active = bounty(1, '5000'), low = bounty(2, '1000'), high = bounty(3, '10000');
   engine.enqueue([active, low]); engine.start(); await until(() => activeSignal);
+  engine.proposals.set(key(high), { item: high, context: context(high), payout: high.amount });
   engine.enqueue([high]);
   assert.equal(engine.activeKey, key(active)); assert.equal(activeSignal.aborted, false);
+  assert.equal(engine.nextReady(Date.now())[0], key(high));
   gate.resolve(); await until(() => engine.snapshot().completed === 3 && !engine.running);
-  assert.deepEqual(starts, [active, low, high].map(key));
-  assert.deepEqual(submissions, starts);
+  assert.deepEqual(starts, [active, low].map(key), 'the new leader reuses its already authenticated proposal');
+  assert.deepEqual(submissions, [active, high, low].map(key));
+});
+
+test('simultaneous same-domain connections all target the highest ready score', async t => {
+  const attempts = [];
+  const { engine } = fixture(t, {
+    options: { connectionsPerSecond: 256, concurrency: 3 },
+    poolFactory: () => ({ pacesStarts: true, async start() {}, async resolve() {}, async close() {},
+      async attempt(_context, { bountyId, signal, onStarted }) {
+        attempts.push(bountyId); onStarted();
+        return new Promise(resolve => signal.addEventListener('abort', () => resolve({
+          started: true, captured: false, validationPassed: null, cancelled: true, seconds: 0, proof: null, verified: false,
+        }), { once: true }));
+      },
+    }),
+  });
+  const best = bounty(1, '10000'), lower = bounty(2, '1000');
+  engine.enqueue([lower, best]); engine.start();
+  await until(() => attempts.length === 3);
+  assert.deepEqual(attempts, Array(3).fill(key(best)));
+  assert.equal(engine.connections.size, 3);
+  await engine.stop();
 });
 
 test('invalid metadata and nonpositive net rewards cannot acquire a scheduling position', t => {
@@ -376,7 +411,7 @@ test('an authenticated fixed payout below the raw floor never reaches TLS or con
   await tick();
   assert.equal(proofs, 0); assert.equal(prepares, 1);
   assert.equal(engine.preferReward, false);
-  assert.equal(engine.domainCursors.size, 0);
+  assert.equal(engine.scheduler.domainAfter, null);
   assert.equal(engine.timer, null, 'an ineligible zero-due job cannot create a busy polling loop');
 });
 
@@ -488,7 +523,6 @@ test('DNS resolution failure before TCP does not consume a fair or economic turn
   await until(() => engine.dns.get('example.com')?.ok === false && !engine.running);
   assert.equal(engine.preferReward, false);
   assert.equal(engine.scheduler.domainAfter, null);
-  assert.equal(engine.domainCursors.size, 0);
 });
 
 test('a real failed TLS capture consumes exactly one turn at its TCP start', async t => {
@@ -507,7 +541,7 @@ test('a real failed TLS capture consumes exactly one turn at its TCP start', asy
   await until(() => engine.domainStats.get('example.com:7')?.completed === 1);
   await engine.stop();
   assert.equal(assignments, 1); assert.equal(engine.preferReward, true);
-  assert.equal(engine.scheduler.domainAfter, 'example.com'); assert.equal(engine.domainCursors.size, 1);
+  assert.equal(engine.scheduler.domainAfter, 'example.com');
   assert.equal(engine.domainStats.get('example.com:7').completed, 1);
   assert.equal(engine.domainStats.get('example.com:7').connectionRate(), (0.999 * 0.1) / (0.999 * 0.02 + 0.001 * 0.1));
 });
@@ -520,5 +554,5 @@ test('a verified proof from an injected runner without progress still consumes e
   engine.enqueue([bounty(1)]); engine.start();
   await until(() => engine.snapshot().completed === 1 && !engine.running);
   assert.equal(assignments, 1); assert.equal(engine.preferReward, true);
-  assert.equal(engine.scheduler.domainAfter, 'example.com'); assert.equal(engine.domainCursors.size, 1);
+  assert.equal(engine.scheduler.domainAfter, 'example.com');
 });

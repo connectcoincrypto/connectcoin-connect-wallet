@@ -7,8 +7,9 @@ are not required at runtime. The upstream license is retained alongside it.
 ConnectWallet's local hardening in `generator.py` also rejects multicast,
 reserved and IPv6 translation/tunnel destinations: `is_global` by itself is
 not a sufficient SSRF boundary. Local patches also add independently cancellable
-capture sockets and completion telemetry. Raw capture success means completion
-through CertificateVerify before certificate verification and the hash-target
+capture sockets and completion telemetry. Desktop raw capture success now means
+TLS completion through authenticated server Finished and sent client Finished,
+before certificate-path/CertificateVerify verification and the hash-target
 test; it still governs the existing successful-connection budget. The protocol-4
 desktop service emits a raw capture event before verification, then one terminal
 result per request with a required tri-state `validationPassed`. For each domain and exact
@@ -58,7 +59,8 @@ The local `--probe-rsa` mode follows Core's `ProbeP2CRsaForTest` in
 version-1 roots, and certificate validation at the supplied wall-clock time.
 It completes TLS 1.3, verifies Server Finished and sends Client Finished before
 reporting authenticated RSA capability. This is an opt-in extension to `tls13.py`;
-claim capture still ends at CertificateVerify. The probe uses a random dummy
+the desktop claims service now opts into full handshake completion too. Proofs
+still encode only the original five messages through CertificateVerify. The probe uses a random dummy
 transaction ID solely to reuse the challenge/proof verifier, and a maximum work
 target; no wallet transaction or keys enter the process and no HTTP is sent.
 Its three-second monotonic deadline includes input, roots, DNS, TLS and verification.
@@ -96,10 +98,32 @@ consensus validation remains authoritative.
 
 The desktop uses one persistent helper/executor shared across all bounties,
 defaulting to 100 starts/sec and 100 simultaneous TLS connections (maximum 256
-of either). Each connection has a 10-second deadline; there is no 1,000-attempt
+of either). Those global limits remain available to a single domain, without
+additional per-domain/IP caps or progressive transport cooldowns. Below-floor domain/mask
+policies that qualify at the initial 5/s rate have bounded once-per-minute
+recovery probes without resetting EMA or weakening verification. Each connection
+has a 10-second network deadline, excluding local queue/rate/start-report waits;
+there is no 1,000-attempt
 or 180-second batch limit. DNS resolution uses two bounded slots, a 60-second
 positive cache and 2-second negative cache. The cache holds at most 4,096 domains
 with 32 pinned endpoints each, and the total pending-request limit is 512.
+Resolved endpoints use a weighted rotation per domain/signature-policy mask:
+99% of selection weight follows each IP's valid-proof/TCP-TLS-time EMA and 1%
+is uniform exploration. Each IP starts with `connections = 0.1` and
+`totalTime = 0.02`, updating both with `0.999 * old + 0.001 * observation`.
+Only certificate/path and proof-signature validation counts as success; a
+valid target miss is also successful, while inconclusive cancellations are
+neutral. This does not change the separate domain EMA or capture budget.
+IP histories for unchanged endpoints survive DNS refreshes and are bounded by
+the existing cache and seven supported signature-policy masks. No per-IP
+connection cap or cooldown is added, and the ten-second timeout is unchanged.
+Socket-start
+reports run outside the cancellation lock. A second actual-connect pacing gate
+prevents delayed reports from creating a TCP-start burst. Full handshakes send
+an application-key close_notify and drain up to 64 KiB for at most 200 ms;
+best-effort teardown failures do not invalidate a completed proof, while
+cancellation still aborts delivery. These are ConnectWallet-local patches;
+Core and the upstream P2C Tools repository are not changed by them.
 The helper independently enforces Core's exact successful-capture budget:
 stop starting attempts once `successes * (target + 1) > 2^257`, including successful
 captures whose hash misses. Already in-flight captures may still finish. A

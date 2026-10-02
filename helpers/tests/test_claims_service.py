@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import socket
 import sys
 import threading
@@ -35,10 +36,11 @@ def endpoint(ip="8.8.8.8"):
     return Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (ip, 443), ip)
 
 
-def fake_capture(_endpoint, _domain, _challenge, *, control, before_start, on_started, **_):
+def fake_capture(_endpoint, _domain, _challenge, *, control, before_start, on_started, on_connecting=None, **_):
     with control:
         before_start()
         control.begin(SimpleNamespace(shutdown=lambda *_: None, close=lambda: None), on_started)
+        if on_connecting is not None: on_connecting()
         return SimpleNamespace(encoded_proof=b"\x02\x01", peer_ip=_endpoint.ip)
 
 
@@ -358,6 +360,98 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(h.resolve.call_count, 1)
             self.assertEqual([call.args[0].ip for call in h.capture.call_args_list], ["8.8.8.8", "1.1.1.1", "8.8.8.8"])
 
+    def test_failed_endpoint_does_not_block_new_attempts_or_reduce_configured_concurrency(self):
+        release = threading.Event()
+        with Fixture(concurrency=12) as h:
+            h.resolve_domain()
+            def fails(*args, **kwargs):
+                fake_capture(*args, **kwargs)
+                raise TimeoutError("simulated endpoint failure")
+            h.capture.side_effect = fails
+            h.attempt(2)
+            self.assertFalse(h.wait("attempt", 2)["captured"])
+
+            def simultaneous_failures(*args, **kwargs):
+                fake_capture(*args, **kwargs)
+                if not release.wait(3): raise AssertionError("test release timed out")
+                raise TimeoutError("same endpoint still unreachable")
+            h.capture.side_effect = simultaneous_failures
+            identifiers = range(3, 15)
+            try:
+                for identifier in identifiers:
+                    h.attempt(identifier)
+                for identifier in identifiers:
+                    h.wait("started", identifier)
+                self.assertEqual(h.service.active_tls, 12)
+                self.assertEqual(h.capture.call_count, 13)
+            finally:
+                release.set()
+            for identifier in identifiers:
+                result = h.wait("attempt", identifier)
+                self.assertTrue(result["started"])
+                self.assertFalse(result["captured"])
+                self.assertFalse(result["validationPassed"])
+                self.assertEqual(result["successfulConnections"], "0")
+                self.assertNotIn("blocked", result)
+                self.assertNotIn("retryAfterMs", result)
+            self.assertEqual(h.resolve.call_count, 1)
+
+    def test_failed_ipv4_and_ipv6_endpoints_remain_available_across_dns_refresh(self):
+        ipv6 = Endpoint(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                        ("2001:4860:4860::8888", 443, 0, 0), "2001:4860:4860::8888")
+        endpoints = (endpoint(), ipv6, endpoint("1.1.1.1"))
+        with Fixture() as h:
+            h.resolve.return_value = endpoints
+            h.resolve_domain()
+            def fails(*args, **kwargs):
+                fake_capture(*args, **kwargs)
+                raise TimeoutError("simulated address failure")
+            h.capture.side_effect = fails
+            h.attempt(2)
+            self.assertTrue(h.wait("attempt", 2)["started"])
+            h.service.dns["example.com"]["expires"] = 0
+            h.resolve_domain(3)
+            for identifier in range(4, 9):
+                h.attempt(identifier)
+                result = h.wait("attempt", identifier)
+                self.assertTrue(result["started"])
+                self.assertFalse(result["captured"])
+                self.assertNotIn("blocked", result)
+                self.assertNotIn("retryAfterMs", result)
+            self.assertEqual(set(call.args[0] for call in h.capture.call_args_list), set(endpoints))
+            self.assertEqual(h.resolve.call_count, 2)
+
+    def test_actual_tcp_start_rate_survives_delayed_start_reports_without_burst(self):
+        with Fixture(connectionsPerSecond=10) as h:
+            clock = [100.0]
+            jobs = [service.Job(index, "attempt") for index in range(3)]
+            with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]), \
+                 patch.object(service.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + max(seconds, 0.001))):
+                # All three reports became ready after a delayed pipe; the
+                # independent network gate still spaces their actual connects.
+                for job in jobs: h.service._connecting(job)
+            self.assertGreaterEqual(jobs[1].started_at - jobs[0].started_at, 0.0999)
+            self.assertGreaterEqual(jobs[2].started_at - jobs[1].started_at, 0.0999)
+            cancelled = service.Job(4, "attempt")
+            cancelled.control.cancel()
+            with self.assertRaises(CaptureCancelled): h.service._connecting(cancelled)
+
+    def test_service_completes_handshake_and_measures_after_start_acknowledgement(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            clock = [100.0]
+            emit = h.service.emit_callback
+            def blocked_emit(frame):
+                if frame["type"] == "started": clock[0] += 11
+                emit(frame)
+            h.service.emit_callback = blocked_emit
+            with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]):
+                h.attempt(2)
+                result = h.wait("attempt", 2)
+            self.assertTrue(result["captured"])
+            self.assertEqual(result["seconds"], 0)
+            self.assertIs(h.capture.call_args.kwargs["complete_handshake"], True)
+
     def test_exact_two_expected_gate_is_strict_and_counts_only_success(self):
         with Fixture() as h:
             h.resolve_domain()
@@ -583,6 +677,7 @@ class ServiceTests(unittest.TestCase):
                 # the dedicated cross-domain rate test still uses real time.
                 with h.service.condition:
                     h.service.next_start = 0
+                    h.service.next_connection = 0
                 h.attempt(identifier, bounty=identifier)
                 self.assertTrue(h.wait("attempt", identifier)["captured"])
             self.assertIs(h.service.executor, executor)
@@ -634,6 +729,227 @@ class ServiceTests(unittest.TestCase):
                 capture_tls13_proof(endpoint(), proof.domain, proof.challenge,
                     signature_algorithms_mask=1, control=control)
         new_socket.assert_not_called()
+
+
+class EndpointSelectionTests(unittest.TestCase):
+    def test_equal_priors_rotate_ipv4_ipv6_and_ties_have_independent_policy_cursors(self):
+        ipv6 = Endpoint(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                        ("2001:4860:4860::8888", 443, 0, 0), "2001:4860:4860::8888")
+        endpoints = (endpoint(), ipv6, endpoint("1.1.1.1"))
+        with Fixture() as h:
+            h.resolve.return_value = endpoints
+            h.resolve_domain()
+            self.assertTrue(all(not policies for policies in h.service.dns["example.com"]["scores"].values()))
+            selected = [h.service._select_endpoint("example.com", 1)[0] for _ in range(9)]
+            self.assertEqual(selected, list(endpoints) * 3)
+            h.service._select_endpoint("example.com", 1)
+            self.assertEqual(h.service._select_endpoint("example.com", 2)[0], endpoints[0])
+            self.assertEqual(h.service._select_endpoint("example.com", 1)[0], endpoints[1])
+
+    def test_weighted_selection_prefers_fast_valid_ip_and_keeps_uniform_exploration(self):
+        endpoints = (endpoint(), endpoint("1.1.1.1"))
+        with Fixture() as h:
+            h.resolve.return_value = endpoints
+            h.resolve_domain()
+            h.service._select_endpoint("example.com", 1)
+            good, bad = [h.service.dns["example.com"]["scores"][item][1] for item in endpoints]
+            for _ in range(1000):
+                h.service._observe_endpoint(good, True, 0.02)
+                h.service._observe_endpoint(bad, False, 1.5)
+            self.assertAlmostEqual(good.connections, 1 - 0.9 * 0.999 ** 1000)
+            self.assertAlmostEqual(bad.connections, 0.1 * 0.999 ** 1000)
+            self.assertAlmostEqual(bad.total_time, 1.5 - 1.48 * 0.999 ** 1000)
+            samples = 10000
+            selected = [h.service._select_endpoint("example.com", 1)[0] for _ in range(samples)]
+            expected_bad_share = 0.01 / 2 + 0.99 * bad.rate() / (good.rate() + bad.rate())
+            self.assertLess(abs(selected.count(endpoints[1]) - samples * expected_bad_share), 2)
+            self.assertGreater(selected.count(endpoints[0]), 9900)
+            self.assertGreaterEqual(selected.count(endpoints[1]), 49)
+            self.assertEqual(service.ENDPOINT_EXPLORATION, 0.01)
+
+    def test_extreme_finite_rates_and_zero_successes_keep_finite_credits_and_exploration(self):
+        endpoints = (endpoint(), endpoint("1.1.1.1"), endpoint("9.9.9.9"))
+        with Fixture() as h:
+            h.resolve.return_value = endpoints
+            h.resolve_domain()
+            h.service._select_endpoint("example.com", 1)
+            scores = [h.service.dns["example.com"]["scores"][item][1] for item in endpoints]
+            for score in scores:
+                score.connections = 0
+                score.credit = 0
+            self.assertTrue(all(math.isfinite(score.rate()) and score.rate() > 0 for score in scores))
+            selected = [h.service._select_endpoint("example.com", 1)[0] for _ in range(30)]
+            self.assertTrue(all(selected.count(item) == 10 for item in endpoints))
+            scores[0].connections, scores[0].total_time = 1, math.ulp(0.0)
+            scores[1].connections, scores[1].total_time = math.ulp(0.0), sys.float_info.max
+            scores[2].connections, scores[2].total_time = 1, 0
+            self.assertTrue(all(math.isfinite(score.rate()) and score.rate() > 0 for score in scores))
+            selected = [h.service._select_endpoint("example.com", 1)[0] for _ in range(10000)]
+            self.assertGreaterEqual(selected.count(endpoints[1]), 32)
+            self.assertTrue(all(math.isfinite(score.credit) and abs(score.credit) < 2 for score in scores))
+            # Reversing the preferences must not leave unbounded historical debt.
+            scores[0].connections, scores[0].total_time = 0, 1
+            scores[1].connections, scores[1].total_time = 1, 0.02
+            scores[2].connections, scores[2].total_time = 0, 1
+            selected = [h.service._select_endpoint("example.com", 1)[0] for _ in range(10000)]
+            self.assertGreater(selected.count(endpoints[1]), 9900)
+            self.assertTrue(all(math.isfinite(score.credit) and abs(score.credit) < 2 for score in scores))
+
+    def test_only_terminal_validation_updates_ema_once_before_emit_and_excludes_local_waits(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid), Fixture() as h:
+                h.resolve_domain()
+                clock = [time.monotonic()]
+                snapshots = []
+                original_emit = h.service.emit_callback
+                def emit(frame):
+                    if frame["type"] == "started": clock[0] += 11
+                    if frame["type"] in ("capture", "attempt"):
+                        score = h.service.dns["example.com"]["scores"][endpoint()][1]
+                        snapshots.append((frame["type"], score.connections, score.total_time))
+                    original_emit(frame)
+                h.service.emit_callback = emit
+                def capture(*args, **kwargs):
+                    result = fake_capture(*args, **kwargs)
+                    clock[0] += 0.2
+                    return result
+                def verify(*_):
+                    clock[0] += 20
+                    if not valid: raise ProofVerificationError("invalid certificate")
+                h.capture.side_effect = capture
+                h.verify.side_effect = verify
+                h.meets.return_value = False  # A target miss is still a valid connection.
+                with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]):
+                    h.attempt(2)
+                    result = h.wait("attempt", 2)
+                self.assertEqual(result["seconds"], 0.2)
+                self.assertIs(result["validationPassed"], valid)
+                self.assertFalse(result["verified"])
+                self.assertEqual(snapshots[0], ("capture", 0.1, 0.02))
+                self.assertEqual(snapshots[1][0], "attempt")
+                self.assertAlmostEqual(snapshots[1][1], 0.999 * 0.1 + 0.001 * int(valid))
+                self.assertAlmostEqual(snapshots[1][2], 0.999 * 0.02 + 0.001 * 0.2)
+                self.assertEqual(len(snapshots), 2)
+                self.assertEqual(h.capture.call_args.kwargs["timeout"], 10.0)
+
+    def test_inconclusive_cancellation_and_budget_refusal_do_not_update_ema(self):
+        for reason in ("capture", "before_validation", "budget"):
+            with self.subTest(reason=reason), Fixture() as h:
+                h.resolve_domain()
+                if reason == "capture":
+                    def capture(*args, **kwargs):
+                        fake_capture(*args, **kwargs)
+                        kwargs["control"].cancel()
+                        raise CaptureCancelled("cancelled during network")
+                    h.capture.side_effect = capture
+                elif reason == "before_validation":
+                    emit = h.service.emit_callback
+                    def cancel_at_capture(frame):
+                        if frame["type"] == "capture": h.service.command({"type": "cancel", "id": frame["id"]})
+                        emit(frame)
+                    h.service.emit_callback = cancel_at_capture
+                h.attempt(2, successes="3" if reason == "budget" else "0")
+                result = h.wait("attempt", 2)
+                self.assertIsNone(result["validationPassed"])
+                score = h.service.dns["example.com"]["scores"][endpoint()][1]
+                self.assertEqual((score.connections, score.total_time), (0.1, 0.02))
+
+    def test_conclusive_outcome_still_updates_when_cancel_arrives_after_it(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid), Fixture() as h:
+                h.resolve_domain()
+                def verify(*_):
+                    h.service.command({"type": "cancel", "id": 2})
+                    if not valid: raise ProofVerificationError("invalid certificate")
+                h.verify.side_effect = verify
+                h.attempt(2)
+                result = h.wait("attempt", 2)
+                self.assertTrue(result["cancelled"])
+                score = h.service.dns["example.com"]["scores"][endpoint()][1]
+                self.assertAlmostEqual(score.connections, 0.999 * 0.1 + 0.001 * int(valid))
+                self.assertAlmostEqual(score.total_time, 0.999 * 0.02 + 0.001 * result["seconds"])
+
+    def test_domain_and_signature_mask_scores_are_isolated(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            h.resolve_domain(2, "other.example")
+            scores = [h.service._select_endpoint(domain, mask)[1]
+                      for domain, mask in (("example.com", 1), ("example.com", 2), ("other.example", 1))]
+            h.service._observe_endpoint(scores[0], False, 10)
+            self.assertAlmostEqual(scores[0].connections, 0.0999)
+            for score in scores[1:]: self.assertEqual((score.connections, score.total_time), (0.1, 0.02))
+            self.assertEqual(len(set(map(id, scores))), 3)
+
+    def test_dns_refresh_preserves_score_identity_for_validation_already_in_flight(self):
+        entered, release = threading.Event(), threading.Event()
+        with Fixture() as h:
+            h.resolve_domain()
+            def verify(*_):
+                entered.set()
+                if not release.wait(3): raise AssertionError("verification release timed out")
+            h.verify.side_effect = verify
+            h.attempt(2)
+            try:
+                self.assertTrue(entered.wait(3))
+                score = h.service.dns["example.com"]["scores"][endpoint()][1]
+                self.assertEqual(score.connections, 0.1)
+                h.resolve.return_value = (endpoint(), endpoint("1.1.1.1"))
+                h.service.dns["example.com"]["expires"] = 0
+                h.resolve_domain(3)
+                self.assertIs(h.service.dns["example.com"]["scores"][endpoint()][1], score)
+            finally:
+                release.set()
+            self.assertIs(h.wait("attempt", 2)["validationPassed"], True)
+            self.assertAlmostEqual(score.connections, 0.1009)
+
+    def test_removed_then_readded_ip_does_not_inherit_late_validation(self):
+        entered, release = threading.Event(), threading.Event()
+        with Fixture() as h:
+            h.resolve_domain()
+            def verify(*_):
+                entered.set()
+                if not release.wait(3): raise AssertionError("verification release timed out")
+            h.verify.side_effect = verify
+            h.attempt(2)
+            try:
+                self.assertTrue(entered.wait(3))
+                removed = h.service.dns["example.com"]["scores"][endpoint()][1]
+                h.resolve.return_value = (endpoint("1.1.1.1"),)
+                h.service.dns["example.com"]["expires"] = 0
+                h.resolve_domain(3)
+                self.assertNotIn(endpoint(), h.service.dns["example.com"]["scores"])
+                h.resolve.return_value = (endpoint(),)
+                h.service.dns["example.com"]["expires"] = 0
+                h.resolve_domain(4)
+                _, current = h.service._select_endpoint("example.com", 1)
+                self.assertIsNot(current, removed)
+            finally:
+                release.set()
+            self.assertIs(h.wait("attempt", 2)["validationPassed"], True)
+            self.assertEqual((current.connections, current.total_time), (0.1, 0.02))
+            self.assertEqual(set(h.service.dns["example.com"]["scores"]), {endpoint()})
+
+    def test_dns_scores_are_bounded_by_domains_endpoints_and_lazy_masks(self):
+        with patch.object(service, "MAX_DNS_CACHE", 3), Fixture() as h:
+            h.resolve.return_value = tuple(endpoint(f"8.8.8.{index}") for index in range(1, 41))
+            stale = None
+            for identifier in range(1, 6):
+                domain = f"d{identifier}.example"
+                h.resolve_domain(identifier, domain)
+                cached = h.service.dns[domain]
+                self.assertEqual(len(cached["endpoints"]), 32)
+                self.assertTrue(all(not policies for policies in cached["scores"].values()))
+                for mask in range(1, 8):
+                    _, score = h.service._select_endpoint(domain, mask)
+                    if stale is None: stale = score
+                self.assertEqual(sum(len(policies) for policies in cached["scores"].values()), 32 * 7)
+                for mask in (0, 8, True):
+                    with self.assertRaises(ValueError): h.service._select_endpoint(domain, mask)
+            self.assertEqual(list(h.service.dns), ["d3.example", "d4.example", "d5.example"])
+            h.service._observe_endpoint(stale, True, 0.1)
+            self.assertNotIn("d1.example", h.service.dns)
+            self.assertEqual(sum(len(policies) for cached in h.service.dns.values()
+                                 for policies in cached["scores"].values()), 3 * 32 * 7)
 
 
 if __name__ == "__main__":

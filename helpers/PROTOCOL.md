@@ -10,8 +10,9 @@ Proof encoding and the probe's fixed response fields are unchanged. Protocols
 1–3 are rejected before starting work; older helpers do not provide validated
 attempt outcomes and cannot be used for EMA observations.
 
-An attempt emits `started` when TCP starts, `capture` when that capture finishes,
-then one terminal `attempt` result. The terminal result repeats the capture's
+An attempt emits `started` after reserving its start, immediately before the
+actual TCP-start pacing gate, then `capture` when that capture finishes and one
+terminal `attempt` result. The terminal result repeats the capture's
 status, elapsed seconds and exact successful-connection count. A failed capture
 does not consume the successful-capture budget. A full capture still consumes
 that budget even if its certificate/signature later fails validation. This
@@ -33,8 +34,22 @@ attempt never returns a proof, but validation already completed or running to
 completion retains its known `true`/`false` outcome. Only the terminal result
 supplies a validated EMA observation, once per request; early `capture` frames
 remain useful for diagnostics and the existing successful-connection budget.
-The `seconds` field remains original TCP/TLS elapsed time and excludes local
-proof verification. The ten-second capture deadline is unchanged.
+The `seconds` field measures TCP/TLS effort from the actual connection start and
+excludes queueing, local start-reporting delays, rate waits and proof verification.
+The absolute handshake deadline remains ten seconds. Desktop captures complete
+TLS 1.3, including server/client Finished, and attempt an authenticated
+`close_notify`; this best-effort teardown adds at most 200 ms and drains at most
+64 KiB. Teardown failure does not discard a completed capture.
+
+The existing `blocked: "budget"` result is a no-start outcome, requiring
+`started: false`, `captured: false`, `seconds: 0`, `validationPassed: null`,
+`proof: null` and `verified: false`. No per-domain/IP cooldown response is
+supported: `blocked: "endpoint"` and `retryAfterMs` are rejected. The helper
+uses a weighted rotation of resolved public IPs, independently per domain and
+signature-policy mask, without imposing additional transport backoff. It learns
+from the same conclusive validated outcomes as the domain EMA, including valid
+target misses, and reserves 1% of selection weight for uniform exploration.
+Endpoint scores remain internal; no new wire fields or private data are needed.
 
 During shutdown, the desktop drains results for outstanding requests within
 the existing two-second process-termination deadline. Known validation outcomes

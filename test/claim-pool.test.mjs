@@ -51,6 +51,29 @@ function complete(command, child, overrides = {}) {
   child.send({ type: 'attempt', ...value, proof: '020100', verified: true });
 }
 
+test('exhausted capture budget is a no-start result, not an attempt or failed observation', async t => {
+  const { pool } = fixture(t, (command, child) => child.send({ type: 'attempt', ...observation(command, {
+    started: false, captured: false, seconds: 0, successfulConnections: command.successfulConnections,
+  }), proof: null, verified: false, blocked: 'budget' }));
+  await pool.start({});
+  let starts = 0, captures = 0;
+  const result = await pool.attempt(context(), { bountyId, onStarted: () => starts++, onCapture: () => captures++ });
+  assert.equal(result.blocked, 'budget'); assert.equal(result.retryAfterMs, undefined);
+  assert.equal(result.validationPassed, null); assert.equal(starts, 0); assert.equal(captures, 0);
+});
+
+for (const patch of [{ retryAfterMs: 0 }, { retryAfterMs: 60001 }, { retryAfterMs: '2000' }, { retryAfterMs: 1.5 },
+  { blocked: 'endpoint' }, { blocked: 'unknown' }, { blocked: 'endpoint', retryAfterMs: 2000 },
+  { validationPassed: false }, { seconds: 1 }, { proof: '020100', verified: true }]) {
+  test(`rejects unsupported endpoint pauses and malformed budget outcomes ${JSON.stringify(patch)}`, async t => {
+    const { pool } = fixture(t, (command, child) => child.send({ type: 'attempt', ...observation(command, {
+      started: false, captured: false, seconds: 0, successfulConnections: command.successfulConnections,
+    }), proof: null, verified: false, blocked: 'budget', ...patch }));
+    await pool.start({});
+    await assert.rejects(pool.attempt(context(), { bountyId }), error => error.helperFatal === true);
+  });
+}
+
 test('connection-only settings reject lifetime batch options and invalid global limits', () => {
   assert.deepEqual(validateConnectionOptions(), { connectionsPerSecond: 100, concurrency: 100 });
   for (const input of [null, [], { maxAttempts: 1 }, { overallTimeout: 1 }, { concurrency: 0 }, { concurrency: 257 }, { connectionsPerSecond: NaN }, { concurrency: 1.5 }]) assert.throws(() => validateConnectionOptions(input));

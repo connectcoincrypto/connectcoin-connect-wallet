@@ -80,6 +80,40 @@ test('thousands of successful operations have bounded samples and one progress r
   const count = events.length; now = 20000; t.mock.timers.tick(10000); assert.equal(events.length, count);
 });
 
+test('catalog resync preserves both activity counters and subsequent submissions accumulate', async t => {
+  const { engine } = fixture(t);
+  engine.enqueue([row(0), row(1)]); engine.start();
+  await until(() => engine.state.completed === 2 && !engine.running);
+  const totals = () => ({ attempts: engine.snapshot().attempts, completed: engine.snapshot().completed });
+  assert.deepEqual(totals(), { attempts: 2, completed: 2 });
+  for (let next = 2; next < 4; next++) {
+    await engine.suspend();
+    engine.clear({ preserveSelection: true });
+    assert.deepEqual(totals(), { attempts: next, completed: next });
+    engine.enqueue([row(next)]); engine.resume();
+    await until(() => engine.state.completed === next + 1 && !engine.running);
+    assert.deepEqual(totals(), { attempts: next + 1, completed: next + 1 });
+    assert.equal(engine.diagnosticSnapshot().completed, next + 1);
+  }
+});
+
+test('stop and restart preserve both activity counters; full clear resets both together', async t => {
+  const { engine } = fixture(t);
+  const totals = () => ({ attempts: engine.snapshot().attempts, completed: engine.snapshot().completed });
+  engine.enqueue([row(0)]); engine.start();
+  await until(() => engine.state.completed === 1 && !engine.running);
+  await engine.stop();
+  assert.deepEqual(totals(), { attempts: 1, completed: 1 });
+  engine.enqueue([row(1)]); engine.start();
+  await until(() => engine.state.completed === 2 && !engine.running);
+  assert.deepEqual(totals(), { attempts: 2, completed: 2 });
+  await engine.stop(); engine.clear();
+  assert.deepEqual(totals(), { attempts: 0, completed: 0 });
+  engine.enqueue([row(2)]); engine.start();
+  await until(() => engine.state.completed === 1 && !engine.running);
+  assert.deepEqual(totals(), { attempts: 1, completed: 1 });
+});
+
 test('success duration measures submit only while progress aggregates completed stage work', async t => {
   let now = 0; t.mock.method(performance, 'now', () => now);
   const { engine, events } = fixture(t, {

@@ -17,6 +17,7 @@ from unittest.mock import patch
 HELPERS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HELPERS))
 import claims_bridge
+from connectcoin_p2c_tools import tls13
 from connectcoin_p2c_tools.envelope import ConnectionProof
 from connectcoin_p2c_tools.generator import GenerationError, resolve_endpoints
 from connectcoin_p2c_tools.hashes import internal_hash_to_display
@@ -69,6 +70,89 @@ def identity(*, rsa_leaf=False, leaf_domain="example.com"):
 
 
 class ClaimsTests(unittest.TestCase):
+    def test_completed_tls_handshake_closes_cleanly_with_session_tickets(self):
+        # A normal server sends TLS 1.3 tickets after client Finished. Verify
+        # both Finished and close_notify using OpenSSL, for both offered suites.
+        for cipher_suite in (tls13.TLS_AES_128_GCM_SHA256, tls13.TLS_CHACHA20_POLY1305_SHA256):
+            with self.subTest(cipher_suite=cipher_suite):
+                self._completed_tls_capture(cipher_suite, consume_close=True)
+
+    def test_completed_tls_proof_survives_an_unresponsive_close_peer(self):
+        self._completed_tls_capture(tls13.TLS_AES_128_GCM_SHA256, consume_close=False)
+
+    def _completed_tls_capture(self, cipher_suite, *, consume_close):
+        root_pem, cert_pem, key_pem = identity()
+        context, _ = claims_bridge.parse_request(request())
+        with tempfile.TemporaryDirectory(prefix="connectwallet-completed-tls-test-") as directory:
+            directory = Path(directory)
+            roots, cert, key = (directory / name for name in ("roots.pem", "cert.pem", "key.pem"))
+            roots.write_bytes(root_pem)
+            cert.write_bytes(cert_pem)
+            key.write_bytes(key_pem)
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.minimum_version = server_context.maximum_version = ssl.TLSVersion.TLSv1_3
+            server_context.load_cert_chain(cert, key)
+            self.assertGreater(server_context.num_tickets, 0)
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(3)
+            endpoint = Endpoint(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                                listener.getsockname(), "127.0.0.1")
+            completed, failures = [], []
+            release = threading.Event()
+
+            def server():
+                try:
+                    peer, _ = listener.accept()
+                    with peer:
+                        peer.settimeout(3)
+                        with server_context.wrap_socket(peer, server_side=True,
+                                                       suppress_ragged_eofs=False) as encrypted:
+                            completed.append(encrypted.version())
+                            if consume_close:
+                                # Only an authenticated TLS close_notify may
+                                # produce this EOF; no HTTP/application bytes.
+                                self.assertEqual(encrypted.recv(1), b"")
+                                with encrypted.unwrap():
+                                    pass
+                            else:
+                                release.wait(3)
+                except Exception as error:
+                    failures.append(error)
+                finally:
+                    listener.close()
+
+            original_hello = tls13.build_client_hello
+            def one_cipher_hello(*args, **kwargs):
+                message = original_hello(*args, **kwargs)
+                body = message[4:]
+                position = 35 + body[34]
+                size = int.from_bytes(body[position:position + 2], "big")
+                body = (body[:position] + b"\x00\x02" + cipher_suite.to_bytes(2, "big")
+                        + body[position + 2 + size:])
+                return message[:1] + len(body).to_bytes(3, "big") + body
+
+            worker = threading.Thread(target=server)
+            worker.start()
+            try:
+                with patch.object(tls13, "build_client_hello", side_effect=one_cipher_hello):
+                    captured = capture_tls13_proof(endpoint, context.domain, context.challenge,
+                        signature_algorithms_mask=1, timeout=2,
+                        control=tls13.CaptureControl(), complete_handshake=True)
+            finally:
+                release.set()
+                worker.join(4)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(completed, ["TLSv1.3"])
+            proof = dataclasses.replace(context, proof=captured.encoded_proof)
+            verify_connection_proof(proof, roots, enforce_root_pin=False)
+            # Finished and close_notify remain outside the consensus proof.
+            self.assertEqual(captured.encoded_proof, b"\x02" + captured.client_hello
+                + captured.server_hello + captured.encrypted_extensions
+                + captured.certificate + captured.certificate_verify)
+
     def test_immutable_root_bundle(self):
         self.assertEqual(hashlib.sha256((HELPERS / "p2c_roots_v1.pem").read_bytes()).hexdigest(), ROOTS_V1_SHA256)
 

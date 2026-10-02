@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -29,6 +31,7 @@ MAX_UINT64 = (1 << 64) - 1
 DNS_TTL = 60.0
 DNS_RETRY = 2.0
 CONNECTION_TIMEOUT = 10.0
+ENDPOINT_EXPLORATION = 0.01
 PUBLIC_FIELDS = ("domain", "txid", "input_index", "connection_work_target",
                  "root_certificates_version", "signature_algorithms_mask", "validation_time")
 
@@ -78,6 +81,23 @@ class Budget:
     users: int = 0
 
 
+@dataclass(slots=True)
+class EndpointScore:
+    # Match the domain EMA prior and smoothing, but learn separately for each
+    # DNS endpoint and exact on-chain signature policy. Credit is SWRR state,
+    # not a concurrency reservation or a reason to defer any connection.
+    connections: float = 0.1
+    total_time: float = 0.02
+    credit: float = 0.0
+
+    def rate(self):
+        # Representational bounds only: preserve finite weights after even an
+        # extreme run of zero-duration samples, without a scheduling floor.
+        if self.total_time == 0:
+            return sys.float_info.max
+        return min(sys.float_info.max, max(math.ulp(0.0), self.connections / self.total_time))
+
+
 @dataclass
 class Job:
     identifier: int
@@ -114,6 +134,7 @@ class ClaimsService:
         self.active_tls = 0
         self.active_dns = 0
         self.next_start = 0.0
+        self.next_connection = 0.0
         self.closed = False
         # Two resolver slots cannot occupy the TLS capacity. The same executor
         # serves all domains/bounties for the entire unlocked claims session.
@@ -230,8 +251,16 @@ class ClaimsService:
                     endpoints = resolve_endpoints(job.domain, 443, allow_private=False)[:32]
                 except Exception:
                     endpoints = ()
-                cached = {"endpoints": endpoints, "expires": time.monotonic() + (DNS_TTL if endpoints else DNS_RETRY), "next": 0}
                 with self.condition:
+                    previous = self.dns.get(job.domain)
+                    cached = {"endpoints": endpoints, "expires": time.monotonic() + (DNS_TTL if endpoints else DNS_RETRY),
+                              "next": previous["next"] if previous else {},
+                              # Keep the actual score objects for unchanged IPs:
+                              # validation already in flight must update those
+                              # same objects, not a stale copy. Removed endpoints
+                              # and evicted domains have no retained cache owner.
+                              "scores": {endpoint: previous["scores"].get(endpoint, {}) if previous else {}
+                                         for endpoint in endpoints}}
                     self.dns[job.domain] = cached
                     self.dns.move_to_end(job.domain)
                     while len(self.dns) > MAX_DNS_CACHE:
@@ -269,6 +298,66 @@ class ClaimsService:
             job.started_at = time.monotonic()
         self.emit({"type": "started", "id": job.identifier})
 
+    def _connecting(self, job):
+        # Keep actual TCP starts spaced even when IPC delayed several already
+        # reserved start reports. The pre-report gate remains necessary to avoid
+        # flooding the desktop with acknowledgements for rate-waiting requests.
+        # Neither local wait belongs to the network deadline or EMA duration.
+        while True:
+            with self.condition:
+                if self.closed or job.control.cancelled():
+                    raise CaptureCancelled("TLS capture cancelled")
+                now = time.monotonic()
+                delay = self.next_connection - now
+                if delay <= 0:
+                    self.next_connection = now + 1.0 / self.rate
+                    job.started_at = now
+                    return
+            time.sleep(min(delay, 0.010))
+
+    def _select_endpoint(self, domain, signature_algorithms_mask):
+        _integer(signature_algorithms_mask, 1, 7)
+        with self.condition:
+            cached = self.dns.get(domain)
+            if not cached or cached["expires"] <= time.monotonic() or not cached["endpoints"]:
+                raise ValueError("Resolve the public domain before attempting TLS")
+            endpoints = cached["endpoints"]
+            scores = []
+            for endpoint in endpoints:
+                policies = cached["scores"][endpoint]
+                score = policies.get(signature_algorithms_mask)
+                if score is None:
+                    score = policies[signature_algorithms_mask] = EndpointScore()
+                scores.append(score)
+            rates = [score.rate() for score in scores]
+            maximum = max(rates)
+            normalized = [rate / maximum for rate in rates]
+            total = sum(normalized)
+            count = len(endpoints)
+            for score, rate in zip(scores, normalized):
+                # Reserve a small uniform share for exploration; all remaining
+                # starts follow validated connections / network second.
+                score.credit += ENDPOINT_EXPLORATION / count + (1.0 - ENDPOINT_EXPLORATION) * rate / total
+            cursor = cached["next"].get(signature_algorithms_mask, 0) % count
+            selected = cursor
+            for offset in range(1, count):
+                candidate = (cursor + offset) % count
+                if scores[candidate].credit > scores[selected].credit:
+                    selected = candidate
+            scores[selected].credit -= 1.0
+            cached["next"][signature_algorithms_mask] = (selected + 1) % count
+            self.dns.move_to_end(domain)
+            return endpoints[selected], scores[selected]
+
+    def _observe_endpoint(self, score, validation_passed, seconds):
+        if score is None or type(validation_passed) is not bool or not math.isfinite(seconds) or seconds < 0:
+            return
+        with self.condition:
+            score.connections = 0.999 * score.connections + 0.001 * int(validation_passed)
+            score.total_time = 0.999 * score.total_time + 0.001 * seconds
+            # Only mutate the selected object. Never insert it into DNS here:
+            # a late result for a removed IP/domain must not resurrect its state.
+
     def _fields(self, job):
         with self.condition:
             successes = (self.budgets[job.bounty_id].successes if job.successful_connections is None
@@ -284,21 +373,17 @@ class ClaimsService:
         blocked = None
         validation_passed = None
         validation_started = False
+        endpoint_score = None
         try:
             if job.control.cancelled():
                 raise CaptureCancelled("TLS capture cancelled")
-            with self.condition:
-                cached = self.dns.get(job.domain)
-                if not cached or cached["expires"] <= time.monotonic() or not cached["endpoints"]:
-                    raise ValueError("Resolve the public domain before attempting TLS")
-                endpoint = cached["endpoints"][cached["next"] % len(cached["endpoints"])]
-                cached["next"] += 1
-                self.dns.move_to_end(job.domain)
+            endpoint, endpoint_score = self._select_endpoint(job.domain, job.context.signature_algorithms_mask)
             try:
                 captured = capture_tls13_proof(endpoint, job.context.domain, job.context.challenge,
                     signature_algorithms_mask=job.context.signature_algorithms_mask,
                     timeout=CONNECTION_TIMEOUT, control=job.control,
-                    before_start=lambda: self._before_start(job), on_started=lambda: self._started(job))
+                    before_start=lambda: self._before_start(job), on_started=lambda: self._started(job),
+                    on_connecting=lambda: self._connecting(job), complete_handshake=True)
                 job.captured = True
             except CaptureCancelled:
                 raise
@@ -362,6 +447,10 @@ class ClaimsService:
         # Snapshot terminal state once, and never return a proof labelled cancelled.
         if fields["cancelled"]:
             proof = None
+        # Raw capture is not sufficient evidence of a useful endpoint. Learn
+        # exactly once from the terminal validated result, before publishing it;
+        # an inconclusive cancellation is neutral, a known result is retained.
+        self._observe_endpoint(endpoint_score, validation_passed, job.seconds)
         self.emit({"type": "attempt", **fields, "proof": proof,
                    "verified": proof is not None, "validationPassed": validation_passed,
                    **({"message": message} if message else {}), **({"blocked": blocked} if blocked else {})})

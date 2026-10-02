@@ -58,6 +58,10 @@ MAX_CAPTURED_HANDSHAKE = 64 * 1024
 # select/recv on every OS. Poll only cancellable receives; the handshake still
 # has one absolute deadline, not a fresh timeout for each poll or TLS record.
 CANCEL_POLL_SECONDS = 0.1
+# Teardown is best effort and cannot turn a completed proof into a timeout.
+# Bound both time and bytes, even if a peer sends endless post-handshake data.
+CLOSE_DRAIN_SECONDS = 0.2
+MAX_CLOSE_DRAIN_BYTES = 64 * 1024
 
 
 class TLSGenerationError(P2CError):
@@ -90,8 +94,12 @@ class CaptureControl:
             if self.cancelled():
                 raise CaptureCancelled("TLS capture cancelled")
             self._socket = connection
-            if on_started is not None:
-                on_started()
+        # Reporting may block on the parent's output pipe. Never make socket
+        # cancellation wait for reporting, and recheck before any network use.
+        if on_started is not None:
+            on_started()
+        if self.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
 
     def bind(self, connection: socket.socket) -> None:
         self.begin(connection, None)
@@ -264,12 +272,15 @@ def derive_secret(secret: bytes, label: bytes, transcript: bytes) -> bytes:
     return hkdf_expand_label(secret, label, hashlib.sha256(transcript).digest(), 32)
 
 
-def _handshake_traffic_secret(shared_secret: bytes, transcript: bytes, label: bytes) -> bytes:
+def _handshake_secret(shared_secret: bytes) -> bytes:
     zeroes = b"\x00" * 32
     early_secret = hkdf_extract(zeroes, zeroes)
     derived_secret = derive_secret(early_secret, b"derived", b"")
-    handshake_secret = hkdf_extract(derived_secret, shared_secret)
-    return derive_secret(handshake_secret, label, transcript)
+    return hkdf_extract(derived_secret, shared_secret)
+
+
+def _handshake_traffic_secret(shared_secret: bytes, transcript: bytes, label: bytes) -> bytes:
+    return derive_secret(_handshake_secret(shared_secret), label, transcript)
 
 
 def _handshake_keys(traffic_secret: bytes, cipher_suite: int) -> tuple[bytes, bytes]:
@@ -314,6 +325,59 @@ def _client_finished_record(
     key, iv = _handshake_keys(traffic_secret, cipher_suite)
     cipher = AESGCM(key) if cipher_suite == TLS_AES_128_GCM_SHA256 else ChaCha20Poly1305(key)
     return header + cipher.encrypt(_record_nonce(iv, 0), plaintext, header)
+
+
+def _client_close_notify_record(
+    shared_secret: bytes, server_finished_transcript: bytes, cipher_suite: int
+) -> bytes:
+    # Application traffic keys use the transcript through server Finished,
+    # unlike the client Finished verify_data, which uses handshake keys.
+    derived = derive_secret(_handshake_secret(shared_secret), b"derived", b"")
+    master_secret = hkdf_extract(derived, b"\x00" * 32)
+    traffic_secret = derive_secret(master_secret, b"c ap traffic", server_finished_transcript)
+    key, iv = _handshake_keys(traffic_secret, cipher_suite)
+    plaintext = b"\x01\x00" + bytes([CONTENT_ALERT])
+    header = bytes([CONTENT_APPLICATION_DATA]) + _u16(TLS_1_2) + _u16(len(plaintext) + 16)
+    cipher = AESGCM(key) if cipher_suite == TLS_AES_128_GCM_SHA256 else ChaCha20Poly1305(key)
+    return header + cipher.encrypt(_record_nonce(iv, 0), plaintext, header)
+
+
+def _close_completed_handshake(
+    connection: socket.socket,
+    close_notify: bytes,
+    control: CaptureControl | None,
+) -> None:
+    # Let servers finish sending session tickets and observe close_notify.
+    # Immediately closing with unread tickets can reset an otherwise valid
+    # connection on Windows. No application data is sent or retained here.
+    deadline = time.monotonic() + CLOSE_DRAIN_SECONDS
+    drained = 0
+    try:
+        if control is not None and control.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
+        connection.settimeout(_remaining_timeout(deadline))
+        connection.sendall(close_notify)
+        while drained < MAX_CLOSE_DRAIN_BYTES:
+            if control is not None and control.cancelled():
+                raise CaptureCancelled("TLS capture cancelled")
+            remaining = _remaining_timeout(deadline)
+            connection.settimeout(min(remaining, CANCEL_POLL_SECONDS))
+            try:
+                chunk = connection.recv(min(4096, MAX_CLOSE_DRAIN_BYTES - drained))
+            except TimeoutError:
+                continue
+            if not chunk:
+                return
+            drained += len(chunk)
+    except CaptureCancelled:
+        raise
+    except (OSError, TLSGenerationError):
+        # The server Finished was authenticated and client Finished sent;
+        # failure to finish closing cannot invalidate that completed capture.
+        pass
+    finally:
+        if control is not None and control.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
 
 
 def _remaining_timeout(deadline: float) -> float:
@@ -483,6 +547,7 @@ def capture_tls13_proof(
     control: CaptureControl | None = None,
     on_started: Callable[[], None] | None = None,
     before_start: Callable[[], None] | None = None,
+    on_connecting: Callable[[], None] | None = None,
     complete_handshake: bool = False,
 ) -> TLSProofMessages:
     validate_signature_algorithms_mask(signature_algorithms_mask)
@@ -502,19 +567,22 @@ def capture_tls13_proof(
         session_id,
         signature_algorithms_mask=signature_algorithms_mask,
     )
-    deadline = time.monotonic() + timeout
-
     with socket.socket(endpoint.family, endpoint.socket_type, endpoint.protocol) as connection, (control if control is not None else nullcontext()):
         if control is not None:
             control.bind(connection)
         if before_start is not None:
             before_start()
-        # Queued/rate-limited time is not part of a TCP/TLS attempt deadline.
-        deadline = time.monotonic() + timeout
         if control is not None:
             control.begin(connection, on_started)
         elif on_started is not None:
             on_started()
+        # Queue/rate waits and potentially blocking start reporting do not
+        # consume the network budget. This cheap hook marks actual TCP timing.
+        if on_connecting is not None:
+            on_connecting()
+        if control is not None and control.cancelled():
+            raise CaptureCancelled("TLS capture cancelled")
+        deadline = time.monotonic() + timeout
         connection.settimeout(_remaining_timeout(deadline))
         connection.connect(endpoint.address)
         connection.settimeout(_remaining_timeout(deadline))
@@ -601,6 +669,9 @@ def capture_tls13_proof(
             connection.settimeout(_remaining_timeout(deadline))
             connection.sendall(_client_finished_record(client_secret, transcript + captured[3], cipher_suite))
             _remaining_timeout(deadline)
+            _close_completed_handshake(connection,
+                _client_close_notify_record(shared_secret, transcript + captured[3], cipher_suite),
+                control)
 
     result = TLSProofMessages(
         client_hello=client_hello,

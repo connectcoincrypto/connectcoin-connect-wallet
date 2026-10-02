@@ -235,22 +235,24 @@ test('catalog retirement bounds local factors and statistics but retains an acti
   assert.equal(engine.factors.has(second.txid + ':1'), true);
 });
 
-test('selection-preserving discovery reset keeps factors, stats and cursors; normal clear erases them', t => {
+test('selection-preserving discovery reset keeps factors, stats and domain turn; normal clear erases them', t => {
   const engine = engineFixture(t), row = bounty(), id = row.txid + ':0';
   const job = engine.queue.get(id), factor = job.factor;
   engine.recordAttemptStats(job, { validation: 'certificate-proof-v1', completed: 1, recent: [[true, 0.1]] }, 0);
-  engine.markAssigned(job);
-  const cursor = engine.domainCursors.get('example.com');
+  engine.markAssigned(engine.nextReady());
+  assert.equal(engine.scheduler.domainAfter, 'example.com');
+  assert.equal(engine.preferReward, true);
   engine.clear({ preserveSelection: true });
   assert.equal(engine.queue.size, 0);
   assert.equal(engine.factors.get(id), factor);
   assertRate(engine.domainStats.get('example.com:7'), [[true, 0.1]]);
-  assert.strictEqual(engine.domainCursors.get('example.com'), cursor);
+  assert.equal(engine.scheduler.domainAfter, 'example.com');
+  assert.equal(engine.preferReward, true);
   engine.enqueue([row]);
   assert.equal(engine.queue.get(id).factor, factor);
   engine.clear();
   assert.equal(engine.factors.size, 0); assert.equal(engine.domainStats.size, 0);
-  assert.equal(engine.domainCursors.size, 0); assert.equal(engine.preferReward, false);
+  assert.equal(engine.scheduler.domainAfter, null); assert.equal(engine.preferReward, false);
 });
 
 test('old helpers missing completion telemetry fail closed instead of silently keeping the rate prior', async () => {
