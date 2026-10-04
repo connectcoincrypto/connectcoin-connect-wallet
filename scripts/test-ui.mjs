@@ -1290,7 +1290,15 @@ try {
   // No transaction is constructed or sent by this fixture.
   await application.evaluate((_electron, moduleUrl) => {
     const { WalletService } = process.getBuiltinModule('module').createRequire(moduleUrl)('./wallet-service.mjs');
-    const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.previewSend, calls: 0 };
+    const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.previewSend,
+      originalGetState: WalletService.prototype.getState, calls: 0, backgroundPublications: 0 };
+    fixture.prototype.getState = function () {
+      const snapshot = fixture.originalGetState.call(this);
+      if (this === fixture.service && fixture.backgroundStatus) {
+        snapshot.network = { ...snapshot.network, status: fixture.backgroundStatus };
+      }
+      return snapshot;
+    };
     fixture.prototype.previewSend = async function () {
       fixture.calls++;
       fixture.service = this;
@@ -1315,9 +1323,21 @@ try {
     await expect(page.locator('#modal-error')).toHaveText('Isolated payment preparation failure.');
     assert.match(await page.locator('dialog[open]').textContent(), /Nothing was sent/);
     assert.equal(await page.locator('[data-action="confirm-send"]').count(), 0);
-    const failureSnapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
-    failureSnapshot.network.status = 'payment-failure-background-check';
-    await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), failureSnapshot);
+    await application.evaluate(() => {
+      const fixture = globalThis.paymentFailureFixture;
+      // Both main and renderer coalesce state for 200 ms. A one-off forged
+      // snapshot can correctly disappear behind a queued real publication.
+      // Keep this marker in the scoped fixture's snapshots, including a second
+      // queued publication, without changing the service's actual network state.
+      fixture.backgroundStatus = 'payment-failure-background-check';
+      fixture.onBackgroundState = snapshot => {
+        if (snapshot.network.status === fixture.backgroundStatus) fixture.backgroundPublications++;
+      };
+      fixture.service.on('state', fixture.onBackgroundState);
+      fixture.service.statePublisher.request({ immediate: true });
+      fixture.service.emitState();
+    });
+    await expect.poll(() => application.evaluate(() => globalThis.paymentFailureFixture.backgroundPublications)).toBeGreaterThanOrEqual(2);
     await expect(page.locator('.network-pill')).toContainText('payment-failure-background-check');
     await expect(page.locator('#modal-error')).toBeVisible();
     await expect(page.locator('#modal-error')).toHaveText('Isolated payment preparation failure.');
@@ -1338,6 +1358,8 @@ try {
       const fixture = globalThis.paymentFailureFixture;
       fixture.release?.();
       fixture.prototype.previewSend = fixture.original;
+      fixture.prototype.getState = fixture.originalGetState;
+      if (fixture.onBackgroundState) fixture.service.off('state', fixture.onBackgroundState);
       if (fixture.service) { fixture.service.paymentPreparation = null; fixture.service.emitState(); }
       delete globalThis.paymentFailureFixture;
     });
