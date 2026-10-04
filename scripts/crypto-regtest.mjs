@@ -95,6 +95,25 @@ try {
   const forgedAmount = { ...coins[2], amount: '999999999999' };
   assert.throws(() => buildPayment({ utxos: [forgedAmount], outputs: [{ address: receiver.address, amount: COIN.toString() }], changeAddress: owner.address, network: 'regtest' }), /amount/);
   console.log('PASS: altered recipient amount and dishonest RPC funding amount are rejected.');
+
+  // Exercise deduction against the real node, including an exact sweep and
+  // dust-sized change. testmempoolaccept validates without broadcasting.
+  const available = BigInt(coins[2].amount);
+  for (const [name, output] of [
+    ['exact all-balance payment', { address: receiver.address, amount: available.toString() }],
+    ['deducted fee with change', { address: receiver.address, amount: (available / 2n).toString() }],
+    ['deducted fee with dust-change top-up', { address: receiver.address, amount: (available - 1n).toString() }],
+    ['exact all-balance P2C bounty', { domain: 'example.com', amount: available.toString(), expectedConnections: '1024', mask: 6 }],
+  ]) {
+    const deducted = buildPayment({ utxos: [coins[2]], outputs: [output], changeAddress: owner.address, network: 'regtest', subtractFeeFromAmount: true });
+    assert.equal(BigInt(deducted.total) + BigInt(deducted.fee) + BigInt(deducted.change), available);
+    const decoded = await rpc('decoderawtransaction', [deducted.hex]);
+    assert.equal(decoded.vsize, deducted.vsize);
+    assert.equal(decoded.txid, deducted.txid);
+    const acceptance = await rpc('testmempoolaccept', [[deducted.hex]]);
+    assert.equal(acceptance[0].allowed, true, `${name}: ${JSON.stringify(acceptance)}`);
+    console.log(`PASS: Core accepted ${name}.`);
+  }
   success = true;
 } finally {
   owner.privateKey.fill(0); receiver.privateKey.fill(0);

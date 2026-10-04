@@ -7,6 +7,13 @@ export const COIN = 10_000_000_000n;
 export const MAX_MONEY = 100_000_000n * COIN;
 export const DEFAULT_FEE_RATE = 1500; // integer connects/vbyte, NOT CONN or sat/vbyte
 export const MAX_PROOF_SIZE = 65536;
+// 1,738 native P2PK inputs plus one P2PK output fit Core's 400,000-weight
+// standard transaction limit. Larger output sets are checked exactly below.
+export const MAX_PAYMENT_INPUTS = 1738;
+// Bound text sent to the signing worker before structured cloning. Count hex
+// characters (ASCII bytes), including repeated legacy per-input parents.
+export const MAX_PAYMENT_PARENT_HEX_BYTES = 64 * 1024 * 1024;
+const MAX_PAYMENT_WEIGHT = 400_000;
 const MAX_TX_BYTES = 4_000_000;
 const MAX_INPUTS = 10000;
 const MAX_OUTPUTS = 10000;
@@ -58,8 +65,19 @@ export function workTargetForExpectedConnections(expected) {
   if (count < 1n || count > (1n << 256n)) throw new Error('Expected connections is out of range');
   return (((1n << 256n) / count) - 1n).toString(16).padStart(64, '0');
 }
-export function outputPayload(output) {
-  if (output.type === 1) return Buffer.concat([Buffer.from([1]), validatePublicKey(output.publicKey)]);
+function transactionPublicKey(value, publicKeys) {
+  // A successful curve lift is immutable for these exact 32 bytes. Reuse it
+  // only within this bounded transaction operation; malformed or changed keys
+  // still pass through the complete validator before they can be cached.
+  const key = typeof value === 'string' && value.length === 64 ? value.toLowerCase()
+    : value instanceof Uint8Array && value.length === 32 ? Buffer.from(value).toString('hex') : null;
+  if (key !== null && publicKeys?.has(key)) return publicKeys.get(key);
+  const validated = validatePublicKey(value);
+  if (publicKeys && publicKeys.size < MAX_OUTPUTS) publicKeys.set(validated.toString('hex'), validated);
+  return validated;
+}
+function outputPayloadWithKeys(output, publicKeys) {
+  if (output.type === 1) return Buffer.concat([Buffer.from([1]), transactionPublicKey(output.publicKey, publicKeys)]);
   if (output.type === 2) {
     if (!isCanonicalDomain(output.domain)) throw new Error('Noncanonical P2C domain');
     if (!Number.isInteger(output.rootVersion) || output.rootVersion < 1 || output.rootVersion > 0xffffffff) throw new Error('Invalid P2C root bundle version');
@@ -68,7 +86,9 @@ export function outputPayload(output) {
   }
   throw new Error('Unknown or invalid ConnectCoin output type');
 }
-export function serializeOutput(output) { return Buffer.concat([i64(output.amount), outputPayload(output)]); }
+export function outputPayload(output) { return outputPayloadWithKeys(output); }
+function serializeOutputWithKeys(output, publicKeys) { return Buffer.concat([i64(output.amount), outputPayloadWithKeys(output, publicKeys)]); }
+export function serializeOutput(output) { return serializeOutputWithKeys(output); }
 function outpoint(input) { return Buffer.concat([hexBytes(input.txid, 32, 'transaction ID').reverse(), u32(input.vout)]); }
 function validateShape(tx) {
   u32(tx.version); u32(tx.locktime);
@@ -83,12 +103,12 @@ function validateShape(tx) {
     if (hexBytes(input.scriptSig ?? '').length > 10000 || !Array.isArray(input.witness ?? []) || (input.witness ?? []).length > 100) throw new Error('Oversized input script or witness stack');
   }
 }
-export function serializeTransaction(tx, { witness = true } = {}) {
+function serializeTransactionWithKeys(tx, { witness = true } = {}, publicKeys) {
   validateShape(tx);
   const hasWitness = witness && tx.inputs.some(input => (input.witness ?? []).length > 0);
   const parts = [u32(tx.version), ...(hasWitness ? [Buffer.from([0, 1])] : []), compactSize(tx.inputs.length)];
   for (const input of tx.inputs) parts.push(outpoint(input), variable(hexBytes(input.scriptSig ?? '')), u32(input.sequence));
-  parts.push(compactSize(tx.outputs.length), ...tx.outputs.map(serializeOutput));
+  parts.push(compactSize(tx.outputs.length), ...tx.outputs.map(output => serializeOutputWithKeys(output, publicKeys)));
   if (hasWitness) for (const input of tx.inputs) {
     parts.push(compactSize((input.witness ?? []).length));
     for (const item of input.witness ?? []) {
@@ -102,6 +122,7 @@ export function serializeTransaction(tx, { witness = true } = {}) {
   if (result.length > MAX_TX_BYTES) throw new Error('Transaction exceeds local size limit');
   return result;
 }
+export function serializeTransaction(tx, options) { return serializeTransactionWithKeys(tx, options, new Map()); }
 export function transactionId(tx) { return hash256(serializeTransaction(tx, { witness: false })).reverse().toString('hex'); }
 export function transactionVsize(tx) {
   const base = serializeTransaction(tx, { witness: false }).length;
@@ -120,7 +141,62 @@ class Reader {
   }
   blob(max) { return this.take(this.count(max)); }
 }
-export function parseTransaction(raw) {
+/**
+ * Check bounded, canonical wire framing and hash the witness-stripped bytes.
+ * This is an identity check for cached funding, NOT a semantic/ownership check:
+ * unlike parseTransaction(), it deliberately does not lift public keys onto the
+ * curve. Signing must still use verifyFunding() on the full original bytes.
+ */
+export function transactionIdFromRaw(raw) {
+  if (typeof raw !== 'string' || raw.length > MAX_TX_BYTES * 2) throw new Error('Transaction exceeds local size limit');
+  const reader = new Reader(hexBytes(raw));
+  const version = reader.take(4);
+  let inputStart = reader.offset;
+  let count = reader.count(MAX_INPUTS), witnessed = false;
+  if (count === 0) {
+    if (reader.byte() !== 1) throw new Error('Unknown transaction witness flag');
+    witnessed = true; inputStart = reader.offset; count = reader.count(MAX_INPUTS);
+  }
+  if (count < 1 || count > (reader.data.length - reader.offset) / 41) throw new Error('Invalid transaction input count');
+  const seen = new Set();
+  for (let index = 0; index < count; index++) {
+    const outpoint = reader.take(36).toString('hex');
+    if (seen.has(outpoint)) throw new Error('Duplicate transaction input');
+    seen.add(outpoint);
+    reader.blob(10000); reader.take(4);
+  }
+  const outputCount = reader.count(MAX_OUTPUTS);
+  if (outputCount < 1 || outputCount > (reader.data.length - reader.offset) / 9) throw new Error('Invalid transaction output count');
+  let total = 0n;
+  for (let index = 0; index < outputCount; index++) {
+    total += amountInConnects(reader.take(8).readBigInt64LE());
+    if (total > MAX_MONEY) throw new Error('Total transaction outputs exceed money range');
+    const type = reader.byte();
+    if (type === 1) reader.take(32);
+    else if (type === 2) {
+      const domain = reader.take(reader.byte());
+      if (domain.some(byte => byte > 127)) throw new Error('Non-ASCII P2C domain');
+      if (!isCanonicalDomain(domain.toString('ascii'))) throw new Error('Noncanonical P2C domain');
+      reader.take(32);
+      if (reader.uint() < 1) throw new Error('Invalid P2C root bundle version');
+      const mask = reader.byte();
+      if (mask < 1 || mask > 7) throw new Error('Invalid P2C signature mask');
+    } else throw new Error('Unknown or invalid ConnectCoin output type');
+  }
+  const outputsEnd = reader.offset;
+  let hasWitness = false;
+  if (witnessed) for (let index = 0; index < count; index++) {
+    const items = reader.count(100);
+    hasWitness ||= items > 0;
+    for (let item = 0; item < items; item++) reader.blob(MAX_PROOF_SIZE);
+  }
+  if (witnessed && !hasWitness) throw new Error('Superfluous witness record');
+  const locktime = reader.take(4);
+  if (reader.offset !== reader.data.length) throw new Error('Trailing transaction data');
+  const stripped = witnessed ? Buffer.concat([version, reader.data.subarray(inputStart, outputsEnd), locktime]) : reader.data;
+  return hash256(stripped).reverse().toString('hex');
+}
+function parseTransactionWithKeys(raw, publicKeys) {
   if (typeof raw !== 'string' || raw.length > MAX_TX_BYTES * 2) throw new Error('Transaction exceeds local size limit');
   const reader = new Reader(hexBytes(raw));
   const version = reader.uint();
@@ -136,7 +212,7 @@ export function parseTransaction(raw) {
   for (let index = 0; index < outputCount; index++) {
     const amount = amountInConnects(reader.take(8).readBigInt64LE()).toString();
     const type = reader.byte();
-    if (type === 1) outputs.push({ type, amount, publicKey: validatePublicKey(reader.take(32)).toString('hex') });
+    if (type === 1) outputs.push({ type, amount, publicKey: transactionPublicKey(reader.take(32), publicKeys).toString('hex') });
     else if (type === 2) {
       const domainBytes = reader.take(reader.byte());
       if (domainBytes.some(byte => byte > 127)) throw new Error('Non-ASCII P2C domain');
@@ -153,34 +229,78 @@ export function parseTransaction(raw) {
   if (witnessed && !inputs.some(input => input.witness.length)) throw new Error('Superfluous witness record');
   const tx = { version, inputs, outputs, locktime: reader.uint() };
   if (reader.offset !== reader.data.length) throw new Error('Trailing transaction data');
-  if (!serializeTransaction(tx).equals(reader.data)) throw new Error('Noncanonical transaction encoding');
+  if (!serializeTransactionWithKeys(tx, undefined, publicKeys).equals(reader.data)) throw new Error('Noncanonical transaction encoding');
   return tx;
 }
-export function verifyFunding(utxo, expectedPublicKey) {
+export function parseTransaction(raw) { return parseTransactionWithKeys(raw, new Map()); }
+function checkFundingOutput(utxo, expectedPublicKey, funding, fundingId) {
   if (!utxo || typeof utxo !== 'object') throw new Error('Missing funding output');
   hexBytes(utxo.txid, 32, 'funding transaction ID');
-  const funding = parseTransaction(utxo.rawTransaction);
-  if (transactionId(funding) !== utxo.txid.toLowerCase()) throw new Error('Funding transaction ID does not match its bytes');
+  if (fundingId !== utxo.txid.toLowerCase()) throw new Error('Funding transaction ID does not match its bytes');
   if (!Number.isInteger(utxo.vout) || utxo.vout < 0 || utxo.vout >= funding.outputs.length) throw new Error('Funding output does not exist');
   const output = funding.outputs[utxo.vout];
   if (amountInConnects(output.amount) !== amountInConnects(utxo.amount)) throw new Error('RPC funding amount does not match the original transaction');
   if (expectedPublicKey !== undefined && (output.type !== 1 || output.publicKey !== validatePublicKey(expectedPublicKey).toString('hex'))) throw new Error('Funding output is not owned by this wallet key');
   return output;
 }
-export function signatureHash(tx, spentOutputs, index) {
+export function verifyFunding(utxo, expectedPublicKey) {
+  if (!utxo || typeof utxo !== 'object') throw new Error('Missing funding output');
+  hexBytes(utxo.txid, 32, 'funding transaction ID');
+  const funding = parseTransaction(utxo.rawTransaction);
+  return checkFundingOutput(utxo, expectedPublicKey, funding, transactionId(funding));
+}
+/** Cheap pre-clone limits; full raw framing, identity and ownership stay local. */
+export function validatePaymentFundingPayload(input) {
+  if (!Array.isArray(input?.utxos) || input.utxos.length < 1 || input.utxos.length > MAX_PAYMENT_INPUTS) throw new Error('Invalid payment input count');
+  let hexBytes = 0;
+  const countRaw = raw => {
+    if (typeof raw !== 'string' || raw.length < 2 || raw.length > MAX_TX_BYTES * 2 || raw.length % 2) throw new Error('Invalid funding transaction bytes');
+    hexBytes += raw.length;
+    if (hexBytes > MAX_PAYMENT_PARENT_HEX_BYTES) throw new Error('Payment funding data exceeds the local memory limit; use fewer inputs');
+  };
+  const validId = value => typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
+  const parents = new Map();
+  if (input.parents !== undefined) {
+    if (!Array.isArray(input.parents) || input.parents.length < 1 || input.parents.length > MAX_PAYMENT_INPUTS) throw new Error('Invalid funding parent count');
+    for (const parent of input.parents) {
+      if (!validId(parent?.txid)) throw new Error('Invalid funding transaction ID');
+      const id = parent.txid.toLowerCase();
+      if (parents.has(id)) throw new Error('Duplicate funding parent');
+      countRaw(parent.hex); parents.set(id, parent.hex);
+    }
+  }
+  for (const utxo of input.utxos) {
+    if (!validId(utxo?.txid)) throw new Error('Invalid funding transaction ID');
+    const parent = parents.get(utxo.txid.toLowerCase());
+    if (utxo.rawTransaction !== undefined) {
+      countRaw(utxo.rawTransaction);
+      if (parent !== undefined && parent !== utxo.rawTransaction) throw new Error('Conflicting funding transaction bytes');
+    } else if (parent === undefined) throw new Error('Missing funding parent');
+  }
+  return parents;
+}
+function paymentSignatureHashes(tx, spentOutputs) {
   validateShape(tx);
-  if (!Array.isArray(spentOutputs) || spentOutputs.length !== tx.inputs.length || !Number.isInteger(index) || index < 0 || index >= tx.inputs.length) throw new Error('All spent outputs are required for signing');
+  if (!Array.isArray(spentOutputs) || spentOutputs.length !== tx.inputs.length) throw new Error('All spent outputs are required for signing');
   // BIP341-style SIGHASH_DEFAULT with native typed locks (not Script encodings).
-  return taggedHash('TapSighash', Buffer.concat([
+  // Snapshot the common digest once. This cache is private to one synchronous
+  // signing operation, never retained across a transaction/output mutation.
+  const prefix = Buffer.concat([
     Buffer.from([0, 0]), u32(tx.version), u32(tx.locktime),
     sha256(Buffer.concat(tx.inputs.map(outpoint))),
     sha256(Buffer.concat(spentOutputs.map(output => i64(output.amount)))),
     sha256(Buffer.concat(spentOutputs.map(outputPayload))),
     sha256(Buffer.concat(tx.inputs.map(input => u32(input.sequence)))),
     sha256(Buffer.concat(tx.outputs.map(serializeOutput))),
-    Buffer.from([0]), u32(index),
-  ]));
+    Buffer.from([0]),
+  ]);
+  const inputCount = tx.inputs.length;
+  return index => {
+    if (!Number.isInteger(index) || index < 0 || index >= inputCount) throw new Error('All spent outputs are required for signing');
+    return taggedHash('TapSighash', Buffer.concat([prefix, u32(index)]));
+  };
 }
+export function signatureHash(tx, spentOutputs, index) { return paymentSignatureHashes(tx, spentOutputs)(index); }
 export function dustThreshold(output) {
   const spend = output.type === 2 ? 41 + Math.ceil((1 + 5 + MAX_PROOF_SIZE) / 4) : 58;
   return BigInt((serializeOutput(output).length + spend) * 3);
@@ -198,43 +318,116 @@ function checkedFeeRate(value) {
   if (!Number.isSafeInteger(value) || value < 1201 || value > 1_000_000) throw new Error('Fee rate must be 1,201–1,000,000 connects per vbyte');
   return BigInt(value);
 }
-export function buildPayment({ utxos, outputs, changeAddress, network = 'testnet4', feeRate = DEFAULT_FEE_RATE, maxFee = COIN.toString() }) {
+function paymentPlan({ utxos, outputs, changeAddress, network = 'testnet4', feeRate = DEFAULT_FEE_RATE, maxFee = COIN.toString(), subtractFeeFromAmount = false }) {
   const rate = checkedFeeRate(feeRate);
   const maximumFee = amountInConnects(maxFee);
-  if (!Array.isArray(utxos) || utxos.length < 1 || utxos.length > 256 || !Array.isArray(outputs) || outputs.length < 1 || outputs.length > 100) throw new Error('Invalid payment input/output count');
+  if (typeof subtractFeeFromAmount !== 'boolean') throw new Error('Deduct fees from payment must be a boolean');
+  if (!Array.isArray(utxos) || utxos.length < 1 || utxos.length > MAX_PAYMENT_INPUTS || !Array.isArray(outputs) || outputs.length < 1 || outputs.length > 100) throw new Error('Invalid payment input/output count');
+  if (subtractFeeFromAmount && outputs.length !== 1) throw new Error('Deduct fees from payment requires exactly one recipient');
   const recipients = outputs.map(output => recipientOutput(output, network));
-  const total = recipients.reduce((sum, output) => sum + BigInt(output.amount), 0n);
-  amountInConnects(total);
+  const requestedTotal = recipients.reduce((sum, output) => sum + BigInt(output.amount), 0n);
+  amountInConnects(requestedTotal);
+  let total = requestedTotal;
   const changeKey = decodeAddress(changeAddress, network).toString('hex');
   const changeOutput = { type: 1, amount: '0', publicKey: changeKey };
-  const sorted = [...utxos].sort((a, b) => amountInConnects(a.amount) > amountInConnects(b.amount) ? -1 : amountInConnects(a.amount) < amountInConnects(b.amount) ? 1 : 0);
+  const sorted = utxos.map(utxo => ({ utxo, amount: amountInConnects(utxo.amount) }))
+    .sort((a, b) => {
+      // Fee-deducted payments can spend an exact coin without a change output.
+      // Choosing a larger coin first can make its extra fee consume a small
+      // recipient even though the exact coin funds a valid payment.
+      if (subtractFeeFromAmount && (a.amount === requestedTotal) !== (b.amount === requestedTotal)) return a.amount === requestedTotal ? -1 : 1;
+      return a.amount > b.amount ? -1 : a.amount < b.amount ? 1 : 0;
+    });
   const selected = [];
-  const spentOutputs = [];
+  const seen = new Set();
   const tx = { version: 2, inputs: [], outputs: recipients, locktime: 0 };
+  const recipientBytes = recipients.reduce((sum, output) => sum + serializeOutput(output).length, 0);
+  const changeBytes = serializeOutput(changeOutput).length;
+  const changeDust = dustThreshold(changeOutput);
+  // Every payment input is native P2PK: 41 base bytes and a 66-byte Schnorr
+  // witness. Account for both CompactSize boundaries and marker/flag exactly,
+  // without serializing all preceding inputs for every selection candidate.
+  const estimateWeight = withChange => {
+    const count = tx.inputs.length;
+    const base = 8 + compactSize(count).length + 41 * count +
+      compactSize(recipients.length + Number(withChange)).length + recipientBytes + (withChange ? changeBytes : 0);
+    return base * 4 + 2 + 66 * count;
+  };
+  const estimateVsize = withChange => Math.ceil(estimateWeight(withChange) / 4);
   let inputTotal = 0n;
   let fee;
   let change = 0n;
-  for (const utxo of sorted) {
-    const key = publicKeyFromPrivate(utxo.privateKey);
-    const spent = verifyFunding(utxo, key);
-    if (selected.some(previous => previous.txid === utxo.txid && previous.vout === utxo.vout)) throw new Error('Duplicate funding output');
-    selected.push(utxo); spentOutputs.push(spent);
-    inputTotal += BigInt(spent.amount); amountInConnects(inputTotal);
+  for (const { utxo, amount } of sorted) {
+    const fundingKey = outpoint(utxo).toString('hex');
+    if (seen.has(fundingKey)) throw new Error('Duplicate funding output');
+    seen.add(fundingKey); selected.push(utxo);
+    inputTotal += amount; amountInConnects(inputTotal);
     tx.inputs.push({ txid: utxo.txid, vout: utxo.vout, scriptSig: '', sequence: 0xfffffffd, witness: ['00'.repeat(64)] });
+    // Reject an oversized plan before reading parents or creating signatures.
+    if (estimateWeight(false) > MAX_PAYMENT_WEIGHT) throw new Error('Payment exceeds the standard transaction weight limit; use fewer inputs');
+    if (subtractFeeFromAmount) {
+      if (inputTotal < requestedTotal) continue;
+      const remainder = inputTotal - requestedTotal;
+      change = remainder === 0n ? 0n : remainder < changeDust ? changeDust : remainder;
+      if (estimateWeight(change > 0n) > MAX_PAYMENT_WEIGHT) throw new Error('Payment exceeds the standard transaction weight limit; use fewer inputs');
+      fee = rate * BigInt(estimateVsize(change > 0n));
+      // Do not turn tiny change into a surprise additional miner fee. Keep it
+      // spendable by subtracting its dust shortfall from the sole recipient.
+      total = requestedTotal - fee - (change - remainder);
+      if (total <= 0n || total < dustThreshold(recipients[0])) throw new Error('Recipient amount after deducting the fee is below the relay dust threshold');
+      tx.outputs = [{ ...recipients[0], amount: total.toString() },
+        ...(change > 0n ? [{ ...changeOutput, amount: change.toString() }] : [])];
+      break;
+    }
     tx.outputs = [...recipients, changeOutput];
-    const withChangeFee = rate * BigInt(transactionVsize(tx));
+    const withChangeFee = rate * BigInt(estimateVsize(true));
     const candidateChange = inputTotal - total - withChangeFee;
-    if (candidateChange >= dustThreshold(changeOutput)) { change = candidateChange; tx.outputs[tx.outputs.length - 1] = { ...changeOutput, amount: change.toString() }; fee = withChangeFee; break; }
+    if (candidateChange >= changeDust) {
+      if (estimateWeight(true) > MAX_PAYMENT_WEIGHT) throw new Error('Payment exceeds the standard transaction weight limit; use fewer inputs');
+      change = candidateChange; tx.outputs[tx.outputs.length - 1] = { ...changeOutput, amount: change.toString() }; fee = withChangeFee; break;
+    }
     tx.outputs = recipients;
-    const noChangeFee = rate * BigInt(transactionVsize(tx));
+    const noChangeFee = rate * BigInt(estimateVsize(false));
     if (inputTotal >= total + noChangeFee) { fee = inputTotal - total; break; }
   }
   if (fee === undefined) throw new Error('Insufficient verified funds for this payment and its fee');
   if (fee > maximumFee) throw new Error('Transaction fee exceeds the wallet safety limit');
-  for (let index = 0; index < selected.length; index++) tx.inputs[index].witness = [signSchnorr(signatureHash(tx, spentOutputs, index), selected[index].privateKey).toString('hex')];
+  return { selected, tx, fee: fee.toString(), total: total.toString(), requestedTotal: requestedTotal.toString(), subtractFeeFromAmount,
+    inputTotal: inputTotal.toString(), change: change.toString(), vsize: estimateVsize(change > 0n) };
+}
+/** Select candidates using public metadata only; this does NOT verify funding. */
+export function selectPaymentFunding(options) {
+  const { tx, ...selection } = paymentPlan(options);
+  return selection;
+}
+export function buildPayment(options) {
+  const { selected, tx, ...payment } = paymentPlan(options);
+  // Metadata is untrusted until the amount and ownership match the raw parent.
+  // Verify every selected output before creating any payment signature.
+  // Many outputs can share one large parent. Parse each distinct byte string
+  // only once, but repeat txid, vout, amount and ownership checks per input.
+  const parents = new Map(), publicKeys = new Map();
+  let parentHexBytes = 0;
+  const spentOutputs = selected.map(utxo => {
+    const raw = utxo.rawTransaction;
+    let parent = parents.get(raw);
+    if (!parent) {
+      if (typeof raw !== 'string') throw new Error('Invalid funding transaction bytes');
+      parentHexBytes += raw.length;
+      if (parentHexBytes > MAX_PAYMENT_PARENT_HEX_BYTES) throw new Error('Payment funding data exceeds the local memory limit; use fewer inputs');
+      const funding = parseTransactionWithKeys(raw, publicKeys);
+      const txid = hash256(serializeTransactionWithKeys(funding, { witness: false }, publicKeys)).reverse().toString('hex');
+      parent = { funding, txid }; parents.set(raw, parent);
+    }
+    return checkFundingOutput(utxo, publicKeyFromPrivate(utxo.privateKey), parent.funding, parent.txid);
+  });
+  const signatureForInput = paymentSignatureHashes(tx, spentOutputs);
+  for (let index = 0; index < selected.length; index++) tx.inputs[index].witness = [signSchnorr(signatureForInput(index), selected[index].privateKey).toString('hex')];
   const hex = serializeTransaction(tx).toString('hex');
   if (hex.length > 800_000) throw new Error('Payment exceeds relay size limit');
-  return { hex, txid: transactionId(tx), fee: fee.toString(), total: total.toString(), inputTotal: inputTotal.toString(), change: change.toString(), vsize: transactionVsize(tx), selected: selected.map(({ txid, vout }) => ({ txid, vout })), transaction: tx };
+  if (serializeTransaction(tx, { witness: false }).length * 3 + hex.length / 2 > MAX_PAYMENT_WEIGHT) throw new Error('Payment exceeds the standard transaction weight limit');
+  if (transactionVsize(tx) !== payment.vsize) throw new Error('Payment size differs from its fee estimate');
+  return { hex, txid: transactionId(tx), ...payment, selected: selected.map(({ txid, vout }) => ({ txid, vout })), transaction: tx };
 }
 export function claimChallenge(tx, index = 0) {
   if (!Number.isInteger(index) || index < 0 || index >= tx.inputs.length) throw new Error('Claim input index is out of range');

@@ -245,3 +245,43 @@ test('real address notifications merged with subscription catch-ups stay real', 
   assert.equal(s.changes.length, 1); assert.equal(s.changes[0].catchup, false);
   assert.equal(s.changes[0].wallet, true); s.live.close();
 });
+
+test('watchAddress releases a registered target before unrelated subscriptions finish', async () => {
+  const s = setup(), pending = deferred();
+  s.setAddresses(['abcdefgh1', 'abcdefgh2']);
+  s.rpc.handler = call => call.method === 'subscribeaddress' && call.params.address === 'abcdefgh2' ? pending.promise : undefined;
+  s.live.start();
+  let result;
+  const watched = s.live.watchAddress('abcdefgh1').then(value => { result = value; });
+  try {
+    await flush();
+    assert.equal(s.live.registrations.has('address:abcdefgh1'), true);
+    assert.equal(result, true, 'An unrelated queued registration must not hold a ready address read');
+    assert.ok(s.live.running, 'The later subscription should still be pending');
+    assert.equal(s.live.addressWaiters.size, 0);
+    pending.reject(new Error('Unrelated later subscription failed'));
+    await watched; await flush();
+    assert.equal(result, true);
+    assert.equal(s.errors.length, 1, 'The worker still reports later failures');
+  } finally { pending.resolve({ subscription_id: 'last', tip, cursor: 'c' }); s.live.close(); }
+});
+
+for (const action of ['close', 'disconnect']) test(`watchAddress promptly rejects on ${action} while a registration reply is held`, async () => {
+  const s = setup(), pending = deferred();
+  s.rpc.handler = call => call.method === 'subscribeaddress' ? pending.promise : undefined;
+  s.live.start(); await flush();
+  let failure;
+  const watched = s.live.watchAddress('abcdefgh1').catch(error => { failure = error; });
+  try {
+    await flush(); assert.equal(failure, undefined);
+    if (action === 'close') s.live.close(); else s.rpc.disconnect();
+    await flush();
+    assert.ok(failure, 'Changing the lifecycle must settle the waiter without its old reply');
+    if (action === 'close') assert.equal(failure.name, 'AbortError');
+    else assert.match(failure.message, /reconnecting/);
+    assert.equal(s.live.addressWaiters.size, 0);
+    pending.resolve({ subscription_id: 'late', tip, cursor: 'c' });
+    await watched; await flush();
+    assert.equal(s.live.registrations.size, 0);
+  } finally { pending.resolve({ subscription_id: 'late', tip, cursor: 'c' }); s.live.close(); }
+});

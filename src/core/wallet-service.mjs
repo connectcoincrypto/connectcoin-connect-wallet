@@ -8,7 +8,8 @@ import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
 import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, networkParameters, MAX_ADDRESS_INDEX } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
-import { buildPayment, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, parseTransaction, transactionId } from './transaction.mjs';
+import { MAX_PAYMENT_INPUTS, MAX_PAYMENT_PARENT_HEX_BYTES, selectPaymentFunding, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, transactionIdFromRaw, normalizeDomain, workTargetForExpectedConnections } from './transaction.mjs';
+import { buildPaymentInWorker } from './payment-builder.mjs';
 import { ClaimsEngine, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
 import { bountyKey, discoverBounties, readBountyBlock } from './bounty-discovery.mjs';
 import { DiagnosticLog } from './diagnostics.mjs';
@@ -70,7 +71,7 @@ export class WalletService extends EventEmitter {
     this.diagnostics = null;
     this.session = null; this.epoch = 0; this.setup = null; this.preview = null;
     this.rsaProbe = rsaProbe ?? createRsaProbe({ resourcesPath });
-    this.sendPreparation = null;
+    this.sendPreparation = null; this.sendConfirmation = null;
     this.replacement = null; this.walletWrite = null; this.closed = false;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
@@ -103,6 +104,7 @@ export class WalletService extends EventEmitter {
   connectClient() {
     this.stopLiveUpdates();
     this.cancelSendPreview();
+    this.batchFundingSupported = undefined;
     this.rpc?.close(); this.refreshing = null; this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.tip = null;
@@ -215,6 +217,7 @@ export class WalletService extends EventEmitter {
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
         helperAvailable: Boolean(this.proofRunner || this.connectionPoolFactory || getClaimsHelper({ resourcesPath: this.resourcesPath })), scanning: Boolean(this.scanningBounties) },
       busy: Boolean(this.refreshing), error: this.error ?? this.liveUpdateWarning,
+      paymentPreparation: this.session && this.paymentPreparation ? { ...this.paymentPreparation } : null,
       diagnostics: this.session && this.config.developerMode ? this.diagnostics?.snapshot() ?? null : null,
     };
   }
@@ -471,12 +474,16 @@ export class WalletService extends EventEmitter {
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
     this.tip = null; this.retiredClaims.clear();
     this.fundingCache.clear(); this.fundingPending.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.reserved.clear(); this.accountCache.clear();
-    this.rpc?.close();
+    // Install an idle client while still locked. Password entry can finish
+    // before a slow claims helper drains; that newer session must not inherit
+    // the permanently closed RPC/live-update objects from the previous one.
+    // Construction does not connect or subscribe until the wallet unlocks.
+    this.connectClient();
     // Hide sensitive renderer state immediately, before waiting for helper shutdown.
     this.emitState();
     await this.engine?.stop('locked'); this.engine?.clear();
     if (epoch !== this.epoch) return this.getState();
-    this.connectClient(); this.emitState(); return this.getState();
+    this.emitState(); return this.getState();
   }
   async newAddress() {
     this.assertSession();
@@ -498,23 +505,25 @@ export class WalletService extends EventEmitter {
     const verified = await unlockVault(this.vaultFile, password); this.assertSession(epoch);
     return { mnemonic: verified.mnemonic, path: `m/44'/${networkParameters(verified.network).coin}'/0'/change/index`, network: verified.network };
   }
-  async ensureNetwork() {
+  async ensureNetwork({ signal } = {}) {
     const epoch = this.epoch, rpc = this.rpc;
-    const tip = validateTip(await rpc.request('getchaintip'), this.config.network);
+    const tip = validateTip(await rpc.request('getchaintip', {}, { signal }), this.config.network);
     this.assertSession(epoch);
     if (rpc !== this.rpc) throw new Error('RPC connection changed.');
     this.network = { ...this.network, status: 'online', height: tip.height, chain: tip.chain };
     this.tip = tip; return tip;
   }
   checkResponse(response) { validateTip(response?.tip, this.config.network); return response; }
-  async page(method, address, { firstOnly = false, onTip } = {}) {
+  async page(method, address, { firstOnly = false, onTip, onPage, signal } = {}) {
     const epoch = this.epoch, rpc = this.rpc; const items = []; let cursor; const seen = new Set();
     do {
       this.assertSession(epoch);
       if (seen.size >= 1000) throw new Error('Address pagination exceeds this release’s local resource limit.');
-      const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}) }));
+      if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
+      const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}) }, { signal }));
       this.assertSession(epoch);
       if (rpc !== this.rpc) throw new Error('RPC connection changed.');
+      if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
       if (result.address !== address || result.unit !== 'connects' || !Array.isArray(result.items) || result.items.length > 500) throw new Error('RPC returned an invalid address page.');
       onTip?.(result.tip);
       items.push(...result.items.map(validateRow));
@@ -522,6 +531,7 @@ export class WalletService extends EventEmitter {
       cursor = result.next_cursor;
       if (cursor !== null && (typeof cursor !== 'string' || !cursor.length || cursor.length > 4096 || seen.has(cursor))) throw new Error('RPC returned an invalid or repeated cursor.');
       seen.add(cursor);
+      onPage?.(seen.size);
       // An empty page may still have a continuation; only a positive result or
       // exhaustion proves whether this address contributes to the recovery gap.
       if (firstOnly && items.length) break;
@@ -687,26 +697,169 @@ export class WalletService extends EventEmitter {
       this.assertSession(epoch);
       if (this.rpc !== rpc) throw new Error('RPC connection changed while preparing funding.');
       const raw = this.checkResponse(result).transaction?.hex;
-      if (transactionId(parseTransaction(raw)) !== txid) throw new Error('The RPC server supplied transaction bytes that do not match their ID.');
+      if (transactionIdFromRaw(raw) !== txid) throw new Error('The RPC server supplied transaction bytes that do not match their ID.');
       if (this.fundingCache.size >= 256) this.fundingCache.delete(this.fundingCache.keys().next().value);
       this.fundingCache.set(txid, raw); return raw;
     }).finally(() => { if (this.fundingPending.get(txid) === entry) this.fundingPending.delete(txid); });
     this.fundingPending.set(txid, entry);
     return wait(entry.promise);
   }
+  async paymentParents(selected, signal, onProgress) {
+    const epoch = this.epoch, rpc = this.rpc, parents = new Map();
+    let parentHexLength = 0;
+    const check = () => {
+      this.assertSession(epoch);
+      if (signal.aborted || rpc !== this.rpc) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
+    };
+    const progress = () => onProgress(selected.filter(row => parents.has(row.txid)).length);
+    const retain = (txid, hex) => {
+      if (parents.has(txid)) return;
+      if (parentHexLength + hex.length > MAX_PAYMENT_PARENT_HEX_BYTES) throw new Error('Payment funding data exceeds the wallet memory safety limit. Send a smaller amount in separate payments.');
+      parentHexLength += hex.length;
+      parents.set(txid, hex);
+    };
+    const remember = (txid, hex) => {
+      retain(txid, hex);
+      if (this.fundingCache.size >= 256 && !this.fundingCache.has(txid)) this.fundingCache.delete(this.fundingCache.keys().next().value);
+      this.fundingCache.set(txid, hex);
+    };
+    const missing = [...new Set(selected.map(row => row.txid))].filter(txid => {
+      if (!this.fundingCache.has(txid)) return true;
+      retain(txid, this.fundingCache.get(txid)); return false;
+    });
+    progress();
+    while (missing.length) {
+      check();
+      if (this.batchFundingSupported === false) {
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(4, missing.length) }, async () => {
+          for (;;) {
+            check(); const index = next++;
+            if (index >= missing.length) return;
+            const txid = missing[index];
+            const hex = await this.funding(txid, { signal }); check();
+            retain(txid, hex); progress();
+          }
+        }));
+        break;
+      }
+      const txids = missing.slice(0, 32);
+      let response;
+      try { response = this.checkResponse(await waitForReview(rpc.request('gettransactions', { txids }, { signal }), signal)); }
+      catch (error) {
+        check();
+        if (error?.code === -32601) { this.batchFundingSupported = false; continue; }
+        // A parent too large for the bounded batch uses the existing individual
+        // method, never a larger frame or an unverified metadata-only shortcut.
+        if (error?.code === -32021 && error.data?.txid === txids[0]) {
+          const hex = await this.funding(txids[0], { signal }); check();
+          retain(txids[0], hex); missing.shift(); progress(); continue;
+        }
+        throw error;
+      }
+      check();
+      const rows = response.transactions;
+      if (!Array.isArray(rows) || rows.length < 1 || rows.length > txids.length || !Array.isArray(response.remaining) ||
+          response.remaining.length !== txids.length - rows.length || response.remaining.some((id, index) => id !== txids[rows.length + index])) {
+        throw new Error('Invalid RPC funding batch.');
+      }
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        if (row?.txid !== txids[index] || transactionIdFromRaw(row.hex) !== txids[index]) throw new Error('RPC funding transaction bytes do not match their ID.');
+        remember(row.txid, row.hex);
+        if (index % 4 === 3) { await yieldTask(); check(); }
+      }
+      this.batchFundingSupported = true;
+      missing.splice(0, rows.length); progress();
+    }
+    check(); return parents;
+  }
   cancelSendPreview() {
     this.sendPreparation?.abort();
     this.sendPreparation = null;
+    this.sendConfirmation?.abort();
+    this.sendConfirmation = null;
     this.preview = null;
+    this.paymentPreparation = null;
   }
-  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections, label = '', message = '' } = {}) {
+  async paymentFunding(options, signal, onProgress) {
+    const epoch = this.epoch, rpc = this.rpc;
+    const report = (stage, completed, total, pages = 0) => {
+      this.assertSession(epoch);
+      if (signal?.aborted || rpc !== this.rpc) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
+      onProgress?.({ stage, completed, total, pages });
+    };
+    // History is for display/recovery, not a prerequisite for spending. Query
+    // fresh UTXOs only, prioritizing accounts known to have large outputs. The
+    // cached amounts influence order, never validation of a selected input.
+    report('network', 0, 0);
+    await waitForReview(this.ensureNetwork({ signal }), signal);
+    this.assertSession(epoch);
+    const largest = new Map();
+    for (const utxo of this.utxos) {
+      const path = `${utxo.account.change}:${utxo.account.index}`;
+      const value = amount(utxo.amount);
+      if (value > (largest.get(path) ?? 0n)) largest.set(path, value);
+    }
+    const accounts = [...this.accounts].sort((a, b) => {
+      const first = largest.get(`${a.change}:${a.index}`) ?? 0n;
+      const second = largest.get(`${b.change}:${b.index}`) ?? 0n;
+      return first > second ? -1 : first < second ? 1 : 0;
+    });
+    const utxos = [], seen = new Set();
+    const exactAmount = options.subtractFeeFromAmount === true && options.outputs?.length === 1
+      ? amount(options.outputs[0].amount) : null;
+    let insufficient, exceedsInputLimit = false;
+    let completed = 0, pages = 0;
+    report('outputs', completed, accounts.length, pages);
+    for (const account of accounts) {
+      const rows = await waitForReview(this.page('getaddressutxos', account.address, { signal,
+        onPage: () => report('outputs', completed, accounts.length, ++pages),
+      }), signal);
+      this.assertSession(epoch);
+      for (const row of rows) {
+        if (!Number.isInteger(row.vout) || row.vout < 0 || row.vout > 0xffffffff || amount(row.amount) < 0n) throw new Error('Invalid RPC output.');
+        const outpoint = `${row.txid}:${row.vout}`;
+        if (seen.has(outpoint)) throw new Error('Duplicate RPC funding output.');
+        seen.add(outpoint);
+        if (row.status === 'confirmed' && row.mature === true && !this.reserved.has(outpoint)) utxos.push({ ...row, account });
+      }
+      report('outputs', ++completed, accounts.length, pages);
+      // Match the planner's exact-coin preference for fee deduction before
+      // applying the input cap; otherwise a large wallet could discard its
+      // only viable no-change input. Keep the largest remaining candidates.
+      // Never silently call a truncated set the wallet's entire balance.
+      utxos.sort((a, b) => {
+        const first = BigInt(a.amount), second = BigInt(b.amount);
+        if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
+        return first > second ? -1 : first < second ? 1 : 0;
+      });
+      if (utxos.length > MAX_PAYMENT_INPUTS) { exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS; }
+      if (!utxos.length) continue;
+      try { return selectPaymentFunding({ ...options, utxos }).selected; }
+      catch (error) {
+        // Fees/weight depend on the candidate set too. A later account may
+        // contain a single larger coin that makes the same payment viable.
+        if (!/^(?:Insufficient|Payment exceeds (?:relay|the standard transaction weight)|Recipient amount after deducting the fee|Transaction fee exceeds the wallet safety limit)/.test(error.message)) throw error;
+        insufficient = error;
+      }
+    }
+    if (exceedsInputLimit) throw new Error('This amount needs too many inputs for one standard transaction. Send smaller amounts in separate payments.');
+    throw insufficient ?? new Error('Insufficient verified funds for this payment and its fee');
+  }
+  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections, label = '', message = '', subtractFeeFromAmount = false } = {}) {
     this.assertSession(); const epoch = this.epoch;
     if (this.session.data.needsRecovery) throw new Error('Wait for recovery discovery to finish before sending.');
     this.cancelSendPreview();
+    if (typeof subtractFeeFromAmount !== 'boolean') throw new Error('Choose whether to deduct fees from the payment.');
     const details = validatePaymentDetails({ label, message });
     if (domain === undefined) {
       try { decodeAddress(address, this.config.network); }
       catch { throw new Error('The payment address is invalid or belongs to a different network.'); }
+    } else {
+      // Report invalid local bounty details before waiting for network/funding.
+      domain = normalizeDomain(domain);
+      workTargetForExpectedConnections(expectedConnections ?? '1');
     }
     const value = parseCoinAmount(coins); if (value <= 0n) throw new Error('Enter an amount greater than zero.');
     const preparation = new AbortController(), rpc = this.rpc;
@@ -717,26 +870,43 @@ export class WalletService extends EventEmitter {
         throw Object.assign(new Error('Payment review cancelled. Review the payment again.'), { name: 'AbortError' });
       }
     };
-    const verified = []; const keys = [];
-    try {
-      await waitForReview(this.refresh(), preparation.signal); check();
-      const eligible = this.utxos.filter(u => u.status === 'confirmed' && u.mature === true && !this.reserved.has(`${u.txid}:${u.vout}`)).sort((a,b) => BigInt(a.amount) > BigInt(b.amount) ? -1 : 1);
-      let total = 0n;
-      for (const utxo of eligible.slice(0,256)) {
-        const rawTransaction = await this.funding(utxo.txid, { signal: preparation.signal }); check();
-        const key = deriveAccount(this.session.data.mnemonic, { network: this.config.network, index: utxo.account.index, change: utxo.account.change, passphrase: this.session.data.passphrase });
-        keys.push(key.privateKey); verified.push({ ...utxo, rawTransaction, privateKey: key.privateKey });
-        total += BigInt(utxo.amount);
-        if (total > value + 100000000n) break;
-      }
+    const verified = [];
+    const started = performance.now();
+    let stage = 'prepare';
+    const progress = (completed = 0, total = 0, pages) => {
       check();
+      this.paymentPreparation = { stage, completed, total, ...(pages === undefined ? {} : { pages }) };
+      this.emitState();
+    };
+    progress();
+    this.recordDiagnostic('payment.prepare_started', { stage });
+    try {
       const change = this.publicAccount(this.session.data.changeIndex, 1);
       const output = domain === undefined ? { address, amount: value.toString() } : { domain, amount: value.toString(), expectedConnections, rootVersion: 1, mask: 7 };
-      const build = () => buildPayment({ utxos: verified, outputs: [output], changeAddress: change.address, network: this.config.network, feeRate });
+      const options = { outputs: [output], changeAddress: change.address, network: this.config.network, feeRate, subtractFeeFromAmount };
+      const selected = await this.paymentFunding(options, preparation.signal, update => {
+        stage = update.stage; progress(update.completed, update.total, update.pages);
+      }); check();
+      stage = 'funding';
+      let completed = 0;
+      progress(completed, selected.length);
+      const parents = await this.paymentParents(selected, preparation.signal, count => { completed = count; progress(count, selected.length); });
+      for (const utxo of selected) verified.push({ txid: utxo.txid, vout: utxo.vout, amount: utxo.amount,
+        account: { index: utxo.account.index, change: utxo.account.change } });
+      check();
+      const build = () => buildPaymentInWorker({ ...options, utxos: verified,
+        parents: [...parents].map(([txid, hex]) => ({ txid, hex })),
+        mnemonic: this.session.data.mnemonic, passphrase: this.session.data.passphrase,
+      }, { signal: preparation.signal });
+      stage = 'signing';
+      progress(completed, selected.length);
       // Validate funding/fees/domain before opening a connection. No wallet keys
       // or transaction bytes are ever passed to the isolated capability helper.
-      let payment = build(), policy = {};
+      let payment = await build(), policy = {};
+      check();
       if (domain !== undefined) {
+        stage = 'proof';
+        progress(completed, selected.length);
         output.domain = payment.transaction.outputs[0].domain;
         let result;
         try {
@@ -748,60 +918,97 @@ export class WalletService extends EventEmitter {
         check();
         const rsaVerified = result?.verified === true && result.status === 'verified';
         output.mask = rsaVerified ? 6 : 7;
-        if (rsaVerified) payment = build();
+        if (rsaVerified) { stage = 'signing'; progress(completed, selected.length); payment = await build(); }
         const status = rsaVerified ? 'verified' : ['unavailable', 'timeout', 'busy'].includes(result?.status) ? result.status : 'failed';
         policy = { signatureAlgorithmsMask: output.mask, rsaProbeStatus: status, expectedConnections: String(expectedConnections ?? '1') };
       }
       check();
       // The selected mask and signed bytes are frozen together for confirmation.
-      this.preview = Object.freeze({ ...payment, ...policy, ...details, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: formatCoinAmount(value), changeIndex: change.index });
-      return { previewId: this.preview.previewId, address: this.preview.address, amount: formatCoinAmount(value), fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(value + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy, ...details };
+      const received = formatCoinAmount(BigInt(payment.total));
+      const changeAdjustment = subtractFeeFromAmount ? formatCoinAmount(value - BigInt(payment.total) - BigInt(payment.fee)) : '0';
+      this.preview = Object.freeze({ ...payment, ...policy, ...details, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: received, requestedAmount: formatCoinAmount(value), changeAdjustment, changeIndex: change.index });
+      this.recordDiagnostic('payment.prepared', { stage, inputCount: payment.selected.length, durationMs: performance.now() - started });
+      return { previewId: this.preview.previewId, address: this.preview.address, amount: received, requestedAmount: formatCoinAmount(value), subtractFeeFromAmount, changeAdjustment, fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(BigInt(payment.total) + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy, ...details };
+    } catch (error) {
+      const cancelled = error?.name === 'AbortError';
+      this.recordDiagnostic(cancelled ? 'payment.prepare_cancelled' : 'payment.prepare_failed', { stage, ...(!cancelled ? { error } : {}), durationMs: performance.now() - started });
+      throw error;
     } finally {
-      for (const key of keys) key.fill(0);
-      if (this.sendPreparation === preparation) this.sendPreparation = null;
+      preparation.abort();
+      if (this.sendPreparation === preparation) {
+        this.sendPreparation = null;
+        this.paymentPreparation = null;
+        this.emitState();
+      }
     }
   }
   async confirmSend({ previewId } = {}) {
     const preview = this.preview; this.preview = null;
     if (!preview || preview.previewId !== previewId || preview.expires < Date.now()) throw new Error('Payment review expired. Review the payment again.');
     this.assertSession(preview.epoch);
-    await this.ensureNetwork(); this.assertSession(preview.epoch);
-    // Save the review's local notes and change path BEFORE broadcast. A timeout,
-    // lock or lost reply must not discard metadata for a submitted transaction.
-    const session = this.session, previousChangeIndex = session.data.changeIndex, previousDetails = session.data.paymentDetails;
-    const hasDetails = Boolean(preview.label || preview.message);
-    let nextChangeIndex = previousChangeIndex;
-    if (BigInt(preview.change) > 0n) {
-      if (this.session.data.changeIndex >= MAX_ADDRESS_INDEX) throw new Error('The BIP32 change-address index range is exhausted.');
-      if (this.session.data.changeIndex >= (this.session.data.lastUsedChange ?? -1) + ADDRESS_GAP) throw new Error('Too many unused change addresses. Wait for pending payments to appear before sending again.');
-      nextChangeIndex = Math.max(previousChangeIndex, preview.changeIndex + 1);
-    }
-    const nextDetails = hasDetails ? { ...previousDetails, [preview.txid]: { label: preview.label, message: preview.message } } : previousDetails;
-    if (hasDetails && Buffer.byteLength(JSON.stringify({ ...session.data, changeIndex: nextChangeIndex, paymentDetails: nextDetails }), 'utf8') > WALLET_PLAINTEXT_LIMIT - PAYMENT_DETAILS_HEADROOM) {
-      throw new Error('Local payment details storage is full. Clear Label and Message and review again to send without saving new details. No transaction was sent.');
-    }
-    if (nextChangeIndex !== previousChangeIndex || hasDetails) {
-      session.data.changeIndex = nextChangeIndex;
-      if (hasDetails) session.data.paymentDetails = nextDetails;
-      try { await this.persist(); }
-      catch (error) {
-        if (this.session === session) {
-          session.data.changeIndex = previousChangeIndex;
-          if (previousDetails === undefined) delete session.data.paymentDetails;
-          else session.data.paymentDetails = previousDetails;
-        }
-        throw error;
-      }
+    const confirmation = new AbortController(), rpc = this.rpc;
+    this.sendConfirmation = confirmation;
+    const check = () => {
       this.assertSession(preview.epoch);
-      if (nextChangeIndex !== previousChangeIndex) { await this.buildAccounts(); this.assertSession(preview.epoch); }
-    }
-    for (const input of preview.selected) this.reserved.add(`${input.txid}:${input.vout}`);
+      if (confirmation.signal.aborted || this.sendConfirmation !== confirmation || this.rpc !== rpc) {
+        throw Object.assign(new Error('Payment confirmation cancelled. Review the payment again. No transaction was sent.'), { name: 'AbortError' });
+      }
+    };
     try {
-      const result = await this.rpc.request('sendrawtransaction', { transaction_hex: preview.hex });
-      if (result?.txid !== preview.txid) throw new Error('RPC returned an unexpected transaction ID.');
-      if (this.session) void this.refresh().catch(() => {});
-      return { txid: preview.txid, status: 'submitted' };
-    } catch { throw new Error(`Broadcast was not confirmed. Check transaction ${preview.txid} before trying again; selected inputs remain reserved until the wallet is reopened.`); }
+      await waitForReview(this.ensureNetwork({ signal: confirmation.signal }), confirmation.signal); check();
+      // Save the review's local notes and change path BEFORE broadcast. A timeout,
+      // lock or lost reply must not discard metadata for a submitted transaction.
+      const session = this.session, previousChangeIndex = session.data.changeIndex, previousDetails = session.data.paymentDetails;
+      const hasDetails = Boolean(preview.label || preview.message);
+      let nextChangeIndex = previousChangeIndex;
+      if (BigInt(preview.change) > 0n) {
+        if (this.session.data.changeIndex >= MAX_ADDRESS_INDEX) throw new Error('The BIP32 change-address index range is exhausted.');
+        if (this.session.data.changeIndex >= (this.session.data.lastUsedChange ?? -1) + ADDRESS_GAP) throw new Error('Too many unused change addresses. Wait for pending payments to appear before sending again.');
+        nextChangeIndex = Math.max(previousChangeIndex, preview.changeIndex + 1);
+      }
+      const nextDetails = hasDetails ? { ...previousDetails, [preview.txid]: { label: preview.label, message: preview.message } } : previousDetails;
+      if (hasDetails && Buffer.byteLength(JSON.stringify({ ...session.data, changeIndex: nextChangeIndex, paymentDetails: nextDetails }), 'utf8') > WALLET_PLAINTEXT_LIMIT - PAYMENT_DETAILS_HEADROOM) {
+        throw new Error('Local payment details storage is full. Clear Label and Message and review again to send without saving new details. No transaction was sent.');
+      }
+      if (nextChangeIndex !== previousChangeIndex || hasDetails) {
+        session.data.changeIndex = nextChangeIndex;
+        if (hasDetails) session.data.paymentDetails = nextDetails;
+        try { await this.persist(); }
+        catch (error) {
+          if (this.session === session) {
+            session.data.changeIndex = previousChangeIndex;
+            if (previousDetails === undefined) delete session.data.paymentDetails;
+            else session.data.paymentDetails = previousDetails;
+          }
+          throw error;
+        }
+        check();
+        if (nextChangeIndex !== previousChangeIndex) { await this.buildAccounts(); check(); }
+      }
+      check();
+      // Keep cancellation active through RPC quota/connection waits. RpcClient
+      // stops honoring an individual abort once bytes have been handed to the
+      // socket, preserving the actual reply or uncertain broadcast outcome.
+      for (const input of preview.selected) this.reserved.add(`${input.txid}:${input.vout}`);
+      try {
+        const result = await rpc.request('sendrawtransaction', { transaction_hex: preview.hex }, { signal: confirmation.signal });
+        if (result?.txid !== preview.txid) throw new Error('RPC returned an unexpected transaction ID.');
+        if (this.session) void this.refresh().catch(() => {});
+        return { txid: preview.txid, status: 'submitted' };
+      } catch (error) {
+        // Only the local transport's explicit pre-transmission cancellation is
+        // proof that no bytes were sent. Never release inputs on a lost reply.
+        if (error?.name === 'AbortError' && error.notSent === true && !error.unknownOutcome) {
+          if (this.epoch === preview.epoch && this.rpc === rpc) {
+            for (const input of preview.selected) this.reserved.delete(`${input.txid}:${input.vout}`);
+          }
+          throw Object.assign(new Error('Payment confirmation cancelled. Review the payment again. No transaction was sent.'), { name: 'AbortError' });
+        }
+        throw Object.assign(new Error(`Broadcast was not confirmed. Check transaction ${preview.txid} before trying again; selected inputs remain reserved until the wallet is reopened.`), { unknownOutcome: true, txid: preview.txid });
+      }
+    } finally {
+      if (this.sendConfirmation === confirmation) this.sendConfirmation = null;
+    }
   }
   queueSettings(operation, { duringClose = false } = {}) {
     if (this.closed && !duringClose) return Promise.reject(new Error('The wallet is closing.'));

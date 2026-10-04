@@ -11,6 +11,7 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 - Create or restore a wallet with **12, 18 or 24 BIP39 recovery words**; 24 is the default.
 - Protect the local wallet with a password before creating it, and verify your recovery backup.
 - Receive using a copyable `connectcoin:` payment link and its QR code, with optional amount, label and message; send native ConnectCoin payments with a recipient/amount/fee review before broadcast.
+- Use **Use all balance** to fill the available confirmed balance and enable **Deduct fees from payment**, or enable fee deduction separately. Review the recipient's net amount, exact fee and any change before confirming; unavailable or reserved funds cannot be spent.
 - Create Pay-to-Connect bounties with a domain, reward and hash target, expressed as an expected number of candidate evaluations—not a guaranteed count of physical connections.
 - Opt into **Automatic Claims**, with local TLS proof generation and local proof verification.
 - Browse balances and transaction history, create receive addresses, export an encrypted backup and lock your wallet.

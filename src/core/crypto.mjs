@@ -1,4 +1,4 @@
-// Secret-bearing module. Import only in the Electron main process or tests.
+// Secret-bearing module. Import only in Electron main, trusted Node signing workers or tests.
 import { randomBytes, createHash } from 'node:crypto';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic as validateBip39 } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';

@@ -435,7 +435,7 @@ async function assertTrailingPeriodSendReview({ bounty, address }) {
   await page.getByRole('heading', { name: 'One final look.', exact: true }).waitFor();
   const payload = await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.at(-1));
   assert.deepEqual(payload, {
-    ...(bounty ? { domain: 'example.com', expectedConnections: '1000' } : { address }), amount: '123', feeRate: 1500,
+    ...(bounty ? { domain: 'example.com', expectedConnections: '1000' } : { address }), amount: '123', feeRate: 1500, subtractFeeFromAmount: false,
   }, 'Review IPC must receive canonical numeric values after trailing-period drafts.');
   assert.equal(await page.locator('#send-amount').inputValue(), '123.');
   assert.equal(await page.locator('#send-fee').inputValue(), '1500.');
@@ -1285,6 +1285,63 @@ try {
   assert.equal(await page.locator('#send-address').getAttribute('data-text-count'), 'utf16');
   assert.equal(await page.getByRole('button', { name: 'Review payment', exact: true }).isVisible(), true);
   await assertAmountInputGuard('#send-amount');
+  nextStage('payment preparation failures remain visible and cancellation ignores late failures');
+  // Only synthetic failures cross the real renderer/preload IPC boundary.
+  // No transaction is constructed or sent by this fixture.
+  await application.evaluate((_electron, moduleUrl) => {
+    const { WalletService } = process.getBuiltinModule('module').createRequire(moduleUrl)('./wallet-service.mjs');
+    const fixture = { prototype: WalletService.prototype, original: WalletService.prototype.previewSend, calls: 0 };
+    fixture.prototype.previewSend = async function () {
+      fixture.calls++;
+      fixture.service = this;
+      this.paymentPreparation = { stage: 'prepare', completed: 0, total: 0 };
+      this.emitState();
+      try {
+        await new Promise(resolve => { fixture.release = resolve; });
+        throw new Error('Isolated payment preparation failure.');
+      } finally { this.paymentPreparation = null; this.emitState(); }
+    };
+    globalThis.paymentFailureFixture = fixture;
+  }, pathToFileURL(path.join(root, 'src/core/wallet-service.mjs')).href);
+  try {
+    await page.locator('#send-address').fill(nextAddress);
+    await page.locator('#send-amount').fill('3.3872074');
+    await page.locator('#send-subtract-fee').check();
+    await page.getByRole('button', { name: 'Review payment', exact: true }).click();
+    await expect(page.locator('#payment-preparation-status')).toHaveText('Checking spendable outputs…');
+    await expect.poll(() => application.evaluate(() => globalThis.paymentFailureFixture.calls)).toBe(1);
+    await application.evaluate(() => globalThis.paymentFailureFixture.release());
+    await page.getByRole('heading', { name: 'Could not prepare your payment.', exact: true }).waitFor();
+    await expect(page.locator('#modal-error')).toHaveText('Isolated payment preparation failure.');
+    assert.match(await page.locator('dialog[open]').textContent(), /Nothing was sent/);
+    assert.equal(await page.locator('[data-action="confirm-send"]').count(), 0);
+    const failureSnapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
+    failureSnapshot.network.status = 'payment-failure-background-check';
+    await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), failureSnapshot);
+    await expect(page.locator('.network-pill')).toContainText('payment-failure-background-check');
+    await expect(page.locator('#modal-error')).toBeVisible();
+    await expect(page.locator('#modal-error')).toHaveText('Isolated payment preparation failure.');
+    assert.equal(await application.evaluate(() => globalThis.paymentFailureFixture.calls), 1, 'A failed review must not retry automatically.');
+    await page.getByRole('button', { name: 'Back to form', exact: true }).click();
+    assert.equal(await page.locator('#send-amount').inputValue(), '3.3872074');
+    assert.equal(await page.locator('#send-subtract-fee').isChecked(), true);
+    await page.getByRole('button', { name: 'Review payment', exact: true }).click();
+    await expect.poll(() => application.evaluate(() => globalThis.paymentFailureFixture.calls)).toBe(2);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await application.evaluate(() => globalThis.paymentFailureFixture.release());
+    await page.waitForFunction(() => document.querySelector('#app').getAttribute('aria-busy') === 'false');
+    assert.equal(await page.locator('dialog[open]').count(), 0, 'A cancelled review must not reopen a failure modal.');
+    assert.equal(await page.locator('#view-error').isVisible(), false, 'A cancelled review must ignore its late failure.');
+    await page.locator('#send-subtract-fee').uncheck();
+  } finally {
+    await application.evaluate(() => {
+      const fixture = globalThis.paymentFailureFixture;
+      fixture.release?.();
+      fixture.prototype.previewSend = fixture.original;
+      if (fixture.service) { fixture.service.paymentPreparation = null; fixture.service.emitState(); }
+      delete globalThis.paymentFailureFixture;
+    });
+  }
   // Capture the real renderer/preload IPC payload inside the isolated process.
   // The stub neither prepares a real transaction nor contacts a bounty domain.
   await application.evaluate((_electron, moduleUrl) => {

@@ -198,7 +198,9 @@ else {
         } finally { actionInProgress = false; }
       } catch(error) {
         // Do not serialize stacks, config files, process environments, or secrets.
-        return { ok:false,error:String(error.message ?? 'Wallet action failed.').slice(0,500) };
+        return { ok:false,error:String(error.message ?? 'Wallet action failed.').slice(0,500),
+          ...(method === 'confirmSend' && error.unknownOutcome === true ? { unknownOutcome: true,
+            ...(typeof error.txid === 'string' && /^[0-9a-f]{64}$/.test(error.txid) ? { txid: error.txid } : {}) } : {}) };
       }
     });
     window.once('ready-to-show', () => { window.show(); });

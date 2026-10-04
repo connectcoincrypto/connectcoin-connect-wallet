@@ -48,12 +48,13 @@ let state = { phase: 'welcome', network: { status: 'disconnected', chain: 'main'
 let view = 'overview';
 let sendMode = 'address';
 let sendReviewSequence = 0;
+let recoveryRevealSequence = 0;
 let authView = 'welcome';
 let setup = null;
 let replacement = null;
 let busy = false;
 let locking = false;
-const emptySend = () => ({ address: '', domain: '', amount: '', expectedConnections: '1000', label: '', message: '', ignoredParameters: [] });
+const emptySend = () => ({ address: '', domain: '', amount: '', subtractFeeFromAmount: false, expectedConnections: '1000', label: '', message: '', ignoredParameters: [] });
 const emptyReceive = () => ({ amount: '', label: '', message: '' });
 let draft = { send: emptySend(), receive: emptyReceive(), claims: {}, settings: {} };
 const receivePreview = createReceiveRequestPreview({
@@ -139,7 +140,12 @@ function showPaymentPasteError(error) {
 function showError(error, source = '') {
   const message = errorMessage(error);
   const container = dialog.open ? $('#modal-error') : $('#view-error');
-  if (container) { container.textContent = message; container.classList.remove('hidden'); container.setAttribute('role', 'alert'); container.dataset.errorSource = source; }
+  if (container) {
+    container.textContent = message; container.classList.remove('hidden'); container.setAttribute('role', 'alert'); container.dataset.errorSource = source;
+    // Validation near the bottom of a long form must not put its only feedback
+    // above the viewport. Keep focus/caret, but make the action's error visible.
+    container.scrollIntoView({ block: 'nearest' });
+  }
   else toast(message);
 }
 function setBusy(value) {
@@ -149,13 +155,30 @@ function setBusy(value) {
 }
 async function invoke(method, payload = {}) {
   if (!bridge?.invoke) throw new Error('Open ConnectWallet in the desktop app to use your wallet.');
-  return bridge.invoke(method, payload);
+  const reply = await bridge.invoke(method, payload);
+  if (method !== 'confirmSend') return reply;
+  if (reply?.ok === true) return reply.value;
+  throw Object.assign(new Error(reply?.error || 'Payment submission could not be confirmed.'), {
+    unknownOutcome: reply?.unknownOutcome === true,
+    ...(typeof reply?.txid === 'string' && /^[0-9a-f]{64}$/.test(reply.txid) ? { txid: reply.txid } : {}),
+  });
 }
 async function run(operation) {
   if (busy || locking) return;
+  const phase = state.phase, securityEpoch = state.securityEpoch;
+  const active = () => state.phase === phase && state.securityEpoch === securityEpoch;
+  let operationStarted = false;
   document.querySelectorAll('.inline-error').forEach(target => { target.textContent = ''; target.classList.add('hidden'); });
   setBusy(true);
-  try { rpcDraftReady = true; await preferences.flush(); await operation(); } catch (error) { showError(error); } finally { setBusy(false); }
+  try {
+    rpcDraftReady = true; await preferences.flush();
+    // Locking can interrupt an action while its preference write is pending.
+    // Do not start a captured form/action in the next wallet context.
+    if (!active()) return;
+    operationStarted = true;
+    await operation();
+  } catch (error) { if (operationStarted || active()) showError(error); }
+  finally { setBusy(false); }
 }
 async function reload() { acceptState(await invoke('getState')); }
 async function lockWallet() {
@@ -181,6 +204,9 @@ function acceptState(next, { background = false } = {}) {
     (next.claims?.lastError && !next.claims.lastErrorDiagnostic &&
       !next.claims.lastErrorTransient && next.claims.lastError !== state.claims?.lastError);
   const securityChanged = state.securityEpoch !== undefined && next.securityEpoch !== state.securityEpoch;
+  // Chromium may remove a composing control without delivering compositionend
+  // to document. Its old IME session must not block saves/renders after unlock.
+  if (securityChanged || previous !== next.phase) compositionActive = false;
   // A new security context must never retain live controls/drafts from the old
   // wallet, even if both snapshots happen to report an unlocked phase.
   if (securityChanged) { lastShellMarkup = null; lastShellView = null; }
@@ -200,6 +226,7 @@ function acceptState(next, { background = false } = {}) {
   applyTheme();
   if (next.phase === 'locked' && previous !== 'locked') { setup = null; draft.send = emptySend(); closeModal(); }
   if (next.phase === 'unlocked' && previous !== 'unlocked') { setup = null; authView = 'welcome'; closeModal(); }
+  updatePaymentPreparation();
   if (!clearSetup && previous === next.phase && next.phase !== 'unlocked' && app.children.length && !$('.boot')) return;
   if (background && previous === next.phase && !securityChanged && !clearSetup && !importantChange) scheduleRender();
   else render();
@@ -282,7 +309,25 @@ function paymentPasteControl() {
 function sendPage() {
   const values = { ...draft.send, feeRate: draft.settings.feeRate ?? state.config?.feeRate ?? 1500 };
   const bounty = sendMode === 'bounty';
-  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : `Make sure the destination is a ConnectCoin ${e(networkLabel())} address.`}</p>${bounty ? '' : `${paymentPasteControl()}${values.ignoredParameters?.length ? notice(`The link includes optional fields this wallet does not use: ${e(values.ignoredParameters.join(', '))}. Confirm the payment details with the recipient if needed.`, 'warning') : ''}`}<form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-text-limit="1024" data-text-count="utf16" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-text-limit="90" data-text-count="utf16" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}<label class="field"><span class="field-label">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></span><div class="input-row"><input class="input" id="send-amount" data-numeric="amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div></label>${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-numeric="integer" data-integer-digits="77" min="1" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}${bounty ? '' : sendMetadataFields(values)}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="settings.feeRate" name="feeRate" value="${e(values.feeRate)}" type="text" data-numeric="integer" inputmode="numeric" min="1201" max="100000" step="1" required><p class="field-help">Saved automatically for future payments. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using ${e(networkLabel())}</strong><p>Only send to compatible ConnectCoin ${e(networkLabel())} addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
+  return `${pageHeading('Send a little connection.', 'Simple payments, signed privately on your device.')}<div class="form-layout"><section class="card form-card"><div class="send-modes filter-tabs" aria-label="Payment type"><button type="button" class="filter-tab ${bounty ? '' : 'active'}" data-send-mode="address" aria-pressed="${!bounty}">To an address</button><button type="button" class="filter-tab ${bounty ? 'active' : ''}" data-send-mode="bounty" aria-pressed="${bounty}">Create a bounty</button></div><h2>${bounty ? 'Pay for a connection.' : 'Send ConnectCoin'}</h2><p class="card-description">${bounty ? 'Create a public Pay-to-Connect reward. Anyone with an eligible proof can claim it.' : `Make sure the destination is a ConnectCoin ${e(networkLabel())} address.`}</p>${bounty ? '' : `${paymentPasteControl()}${values.ignoredParameters?.length ? notice(`The link includes optional fields this wallet does not use: ${e(values.ignoredParameters.join(', '))}. Confirm the payment details with the recipient if needed.`, 'warning') : ''}`}<form id="send-form">${bounty ? `<label class="field"><span class="field-label">HTTPS website domain</span><input class="input address-input" id="send-domain" data-text-limit="1024" data-text-count="utf16" data-draft="send.domain" name="domain" value="${e(values.domain)}" placeholder="example.com" autocomplete="off" spellcheck="false" required><p class="field-help">Enter only the domain, without https://, a path or a port.</p></label>` : `<label class="field"><span class="field-label">Recipient address</span><input class="input address-input" id="send-address" data-text-limit="90" data-text-count="utf16" data-draft="send.address" name="address" value="${e(values.address)}" placeholder="Paste a ConnectCoin address" autocomplete="off" spellcheck="false" required></label>`}${sendAmountFields(values, bounty)}${bounty ? `<label class="field"><span class="field-label">Expected candidate evaluations</span><input class="input" id="send-expected" data-numeric="integer" data-integer-digits="77" min="1" data-draft="send.expectedConnections" name="expectedConnections" value="${e(values.expectedConnections)}" inputmode="numeric" autocomplete="off" required><p class="field-help">Sets the hash target. For example, 1,000 means one qualifying candidate per 1,000 on average—not a guaranteed connection count. Only the qualifying proof goes on-chain.</p></label>` : ''}${bounty ? '' : sendMetadataFields(values)}<details class="advanced-fee"><summary class="text-button">Advanced fee settings</summary><label class="field"><span class="field-label">Fee rate <small>connects / virtual byte</small></span><input class="input" id="send-fee" data-draft="settings.feeRate" name="feeRate" value="${e(values.feeRate)}" type="text" data-numeric="integer" inputmode="numeric" min="1201" max="100000" step="1" required><p class="field-help">Saved automatically for future payments. 10,000,000,000 connects = 1 CONN. The exact network fee is shown before you confirm.</p></label></details><div class="form-divider"></div>${notice(bounty ? 'You are funding a public bounty, not paying the website directly. Review the domain, reward and fee before confirming.' : 'You’ll review the destination, amount and exact fee before anything is sent.', 'info')}<div class="form-actions"><button class="button" data-busy type="submit">${bounty ? 'Review bounty' : 'Review payment'} ${icon('arrow')}</button></div></form></section><section class="card"><h3>${bounty ? 'More off-chain. Less on-chain.' : 'A quick confidence check.'}</h3><ul class="tip-list">${bounty ? `<li>${icon('globe')}<div><strong>You choose the website</strong><p>Claimers connect to the specified HTTPS domain and produce cryptographic evidence.</p></div></li><li>${icon('spark')}<div><strong>You choose the hash target</strong><p>A harder target increases the expected number of candidates. They do not each need their own blockchain transaction.</p></div></li><li>${icon('shield')}<div><strong>One eligible proof claims the reward</strong><p>Nodes validate the claim. This does not prove a human visited a page or guarantee website traffic, SEO, or a fixed number of connections.</p></div></li>` : `<li>${icon('shield')}<div><strong>Keep your recovery phrase private</strong><p>You never need to share it to send or receive a payment.</p></div></li><li>${icon('check')}<div><strong>Check the entire address</strong><p>Payments cannot be reversed once confirmed. Compare the destination with your recipient.</p></div></li><li>${icon('globe')}<div><strong>You’re using ${e(networkLabel())}</strong><p>Only send to compatible ConnectCoin ${e(networkLabel())} addresses, not Bitcoin or other networks.</p></div></li>`}</ul></section></div>`;
+}
+function availableSendAmount() {
+  const value = state.wallet?.balance?.available;
+  // Keep the exact decimal string. A Number conversion would lose connects
+  // for larger balances, and unavailable/zero balances must not become sends.
+  if (typeof value !== 'string' || !/^\d{1,9}(?:\.\d{1,10})?$/.test(value)) return null;
+  const [whole, fraction = ''] = value.split('.');
+  const connects = BigInt(whole) * 10_000_000_000n + BigInt(fraction.padEnd(10, '0'));
+  return connects > 0n && connects <= 1_000_000_000_000_000_000n ? value : null;
+}
+function sendAmountFields(values, bounty) {
+  const available = availableSendAmount();
+  return `<div class="field send-amount-field"><label class="field-label" for="send-amount">${bounty ? 'Bounty reward' : 'Amount'} <small>Available: ${e(cc(state.wallet?.balance?.available))}</small></label>
+    <div class="input-row"><input class="input" id="send-amount" data-numeric="amount" data-draft="send.amount" name="amount" value="${e(values.amount)}" placeholder="0.00" inputmode="decimal" autocomplete="off" required><span class="input-suffix">CONN</span></div>
+    <div class="send-amount-actions"><button class="text-button" type="button" data-action="use-all-balance" data-busy data-unavailable="${available === null}" ${available === null ? 'disabled' : ''}>Use all balance</button></div>
+    <label class="checkbox"><input id="send-subtract-fee" type="checkbox" name="subtractFeeFromAmount" value="true" data-draft="send.subtractFeeFromAmount" aria-describedby="send-subtract-fee-help" ${values.subtractFeeFromAmount === true ? 'checked' : ''}>Deduct fees from payment</label>
+    <p class="field-help" id="send-subtract-fee-help">When checked, fees come out of the amount above. Review ${bounty ? 'the final public reward' : 'the recipient’s final amount'}, fee and any change before confirming.</p>
+  </div>`;
 }
 function sendMetadataFields(values) {
   return `<details class="send-metadata" id="send-metadata" ${values.label || values.message ? 'open' : ''}>
@@ -307,7 +352,7 @@ function pastePaymentLink() {
       // A lock or edits made while waiting must not be overwritten by a late reply.
       if (!active()) return;
       draft.send = { ...draft.send, address: payment.address, amount: payment.kind === 'address' ? draft.send.amount : payment.amount,
-        label: payment.label, message: payment.message, ignoredParameters: payment.ignoredParameters ?? [] };
+        label: payment.label, message: payment.message, ignoredParameters: payment.ignoredParameters ?? [], subtractFeeFromAmount: false };
       // Typing changes live controls without changing the cached shell markup.
       // Re-pasting an earlier link must still replace those values, including a
       // focused field, while preserving other disclosures and fee settings.
@@ -411,6 +456,7 @@ function openModal(heading, description, body, kind) {
 }
 function closeModal() {
   sendReviewSequence++;
+  recoveryRevealSequence++;
   clearTimeout(secretTimer); currentPreview = null; modalKind = null;
   if (dialog.open) dialog.close();
   dialog.innerHTML = '';
@@ -418,6 +464,26 @@ function closeModal() {
 function cancelSendReview() {
   closeModal();
   void invoke('cancelSendPreview').catch(showError);
+}
+function updatePaymentPreparation() {
+  if (modalKind !== 'send-preparing' || !dialog.open) return;
+  const target = $('#payment-preparation-status');
+  if (!target) return;
+  const progress = state.paymentPreparation;
+  let text = 'Checking spendable outputs…';
+  if (progress?.stage === 'network') text = 'Checking the network…';
+  else if (progress?.stage === 'outputs') {
+    const { completed, total, pages } = progress;
+    const counted = Number.isSafeInteger(completed) && Number.isSafeInteger(total) && total > 0 && completed >= 0 && completed <= total;
+    text = `Checking spendable outputs${counted ? `: ${completed} of ${total} addresses checked` : ''}${Number.isSafeInteger(pages) && pages >= 0 ? ` (${pages} pages received)` : ''}…`;
+  } else if (progress?.stage === 'funding') {
+    const { completed, total } = progress;
+    const counted = Number.isSafeInteger(completed) && Number.isSafeInteger(total) && total > 0 && completed >= 0 && completed <= total;
+    text = `Verifying funding transactions${counted ? `: ${completed} of ${total}` : ''}. RPC limits may require a wait.`;
+  } else if (progress?.stage === 'signing') text = 'Signing locally…';
+  else if (progress?.stage === 'proof') text = 'Checking the website’s RSA support…';
+  // Preserve the dialog, focus and Cancel control while background state changes.
+  if (target.textContent !== text) target.textContent = text;
 }
 function requestReplacement(mode) {
   const recovering = mode === 'recover';
@@ -443,7 +509,18 @@ function sendReview(preview) {
   const metadata = !bounty && (preview.label || preview.message)
     ? `${preview.label ? `<div class="review-line"><dt>Label · local only</dt><dd class="payment-note">${e(preview.label)}</dd></div>` : ''}${preview.message ? `<div class="review-line"><dt>Message · local only</dt><dd class="payment-note">${e(preview.message)}</dd></div>` : ''}` : '';
   currentPreview = preview;
-  openModal('One final look.', 'Check every detail. Nothing will be broadcast until you confirm.', `<dl><div class="review-line"><dt>Network</dt><dd>ConnectCoin ${e(networkLabel())}</dd></div><div class="review-line address"><dt>${bounty ? 'Bounty domain' : 'Sending to'}</dt><dd>${e(preview.address)}</dd></div><div class="review-line"><dt>${bounty ? 'Public reward' : 'Amount'}</dt><dd>${e(cc(preview.amount))}</dd></div>${bounty ? `<div class="review-line"><dt>Expected candidates</dt><dd>${e(preview.expectedConnections)}</dd></div>${policy}` : ''}${metadata}<div class="review-line"><dt>Network fee</dt><dd>${e(cc(preview.fee))}</dd></div><div class="review-line review-total"><dt>Total</dt><dd>${e(cc(preview.total))}</dd></div></dl>${probeNotice}${notice(bounty ? 'This public reward can be spent by any eligible claimer. It is not a payment to the domain owner. Confirmed transactions cannot be reversed.' : `This payment is on ConnectCoin ${e(networkLabel())}. Confirmed payments cannot be reversed.`)}<div class="modal-actions"><button class="button secondary" data-action="close-modal">Go back</button><button class="button" data-action="confirm-send" data-busy>${bounty ? 'Create bounty' : 'Confirm & send'} ${icon('send')}</button></div>`, 'send');
+  openModal('One final look.', 'Check every detail. Nothing will be broadcast until you confirm.', `<dl><div class="review-line"><dt>Network</dt><dd>ConnectCoin ${e(networkLabel())}</dd></div><div class="review-line address"><dt>${bounty ? 'Bounty domain' : 'Sending to'}</dt><dd>${e(preview.address)}</dd></div>${preview.subtractFeeFromAmount ? `<div class="review-line"><dt>Entered amount</dt><dd>${e(cc(preview.requestedAmount))}</dd></div>` : ''}<div class="review-line"><dt>${bounty ? 'Public reward' : preview.subtractFeeFromAmount ? 'Recipient receives' : 'Amount'}</dt><dd>${e(cc(preview.amount))}</dd></div>${bounty ? `<div class="review-line"><dt>Expected candidates</dt><dd>${e(preview.expectedConnections)}</dd></div>${policy}` : ''}${metadata}<div class="review-line"><dt>Network fee${preview.subtractFeeFromAmount ? ' · deducted' : ''}</dt><dd>${e(cc(preview.fee))}</dd></div>${preview.subtractFeeFromAmount && /[1-9]/.test(preview.changeAdjustment ?? '') ? `<div class="review-line"><dt>Kept as spendable change</dt><dd>${e(cc(preview.changeAdjustment))}</dd></div>` : ''}<div class="review-line review-total"><dt>Total from your wallet</dt><dd>${e(cc(preview.total))}</dd></div></dl>${probeNotice}${notice(bounty ? 'This public reward can be spent by any eligible claimer. It is not a payment to the domain owner. Confirmed transactions cannot be reversed.' : `This payment is on ConnectCoin ${e(networkLabel())}. Confirmed payments cannot be reversed.`)}<div class="modal-actions"><button class="button secondary" data-action="close-modal">Go back</button><button class="button" data-action="confirm-send" data-busy>${bounty ? 'Create bounty' : 'Confirm & send'} ${icon('send')}</button></div>`, 'send');
+}
+
+function paymentOutcome({ txid, submitted, uncertain = false }) {
+  const transaction = typeof txid === 'string' && /^[0-9a-f]{64}$/.test(txid)
+    ? `<div class="review-line address"><dt>Transaction ID</dt><dd class="payment-note">${e(txid)}</dd></div>` : '';
+  openModal(submitted ? 'Payment submitted.' : uncertain ? 'Payment status is uncertain.' : 'Payment submission was not completed.',
+    submitted ? 'The server accepted your transaction. Confirmation on the blockchain is still pending.'
+      : uncertain ? 'The wallet could not confirm that the transaction was accepted. Check its status before trying again.'
+      : 'This review can no longer be used. Read the error below before reviewing the payment again.',
+    `${transaction ? `<dl>${transaction}</dl>` : ''}${uncertain ? notice('Check this transaction in Activity or an explorer before making another payment. Do not assume it failed or send a replacement while its status is uncertain.', 'warning') : ''}<div class="modal-actions">${!submitted ? '<button class="button secondary" data-action="close-modal">Back to form</button>' : ''}<button class="button" data-action="view-payment-activity">${submitted ? 'View activity' : 'Check activity'}</button></div>`,
+    submitted ? 'send-submitted' : 'send-failed');
 }
 
 function validateNumericControl(input) {
@@ -459,7 +536,7 @@ document.addEventListener('input', event => {
   }
   if (target.dataset.draft) {
     const [section, key] = target.dataset.draft.split('.');
-    if (Object.hasOwn(draft, section)) draft[section][key] = target.value;
+    if (Object.hasOwn(draft, section)) draft[section][key] = target.type === 'checkbox' ? target.checked : target.value;
     if (section === 'receive') render();
     if (section === 'settings' && ['host', 'port'].includes(key)) rpcDraftReady = false;
     else if (['claims', 'settings'].includes(section)) preferences.schedule();
@@ -491,6 +568,7 @@ document.addEventListener('click', event => {
   const button = event.target.closest('button');
   if (button?.dataset.action === 'lock') { void lockWallet(); return; }
   if (button && modalKind === 'send-preparing' && ['close-modal', 'cancel-send-review'].includes(button.dataset.action)) { cancelSendReview(); return; }
+  if (button && modalKind === 'recovery' && button.dataset.action === 'close-modal') { closeModal(); return; }
   if (!button || busy || locking) return;
   if (button.dataset.view && state.phase === 'unlocked') { clearPaymentPasteError(); rpcDraftReady = true; preferences.schedule(0); if (view === 'receive') receivePreview.clear(); view = button.dataset.view; render(); return; }
   if (button.dataset.sendMode) { clearPaymentPasteError(); sendMode = button.dataset.sendMode; render(); return; }
@@ -498,6 +576,15 @@ document.addEventListener('click', event => {
   const action = button.dataset.action;
   if (!action) return;
   if (action === 'import-payment-link' && state.phase === 'unlocked' && sendMode === 'address') { void pastePaymentLink(); return; }
+  if (action === 'use-all-balance' && state.phase === 'unlocked' && view === 'send' && !dialog.open) {
+    const available = availableSendAmount();
+    if (available === null) { showError(new Error('No spendable balance is available. Refresh your wallet and try again.')); return; }
+    draft.send.amount = available; draft.send.subtractFeeFromAmount = true;
+    $('#send-amount').value = available; $('#send-subtract-fee').checked = true;
+    const error = $('#view-error');
+    if (error) { error.textContent = ''; error.classList.add('hidden'); }
+    render(); $('#send-amount').focus(); return;
+  }
   if (action === 'auth-create' || action === 'auth-restore') { authView = action.slice(5); render(); return; }
   if (action === 'auth-back') {
     if (replacement?.mode === 'recover') void run(cancelReplacement);
@@ -510,6 +597,7 @@ document.addEventListener('click', event => {
     button.setAttribute('aria-label', field.type === 'password' ? 'Show password' : 'Hide password'); return;
   }
   if (action === 'close-modal') { if (modalKind === 'send') cancelSendReview(); else closeModal(); return; }
+  if (action === 'view-payment-activity') { closeModal(); historyFilter = 'all'; view = 'activity'; render(); return; }
   if (action === 'backup-back') { authView = 'backup'; render(); return; }
   if (action === 'backup-next') {
     if (!$('#backup-ack')?.checked) { showError(new Error('Please confirm you’ve written down and safely stored your recovery phrase.')); return; }
@@ -553,8 +641,35 @@ document.addEventListener('click', event => {
       case 'cancel-setup': await invoke('cancelSetup'); setup = null; authView = 'welcome'; render(); break;
       case 'confirm-send': {
         if (!currentPreview?.previewId) throw new Error('Payment preview expired. Please review the payment again.');
-        await invoke('confirmSend', { previewId: currentPreview.previewId }); closeModal();
-        draft.send = emptySend(); view = 'activity'; await reload(); toast('Payment submitted to the network.'); break;
+        const preview = currentPreview, securityEpoch = state.securityEpoch;
+        currentPreview = null;
+        const active = () => state.phase === 'unlocked' && state.securityEpoch === securityEpoch;
+        let result;
+        try { result = await invoke('confirmSend', { previewId: preview.previewId }); }
+        catch (error) {
+          // The service consumes the review even on failure. Never leave a
+          // dead Confirm button, or reopen old-wallet information after lock.
+          if (active()) {
+            paymentOutcome({ txid: error.txid ?? preview.txid, submitted: false, uncertain: error.unknownOutcome === true });
+            showError(error);
+          }
+          break;
+        }
+        if (!active()) break;
+        draft.send = emptySend(); historyFilter = 'all'; view = 'activity'; render();
+        paymentOutcome({ txid: result.txid, submitted: true });
+        toast('Payment submitted to the network.');
+        // Refresh failure cannot change a successful broadcast into a failed
+        // payment. Nor should a slow snapshot hold the receipt's controls busy.
+        void invoke('getState').then(next => {
+          if (active() && next?.securityEpoch === securityEpoch) acceptState(next);
+        }).catch(error => {
+          if (!active()) return;
+          const warning = new Error(`Payment was submitted, but the wallet view could not be updated. ${errorMessage(error)}`);
+          if (modalKind === 'send-submitted') showError(warning);
+          else toast(errorMessage(warning));
+        });
+        break;
       }
       case 'toggle-claims': {
         await invoke('setClaims', { enabled: state.config?.claims?.enabled !== true });
@@ -606,13 +721,21 @@ document.addEventListener('submit', event => {
         const destination = sendMode === 'bounty' ? { domain: values.domain.trim(), expectedConnections: values.expectedConnections.trim() }
           : { address: values.address.trim(), ...(values.label || values.message ? { label: values.label, message: values.message } : {}) };
         const sequence = ++sendReviewSequence;
-        if (sendMode === 'bounty') openModal('Preparing your bounty.', 'Checking funds and the website’s RSA support. The TLS check has a three-second deadline and sends no HTTP request.', '<p role="status">Please wait for the signature policy before confirming.</p><div class="modal-actions"><button class="button secondary" data-action="cancel-send-review">Cancel</button></div>', 'send-preparing');
+        const bounty = sendMode === 'bounty';
+        openModal(bounty ? 'Preparing your bounty.' : 'Preparing your payment.',
+          bounty ? 'Verifying available funds and preparing your bounty, then checking the website’s RSA support.' : 'Verifying available funds and preparing your payment for review.',
+          `<p id="payment-preparation-status" role="status" aria-atomic="true">Checking spendable outputs…</p><p>A wallet with many small outputs may take longer. Uncached funding data can take minutes under server rate limits; you can cancel at any time.${bounty ? ' The website check sends no HTTP request.' : ''} Nothing will be sent until you review and confirm.</p><div class="modal-actions"><button class="button secondary" data-action="cancel-send-review">Cancel</button></div>`, 'send-preparing');
         try {
-          const preview = await invoke('previewSend', { ...destination, amount, feeRate: Number(values.feeRate) });
+          const preview = await invoke('previewSend', { ...destination, amount, feeRate: Number(values.feeRate), subtractFeeFromAmount: values.subtractFeeFromAmount === 'true' });
           if (sequence === sendReviewSequence && state.phase === 'unlocked') sendReview(preview);
         } catch (error) {
           if (sequence === sendReviewSequence) {
-            if (modalKind === 'send-preparing') closeModal();
+            if (modalKind === 'send-preparing') {
+              openModal(bounty ? 'Could not prepare your bounty.' : 'Could not prepare your payment.',
+                'Nothing was sent. Return to the form to check the details and review again.',
+                '<div class="modal-actions"><button class="button secondary" data-action="close-modal">Back to form</button></div>', 'send-failed');
+              dialog.querySelector('.modal-actions button')?.focus();
+            }
             throw error;
           }
         }
@@ -625,9 +748,20 @@ document.addEventListener('submit', event => {
         if (['host', 'port'].some(key => Object.hasOwn(draft.settings, key))) throw new Error('Enter a valid server hostname or IP address and a port between 1 and 65535.');
         await reload(); toast('Connection settings saved.'); break;
       case 'recovery-form': {
-        const securityEpoch = state.securityEpoch;
-        const result = await invoke('getRecoveryPhrase', { password: values.password }); form.reset(); values.password = '';
-        if (state.phase !== 'unlocked' || state.securityEpoch !== securityEpoch) throw new Error('Wallet locked. Unlock it before viewing recovery words.');
+        const securityEpoch = state.securityEpoch, sequence = ++recoveryRevealSequence;
+        const active = () => sequence === recoveryRevealSequence && state.phase === 'unlocked' && state.securityEpoch === securityEpoch
+          && modalKind === 'recovery' && dialog.open && !document.hidden;
+        // Preference saving can yield before this handler starts. A dismissed
+        // password form must not begin revealing words in a newer dialog.
+        if (!form.isConnected || !active()) { values.password = ''; break; }
+        let result;
+        try { result = await invoke('getRecoveryPhrase', { password: values.password }); }
+        catch (error) { if (active()) throw error; break; }
+        finally { values.password = ''; }
+        form.reset();
+        // Hiding, cancelling or changing wallet context invalidates the request
+        // even if the user has already returned to this window by completion.
+        if (!active()) break;
         const words = String(result?.mnemonic ?? result).trim().split(/\s+/);
         openModal('For your eyes only.', 'Write these words down in order. This view closes automatically after 45 seconds.', `${notice('Never share your phrase, paste it into a website, or send it to support.')}<div class="seed-grid modal-seed-grid">${words.map((word,index) => `<div class="seed-word"><span>${index + 1}</span>${e(word)}</div>`).join('')}</div><button class="button full" data-action="close-modal">Hide recovery phrase ${icon('lock')}</button>`, 'secret');
         secretTimer = setTimeout(closeModal, 45000); break;
@@ -638,6 +772,7 @@ document.addEventListener('submit', event => {
 dialog.addEventListener('cancel', event => {
   event.preventDefault();
   if (modalKind === 'send-preparing' || (!busy && modalKind === 'send')) cancelSendReview();
+  else if (modalKind === 'recovery') closeModal();
   else if (!busy) closeModal();
 });
 document.addEventListener('keydown', event => {
@@ -655,7 +790,7 @@ document.addEventListener('pointercancel', () => { pointerActive = false; });
 document.addEventListener('compositionstart', () => { compositionActive = true; });
 document.addEventListener('compositionend', () => { compositionActive = false; });
 window.addEventListener('blur', () => { pointerActive = false; actionKeyActive = false; compositionActive = false; });
-document.addEventListener('visibilitychange', () => { if (document.hidden && modalKind === 'secret') closeModal(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && ['recovery', 'secret'].includes(modalKind)) closeModal(); });
 window.addEventListener('beforeunload', () => { unsubscribe?.(); setup = null; replacement = null; currentPreview = null; clearTimeout(secretTimer); clearTimeout(renderTimer); clearPaymentPasteError(); });
 
 render();

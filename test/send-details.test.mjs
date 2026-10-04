@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { WalletService } from '../src/core/wallet-service.mjs';
+import { RpcClient } from '../src/core/rpc.mjs';
 import { DEFAULT_CONFIG, GENESIS } from '../src/core/config.mjs';
 import { deriveAccount } from '../src/core/crypto.mjs';
 import { createVault, unlockVault } from '../src/core/vault.mjs';
@@ -22,7 +23,7 @@ const tip = { chain: 'testnet4', height: 5, hash: 'ab'.repeat(32), mediantime: 1
 
 async function fixture(t, { durable = false, uncertain = false } = {}) {
   const directory = durable ? await mkdtemp(join(tmpdir(), 'connectwallet-send-details-')) : process.cwd();
-  const broadcasts = [], saves = [];
+  const broadcasts = [], saves = [], fundingBatches = [];
   const service = new WalletService({ directory, network: 'testnet4' });
   service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.session = { data: { mnemonic, name: 'Public test wallet', network: 'testnet4', receiveIndex: 0, changeIndex: 0, lastUsedReceive: -1, lastUsedChange: -1 }, password };
@@ -31,6 +32,13 @@ async function fixture(t, { durable = false, uncertain = false } = {}) {
   service.liveUpdates = { start() {}, close() {}, updateAddresses() {} };
   service.engine = { enabled: false, async stop() {}, clear() {} };
   service.rpc = { close() {}, async request(method, params) {
+    if (method === 'getaddressutxos') return { tip, address: params.address, unit: 'connects', next_cursor: null,
+      items: params.address === account.address ? [{ txid: transactionId(funding), vout: 0, amount: funding.outputs[0].amount, status: 'confirmed', mature: true }] : [] };
+    if (method === 'gettransactions') {
+      assert.deepEqual(params, { txids: [transactionId(funding)] });
+      fundingBatches.push(params.txids);
+      return { tip, transactions: [{ txid: transactionId(funding), hex: raw }], remaining: [] };
+    }
     assert.equal(method, 'sendrawtransaction');
     broadcasts.push(params.transaction_hex);
     if (uncertain) throw new Error('untrusted backend canary');
@@ -40,7 +48,6 @@ async function fixture(t, { durable = false, uncertain = false } = {}) {
   service.utxos = [{ txid: transactionId(funding), vout: 0, amount: funding.outputs[0].amount, status: 'confirmed', mature: true, account: { index: 0, change: 0 } }];
   service.refresh = async () => {};
   service.ensureNetwork = async () => { service.tip = tip; return tip; };
-  service.funding = async () => raw;
   if (durable) await createVault(service.vaultFile, service.session.data, password);
   else service.persist = async () => { saves.push(structuredClone(service.session.data)); };
   t.after(async () => {
@@ -50,12 +57,13 @@ async function fixture(t, { durable = false, uncertain = false } = {}) {
       await rm(directory, { recursive: true, force: true });
     }
   });
-  return { service, broadcasts, saves };
+  return { service, broadcasts, saves, fundingBatches };
 }
 
 test('preview validates and freezes payment details without putting them in transaction bytes', async t => {
-  const { service, broadcasts, saves } = await fixture(t);
+  const { service, broadcasts, saves, fundingBatches } = await fixture(t);
   const review = await service.previewSend(payment);
+  assert.deepEqual(fundingBatches, [[transactionId(funding)]]);
   assert.equal(review.label, details.label); assert.equal(review.message, details.message);
   assert.ok(Object.isFrozen(service.preview));
   assert.throws(() => { service.preview.label = 'changed'; }, TypeError);
@@ -70,7 +78,7 @@ test('preview validates and freezes payment details without putting them in tran
 
 test('invalid payment metadata fails before reading funding or publishing a preview', async t => {
   const { service, broadcasts } = await fixture(t);
-  service.refresh = async () => { assert.fail('Invalid details must fail before RPC'); };
+  service.ensureNetwork = async () => { assert.fail('Invalid details must fail before RPC'); };
   for (const fields of [{ label: 'a'.repeat(101) }, { message: 'a'.repeat(201) }, { label: '\ud800' }, { message: 'a\u0000b' }, { label: null }, { message: {} }, { label: 'a\u202eb' }]) {
     await assert.rejects(service.previewSend({ ...payment, ...fields }), /Label|Message/);
     assert.equal(service.preview, null);
@@ -86,6 +94,95 @@ test('a failed encrypted save prevents broadcast and restores the unsaved local 
   assert.deepEqual(broadcasts, []);
   assert.equal(service.session.data.paymentDetails, undefined);
   assert.equal(service.session.data.changeIndex, 0);
+});
+
+test('review cancellation during the pre-broadcast save prevents a late broadcast', async t => {
+  const { service, broadcasts } = await fixture(t);
+  const review = await service.previewSend(payment);
+  const gate = deferred(), entered = deferred();
+  service.persist = async () => { entered.resolve(); await gate.promise; };
+  const sending = service.confirmSend({ previewId: review.previewId });
+  // Observe the result before releasing the deferred operation so a rejection
+  // cannot become unhandled when cancellation begins settling promptly.
+  const outcome = sending.then(value => ({ value }), error => ({ error }));
+  await entered.promise;
+  service.cancelSendPreview();
+  gate.resolve();
+  const result = await outcome;
+  assert.match(result.error?.message ?? '', /cancelled.*Review the payment again/);
+  assert.deepEqual(broadcasts, []);
+  assert.equal(service.reserved.size, 0);
+});
+
+test('review cancellation promptly exits the confirmation network check', async t => {
+  const { service, broadcasts } = await fixture(t);
+  const review = await service.previewSend(payment);
+  const gate = deferred(), entered = deferred();
+  t.after(() => gate.resolve(tip));
+  service.ensureNetwork = async () => { entered.resolve(); return gate.promise; };
+  const rejected = assert.rejects(service.confirmSend({ previewId: review.previewId }), { name: 'AbortError' });
+  await entered.promise;
+  service.cancelSendPreview();
+  await rejected;
+  assert.equal(service.sendConfirmation, null);
+  assert.deepEqual(broadcasts, []);
+  assert.equal(service.reserved.size, 0);
+  gate.resolve(tip);
+  await new Promise(done => setImmediate(done));
+  assert.deepEqual(broadcasts, []);
+});
+
+test('cancelling a confirmed payment while RPC pacing waits prevents transmission and releases its inputs', async t => {
+  const { service, broadcasts } = await fixture(t);
+  const review = await service.previewSend(payment);
+  const entered = deferred(), gate = deferred();
+  const rpc = new RpcClient({ host: '127.0.0.1', port: 1 });
+  let transmissionStarted = false;
+  rpc.pace = async (_method, _params, { signal }) => {
+    entered.resolve();
+    await Promise.race([gate.promise, new Promise((_, reject) => {
+      const abort = () => reject(Object.assign(new Error('Cancelled before transmission'), { name: 'AbortError', code: 'ABORT_ERR' }));
+      if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+    })]);
+  };
+  rpc.connect = async () => {
+    transmissionStarted = true;
+    throw new Error('Synthetic transport: should not have attempted transmission');
+  };
+  service.rpc = rpc;
+  const result = service.confirmSend({ previewId: review.previewId }).then(value => ({ value }), error => ({ error }));
+  await entered.promise;
+  service.cancelSendPreview();
+  gate.resolve();
+  const outcome = await result;
+  assert.equal(transmissionStarted, false);
+  assert.equal(outcome.error?.name, 'AbortError');
+  assert.notEqual(outcome.error?.unknownOutcome, true);
+  assert.match(outcome.error?.message ?? '', /No transaction was sent/);
+  assert.equal(service.reserved.size, 0);
+  assert.deepEqual(broadcasts, []);
+});
+
+for (const uncertain of [false, true]) test(`review cancellation preserves an in-flight ${uncertain ? 'uncertain' : 'successful'} broadcast outcome`, async t => {
+  const { service, broadcasts } = await fixture(t, { uncertain });
+  const review = await service.previewSend(payment);
+  const gate = deferred(), entered = deferred(), request = service.rpc.request;
+  service.rpc.request = async (method, params) => {
+    if (method === 'sendrawtransaction') { entered.resolve(); await gate.promise; }
+    return request(method, params);
+  };
+  const outcome = service.confirmSend({ previewId: review.previewId }).then(value => ({ value }), error => ({ error }));
+  await entered.promise;
+  service.cancelSendPreview();
+  gate.resolve();
+  const result = await outcome;
+  if (uncertain) {
+    assert.equal(result.error?.unknownOutcome, true);
+    assert.equal(result.error?.txid, review.txid);
+    assert.match(result.error?.message ?? '', /Broadcast was not confirmed/);
+  } else assert.deepEqual(result.value, { txid: review.txid, status: 'submitted' });
+  assert.equal(broadcasts.length, 1);
+  assert.equal(service.reserved.size, 1);
 });
 
 test('storage capacity never drops old annotations and still allows an unannotated send', async t => {

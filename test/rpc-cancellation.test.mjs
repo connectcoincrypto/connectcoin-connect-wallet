@@ -127,6 +127,48 @@ function claimFixture(rpc) {
   return { service, prepared, proof, key };
 }
 
+function paymentFixture(rpc) {
+  // Synthetic preview only. The TCP fixture never forwards transaction bytes.
+  const service = new WalletService({ directory: '/unused-payment-cancellation-test' });
+  service.rpc = rpc; service.session = { data: { changeIndex: 0 } };
+  service.ensureNetwork = async () => {};
+  service.refresh = async () => {};
+  const key = `${'13'.repeat(32)}:0`, txid = '14'.repeat(32);
+  service.preview = { previewId: 'synthetic-preview', expires: Date.now() + 10000, epoch: service.epoch,
+    txid, hex: bytes, selected: [{ txid: '13'.repeat(32), vout: 0 }], change: '0' };
+  return { service, key, txid };
+}
+
+for (const mode of ['quota', 'cooldown']) test(`payment cancellation during ${mode} leaves no uncertain outcome or reserved inputs`, async t => {
+  const { client, requests } = await fixture(t, undefined, { windowMs: 180 });
+  if (mode === 'quota') client.history.set('sendrawtransaction', Array(48).fill(performance.now()));
+  else client.cooldowns.set('sendrawtransaction', performance.now() + 180);
+  const { service, key } = paymentFixture(client);
+  const entered = deferred(), pace = client.pace.bind(client);
+  client.pace = (...args) => { entered.resolve(); return pace(...args); };
+  const result = assert.rejects(bounded(service.confirmSend({ previewId: 'synthetic-preview' })), error =>
+    error.name === 'AbortError' && !error.unknownOutcome && /No transaction was sent/.test(error.message));
+  await entered.promise;
+  assert.equal(service.reserved.has(key), true);
+  service.cancelSendPreview();
+  await result; await delay(220);
+  assert.deepEqual(requests, []); assert.equal(service.reserved.has(key), false);
+  assert.equal(client.closed, false);
+});
+
+for (const outcome of ['confirmed', 'disconnected']) test(`payment cancellation after transmission preserves its ${outcome} result and reservation`, async t => {
+  const received = deferred();
+  const { client, requests } = await fixture(t, (request, socket) => received.resolve({ request, socket }));
+  const { service, key, txid } = paymentFixture(client);
+  const submission = service.confirmSend({ previewId: 'synthetic-preview' });
+  const result = outcome === 'confirmed' ? submission : assert.rejects(submission, error => error.unknownOutcome === true && error.txid === txid);
+  const { request, socket } = await received.promise;
+  service.cancelSendPreview();
+  if (outcome === 'confirmed') { reply(socket, request, { txid }); assert.deepEqual(await result, { txid, status: 'submitted' }); }
+  else { socket.destroy(); await result; }
+  assert.equal(service.reserved.has(key), true); assert.equal(requests.length, 1);
+});
+
 test('STOP during claim broadcast quota releases only its unsent reservation and sends no transaction', async t => {
   const { client, requests } = await fixture(t, undefined, { windowMs: 180 });
   client.history.set('sendrawtransaction', Array(48).fill(performance.now()));

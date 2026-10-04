@@ -200,6 +200,38 @@ test('timeout and transport loss make broadcast outcome explicitly unknown, with
   }
 });
 
+for (const failure of ['timeout', 'malformed reply']) test(`immediate retry after ${failure} publishes disconnection before replacing the socket`, async () => {
+  const server = await mock((request, socket, requests) => {
+    if (requests.length > 1) socket.write(line(response(request, true)));
+    else if (failure === 'malformed reply') socket.write('invalid-json\n');
+  }, { timeoutMs: 50 });
+  const events = [];
+  server.client.on('connected', () => events.push('connected'));
+  server.client.on('disconnected', () => events.push('disconnected'));
+  try {
+    await assert.rejects(server.client.request('getchaintip'), /timed out|invalid or oversized/);
+    // Retry in the rejected request's continuation, before the old socket's
+    // close event. Subscription and wallet invalidations must not disappear.
+    assert.equal(await server.client.request('getchaintip'), true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events, ['connected', 'disconnected', 'connected']);
+    assert.equal(server.connections, 2);
+    assert.equal(server.client.pending.size, 0);
+  } finally { await server.close(); }
+});
+
+test('a disconnection listener can close the client before an immediate reconnect', async () => {
+  const server = await mock(() => {}, { timeoutMs: 50 });
+  try {
+    await assert.rejects(server.client.request('getchaintip'), /timed out/);
+    server.client.once('disconnected', () => server.client.close());
+    await assert.rejects(server.client.request('getchaintip'), { name: 'AbortError' });
+    assert.equal(server.connections, 1);
+    assert.equal(server.client.socket, null);
+    assert.equal(server.client.pending.size, 0);
+  } finally { await server.close(); }
+});
+
 test('RPC not-ready and rate limit errors retain structured codes; future request obeys cooldown', async () => {
   const times = [];
   const server = await mock((request, socket, requests) => {

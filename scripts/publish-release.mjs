@@ -313,9 +313,27 @@ async function stageArtifacts(api, runId, context, version, directory) {
   return files;
 }
 
-function releaseNotes(version, runId, sha) {
+function baseReleaseNotes(version, runId, sha) {
   const source = `https://github.com/${repository}/blob/v${version}`;
   return `# ConnectWallet ${version}\n\nDesktop wallet for ConnectCoin mainnet with local encrypted keys, BIP39 recovery, CONN payments, QR codes, transaction history and optional Automatic Claims. Claims are disabled by default. The native claims helper and Python runtime are bundled.\n\n## Downloads\n\n- Windows x64: assisted EXE installer or MSI. Use one format at a time; back up your wallet and uninstall the previous format before switching.\n- macOS Intel x64 and Apple Silicon arm64: DMG or ZIP.\n- Linux x64: DEB, RPM, AppImage or tar.gz, built on Ubuntu 22.04. AppImage may require FUSE 2.\n\nInstallers use English and do not start the wallet or enable claims automatically. Windows downloads are unsigned. macOS downloads are ad-hoc signed, not Developer-ID signed or notarized by Apple. Operating-system security warnings may appear. Do not run the wallet as root or disable its sandbox.\n\nVerify downloads against SHA256SUMS; four platform manifests are included. Hashes verify integrity, not publisher identity. Automated checks cover wallet logic, packaged helper startup, architecture, resources and installer metadata; they do not establish clean-machine installation/uninstallation or GUI compatibility on every OS.\n\nBack up your recovery phrase securely. The wallet relies on a trusted server over an unencrypted RPC connection for chain state and does not independently validate blockchain consensus.\n\nSee the [installer guide](${source}/docs/installers.md) and [README](${source}/README.md).\n\nBuilt and checked by [Wallet installers run ${runId}](https://github.com/${repository}/actions/runs/${runId}) from commit \`${sha}\`.\n`;
+}
+
+export function releaseNotes(version, runId, sha) {
+  const notes = baseReleaseNotes(version, runId, sha);
+  if (version !== '1.1.0') return notes;
+  const highlights = [
+    '## New in 1.1.0',
+    '',
+    '- **Use all balance** fills the available confirmed balance and enables **Deduct fees from payment**.',
+    '- **Deduct fees from payment** subtracts the fee from the entered amount. The review shows the exact recipient amount, fee and any change before confirmation.',
+    '- Payment preparation and signing run without blocking the interface, with progress and cancellation. Funding transactions are fetched in bounded batches when the server supports them, with compatibility fallback for older servers.',
+    '- Faster preparation for wallets with many small claim outputs, while retaining local funding-transaction, ownership, amount and signature checks.',
+    '- Clearer preparation failures and submitted/uncertain outcomes. A lost broadcast reply is not treated as proof of failure; check the transaction before retrying.',
+    '- Fixes for cancellation before transmission, rapid lock/unlock, RPC reconnection, fee-deducted coin selection, stale UI responses and hidden pending payments after receipt navigation.',
+    '',
+    'This update does not change ConnectCoin consensus or the P2P protocol. Close ConnectWallet before upgrading and keep a secure recovery backup. Existing wallet profiles and keys are retained; choose the same Windows installer family as your existing installation.',
+  ].join('\n');
+  return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
 }
 
 async function publish(runId) {

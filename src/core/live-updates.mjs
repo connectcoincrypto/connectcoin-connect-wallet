@@ -14,6 +14,7 @@ export class LiveUpdates {
     Object.assign(this, { rpc, network, isActive, getAddresses, onChange, onError, setTimer, clearTimer, retryMinMs, retryMaxMs });
     this.started = false; this.closed = false; this.generation = 0;
     this.registrations = new Map(); this.ids = new Map(); this.abort = new AbortController();
+    this.addressWaiters = new Set();
     this.running = null; this.requested = false; this.retryTimer = null; this.retryDelay = retryMinMs;
     this.baseReady = false; this.addressCapacity = false;
     this.addressBatch = false; this.addressPending = false; this.addressCatchup = false; this.addressTimer = null;
@@ -39,6 +40,7 @@ export class LiveUpdates {
     this.retryTimer = null;
     if (this.addressTimer !== null) this.clearTimer(this.addressTimer);
     this.addressTimer = null; this.addressBatch = false; this.addressPending = false; this.addressCatchup = false;
+    this.wakeAddressWaiters();
   }
   addressChange(catchup = false) {
     if (!this.active()) return;
@@ -88,15 +90,42 @@ export class LiveUpdates {
       if (!this.addresses().has(value)) throw new Error('Wallet address is not available for live updates.');
       if (this.registrations.has(`address:${value}`)) return true;
       if (this.addressCapacity) return false;
+      if (this.retryTimer !== null) throw new Error('RPC live updates are reconnecting; retry the wallet refresh.');
       this.updateAddresses();
       const pending = this.running;
       if (!pending) throw new Error('RPC live updates are reconnecting; retry the wallet refresh.');
-      await pending;
+      await this.waitForAddress(value, pending);
       // Allow the worker's finally to install a requested next pass if this
       // address was derived after the previous batch took its snapshot.
       await Promise.resolve();
     }
     throw new Error('RPC live updates changed while subscribing; retry the wallet refresh.');
+  }
+  wakeAddressWaiters() {
+    for (const wake of this.addressWaiters) wake();
+  }
+  waitForAddress(value, pending) {
+    const generation = this.generation;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = error => {
+        if (settled) return;
+        settled = true; this.addressWaiters.delete(wake);
+        if (error) reject(error); else resolve();
+      };
+      const wake = () => {
+        if (!this.active()) finish(Object.assign(new Error('Wallet live updates stopped.'), { name: 'AbortError', code: 'ABORT_ERR' }));
+        // The initial connection also advances the generation. Recheck the
+        // current lifecycle before waiting again; never accept an old ID.
+        else if (this.generation !== generation) finish();
+        else if (this.registrations.has(`address:${value}`) || this.addressCapacity) finish();
+      };
+      this.addressWaiters.add(wake);
+      // The target can be ready while unrelated registrations are quota-paced.
+      // Still observe the worker's failure, including after this waiter settles.
+      pending.then(() => finish(), error => finish(error));
+      wake();
+    });
   }
   retry() {
     if (!this.active() || this.retryTimer !== null) return;
@@ -129,6 +158,7 @@ export class LiveUpdates {
     if (this.ids.has(result.subscription_id)) throw new Error('Duplicate RPC subscription identifier.');
     const registration = { id: result.subscription_id, kind, address: params.address };
     this.registrations.set(key, registration); this.ids.set(registration.id, registration);
+    if (kind === 'address') this.wakeAddressWaiters();
     // A notification can precede the promise continuation which installs its ID.
     // Catch up after installing the subscription, not before it.
     if (kind === 'address') this.addressChange(true);
@@ -168,7 +198,7 @@ export class LiveUpdates {
           // Server default: 100 subscriptions per IP, including our two base
           // subscriptions. Other clients behind the same IP may reduce capacity.
           if (this.registrations.size >= 100) {
-            this.addressCapacity = true; this.report(capacityError()); break;
+            this.addressCapacity = true; this.wakeAddressWaiters(); this.report(capacityError()); break;
           }
           try {
             await this.subscribe(key, 'address', { address: value }, generation);
@@ -178,7 +208,7 @@ export class LiveUpdates {
           catch (error) {
             if (!this.current(generation)) return;
             if (error?.code !== -32005) throw error;
-            this.addressCapacity = true; this.report(capacityError()); break;
+            this.addressCapacity = true; this.wakeAddressWaiters(); this.report(capacityError()); break;
           }
         }
       }

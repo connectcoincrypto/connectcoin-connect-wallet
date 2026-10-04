@@ -117,6 +117,36 @@ test('locking during password derivation cancels unlock without reviving keys',a
   const pending=s.unlock({password:PASSWORD});await s.lock();
   await assert.rejects(pending,/cancelled/);assert.equal(s.session,null);
 });
+
+test('unlock during slow claims shutdown uses a fresh RPC and live-update lifecycle', async t => {
+  const s = await fixture(t); await create(s);
+  const oldRpc = s.rpc, oldLive = s.liveUpdates, stop = s.engine.stop.bind(s.engine);
+  let release;
+  const draining = new Promise(resolve => { release = resolve; });
+  s.engine.stop = reason => {
+    const stopped = stop(reason);
+    return reason === 'locked' ? stopped.then(() => draining) : stopped;
+  };
+  const locking = s.lock();
+  try {
+    assert.equal(s.getState().phase, 'locked');
+    assert.equal(oldLive.closed, true);
+    await s.unlock({ password: PASSWORD });
+    assert.notEqual(s.rpc, oldRpc, 'A new unlock must not inherit the permanently closed RPC');
+    assert.notEqual(s.liveUpdates, oldLive);
+    assert.equal(s.liveUpdates.closed, false);
+    assert.equal(s.liveUpdates.started, true);
+    const newRpc = s.rpc, newLive = s.liveUpdates;
+    release(); await locking;
+    assert.equal(s.rpc, newRpc, 'Late shutdown must not replace the newly unlocked connection');
+    assert.equal(s.liveUpdates, newLive);
+    await s.refresh();
+    assert.equal(s.getState().network.status, 'online');
+    assert.equal(s.getState().phase, 'unlocked');
+  } finally {
+    release(); await locking; s.engine.stop = stop;
+  }
+});
 test('receive rotation persists and a stale review never broadcasts',async t=>{
   const s=await fixture(t);await create(s);
   const old=s.getState().wallet.address;

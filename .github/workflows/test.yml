@@ -79,3 +79,19 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: xvfb-run --auto-servernum npm run test:ui:recovery
+      - name: Test real payment signing worker responsiveness
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum npm run test:ui:payment
+      - name: Test real payment signing worker on native desktop
+        if: runner.os != 'Linux'
+        timeout-minutes: 5
+        run: npm run test:ui:payment
+      - name: Test payment outcomes and error feedback
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: xvfb-run --auto-servernum npm run test:ui:send-feedback
+      - name: Test payment outcomes and error feedback on native desktop
+        if: runner.os != 'Linux'
+        timeout-minutes: 5
+        run: npm run test:ui:send-feedback

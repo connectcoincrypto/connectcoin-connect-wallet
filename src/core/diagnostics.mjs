@@ -4,11 +4,12 @@ import { resolve } from 'node:path';
 
 const EVENTS = new Set([
   'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled', 'wallet.subscription_failed',
+  'payment.prepare_started', 'payment.prepared', 'payment.prepare_failed', 'payment.prepare_cancelled',
   'claims.started', 'claims.stopped', 'claims.suspended', 'claims.resumed', 'claims.progress', 'claims.failed',
   'claim.started', 'claim.succeeded', 'claim.failed',
   'claim.cancelled', 'rpc.connected', 'rpc.disconnected', 'rpc.failed', 'rpc.cancelled', 'rpc.slow', 'helper.failed',
 ]);
-const STAGES = new Set(['prepare', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
+const STAGES = new Set(['prepare', 'network', 'outputs', 'funding', 'signing', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
 const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
 const DURATION_SCOPES = new Set(['stage', 'run']);
 const PROCESS_SIGNALS = new Set([
@@ -19,7 +20,7 @@ const PROCESS_SIGNALS = new Set([
 ]);
 const METHODS = new Set([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
-  'getaddresshistory', 'getaddressutxos', 'gettransaction', 'sendrawtransaction',
+  'getaddresshistory', 'getaddressutxos', 'gettransaction', 'gettransactions', 'sendrawtransaction',
   'getbountychanges', 'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe',
 ]);
 const OS_CODES = new Set([
@@ -129,6 +130,7 @@ const NUMBERS = Object.freeze({
   claimId: [0, Number.MAX_SAFE_INTEGER], attempts: [0, 1000000000], queued: [0, 1000000000],
   completed: [0, 1000000000], failures: [0, 1000000000], retryDelayMs: [0, 86400000],
   durationMs: [0, 86400000], height: [0, 0xffffffff], bytes: [0, 1073741824],
+  inputCount: [0, 1738],
   stderrBytes: [0, 1073741824], exitCode: [-2147483648, 0xffffffff],
   runId: [0, Number.MAX_SAFE_INTEGER], operationsStarted: [0, 1000000000], operationsCompleted: [0, 1000000000],
   operationsFailed: [0, 1000000000], operationsCancelled: [0, 1000000000], captures: [0, 1000000000], suppressedEvents: [0, 1000000000],

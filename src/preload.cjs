@@ -9,6 +9,13 @@ contextBridge.exposeInMainWorld('connectwallet', Object.freeze({
   invoke: async (method, payload = {}) => {
     if (!METHODS.has(method)) throw new Error('Unsupported wallet action.');
     const reply = await ipcRenderer.invoke('connectwallet:action', method, payload);
+    // Error custom properties do not reliably survive Electron's contextBridge.
+    // Preserve this action's explicitly bounded outcome as plain data instead.
+    if (method === 'confirmSend') return reply?.ok === true ? { ok: true, value: reply.value } : {
+      ok: false, error: typeof reply?.error === 'string' ? reply.error.slice(0, 500) : 'The wallet action could not be completed.',
+      ...(reply?.unknownOutcome === true ? { unknownOutcome: true,
+        ...(typeof reply.txid === 'string' && /^[0-9a-f]{64}$/.test(reply.txid) ? { txid: reply.txid } : {}) } : {}),
+    };
     if (!reply?.ok) throw new Error(reply?.error || 'The wallet action could not be completed.');
     return reply.value;
   },

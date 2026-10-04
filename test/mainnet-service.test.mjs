@@ -23,12 +23,19 @@ test('mainnet signs locally with coin-0 keys and rejects a wrong chain or genesi
   const funding = { version: 2, inputs: [{ txid: '00'.repeat(32), vout: 0xffffffff, scriptSig: '0101', sequence: 0xffffffff, witness: [] }],
     outputs: [{ type: 1, amount: (10n * COIN).toString(), publicKey: owner.publicKey }], locktime: 0 };
   const raw = serializeTransaction(funding).toString('hex');
-  const broadcasts = [];
+  const broadcasts = [], fundingBatches = [];
   let currentTip = tip;
   class Backend extends EventEmitter {
     close() {}
     async request(method, params) {
       if (method === 'getchaintip') return currentTip;
+      if (method === 'getaddressutxos') return { tip: currentTip, address: params.address, unit: 'connects', next_cursor: null,
+        items: params.address === owner.address ? [{ txid: transactionId(funding), vout: 0, amount: funding.outputs[0].amount, status: 'confirmed', mature: true }] : [] };
+      if (method === 'gettransactions') {
+        assert.deepEqual(params, { txids: [transactionId(funding)] });
+        fundingBatches.push(params.txids);
+        return { tip: currentTip, transactions: [{ txid: transactionId(funding), hex: raw }], remaining: [] };
+      }
       assert.equal(method, 'sendrawtransaction', 'Every RPC call stays inside this in-memory fixture');
       broadcasts.push(params.transaction_hex);
       return { txid: transactionId(parseTransaction(params.transaction_hex)) };
@@ -49,7 +56,6 @@ test('mainnet signs locally with coin-0 keys and rejects a wrong chain or genesi
   // Keep automatic reads inside the fixture; ensureNetwork below remains real.
   service.liveUpdates.start = () => {};
   service.refresh = async () => service.getState();
-  service.funding = async () => raw;
   await service.unlock({ password });
   assert.equal(service.config.network, 'main');
   assert.equal(service.config.claims.enabled, false);
@@ -66,13 +72,20 @@ test('mainnet signs locally with coin-0 keys and rejects a wrong chain or genesi
     status: 'confirmed', mature: true, account: { index: 0, change: 0 } }];
   for (const invalid of [{ ...tip, chain: 'testnet4' }, { ...tip, genesis_hash: GENESIS.testnet4 }]) {
     currentTip = invalid;
+    await assert.rejects(service.previewSend({ address: recipient.address, amount: '1' }), /unexpected network/);
+    assert.equal(service.preview, null);
+    assert.deepEqual(broadcasts, []);
+    assert.equal(service.session.data.changeIndex, 0);
+    currentTip = tip;
     const preview = await service.previewSend({ address: recipient.address, amount: '1' });
+    currentTip = invalid;
     await assert.rejects(service.confirmSend({ previewId: preview.previewId }), /unexpected network/);
     assert.deepEqual(broadcasts, []);
     assert.equal(service.session.data.changeIndex, 0);
   }
   currentTip = tip;
   const preview = await service.previewSend({ address: recipient.address, amount: '1' });
+  assert.deepEqual(fundingBatches, [[transactionId(funding)]], 'Verified batch funding remains cached across later reviews');
   const signed = parseTransaction(service.preview.hex);
   assert.equal(signed.outputs[0].publicKey, recipient.publicKey);
   assert.equal(verifySchnorr(Buffer.from(signed.inputs[0].witness[0], 'hex'), signatureHash(signed, funding.outputs, 0), owner.publicKey), true);

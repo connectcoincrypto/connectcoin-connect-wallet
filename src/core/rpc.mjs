@@ -7,7 +7,7 @@ import { validateRpcEndpoint } from './config.mjs';
 const PARAMS = Object.freeze({
   getchaintip: [], getrecentblockhashes: [], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor'],
-  gettransaction: ['txid'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
+  gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
   subscribebounties: [], subscribeaddress: ['address'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
@@ -32,6 +32,17 @@ export function validateRpcParams(method, params) {
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (!Object.hasOwn(descriptor, 'value')) throw new Error('RPC parameters must be plain data.');
     const value = descriptor.value;
+    if (key === 'txids') {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 32) throw new Error('Invalid RPC transaction batch.');
+      const hashes = [];
+      for (let index = 0; index < value.length; index++) {
+        const entry = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!entry || !Object.hasOwn(entry, 'value') || typeof entry.value !== 'string' || !/^[0-9a-f]{64}$/i.test(entry.value)) throw new Error('Invalid RPC transaction batch.');
+        hashes.push(entry.value.toLowerCase());
+      }
+      if (new Set(hashes).size !== hashes.length) throw new Error('Duplicate RPC transaction hash.');
+      clean[key] = hashes; continue;
+    }
     if (key === 'cursor' && value === null) { clean[key] = null; continue; }
     if (typeof value !== 'string') throw new Error(`Invalid RPC parameter: ${key}.`);
     if ((key === 'block_hash' || key === 'txid') && !/^[0-9a-f]{64}$/i.test(value)) throw new Error('Invalid RPC hash.');
@@ -92,8 +103,19 @@ export class RpcClient extends EventEmitter {
     // Diagnostic sinks must never change transport, quota, or broadcast outcomes.
     try { Promise.resolve(this.onDiagnostic(event, details)).catch(() => {}); } catch {}
   }
+  publishDisconnection(socket) {
+    if (this.socket !== socket) return;
+    this.socket = null; this.emit('disconnected');
+  }
   async connect() {
     if (this.closed) throw closedError();
+    if (this.socket?.destroyed) {
+      // A timeout/protocol failure rejects requests before socket.close runs.
+      // Publish that loss before an immediate retry replaces the socket, or
+      // the late close would silently skip subscription/wallet invalidation.
+      this.publishDisconnection(this.socket);
+      if (this.closed) throw closedError();
+    }
     if (this.socket && !this.socket.destroyed && !this.socket.connecting) return this.socket;
     if (this.connecting) return this.connecting;
     const connecting = new Promise((resolve, reject) => {
@@ -154,7 +176,7 @@ export class RpcClient extends EventEmitter {
         const error = new Error('Connection to the RPC server was lost.');
         this.failAll(error, socket, socketFailure ?? error);
         this.diagnostic('rpc.disconnected', { stage: 'connect', durationMs: performance.now() - startedAt });
-        if (this.socket === socket) { this.socket = null; this.emit('disconnected'); }
+        this.publishDisconnection(socket);
       });
     });
     this.connecting = connecting;
@@ -278,7 +300,7 @@ export class RpcClient extends EventEmitter {
   async pace(method, params, { signal } = {}) {
     const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
     const key = method === 'getblockbounties' ? `${method}:${params.block_hash}` : method;
-    const limit = method === 'getblockbounties' ? 8 : this.quota;
+    const limit = method === 'getblockbounties' || method === 'gettransactions' ? 8 : this.quota;
     for (;;) {
       if (this.closed) throw closedError();
       if (waitingSignal.aborted) throw cancelledError();

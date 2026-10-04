@@ -10,6 +10,7 @@ import {
   GitHubApi,
   parseArguments,
   releaseTargets,
+  releaseNotes,
   validateArchiveListing,
   validateAssets,
   validateJobs,
@@ -46,6 +47,16 @@ const expectedAssetNames = [
   ...expectedTargets.map(target => `manifest-${target.key}.json`),
   'SHA256SUMS',
 ];
+
+test('1.1.0 release notes describe fee deduction and preserve distribution disclosures', () => {
+  const notes = releaseNotes('1.1.0', '5678', sha);
+  for (const text of ['# ConnectWallet 1.1.0', '## New in 1.1.0', 'Use all balance', 'Deduct fees from payment',
+    'uncertain', 'Windows downloads are unsigned', 'not Developer-ID signed or notarized', 'SHA256SUMS',
+    '/blob/v1.1.0/docs/installers.md', '/actions/runs/5678', sha]) assert.ok(notes.includes(text), text);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.ok(!releaseNotes('1.0.0', '5678', sha).includes('## New in 1.1.0'));
+  assert.ok(!releaseNotes('1.2.0', '5678', sha).includes('## New in 1.1.0'));
+});
 
 function run(overrides = {}) {
   return {
