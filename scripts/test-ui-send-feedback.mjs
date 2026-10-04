@@ -48,6 +48,27 @@ async function confirm() {
   await expect.poll(() => application.evaluate(() => globalThis.sendFeedbackFixture.entered)).toBe(true);
 }
 async function idle() { await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false'); }
+async function assertPendingPaymentActivity() {
+  const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  try {
+    for (const width of [1000, 1380]) {
+      await page.setViewportSize({ width, height: 800 });
+      const hash = page.locator(`.transaction-hash[title="${txid}"]`);
+      // Compact desktop layouts hide the hash column, not the transaction.
+      // Select the exact txid's row, then require its meaningful details visible.
+      const row = page.locator('.activity-row').filter({ has: hash });
+      await expect(row).toHaveCount(1);
+      await expect(row).toBeVisible();
+      await expect(row.locator('.status-badge')).toHaveText('Pending');
+      await expect(row.locator('.status-badge')).toBeVisible();
+      await expect(row.locator('.amount')).toHaveText('−1.25 CONN');
+      await expect(row.locator('.amount')).toBeVisible();
+      await expect(page.locator('[data-filter="all"]')).toHaveAttribute('aria-pressed', 'true');
+      if (width === 1000) await expect(hash).toBeHidden();
+      else await expect(hash).toBeVisible();
+    }
+  } finally { await page.setViewportSize(viewport); }
+}
 async function startRecovery({ fail = false } = {}) {
   await application.evaluate((_electron, fail) => {
     const fixture = globalThis.sendFeedbackFixture;
@@ -242,7 +263,7 @@ try {
   await page.getByRole('button', { name: 'Check activity', exact: true }).click();
   await expect(page.locator('dialog[open]')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Your activity, at a glance.', exact: true })).toBeVisible();
-  await expect(page.locator(`.transaction-hash[title="${txid}"]`)).toBeVisible();
+  await assertPendingPaymentActivity();
   await expect(page.locator('[data-filter="all"]')).toHaveAttribute('aria-pressed', 'true');
   assert.equal(await application.evaluate(() => globalThis.sendFeedbackFixture.confirmations.length), 2);
   console.log(`PASS: ${stage}.`);
@@ -265,7 +286,7 @@ try {
   });
   await publishState();
   await page.getByRole('button', { name: 'View activity', exact: true }).click();
-  await expect(page.locator(`.transaction-hash[title="${txid}"]`)).toBeVisible();
+  await assertPendingPaymentActivity();
   await expect(page.locator('[data-filter="all"]')).toHaveAttribute('aria-pressed', 'true');
   await application.evaluate(() => { globalThis.sendFeedbackFixture.state.history = []; });
   await publishState();
