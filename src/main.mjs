@@ -3,6 +3,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { copyFile, chmod, constants, realpath } from 'node:fs/promises';
 import { WalletService } from './core/wallet-service.mjs';
+import { StartupTiming } from './core/startup-timing.mjs';
 import { selectProfileDirectory, selectStartupNetwork } from './core/profile-paths.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -13,7 +14,7 @@ const ICON_URL = pathToFileURL(ICON).href;
 const PAYMENT_URI_URL = pathToFileURL(join(ROOT, 'core', 'payment-uri.mjs')).href;
 const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','paymentRequest','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
-let window, service, quitting = false, closing = false, actionInProgress = false, closeSequence = 0;
+let window, service, startupTiming, quitting = false, closing = false, actionInProgress = false, closeSequence = 0;
 const themeBackground = () => nativeTheme.shouldUseDarkColors ? '#17151e' : '#f7f6f2';
 function applyTheme(theme) {
   if (nativeTheme.themeSource !== theme) nativeTheme.themeSource = theme;
@@ -47,6 +48,7 @@ async function quitAfterSavingPreferences() {
       if (response === 2) break;
     }
     quitting = true;
+    startupTiming?.cancel();
     try { await service?.close(); } finally { app.exit(0); }
   } finally { closing = false; }
 }
@@ -82,6 +84,7 @@ else {
     service = new WalletService({ directory: app.getPath('userData'), resourcesPath: process.resourcesPath,
       network: startupNetwork, allowRegtest: !app.isPackaged && startupNetwork === 'regtest' });
     await service.initialize();
+    startupTiming = new StartupTiming({ record: (event, details) => service.recordDiagnostic(event, details) });
     // Set the saved override before the first paint; 'system' follows OS changes
     // through Chromium's prefers-color-scheme without changing the OS setting.
     applyTheme(service.config.theme);
@@ -109,16 +112,25 @@ else {
       callback({ cancel: !allowed });
     });
     service.on('state', state => {
+      startupTiming.observe({ epoch: state.securityEpoch, unlocked: state.phase === 'unlocked', ready: state.wallet?.balance != null });
       applyTheme(state.config.theme);
       if (window && !window.isDestroyed()) window.webContents.send('connectwallet:state',state);
     });
     nativeTheme.on('updated', () => {
       if (window && !window.isDestroyed()) window.setBackgroundColor(themeBackground());
     });
-    powerMonitor.on('suspend', () => { void service.lock(); });
-    powerMonitor.on('lock-screen', () => { void service.lock(); });
+    powerMonitor.on('suspend', () => { startupTiming.cancel(); void service.lock(); });
+    powerMonitor.on('lock-screen', () => { startupTiming.cancel(); void service.lock(); });
     ipcMain.on('connectwallet:activity', event => {
       if (event.sender === window.webContents && event.senderFrame === window.webContents.mainFrame && event.senderFrame.url === UI_URL) service.activity();
+    });
+    // A bounded, read-only paint acknowledgement. No renderer data other than
+    // the session epoch is accepted; durations use the main process clock.
+    ipcMain.on('connectwallet:render-ready', (event, epoch) => {
+      if (window.isDestroyed() || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || event.senderFrame.url !== UI_URL) return;
+      if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch !== service.epoch || !service.session || service.balance == null) return;
+      startupTiming.observe({ epoch, unlocked: true, ready: true });
+      startupTiming.rendered(epoch);
     });
     ipcMain.handle('connectwallet:action', async (event,method,payload) => {
       try {
@@ -148,12 +160,13 @@ else {
         }
         // Lock and review cancellation can interrupt pending work; other
         // mutations remain serialized (in particular, no parallel broadcasts).
-        if (method === 'lock') return { ok:true,value:await service.lock() };
+        if (method === 'lock') { startupTiming.cancel(); return { ok:true,value:await service.lock() }; }
         if (method === 'cancelSendPreview') return { ok:true,value:service.cancelSendPreview() };
         if (actionInProgress) throw new Error('Another wallet action is in progress. Please wait.');
         actionInProgress = true; service.activity();
         try {
           let value;
+          if (method === 'unlock' && !service.session) startupTiming.begin();
           if (SERVICE_METHODS.has(method)) value = await service[method](payload);
           else if (method === 'copyAddress') {
             service.assertSession(); const epoch = service.epoch;
@@ -195,6 +208,9 @@ else {
             }
           } else throw new Error('Unsupported wallet action.');
           return { ok:true,value };
+        } catch (error) {
+          if (method === 'unlock') startupTiming.cancel();
+          throw error;
         } finally { actionInProgress = false; }
       } catch(error) {
         // Do not serialize stacks, config files, process environments, or secrets.

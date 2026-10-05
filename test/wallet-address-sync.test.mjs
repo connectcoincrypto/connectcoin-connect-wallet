@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import net from 'node:net';
+import { performance } from 'node:perf_hooks';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WalletService } from '../src/core/wallet-service.mjs';
 import { GENESIS } from '../src/core/config.mjs';
+import { RpcClient } from '../src/core/rpc.mjs';
 
 const hash = i => i.toString(16).padStart(64, '0');
 const initialTip = { chain: 'testnet4', height: 999, hash: hash(999), mediantime: 1789500000, genesis_hash: GENESIS.testnet4 };
@@ -15,8 +18,8 @@ const coin = (extra = {}) => ({ txid: hash(1), vout: 0, amount: '201', block_hei
 class Backend extends EventEmitter {
   constructor() { super(); this.socket = {}; this.tip = initialTip; this.calls = []; this.serial = 0; this.legacy = false; }
   async connect() { return this.socket; }
-  async request(method, params = {}) {
-    this.calls.push({ method, params });
+  async request(method, params = {}, options = {}) {
+    this.calls.push({ method, params, options });
     if (method === 'getaddresschanges') {
       if (this.legacy) throw Object.assign(new Error('Method not found'), { code: -32601 });
       return await this.delta?.(params) ?? { tip: this.tip, unit: 'connects', changes: [], next_cursor: `journal-${++this.serial}`, has_more: false, through_sequence: 0, journal_epoch: 1 };
@@ -24,7 +27,7 @@ class Backend extends EventEmitter {
     if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return { subscription_id: `${method}-${params.address ?? 'global'}`, tip: this.tip, cursor: 'journal-start' };
     if (method === 'getchaintip') return this.tip;
     if (method === 'getaddresshistory') {
-      await this.beforeHistory?.(params);
+      await this.beforeHistory?.(params, options);
       const start = params.cursor ? Number(params.cursor) : 0, rows = params.address === this.used ? Array.from({ length: 201 }, (_, i) => row(i + 1)) : [];
       return { tip: this.tip, unit: 'connects', address: params.address, items: rows.slice(start, start + 100), next_cursor: start + 100 < rows.length ? String(start + 100) : null };
     }
@@ -47,6 +50,7 @@ async function fixture(t, { legacy = false } = {}) {
   return { service, rpc };
 }
 const counts = rpc => Object.fromEntries([...new Set(rpc.calls.map(c => c.method))].map(method => [method, rpc.calls.filter(c => c.method === method).length]));
+const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 async function settled(service) {
   for (let pass = 0; pass < 800; pass++) {
     const live = service.liveUpdates;
@@ -146,4 +150,115 @@ test('multi-batch drift retries deltas from a private candidate without another 
   await service.refresh();
   assert.equal(counts(rpc).getaddresshistory, undefined); assert.equal(counts(rpc).getaddressutxos, undefined); assert.equal(counts(rpc).getaddresschanges, 2);
   assert.ok(service.addressSync); assert.equal(service.addressSyncPending, null);
+});
+
+test('initial baseline pipelines at most four reads, preserving watermark, subscriptions and atomic publication', async t => {
+  const { service, rpc } = await fixture(t);
+  const request = rpc.request.bind(rpc);
+  let active = 0, peak = 0, watermark = false;
+  const subscribed = new Set();
+  rpc.request = async (method, params = {}, options = {}) => {
+    if (method === 'getaddresschanges' && !params.cursor) watermark = true;
+    if (!['getaddresshistory', 'getaddressutxos'].includes(method)) return request(method, params, options);
+    assert.equal(watermark, true);
+    assert.ok(subscribed.has(params.address));
+    assert.equal(service.balance, null); assert.equal(service.addressSync, null); assert.deepEqual(service.history, []);
+    active++; peak = Math.max(peak, active);
+    try { await sleep(2); return await request(method, params, options); }
+    finally { active--; }
+  };
+  // Exercise the baseline's subscribe-before-read contract independently of
+  // the shared LiveUpdates worker's own concurrency/capacity tests.
+  service.liveUpdates.started = true;
+  service.liveUpdates.updateAddresses = () => {};
+  service.liveUpdates.watchAddress = async address => { await sleep(1); subscribed.add(address); };
+  await service.refresh();
+  assert.equal(peak, 4); assert.equal(active, 0);
+  assert.equal(subscribed.size, 41);
+  assert.equal(counts(rpc).getaddresshistory, 43); assert.equal(counts(rpc).getaddressutxos, 3);
+  assert.equal(service.history.length, 201); assert.equal(service.balance.confirmed, '0.0000000201');
+  rpc.calls = []; await service.refresh();
+  assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+});
+
+test('failed baseline stops scheduling siblings and drains sent reads before returning the original failure', async t => {
+  const { service, rpc } = await fixture(t);
+  const ready = deferred(), replies = Array.from({ length: 4 }, deferred);
+  let entered = 0, finished = false;
+  rpc.beforeHistory = async () => {
+    const index = entered++;
+    assert.ok(index < 4, 'No new page/address may start after the failure');
+    if (entered === 4) ready.resolve();
+    await replies[index].promise;
+  };
+  const failure = Object.assign(new Error('limited fixture'), { code: -32029 });
+  const refresh = service.refresh();
+  const rejected = assert.rejects(refresh, error => error === failure).then(() => { finished = true; });
+  await ready.promise;
+  replies[0].reject(failure);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(finished, false, 'Already-sent replies must be observed before retry');
+  assert.ok(rpc.calls.filter(c => c.method === 'getaddresshistory').every(c => c.options.signal.aborted));
+  for (const reply of replies.slice(1)) reply.resolve();
+  await rejected;
+  assert.equal(counts(rpc).getaddresshistory, 4); assert.equal(counts(rpc).getaddressutxos, undefined);
+  assert.equal(counts(rpc).getaddresschanges, 1, 'Never replay/publish an incomplete baseline');
+  assert.equal(service.addressSync, null); assert.equal(service.balance, null); assert.deepEqual(service.history, []);
+  rpc.calls = []; rpc.beforeHistory = null;
+  await service.refresh();
+  assert.equal(counts(rpc).getaddresshistory, 43); assert.equal(counts(rpc).getaddresschanges, 2);
+  assert.equal(service.history.length, 201);
+});
+
+test('locking during four in-flight baseline reads discards every late result without scheduling more pages', async t => {
+  const { service, rpc } = await fixture(t);
+  const ready = deferred(), reply = deferred(); let entered = 0;
+  rpc.beforeHistory = async () => { if (++entered === 4) ready.resolve(); await reply.promise; };
+  const rejected = assert.rejects(service.refresh(), /Wallet locked or changed/);
+  await ready.promise; await service.lock(); reply.resolve(); await rejected;
+  assert.equal(entered, 4);
+  assert.equal(counts(rpc).getaddressutxos, undefined); assert.equal(counts(rpc).getaddresschanges, 1);
+  assert.equal(service.session, null); assert.equal(service.addressSync, null); assert.equal(service.balance, null); assert.deepEqual(service.history, []);
+});
+
+test('parallel baseline uses the shared TCP client pacing across multiple 48-request windows', async t => {
+  const { service, rpc: backend } = await fixture(t);
+  service.accounts.push(...Array.from({ length: 60 }, (_, index) => ({ address: `publicfixtureaddress${index}`, index: index + 100, change: 0 })));
+  const sockets = new Set(), historyTimes = [], errors = [];
+  let active = 0, peak = 0;
+  const server = net.createServer(socket => {
+    sockets.add(socket); socket.setNoDelay(true); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket));
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8'); let end;
+      while ((end = buffer.indexOf('\n')) >= 0) {
+        const request = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
+        if (request.method === 'getaddresshistory') historyTimes.push(performance.now());
+        active++; peak = Math.max(peak, active);
+        void (async () => {
+          try {
+            await sleep(2);
+            const result = await backend.request(request.method, request.params);
+            socket.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+          } catch (error) { errors.push(error); socket.destroy(); }
+          finally { active--; }
+        })();
+      }
+    });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  // Same production quota, shortened window only to keep this regression fast.
+  const client = new RpcClient({ host: '127.0.0.1', port: server.address().port, quota: 48, windowMs: 200, timeoutMs: 5000 });
+  t.after(async () => { client.close(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); });
+  service.clientFactory = () => client; service.connectClient();
+  await service.refresh();
+  assert.deepEqual(errors, []); assert.equal(active, 0); assert.equal(peak, 4);
+  assert.equal(historyTimes.length, 103);
+  for (let index = 48; index < historyTimes.length; index++) {
+    assert.ok(historyTimes[index] - historyTimes[index - 48] >= 180, 'Baseline must wait for per-method quota instead of bypassing it');
+  }
+  assert.equal(client.queuedRequests, 0); assert.equal(client.pending.size, 0);
+  assert.equal(service.history.length, 201); assert.equal(service.balance.confirmed, '0.0000000201');
+  backend.calls = []; await service.refresh();
+  assert.deepEqual(counts(backend), { getchaintip: 1, getaddresschanges: 2 });
 });

@@ -80,12 +80,13 @@ export class LiveUpdates {
     if (!this.active()) return;
     this.requested = true; this.kick();
   }
-  async watchAddress(value) {
+  async watchAddress(value, { signal } = {}) {
     if (!address(value)) throw new Error('Invalid wallet address for live updates.');
     // Await registration before reading an address's history, so the following
     // read itself closes the subscription gap. Recovery derives accounts lazily.
     // The owner must include derived public accounts in getAddresses().
     for (let pass = 0; pass < 8; pass++) {
+      if (signal?.aborted) throw Object.assign(new Error('Wallet address registration wait cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
       if (!this.active()) throw Object.assign(new Error('Wallet live updates stopped.'), { name: 'AbortError', code: 'ABORT_ERR' });
       if (!this.addresses().has(value)) throw new Error('Wallet address is not available for live updates.');
       if (this.registrations.has(`address:${value}`)) return true;
@@ -94,7 +95,7 @@ export class LiveUpdates {
       this.updateAddresses();
       const pending = this.running;
       if (!pending) throw new Error('RPC live updates are reconnecting; retry the wallet refresh.');
-      await this.waitForAddress(value, pending);
+      await this.waitForAddress(value, pending, signal);
       // Allow the worker's finally to install a requested next pass if this
       // address was derived after the previous batch took its snapshot.
       await Promise.resolve();
@@ -104,23 +105,28 @@ export class LiveUpdates {
   wakeAddressWaiters() {
     for (const wake of this.addressWaiters) wake();
   }
-  waitForAddress(value, pending) {
+  waitForAddress(value, pending, signal) {
     const generation = this.generation;
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = error => {
         if (settled) return;
-        settled = true; this.addressWaiters.delete(wake);
+        settled = true; this.addressWaiters.delete(wake); signal?.removeEventListener('abort', abortWait);
         if (error) reject(error); else resolve();
       };
+      // Cancelling one baseline read must not abort the shared registration or
+      // another reader waiting for the same address.
+      const abortWait = () => finish(Object.assign(new Error('Wallet address registration wait cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' }));
       const wake = () => {
-        if (!this.active()) finish(Object.assign(new Error('Wallet live updates stopped.'), { name: 'AbortError', code: 'ABORT_ERR' }));
+        if (signal?.aborted) abortWait();
+        else if (!this.active()) finish(Object.assign(new Error('Wallet live updates stopped.'), { name: 'AbortError', code: 'ABORT_ERR' }));
         // The initial connection also advances the generation. Recheck the
         // current lifecycle before waiting again; never accept an old ID.
         else if (this.generation !== generation) finish();
         else if (this.registrations.has(`address:${value}`) || this.addressCapacity) finish();
       };
       this.addressWaiters.add(wake);
+      signal?.addEventListener('abort', abortWait, { once: true });
       // The target can be ready while unrelated registrations are quota-paced.
       // Still observe the worker's failure, including after this waiter settles.
       pending.then(() => finish(), error => finish(error));
@@ -190,27 +196,38 @@ export class LiveUpdates {
       }
       if (!this.addressCapacity) {
         this.addressBatch = true;
-        let registered = 0;
-        for (const value of desired) {
-          if (!this.current(generation)) return;
-          const key = `address:${value}`;
-          if (this.registrations.has(key)) continue;
-          // Server default: 100 subscriptions per IP, including our two base
-          // subscriptions. Other clients behind the same IP may reduce capacity.
-          if (this.registrations.size >= 100) {
-            this.addressCapacity = true; this.wakeAddressWaiters(); this.report(capacityError()); break;
+        let registered = 0, stopped = false, capacity = false, failure;
+        const remaining = desired.values(), inFlight = new Set();
+        const worker = async () => {
+          while (this.current(generation) && !stopped) {
+            const next = remaining.next();
+            if (next.done) return;
+            const value = next.value, key = `address:${value}`;
+            if (this.registrations.has(key)) continue;
+            // Reserve slots before sending. A completed subscribe may already
+            // have installed its ID while its worker's continuation is queued;
+            // count that key only once, not as both registered and in flight.
+            const occupied = this.registrations.size + [...inFlight].filter(pending => !this.registrations.has(pending)).length;
+            if (occupied >= 100) { stopped = true; capacity = true; return; }
+            inFlight.add(key);
+            try {
+              await this.subscribe(key, 'address', { address: value }, generation);
+              if (!this.current(generation)) return;
+              if (++registered % 8 === 0) this.flushAddresses();
+            } catch (error) {
+              if (!this.current(generation)) return;
+              stopped = true;
+              if (error?.code === -32005) capacity = true;
+              else failure ??= error;
+            } finally { inFlight.delete(key); }
           }
-          try {
-            await this.subscribe(key, 'address', { address: value }, generation);
-            if (!this.current(generation)) return;
-            if (++registered % 8 === 0) this.flushAddresses();
-          }
-          catch (error) {
-            if (!this.current(generation)) return;
-            if (error?.code !== -32005) throw error;
-            this.addressCapacity = true; this.wakeAddressWaiters(); this.report(capacityError()); break;
-          }
-        }
+        };
+        // Both workers own their errors. Drain every in-flight registration
+        // before finally flushes notifications or kick schedules a retry.
+        await Promise.all([worker(), worker()]);
+        if (!this.current(generation)) return;
+        if (failure) throw failure;
+        if (capacity) { this.addressCapacity = true; this.wakeAddressWaiters(); this.report(capacityError()); }
       }
       if (this.current(generation)) this.retryDelay = this.retryMinMs;
     } catch (error) {

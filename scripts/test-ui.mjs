@@ -435,7 +435,8 @@ async function assertTrailingPeriodSendReview({ bounty, address }) {
   await page.getByRole('heading', { name: 'One final look.', exact: true }).waitFor();
   const payload = await application.evaluate(() => globalThis.trailingPeriodPreviewFixture.calls.at(-1));
   assert.deepEqual(payload, {
-    ...(bounty ? { domain: 'example.com', expectedConnections: '1000' } : { address }), amount: '123', feeRate: 1500, subtractFeeFromAmount: false,
+    ...(bounty ? { domain: 'example.com', expectedConnections: '1000' } : { address }), amount: '123', feeRate: 1500,
+    subtractFeeFromAmount: false, allowPendingSpent: false,
   }, 'Review IPC must receive canonical numeric values after trailing-period drafts.');
   assert.equal(await page.locator('#send-amount').inputValue(), '123.');
   assert.equal(await page.locator('#send-fee').inputValue(), '1500.');

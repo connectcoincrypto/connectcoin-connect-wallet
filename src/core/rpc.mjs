@@ -113,6 +113,7 @@ export class RpcClient extends EventEmitter {
     this.connectionErrors = new WeakMap();
     this.pending = new Map(); this.streams = new Map(); this.history = new Map(); this.cooldowns = new Map();
     this.nextId = 0; this.socket = null; this.connecting = null; this.closed = false; this.queuedRequests = 0;
+    this.capacityWaiters = []; this.capacityReservations = 0;
     this.abort = new AbortController();
   }
   diagnostic(event, details) {
@@ -217,6 +218,10 @@ export class RpcClient extends EventEmitter {
       if (stream.diagnostic) stream.diagnostic.error ??= diagnosticError;
       clearRequest(stream); this.streams.delete(id); stream.reject(lossError(stream, error));
     }
+    // Queued requests belong to the connection on which they requested a slot.
+    // Never silently reconnect or transmit a queued broadcast after that loss.
+    for (const waiter of [...this.capacityWaiters]) if (!socket || waiter.socket === socket) waiter.fail(error);
+    this.drainCapacity();
   }
   receive(message, socket = this.socket, frameBytes = 0) {
     if (!PLAIN(message) || message.jsonrpc !== '2.0') throw new Error('Invalid RPC envelope.');
@@ -247,6 +252,7 @@ export class RpcClient extends EventEmitter {
       } else {
         this.pending.delete(message.id); clearRequest(pending); pending.resolve(message.result);
       }
+      this.drainCapacity();
       return;
     }
     if (Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error')) throw new Error('Invalid RPC notification.');
@@ -271,6 +277,7 @@ export class RpcClient extends EventEmitter {
         } else {
           this.streams.delete(params.stream_id); clearRequest(stream);
           stream.resolve({ chunks: stream.next, records: stream.records });
+          this.drainCapacity();
         }
       } else {
         if (!Number.isSafeInteger(params.sequence) || params.sequence !== stream.next || !PLAIN(params.items) || stream.next >= 2002) throw new Error('RPC stream sequence mismatch.');
@@ -313,31 +320,71 @@ export class RpcClient extends EventEmitter {
     clearTimeout(stream.timer);
     stream.timer = setTimeout(() => { this.failAll(new Error('Bounty transfer timed out.'), stream.socket); stream.socket.destroy(); }, this.timeoutMs);
   }
-  async pace(method, params, { signal } = {}) {
-    const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
+  waitForCapacity(socket, signal) {
+    // queuedRequests already bounds these waiters. Reserve synchronously when
+    // granting a slot so simultaneous promise continuations cannot exceed 12.
+    return new Promise((resolve, reject) => {
+      const waiter = { socket, signal, fail: null, grant: null };
+      const remove = () => {
+        const index = this.capacityWaiters.indexOf(waiter);
+        if (index !== -1) this.capacityWaiters.splice(index, 1);
+        signal.removeEventListener('abort', abort);
+      };
+      const abort = () => { waiter.fail(cancelledError()); this.drainCapacity(); };
+      waiter.fail = error => { remove(); reject(error); };
+      waiter.grant = () => {
+        remove(); this.capacityReservations++;
+        let held = true;
+        resolve(() => {
+          if (!held) return;
+          held = false; this.capacityReservations--; this.drainCapacity();
+        });
+      };
+      this.capacityWaiters.push(waiter);
+      signal.addEventListener('abort', abort, { once: true });
+      this.drainCapacity();
+    });
+  }
+  drainCapacity() {
+    while (this.capacityWaiters.length) {
+      const waiter = this.capacityWaiters[0];
+      if (waiter.signal.aborted || this.closed) { waiter.fail(cancelledError()); continue; }
+      if (waiter.socket.destroyed || this.socket !== waiter.socket) { waiter.fail(new Error('RPC connection is closed.')); continue; }
+      if (this.pending.size + this.streams.size + this.capacityReservations >= 12) return;
+      waiter.grant();
+    }
+  }
+  quotaWait(method, params, { reserve = false } = {}) {
     const key = method === 'getblockbounties' ? `${method}:${params.block_hash}` : method;
     const limit = method === 'getblockbounties' || method === 'gettransactions' ? 8 : this.quota;
+    const now = performance.now();
+    const cooldown = Math.max(this.cooldowns.get(method) ?? 0, this.cooldowns.get('*') ?? 0);
+    if (cooldown > now) return Math.ceil(cooldown - now);
+    for (const [k, times] of this.history) if (!times.length || times.at(-1) <= now - this.windowMs) this.history.delete(k);
+    const entries = this.history.get(key) ?? [];
+    while (entries.length && entries[0] <= now - this.windowMs) entries.shift();
+    if (entries.length >= limit) return Math.max(1, entries[0] + this.windowMs - now + 10);
+    if (reserve) {
+      if (!this.history.has(key) && this.history.size >= 4096) throw new Error('RPC quota tracking capacity reached; retry after one minute.');
+      entries.push(now); this.history.set(key, entries);
+    }
+    return 0;
+  }
+  async pace(method, params, { signal, reserve = true } = {}) {
+    const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
     for (;;) {
       if (this.closed) throw closedError();
       if (waitingSignal.aborted) throw cancelledError();
-      const now = performance.now();
-      const cooldown = Math.max(this.cooldowns.get(method) ?? 0, this.cooldowns.get('*') ?? 0);
-      if (cooldown > now) { await delay(Math.ceil(cooldown - now), undefined, { signal: waitingSignal }); continue; }
-      for (const [k, times] of this.history) if (!times.length || times.at(-1) <= now - this.windowMs) this.history.delete(k);
-      const entries = this.history.get(key) ?? [];
-      while (entries.length && entries[0] <= now - this.windowMs) entries.shift();
-      if (entries.length < limit) {
-        if (!this.history.has(key) && this.history.size >= 4096) throw new Error('RPC quota tracking capacity reached; retry after one minute.');
-        entries.push(now); this.history.set(key, entries); return;
-      }
-      await delay(Math.max(1, entries[0] + this.windowMs - now + 10), undefined, { signal: waitingSignal });
+      const wait = this.quotaWait(method, params, { reserve });
+      if (!wait) return;
+      await delay(wait, undefined, { signal: waitingSignal });
     }
   }
   async request(method, params = {}, { onChunk, signal } = {}) {
     const startedAt = performance.now(), diagnostic = { stage: 'request', error: null };
     // Never copy caller params, arbitrary method names, or response bodies into diagnostics.
     const metadata = typeof method === 'string' && Object.hasOwn(PARAMS, method) ? { method } : {};
-    let queued = false, sent = false, unknownOutcome = false, cancelled = false;
+    let queued = false, sent = false, unknownOutcome = false, cancelled = false, releaseCapacity;
     try {
       const clean = validateRpcParams(method, params);
       if ((method === 'getblockbounties') !== (typeof onChunk === 'function')) throw new Error('Bounty requests require a stream callback; other requests must not use one.');
@@ -345,14 +392,23 @@ export class RpcClient extends EventEmitter {
       if (waitingSignal.aborted) throw cancelledError();
       if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
       this.queuedRequests++; queued = true;
-      await this.pace(method, clean, { signal: waitingSignal });
+      await this.pace(method, clean, { signal: waitingSignal, reserve: false });
       if (waitingSignal.aborted) throw cancelledError();
       diagnostic.stage = 'connect';
       const socket = await waitForConnection(this.connect(), waitingSignal);
       diagnostic.stage = 'request';
-      if (this.closed) throw closedError();
-      if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
-      if (this.pending.size + this.streams.size >= 12) throw new Error('Too many RPC requests; retry shortly.');
+      for (;;) {
+        releaseCapacity = await this.waitForCapacity(socket, waitingSignal);
+        if (waitingSignal.aborted) throw cancelledError();
+        if (this.closed) throw closedError();
+        if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
+        // A slot wait may outlive a quota window or receive a new server
+        // cooldown. Debit only immediately before transmission, and never
+        // occupy a global slot while waiting on one method's rate limit.
+        if (!this.quotaWait(method, clean, { reserve: true })) break;
+        releaseCapacity(); releaseCapacity = undefined;
+        await this.pace(method, clean, { signal: waitingSignal, reserve: false });
+      }
       if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
       const id = ++this.nextId;
       const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
@@ -362,6 +418,9 @@ export class RpcClient extends EventEmitter {
         const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false, diagnostic, startedAt };
         request.timer = setTimeout(() => { this.failAll(new Error('RPC request timed out.'), socket); socket.destroy(); }, this.timeoutMs);
         this.pending.set(id, request);
+        // The pending request now owns the same slot until its reply or final
+        // stream.end, even if the stream consumer cancels and starts draining.
+        releaseCapacity();
         try {
           // There is no await between the final cancellation check and write.
           // After write starts, preserve the real reply or unknown outcome;
@@ -386,6 +445,7 @@ export class RpcClient extends EventEmitter {
       }
       throw error;
     } finally {
+      releaseCapacity?.();
       if (queued) this.queuedRequests--;
       const durationMs = performance.now() - startedAt;
       if (!cancelled && durationMs >= 1000) this.diagnostic('rpc.slow', { ...metadata, stage: diagnostic.stage, durationMs, unknownOutcome });

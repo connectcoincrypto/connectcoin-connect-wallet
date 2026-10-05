@@ -10,6 +10,21 @@ const $ = selector => document.querySelector(selector);
 const app = $('#app');
 const dialog = $('#modal');
 const bridge = window.connectwallet;
+let reportedRenderEpoch = null, pendingRenderEpoch = null, readyRenderedEpoch = null;
+function reportReadyAfterPaint() {
+  const epoch = state.securityEpoch;
+  if (!bridge?.reportRendered || readyRenderedEpoch !== epoch || state.phase !== 'unlocked' || state.wallet?.balance == null || !Number.isSafeInteger(epoch) || epoch < 0 || reportedRenderEpoch === epoch || pendingRenderEpoch === epoch || document.visibilityState !== 'visible') return;
+  pendingRenderEpoch = epoch;
+  // Two animation frames allow a paint opportunity after the loaded DOM update.
+  // Only the epoch crosses IPC; never passwords, wallet contents or DOM text.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (pendingRenderEpoch === epoch) pendingRenderEpoch = null;
+    if (readyRenderedEpoch !== epoch || state.securityEpoch !== epoch || state.phase !== 'unlocked' || state.wallet?.balance == null || reportedRenderEpoch === epoch || document.visibilityState !== 'visible') return;
+    bridge.reportRendered(epoch);
+    reportedRenderEpoch = epoch;
+  }));
+}
+document.addEventListener('visibilitychange', reportReadyAfterPaint);
 const paths = {
   grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   send:'<path d="m7 17 10-10M7 7h10v10"/>',receive:'<path d="m17 7-10 10M7 7v10h10"/>',
@@ -272,6 +287,8 @@ function render() {
   textInputRestrictions.sync();
   document.querySelectorAll('input[data-numeric="integer"]').forEach(validateNumericControl);
   rendering = false;
+  readyRenderedEpoch = state.phase === 'unlocked' && state.wallet?.balance != null ? state.securityEpoch : null;
+  reportReadyAfterPaint();
 }
 function updateShell(markup) {
   // Unrelated claim progress must not rebuild Activity, Settings or a form.

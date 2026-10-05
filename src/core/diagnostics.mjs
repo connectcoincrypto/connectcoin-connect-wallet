@@ -3,6 +3,7 @@ import { mkdir, lstat, open, rename, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const EVENTS = new Set([
+  'wallet.unlock_started', 'wallet.unlocked', 'wallet.snapshot_ready', 'wallet.render_ready',
   'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled', 'wallet.subscription_failed',
   'payment.prepare_started', 'payment.prepared', 'payment.prepare_failed', 'payment.prepare_cancelled',
   'claims.started', 'claims.stopped', 'claims.suspended', 'claims.resumed', 'claims.progress', 'claims.failed',

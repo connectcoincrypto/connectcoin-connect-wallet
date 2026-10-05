@@ -58,6 +58,49 @@ test('1.1.0 release notes describe fee deduction and preserve distribution discl
   assert.ok(!releaseNotes('1.2.0', '5678', sha).includes('## New in 1.1.0'));
 });
 
+test('adding 1.1.1 release notes preserves the previously published 1.1.0 text exactly', () => {
+  const notes = releaseNotes('1.1.0', '5678', sha);
+  assert.equal(createHash('sha256').update(notes).digest('hex'),
+    '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
+});
+
+test('1.1.1 release notes describe the startup, locking and synchronization changes with their limits', () => {
+  const notes = releaseNotes('1.1.1', '5678', sha);
+  for (const text of [
+    '# ConnectWallet 1.1.1', '## New in 1.1.1', 'Desktop inactivity auto-lock is off by default',
+    'Existing saved timeouts are preserved', 'Lock after inactivity', '**0**',
+    'supported operating-system screen-lock events', 'an unattended wallet can remain unlocked',
+    'up to four address reads and two address subscriptions', 'subscribed before its baseline is read',
+    'shared RPC limits and server cooldowns remain enforced', 'quota-window wait',
+    'Incremental balances and transaction history', 'compatible RPC servers', 'published atomically',
+    'Expired journals or reorganizations', 'older servers', 'session-only, not an on-disk history cache',
+    'common account path is derived once', 'public-only branches', 'Locking or replacing the session discards this cache',
+    'signing keys, signing behavior and encrypted wallet format are unchanged',
+    'Local startup diagnostics', 'without logging passwords, recovery phrases or private keys',
+  ]) assert.ok(notes.includes(text), text);
+  assert.ok(notes.indexOf('## New in 1.1.1') < notes.indexOf('## Downloads'));
+  assert.equal((notes.match(/## New in 1\.1\.1/g) ?? []).length, 1);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.doesNotMatch(notes, /## New in 1\.1\.0|\d+(?:\.\d+)?%|\d+(?:\.\d+)?x faster/i);
+});
+
+test('1.1.1 release notes preserve replacement review, upgrade and distribution disclosures', () => {
+  const notes = releaseNotes('1.1.1', '5678', sha);
+  for (const text of [
+    'Allow replacing pending transactions', 'off by default', 'fresh server information',
+    'payment review listing the conflicting transaction IDs', 'cancel earlier payments or be rejected by the node',
+    'check the transaction before retrying', 'does not retry an uncertain broadcast automatically',
+    'does not change ConnectCoin consensus or the P2P protocol', 'Close ConnectWallet before upgrading',
+    'same Windows installer family', 'Claims are disabled by default', 'Installers use English',
+    'Windows downloads are unsigned', 'not Developer-ID signed or notarized', 'SHA256SUMS',
+    'trusted server over an unencrypted RPC connection', 'does not independently validate blockchain consensus',
+    '/blob/v1.1.1/docs/installers.md', '/blob/v1.1.1/README.md', '/actions/runs/5678', sha,
+  ]) assert.ok(notes.includes(text), text);
+  for (const otherVersion of ['1.0.0', '1.1.0', '1.2.0']) {
+    assert.ok(!releaseNotes(otherVersion, '5678', sha).includes('## New in 1.1.1'));
+  }
+});
+
 function run(overrides = {}) {
   return {
     id: 5678,

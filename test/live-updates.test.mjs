@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
 import { LiveUpdates } from '../src/core/live-updates.mjs';
 import { GENESIS } from '../src/core/config.mjs';
 
@@ -284,4 +284,135 @@ for (const action of ['close', 'disconnect']) test(`watchAddress promptly reject
     await watched; await flush();
     assert.equal(s.live.registrations.size, 0);
   } finally { pending.resolve({ subscription_id: 'late', tip, cursor: 'c' }); s.live.close(); }
+});
+
+test('address registrations run at most two at once after both serial base subscriptions', async () => {
+  const s = setup(), baseTip = deferred(), baseBounties = deferred(), pending = [];
+  let active = 0, peak = 0;
+  s.setAddresses(Array.from({ length: 5 }, (_, i) => `address${i}`));
+  s.rpc.handler = async call => {
+    if (call.method === 'subscribetip') return baseTip.promise;
+    if (call.method === 'subscribebounties') return baseBounties.promise;
+    if (call.method !== 'subscribeaddress') return;
+    const reply = deferred(); pending.push({ reply, call }); peak = Math.max(peak, ++active);
+    try { return await reply.promise; } finally { active--; }
+  };
+  s.live.start(); await flush();
+  assert.deepEqual(s.rpc.calls.map(call => call.method), ['subscribetip']);
+  baseTip.resolve({ subscription_id: 'base-tip', tip, cursor: 'c' }); await flush();
+  assert.deepEqual(s.rpc.calls.map(call => call.method), ['subscribetip', 'subscribebounties']);
+  baseBounties.resolve({ subscription_id: 'base-bounties', tip, cursor: 'c' }); await flush();
+  assert.equal(pending.length, 2); assert.equal(active, 2);
+  const target = s.live.watchAddress('address1');
+  pending[1].reply.resolve({ subscription_id: 'address1', tip, cursor: 'c' });
+  assert.equal(await target, true); await flush();
+  assert.equal(pending.length, 3); assert.equal(active, 2);
+  pending[0].reply.resolve({ subscription_id: 'address0', tip, cursor: 'c' }); await flush();
+  for (let i = 2; i < 5; i++) { pending[i].reply.resolve({ subscription_id: `address${i}`, tip, cursor: 'c' }); await flush(); }
+  assert.equal(peak, 2); assert.equal(active, 0); assert.equal(s.live.registrations.size, 7);
+  assert.equal(new Set(s.rpc.calls.filter(call => call.method === 'subscribeaddress').map(call => call.params.address)).size, 5);
+  assert.equal(s.errors.length, 0); assert.equal(s.live.running, null); s.live.close();
+});
+
+test('delayed replies reserve subscription capacity without overshooting or double-counting installed IDs', async () => {
+  const s = setup(), pending = []; let calls = 0;
+  s.setAddresses(Array.from({ length: 105 }, (_, i) => `address${i}`));
+  s.rpc.handler = call => {
+    if (call.method !== 'subscribeaddress' || ++calls < 97) return;
+    const reply = deferred(); pending.push(reply); return reply.promise;
+  };
+  s.live.start(); await flush();
+  assert.equal(calls, 98); assert.equal(pending.length, 2); assert.equal(s.live.registrations.size, 98);
+  pending[0].resolve({ subscription_id: 'delayed97', tip, cursor: 'c' }); await flush();
+  assert.equal(calls, 98); assert.equal(s.live.registrations.size, 99);
+  assert.equal(s.errors.length, 0, 'Capacity is finalized only after the sibling registration drains');
+  assert.ok(s.live.running);
+  pending[1].resolve({ subscription_id: 'delayed98', tip, cursor: 'c' }); await flush();
+  assert.equal(calls, 98); assert.equal(s.live.registrations.size, 100);
+  assert.equal(s.errors.length, 1); assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_CAPACITY');
+  assert.equal(s.live.running, null); assert.equal(s.timers.size, 0); s.live.close();
+});
+
+for (const siblingFails of [false, true]) test(`ordinary registration failure drains its ${siblingFails ? 'failing' : 'successful'} sibling before retry`, async () => {
+  const s = setup(), pending = [];
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.rpc.handler = call => {
+    if (call.method !== 'subscribeaddress') return;
+    const reply = deferred(); pending.push(reply); return reply.promise;
+  };
+  s.live.start(); await flush(); assert.equal(pending.length, 2);
+  const firstError = new Error('first failure'); pending[0].reject(firstError); await flush();
+  assert.equal(pending.length, 2); assert.ok(s.live.running); assert.equal(s.errors.length, 0); assert.equal(s.timers.size, 0);
+  if (siblingFails) pending[1].reject(new Error('sibling failure'));
+  else pending[1].resolve({ subscription_id: 'surviving-address', tip, cursor: 'c' });
+  await flush();
+  assert.equal(s.errors.length, 1); assert.equal(s.errors[0], firstError);
+  assert.equal(s.live.running, null); assert.equal(s.timers.size, 1);
+  assert.equal(s.live.registrations.size, siblingFails ? 2 : 3);
+  assert.equal(s.live.addressBatch, false);
+  s.rpc.handler = undefined; s.fire(); await flush();
+  assert.equal(s.live.registrations.size, 5); assert.equal(s.timers.size, 0); s.live.close();
+});
+
+test('server capacity failure stops scheduling and drains the sibling without retry or duplicate warnings', async () => {
+  const s = setup(), pending = [];
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.rpc.handler = call => {
+    if (call.method !== 'subscribeaddress') return;
+    const reply = deferred(); pending.push(reply); return reply.promise;
+  };
+  s.live.start(); await flush();
+  pending[0].reject(Object.assign(new Error('capacity'), { code: -32005 })); await flush();
+  assert.equal(pending.length, 2); assert.equal(s.errors.length, 0); assert.ok(s.live.running);
+  pending[1].resolve({ subscription_id: 'accepted-address', tip, cursor: 'c' }); await flush();
+  assert.equal(s.live.registrations.size, 3); assert.equal(s.errors.length, 1);
+  assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_CAPACITY'); assert.equal(s.timers.size, 0);
+  assert.equal(await s.live.watchAddress('abcdefgh3'), false);
+  s.live.updateAddresses(); await flush(); assert.equal(pending.length, 2); s.live.close();
+});
+
+for (const action of ['close', 'reconnect']) test(`${action} invalidates both in-flight registrations and drains old workers before new work`, async () => {
+  const s = setup(), pending = [];
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.rpc.handler = call => {
+    if (call.method !== 'subscribeaddress') return;
+    const reply = deferred(); pending.push({ reply, signal: call.options.signal }); return reply.promise;
+  };
+  s.live.start(); await flush(); assert.equal(pending.length, 2);
+  if (action === 'close') s.live.close(); else { s.rpc.disconnect(); await s.rpc.connect(); }
+  assert.ok(pending.every(item => item.signal.aborted));
+  s.rpc.handler = undefined;
+  pending[0].reply.resolve({ subscription_id: 'old-address', tip, cursor: 'c' }); await flush();
+  assert.equal(s.live.registrations.size, 0); assert.ok(s.live.running);
+  assert.equal(s.rpc.calls.length, 4, 'The next generation must wait for both old workers to settle');
+  pending[1].reply.reject(new Error('old failure')); await flush();
+  assert.equal(s.live.ids.has('old-address'), false); assert.equal(s.errors.length, 0);
+  assert.equal(s.live.running, null); assert.equal(s.timers.size, 0);
+  assert.equal(s.live.registrations.size, action === 'close' ? 0 : 5); s.live.close();
+});
+
+test('aborting one watchAddress waiter preserves the shared subscription and other waiters', async () => {
+  const s = setup(), pending = deferred(), controller = new AbortController();
+  s.rpc.handler = call => call.method === 'subscribeaddress' ? pending.promise : undefined;
+  s.live.start(); await flush();
+  const cancelled = assert.rejects(s.live.watchAddress('abcdefgh1', { signal: controller.signal }), { name: 'AbortError', code: 'ABORT_ERR' });
+  const watched = s.live.watchAddress('abcdefgh1');
+  await flush(); assert.equal(s.live.addressWaiters.size, 2); assert.equal(getEventListeners(controller.signal, 'abort').length, 1);
+  controller.abort(); await cancelled;
+  assert.equal(s.live.addressWaiters.size, 1); assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  assert.equal(s.rpc.calls.find(call => call.method === 'subscribeaddress').options.signal.aborted, false);
+  pending.resolve({ subscription_id: 'shared-address', tip, cursor: 'c' }); assert.equal(await watched, true); await flush();
+  assert.equal(s.live.addressWaiters.size, 0); assert.equal(s.errors.length, 0); s.live.close();
+});
+
+test('watchAddress removes abort listeners on successful registration and rejects already-aborted waits', async () => {
+  const s = setup(), pending = deferred(), controller = new AbortController();
+  s.rpc.handler = call => call.method === 'subscribeaddress' ? pending.promise : undefined;
+  s.live.start(); await flush();
+  const watched = s.live.watchAddress('abcdefgh1', { signal: controller.signal });
+  pending.resolve({ subscription_id: 'ready-address', tip, cursor: 'c' }); assert.equal(await watched, true);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0); assert.equal(s.live.addressWaiters.size, 0);
+  controller.abort();
+  await assert.rejects(s.live.watchAddress('abcdefgh1', { signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(s.live.addressWaiters.size, 0); await flush(); assert.equal(s.errors.length, 0); s.live.close();
 });

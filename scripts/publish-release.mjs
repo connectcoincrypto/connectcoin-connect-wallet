@@ -320,6 +320,21 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.1') {
+    const highlights = [
+      '## New in 1.1.1',
+      '',
+      '- **Desktop inactivity auto-lock is off by default**, so an idle timer no longer interrupts Automatic Claims in new profiles. Existing saved timeouts are preserved; set **Lock after inactivity** to **0** in Settings to disable a saved timeout. Manual locking, suspend and supported operating-system screen-lock events still lock the wallet and stop claims. Without an inactivity timeout, an unattended wallet can remain unlocked.',
+      '- **Bounded parallel startup:** the initial journal-based synchronization pipelines up to four address reads and two address subscriptions. Each address is subscribed before its baseline is read, and journal replay completes before a new balance/history snapshot is published. The shared RPC limits and server cooldowns remain enforced; large histories can still require a quota-window wait.',
+      '- **Incremental balances and transaction history** on compatible RPC servers: after an initial baseline, later updates retrieve journal changes instead of downloading the entire history again. Snapshots are validated and published atomically. Expired journals or reorganizations can require a new baseline; older servers retain the compatibility fallback. The synchronization cache is session-only, not an on-disk history cache.',
+      '- **More efficient public address preparation:** the common account path is derived once per unlocked security context, then receive/change addresses are derived from public-only branches. Locking or replacing the session discards this cache. Existing addresses, derivation paths, signing keys, signing behavior and encrypted wallet format are unchanged.',
+      '- **Reviewed pending replacements:** the optional **Allow replacing pending transactions** setting is off by default. The wallet prefers free confirmed funds, and any selected pending-spent inputs require fresh server information and a payment review listing the conflicting transaction IDs. Replacement may cancel earlier payments or be rejected by the node. A lost broadcast reply is not proof of failure: check the transaction before retrying; the wallet does not retry an uncertain broadcast automatically.',
+      '- Local startup diagnostics distinguish unlocking, validated snapshot readiness and first render, helping investigate slow loading without logging passwords, recovery phrases or private keys.',
+      '',
+      'This update does not change ConnectCoin consensus or the P2P protocol. Close ConnectWallet before upgrading and keep a secure recovery backup. Existing wallet profiles and keys are retained; choose the same Windows installer family as your existing installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version !== '1.1.0') return notes;
   const highlights = [
     '## New in 1.1.0',

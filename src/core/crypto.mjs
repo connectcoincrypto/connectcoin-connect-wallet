@@ -2,7 +2,7 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic as validateBip39 } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
-import { HDKey } from '@scure/bip32';
+import { HARDENED_OFFSET, HDKey } from '@scure/bip32';
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js';
 import { bech32m } from '@scure/base';
 
@@ -82,6 +82,51 @@ export function deriveAccount(mnemonic, { network = 'testnet4', index = 0, chang
     root?.wipePrivateData();
     child?.wipePrivateData();
   }
+}
+// Keep the returned closures outside the secret-bearing constructor scope.
+// These branches contain compressed public points (including their parity),
+// public chain codes and metadata only; they cannot derive hardened children.
+function publicAccountDeriver(network, coin, branches) {
+  return Object.freeze({
+    derive(index, change) {
+      if (!branches) throw new Error('Public account deriver has been destroyed');
+      if (!Number.isSafeInteger(index) || index < 0 || index > MAX_ADDRESS_INDEX || ![0, 1].includes(change)) throw new Error('Invalid derivation index');
+      const child = branches[change].deriveChild(index);
+      // Strip parity only after BIP32 derivation, for the final native x-only
+      // key. This is the same untweaked point used by deriveAccount/signing.
+      const publicKey = Buffer.from(child.publicKey.subarray(1)).toString('hex');
+      return { publicKey, address: encodeAddress(publicKey, network),
+        path: `m/44'/${coin}'/0'/${change}/${index}`, network, index, change };
+    },
+    destroy() { branches = null; },
+  });
+}
+/** Derive many public addresses without repeating BIP39 or the hardened path.
+ * Private nodes and the seed are wiped before this public-only handle returns.
+ * No extended key, mnemonic, seed or private node is exposed or retained by it.
+ */
+export function createPublicAccountDeriver(mnemonic, { network = 'testnet4', passphrase = '' } = {}) {
+  if (typeof network !== 'string') throw new Error('Unsupported ConnectCoin network');
+  const { coin } = networkParameters(network);
+  const phrase = normalizeMnemonic(mnemonic);
+  if (!validateMnemonic(phrase)) throw new Error('Recovery phrase has an invalid word count or checksum');
+  if (typeof passphrase !== 'string' || passphrase.length > 1024) throw new Error('Invalid BIP39 passphrase');
+  const seed = mnemonicToSeedSync(phrase, passphrase), privateNodes = [];
+  let branches;
+  try {
+    let node = HDKey.fromMasterSeed(seed); privateNodes.push(node);
+    // Derive one level at a time so every reachable private intermediate can
+    // be explicitly wiped, including when construction fails partway through.
+    for (const index of [44, coin, 0]) {
+      node = node.deriveChild(HARDENED_OFFSET + index); privateNodes.push(node);
+    }
+    node.wipePrivateData();
+    branches = [node.deriveChild(0), node.deriveChild(1)];
+  } finally {
+    seed.fill(0);
+    for (const node of privateNodes) node.wipePrivateData();
+  }
+  return publicAccountDeriver(network, coin, branches);
 }
 export function signSchnorr(hash, privateKey) {
   if (!(hash instanceof Uint8Array) || hash.length !== 32) throw new Error('Expected 32-byte signature digest');

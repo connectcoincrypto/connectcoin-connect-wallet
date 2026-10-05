@@ -17,6 +17,18 @@ async function fixture(t) {
 }
 async function rows(file) { return (await readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); }
 
+test('startup timing logs retain only safe numeric timing metadata', async t => {
+  const log = new DiagnosticLog({ directory: await fixture(t) });
+  const events = ['wallet.unlock_started', 'wallet.unlocked', 'wallet.snapshot_ready', 'wallet.render_ready'];
+  for (const event of events) log.record(event, { stage: 'lifecycle', runId: 1, durationMs: 123.5,
+    password: 'PRIVATE-CANARY', address: 'PRIVATE-CANARY', balance: 'PRIVATE-CANARY', history: ['PRIVATE-CANARY'] });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored.map(row => row.event), events);
+  for (const row of stored) assert.deepEqual(row.details, { stage: 'lifecycle', runId: 1, durationMs: 123.5 });
+  assert.equal(JSON.stringify(stored).includes('PRIVATE-CANARY'), false);
+});
+
 test('helper DNS, blocked destination and target exhaustion retain safe distinct reasons', () => {
   for (const [message, category] of [
     ['DNS resolution failed for private-canary.example: system diagnostic', 'dns'],

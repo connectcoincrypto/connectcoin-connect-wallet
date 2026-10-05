@@ -6,7 +6,7 @@ import { buildPaymentUri, parsePaymentUri, parseClipboardPaymentText, validatePa
 import { paymentQrDataUrl } from './payment-qr.mjs';
 import { RpcClient } from './rpc.mjs';
 import { readConfig, writeConfig, validateConfig, validateTheme, validateDeveloperMode, validateTip } from './config.mjs';
-import { deriveAccount, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, networkParameters, MAX_ADDRESS_INDEX } from './crypto.mjs';
+import { createPublicAccountDeriver, generateMnemonic, normalizeMnemonic, validateMnemonic, decodeAddress, networkParameters, MAX_ADDRESS_INDEX } from './crypto.mjs';
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { MAX_PAYMENT_INPUTS, MAX_PAYMENT_PARENT_HEX_BYTES, selectPaymentFunding, prepareClaim, attachClaimProof, parseCoinAmount, formatCoinAmount, estimateClaimFee, transactionIdFromRaw, normalizeDomain, workTargetForExpectedConnections } from './transaction.mjs';
 import { buildPaymentInWorker } from './payment-builder.mjs';
@@ -26,6 +26,9 @@ const HASH = /^[0-9a-f]{64}$/;
 const MONEY = /^-?\d{1,19}$/;
 const ADDRESS_GAP = 20;
 const ADDRESS_BUILD_BATCH = 32;
+// Pipeline round trips, not unbounded address fan-out. Each worker sends only
+// one page at a time through RpcClient's shared capacity and per-method quota.
+const ADDRESS_BASELINE_CONCURRENCY = 4;
 // vault.mjs permits 131072 ciphertext hex characters, or 65536 plaintext bytes.
 // Keep every saved annotation; when full, the user can send without new notes.
 const WALLET_PLAINTEXT_LIMIT = 65536;
@@ -75,6 +78,7 @@ export class WalletService extends EventEmitter {
     this.sendPreparation = null; this.sendConfirmation = null;
     this.replacement = null; this.walletWrite = null; this.closed = false;
     this.walletExists = false; this.accounts = []; this.accountCache = new Map(); this.utxos = []; this.history = [];
+    this.accountDerivation = null;
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
     this.network = { status: 'offline', chain: network, height: null };
     this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {}; this.retiredClaims = new Map(); this.tip = null;
@@ -351,6 +355,7 @@ export class WalletService extends EventEmitter {
     walletName(data.name);
     if (data.paymentDetails !== undefined) data.paymentDetails = validateStoredPaymentDetails(data.paymentDetails);
     this.replacement = null; this.setup = null;
+    this.clearAccountDerivation();
     this.session = { data, password }; this.epoch++; this.activity(); this.error = null;
     const epoch = this.epoch;
     await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch); this.emitState();
@@ -358,12 +363,25 @@ export class WalletService extends EventEmitter {
     if (this.session && !this.closed && this.config.claims.enabled) void this.resumeClaims();
     void this.refresh().catch(() => {});
   }
+  clearAccountDerivation() {
+    const previous = this.accountDerivation;
+    this.accountDerivation = null; this.accountCache.clear();
+    previous?.deriver.destroy();
+  }
   publicAccount(index, change) {
     this.assertSession();
+    if (!Number.isSafeInteger(index) || index < 0 || index > MAX_ADDRESS_INDEX || ![0, 1].includes(change)) throw new Error('Invalid derivation index');
+    const context = this.accountDerivation;
+    // Check ownership before even a cache hit. Only public derivation branches
+    // are retained; seed/private nodes are disposed before the helper returns.
+    if (!context || context.epoch !== this.epoch || context.session !== this.session || context.network !== this.config.network) {
+      this.clearAccountDerivation();
+      this.accountDerivation = { epoch: this.epoch, session: this.session, network: this.config.network,
+        deriver: createPublicAccountDeriver(this.session.data.mnemonic, { network: this.config.network, passphrase: this.session.data.passphrase }) };
+    }
     const cacheKey = `${change}:${index}`;
     if (this.accountCache.has(cacheKey)) return this.accountCache.get(cacheKey);
-    const account = deriveAccount(this.session.data.mnemonic, { network: this.config.network, index, change, passphrase: this.session.data.passphrase });
-    const { privateKey, ...publicData } = account; privateKey.fill(0);
+    const publicData = this.accountDerivation.deriver.derive(index, change);
     this.accountCache.set(cacheKey, publicData); return publicData;
   }
   async buildAccounts() {
@@ -475,7 +493,7 @@ export class WalletService extends EventEmitter {
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
     this.tip = null; this.retiredClaims.clear();
-    this.fundingCache.clear(); this.fundingPending.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.reserved.clear(); this.accountCache.clear();
+    this.fundingCache.clear(); this.fundingPending.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.reserved.clear(); this.clearAccountDerivation();
     // Install an idle client while still locked. Password entry can finish
     // before a slow claims helper drains; that newer session must not inherit
     // the permanently closed RPC/live-update objects from the previous one.
@@ -521,13 +539,13 @@ export class WalletService extends EventEmitter {
     do {
       this.assertSession(epoch);
       if (seen.size >= 1000) throw new Error('Address pagination exceeds this release’s local resource limit.');
-      if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
+      if (signal?.aborted) throw Object.assign(new Error('Address query cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
       const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}),
         ...(method === 'getaddressutxos' && includePendingSpent ? { include_pending_spent: true } : {}),
       }, { signal }));
       this.assertSession(epoch);
       if (rpc !== this.rpc) throw new Error('RPC connection changed.');
-      if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
+      if (signal?.aborted) throw Object.assign(new Error('Address query cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
       if (result.address !== address || result.unit !== 'connects' || !Array.isArray(result.items) || result.items.length > 500) throw new Error('RPC returned an invalid address page.');
       onTip?.(result.tip);
       items.push(...result.items.map(validateRow));
@@ -686,16 +704,33 @@ export class WalletService extends EventEmitter {
           // closes races with mining, mempool changes and keyset insertion.
           candidate = await beginAddressSync({ rpc, network: this.config.network, addresses, check });
           this.addressChangesSupported = true;
-          for (const account of accounts) {
-            check();
-            if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address);
-            check();
-            const history = await this.page('getaddresshistory', account.address);
-            const issued = this.session.data[account.change ? 'changeIndex' : 'receiveIndex'];
-            const utxos = history.length || account.index <= issued
-              ? await this.page('getaddressutxos', account.address, { includePendingSpent: true }) : [];
-            setAddressBaseline(candidate, account.address, { history, utxos });
-          }
+          const baseline = new AbortController();
+          let nextAccount = 0, failure;
+          const worker = async () => {
+            while (!baseline.signal.aborted && nextAccount < accounts.length) {
+              const account = accounts[nextAccount++];
+              try {
+                check();
+                if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address, { signal: baseline.signal });
+                check();
+                if (baseline.signal.aborted) return;
+                const history = await this.page('getaddresshistory', account.address, { signal: baseline.signal });
+                check();
+                const issued = this.session.data[account.change ? 'changeIndex' : 'receiveIndex'];
+                const utxos = history.length || account.index <= issued
+                  ? await this.page('getaddressutxos', account.address, { includePendingSpent: true, signal: baseline.signal }) : [];
+                check();
+                if (baseline.signal.aborted) return;
+                setAddressBaseline(candidate, account.address, { history, utxos });
+              } catch (error) {
+                // Keep the original failure, stop queued work, and observe all
+                // already-sent replies before retrying or discarding this snapshot.
+                if (!baseline.signal.aborted) { failure = error; baseline.abort(); }
+              }
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(ADDRESS_BASELINE_CONCURRENCY, accounts.length) }, worker));
+          if (baseline.signal.aborted) throw failure;
         }
         candidate = await updateAddressSync(candidate, { rpc, check }); check();
         const snapshot = addressSyncSnapshot(candidate, accounts);

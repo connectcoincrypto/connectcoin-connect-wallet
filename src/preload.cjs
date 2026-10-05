@@ -25,6 +25,9 @@ contextBridge.exposeInMainWorld('connectwallet', Object.freeze({
     ipcRenderer.on('connectwallet:state', listener);
     return () => ipcRenderer.removeListener('connectwallet:state', listener);
   },
+  reportRendered: epoch => {
+    if (Number.isSafeInteger(epoch) && epoch >= 0) ipcRenderer.send('connectwallet:render-ready', epoch);
+  },
   onBeforeClose: callback => {
     if (typeof callback !== 'function') throw new Error('A callback is required.');
     const listener = async (_event, requestId) => {
