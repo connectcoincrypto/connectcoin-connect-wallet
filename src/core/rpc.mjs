@@ -6,7 +6,8 @@ import { validateRpcEndpoint } from './config.mjs';
 
 const PARAMS = Object.freeze({
   getchaintip: [], getrecentblockhashes: [], getblockbounties: ['block_hash'],
-  getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor'],
+  getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
+  getaddresschanges: ['addresses', 'cursor'],
   gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
   subscribebounties: [], subscribeaddress: ['address'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
@@ -26,12 +27,27 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (key !== 'cursor' && key !== 'include_pending_spent') throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (!Object.hasOwn(descriptor, 'value')) throw new Error('RPC parameters must be plain data.');
     const value = descriptor.value;
+    if (key === 'include_pending_spent') {
+      if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
+      clean[key] = value; continue;
+    }
+    if (key === 'addresses') {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 100) throw new Error('Invalid RPC address batch.');
+      const addresses = [];
+      for (let index = 0; index < value.length; index++) {
+        const entry = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!entry || !Object.hasOwn(entry, 'value') || typeof entry.value !== 'string' || entry.value.length < 8 || entry.value.length > 90 || !/^[a-zA-Z0-9]+$/.test(entry.value)) throw new Error('Invalid RPC address batch.');
+        addresses.push(entry.value);
+      }
+      if (new Set(addresses).size !== addresses.length) throw new Error('Duplicate RPC address.');
+      clean[key] = addresses; continue;
+    }
     if (key === 'txids') {
       if (!Array.isArray(value) || value.length < 1 || value.length > 32) throw new Error('Invalid RPC transaction batch.');
       const hashes = [];

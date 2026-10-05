@@ -142,7 +142,8 @@ try {
       fixture.preview = { previewId: `synthetic-review-${fixture.confirmations.length}`, txid: fixture.txid,
         type: 'payment', address: payload.address, amount: '1.249999', requestedAmount: payload.amount,
         fee: '0.000001', total: payload.amount, subtractFeeFromAmount: payload.subtractFeeFromAmount,
-        label: payload.label, message: payload.message };
+        label: payload.label, message: payload.message,
+        replacingTxids: payload.allowPendingSpent === true ? ['cd'.repeat(32)] : [] };
       if (fixture.previewGate) await fixture.previewGate;
       fixture.previewCompleted++;
       return fixture.preview;
@@ -438,6 +439,28 @@ try {
   await expect(page.locator('#view-error')).toBeHidden();
   assert.equal(await application.evaluate(() => globalThis.sendFeedbackFixture.previewCalls), previewsBeforeLock,
     'A review queued before locking must not start after its preference write completes.');
+  console.log(`PASS: ${stage}.`);
+
+  stage = 'pending replacement is explicit, reviewed and cleared on wallet lock';
+  await publishState({ newEpoch: true });
+  await page.locator('[data-view="send"]').first().click();
+  await page.locator('.advanced-fee summary').click();
+  await expect(page.locator('#send-replace-pending')).not.toBeChecked();
+  await page.locator('#send-replace-pending').check();
+  await review();
+  await expect(page.locator('dialog[open]')).toContainText('This payment conflicts with 1 pending transaction');
+  await expect(page.locator('dialog[open]')).toContainText('cd'.repeat(32));
+  await page.getByRole('button', { name: 'Go back', exact: true }).click();
+  await page.locator('#send-replace-pending').uncheck();
+  await review();
+  await expect(page.locator('dialog[open]')).not.toContainText('This payment conflicts');
+  await page.getByRole('button', { name: 'Go back', exact: true }).click();
+  await page.locator('#send-replace-pending').check();
+  await publishState({ locked: true, newEpoch: true });
+  await page.locator('#unlock-password').waitFor();
+  await publishState({ newEpoch: true });
+  await page.locator('[data-view="send"]').first().click();
+  await expect(page.locator('#send-replace-pending')).not.toBeChecked();
   console.log(`PASS: ${stage}.`);
 
   assert.equal(await application.evaluate(() => globalThis.sendFeedbackFixture.service.session), null,

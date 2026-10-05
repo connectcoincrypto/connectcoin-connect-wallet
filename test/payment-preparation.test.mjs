@@ -27,9 +27,10 @@ async function fixture(t, utxos) {
   service.session = { data: { mnemonic, network: 'main', receiveIndex: 0, changeIndex: 0 }, password: 'unused' };
   service.utxos = utxos;
   await service.buildAccounts();
-  const calls = [], parents = new Map(utxos.map(row => [row.txid, row.rawTransaction]));
+  const calls = [], requests = [], parents = new Map(utxos.map(row => [row.txid, row.rawTransaction]));
   service.rpc = { async request(method, params) {
     calls.push(method);
+    requests.push({ method, params: structuredClone(params) });
     if (method === 'getchaintip') return tip;
     if (method === 'getaddressutxos') {
       const rows = params.address === owner.address ? utxos : [];
@@ -43,8 +44,78 @@ async function fixture(t, utxos) {
   } };
   service.refresh = () => { assert.fail('A payment must not wait for display history'); };
   t.after(() => { service.cancelSendPreview(); service.statePublisher.close(); });
-  return { service, calls };
+  return { service, calls, requests };
 }
+
+test('pending-spent inputs require deliberate opt-in and disclose only selected conflicting transactions', async t => {
+  const utxos = coins(2, 5n * COIN);
+  const spender = 'cd'.repeat(32);
+  for (const row of utxos) row.pending_spent_by = spender;
+  const { service, requests, calls } = await fixture(t, utxos);
+  for (const row of utxos) service.reserved.add(`${row.txid}:${row.vout}`);
+  await assert.rejects(service.previewSend(payment), /Insufficient/);
+  await assert.rejects(service.previewSend({ ...payment, allowPendingSpent: 'true' }), /Choose whether/);
+  const review = await service.previewSend({ ...payment, allowPendingSpent: true });
+  assert.deepEqual(review.replacingTxids, [spender]);
+  assert.deepEqual(service.preview.replacingTxids, [spender]);
+  assert.ok(Object.isFrozen(service.preview.replacingTxids));
+  assert.equal(parseTransaction(service.preview.hex).inputs.length, 1);
+  assert.ok(requests.some(row => row.method === 'getaddressutxos' && row.params.include_pending_spent === true));
+  assert.equal(calls.includes('sendrawtransaction'), false);
+  await assert.rejects(service.previewSend(payment), /Insufficient/);
+  assert.equal(service.preview, null, 'A subsequent ordinary review never inherits opt-in');
+});
+
+test('pending replacement opt-in never releases an uncertain reservation without fresh conflict metadata', async t => {
+  const utxos = coins(1, 5n * COIN);
+  const { service } = await fixture(t, utxos);
+  service.reserved.add(`${utxos[0].txid}:0`);
+  await assert.rejects(service.previewSend({ ...payment, allowPendingSpent: true }), /Insufficient/);
+});
+
+test('pending replacement still refuses unconfirmed or immature outputs and malformed spenders', async t => {
+  const utxos = coins(1, 5n * COIN);
+  utxos[0].pending_spent_by = 'cd'.repeat(32);
+  const { service } = await fixture(t, utxos);
+  for (const state of [
+    { status: 'pending', mature: true, coinbase: false },
+    { status: 'confirmed', mature: false, coinbase: false },
+    { status: 'confirmed', mature: true, coinbase: true, block_height: 100 },
+  ]) {
+    Object.assign(utxos[0], state);
+    await assert.rejects(service.previewSend({ ...payment, allowPendingSpent: true }), /Insufficient/);
+  }
+  Object.assign(utxos[0], { status: 'confirmed', mature: true, coinbase: false, pending_spent_by: 'not-a-hash' });
+  await assert.rejects(service.previewSend({ ...payment, allowPendingSpent: true }), /Invalid RPC pending spender/);
+});
+
+test('free inputs are preferred and no replacement warning is fabricated merely from the opt-in', async t => {
+  const utxos = coins(2, 5n * COIN);
+  utxos[0].pending_spent_by = 'cd'.repeat(32);
+  const { service } = await fixture(t, utxos);
+  const review = await service.previewSend({ ...payment, allowPendingSpent: true });
+  assert.deepEqual(review.replacingTxids, []);
+  assert.equal(parseTransaction(service.preview.hex).inputs[0].txid, utxos[1].txid);
+});
+
+test('pre-transmission cancellation of a replacement preserves the original input reservation', async t => {
+  for (const alreadyReserved of [true, false]) {
+    const utxos = coins(1, 5n * COIN);
+    utxos[0].pending_spent_by = 'cd'.repeat(32);
+    const { service } = await fixture(t, utxos);
+    const outpoint = `${utxos[0].txid}:0`;
+    if (alreadyReserved) service.reserved.add(outpoint);
+    const review = await service.previewSend({ ...payment, allowPendingSpent: true });
+    service.persist = async () => {};
+    const request = service.rpc.request;
+    service.rpc.request = (method, params) => {
+      if (method === 'sendrawtransaction') throw Object.assign(new Error('Synthetic pre-transmission cancellation'), { name: 'AbortError', notSent: true });
+      return request(method, params);
+    };
+    await assert.rejects(service.confirmSend({ previewId: review.previewId }), { name: 'AbortError' });
+    assert.equal(service.reserved.has(outpoint), alreadyReserved);
+  }
+});
 
 test('3 CONN with hundreds of claim outputs prepares without history and fetches only required parents', async t => {
   const { service, calls } = await fixture(t, coins(1000));

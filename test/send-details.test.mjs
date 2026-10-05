@@ -229,6 +229,7 @@ for (const uncertain of [false, true]) test(`${uncertain ? 'uncertain' : 'succes
   await service.unlock({ password });
   assert.deepEqual(service.session.data.paymentDetails[review.txid], details);
   service.rpc.request = async (method, params) => {
+    if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     if (method === 'getaddressbalance') return { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', immature: '0', pending_delta: '0' };
     if (method === 'getaddressutxos') return { tip, address: params.address, unit: 'connects', items: [], next_cursor: null };
     if (method === 'getaddresshistory') return { tip, address: params.address, unit: 'connects', items: params.address === account.address ? [{ txid: review.txid, balance_delta: '-10000000000', status: 'confirmed', confirmations: 1, block_height: 5 }] : [], next_cursor: null };

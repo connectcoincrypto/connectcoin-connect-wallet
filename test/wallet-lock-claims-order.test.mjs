@@ -14,6 +14,7 @@ class Backend extends EventEmitter {
   constructor() { super(); this.socket = {}; }
   async connect() { return this.socket; }
   async request(method, params) {
+    if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
       subscription_id: `${method}-${params?.address ?? 'global'}`, tip, cursor: 'fixture-journal',
     };

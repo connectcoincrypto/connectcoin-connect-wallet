@@ -19,6 +19,7 @@ import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
 import { createRsaProbe } from './rsa-probe.mjs';
 import { LiveUpdates } from './live-updates.mjs';
 import { EventRefresh } from './event-refresh.mjs';
+import { addressSetKey, beginAddressSync, setAddressBaseline, updateAddressSync, addressSyncSnapshot } from './address-sync.mjs';
 import { setImmediate as yieldTask } from 'node:timers/promises';
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -111,6 +112,7 @@ export class WalletService extends EventEmitter {
     this.liveUpdateWarning = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
     this.walletUpdateRevision = 0; this.walletReadRevision = -1;
+    this.addressSync = null; this.addressSyncPending = null; this.addressChangesSupported = undefined;
     const active = () => !this.closed && Boolean(this.session) && this.rpc === rpc;
     this.walletUpdates = new EventRefresh({ isActive: active, delayMs: 150, run: async () => {
       // An event during an existing read needs a fresh pass, not its old promise.
@@ -514,13 +516,15 @@ export class WalletService extends EventEmitter {
     this.tip = tip; return tip;
   }
   checkResponse(response) { validateTip(response?.tip, this.config.network); return response; }
-  async page(method, address, { firstOnly = false, onTip, onPage, signal } = {}) {
+  async page(method, address, { firstOnly = false, onTip, onPage, signal, includePendingSpent = false } = {}) {
     const epoch = this.epoch, rpc = this.rpc; const items = []; let cursor; const seen = new Set();
     do {
       this.assertSession(epoch);
       if (seen.size >= 1000) throw new Error('Address pagination exceeds this release’s local resource limit.');
       if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
-      const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}) }, { signal }));
+      const result = this.checkResponse(await rpc.request(method, { address, ...(cursor ? { cursor } : {}),
+        ...(method === 'getaddressutxos' && includePendingSpent ? { include_pending_spent: true } : {}),
+      }, { signal }));
       this.assertSession(epoch);
       if (rpc !== this.rpc) throw new Error('RPC connection changed.');
       if (signal?.aborted) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
@@ -590,6 +594,7 @@ export class WalletService extends EventEmitter {
   async refreshInternal(epoch) {
     await this.ensureNetwork(); this.assertSession(epoch);
     const updateRevision = this.walletUpdateRevision;
+    if (!this.session.data.needsRecovery && this.addressChangesSupported !== false && await this.refreshAddressChanges(epoch, updateRevision)) return this.getState();
     const rpc = this.rpc, recoveryTipHash = this.tip.hash;
     const emptyAddresses = this.session.data.needsRecovery ? await this.recoverAddresses(epoch) : null;
     // Reuse only fully exhausted empty discovery results inside this refresh.
@@ -666,6 +671,69 @@ export class WalletService extends EventEmitter {
     // Normal discovery never waits here; its subscription queue runs independently.
     if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
     return this.getState();
+  }
+  async refreshAddressChanges(epoch, updateRevision) {
+    const rpc = this.rpc, accounts = [...this.accounts], addresses = accounts.map(account => account.address), key = addressSetKey(addresses);
+    const check = () => {
+      this.assertSession(epoch);
+      if (rpc !== this.rpc) throw Object.assign(new Error('Address synchronization cancelled after the RPC connection changed.'), { name: 'AbortError', code: 'ABORT_ERR' });
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        let candidate = this.addressSyncPending?.key === key ? this.addressSyncPending : this.addressSync?.key === key ? this.addressSync : null;
+        if (!candidate) {
+          // Capture the journal watermark BEFORE the legacy baseline. Replay
+          // closes races with mining, mempool changes and keyset insertion.
+          candidate = await beginAddressSync({ rpc, network: this.config.network, addresses, check });
+          this.addressChangesSupported = true;
+          for (const account of accounts) {
+            check();
+            if (this.liveUpdates?.started) await this.liveUpdates.watchAddress(account.address);
+            check();
+            const history = await this.page('getaddresshistory', account.address);
+            const issued = this.session.data[account.change ? 'changeIndex' : 'receiveIndex'];
+            const utxos = history.length || account.index <= issued
+              ? await this.page('getaddressutxos', account.address, { includePendingSpent: true }) : [];
+            setAddressBaseline(candidate, account.address, { history, utxos });
+          }
+        }
+        candidate = await updateAddressSync(candidate, { rpc, check }); check();
+        const snapshot = addressSyncSnapshot(candidate, accounts);
+        const highestReceive = Math.max(this.session.data.lastUsedReceive ?? -1, snapshot.highestReceive);
+        const highestChange = Math.max(this.session.data.lastUsedChange ?? -1, snapshot.highestChange);
+        if (highestReceive !== this.session.data.lastUsedReceive || highestChange !== this.session.data.lastUsedChange) {
+          this.session.data.lastUsedReceive = highestReceive; this.session.data.lastUsedChange = highestChange;
+          await this.persist(); check(); await this.buildAccounts(); check();
+          if (addressSetKey(this.accounts.map(account => account.address)) !== key) {
+            this.walletUpdateRevision++; this.walletUpdates?.request();
+          }
+        }
+        check();
+        this.addressSync = candidate;
+        this.addressSyncPending = null;
+        this.tip = candidate.tip; this.network = { ...this.network, status: 'online', height: candidate.tip.height, chain: candidate.tip.chain };
+        this.utxos = snapshot.utxos;
+        this.balance = Object.fromEntries(Object.entries(snapshot.totals).map(([name, value]) => [name, formatSigned(value)]));
+        this.history = [...snapshot.history.values()].sort((a, b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
+          txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
+          amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
+        }));
+        this.walletReadRevision = Math.max(this.walletReadRevision, updateRevision);
+        this.error = null; this.emitState(); this.liveUpdates?.updateAddresses();
+        if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
+        return true;
+      } catch (error) {
+        check();
+        if (error?.code === -32601) {
+          this.addressChangesSupported = false; this.addressSync = null; this.addressSyncPending = null; return false;
+        }
+        if (error?.code === 'ADDRESS_SYNC_BUSY') { this.addressSyncPending = error.candidate; throw error; }
+        if (error?.code !== -32011) throw error;
+        this.addressSync = null; this.addressSyncPending = null;
+        if (attempt === 1) throw error;
+      }
+    }
+    return false;
   }
   async funding(txid, { signal } = {}) {
     if (!HASH.test(txid)) throw new Error('Invalid transaction ID.');
@@ -806,14 +874,14 @@ export class WalletService extends EventEmitter {
       const second = largest.get(`${b.change}:${b.index}`) ?? 0n;
       return first > second ? -1 : first < second ? 1 : 0;
     });
-    const utxos = [], seen = new Set();
+    const utxos = [], pendingCandidates = [], seen = new Set();
     const exactAmount = options.subtractFeeFromAmount === true && options.outputs?.length === 1
       ? amount(options.outputs[0].amount) : null;
     let insufficient, exceedsInputLimit = false;
     let completed = 0, pages = 0;
     report('outputs', completed, accounts.length, pages);
     for (const account of accounts) {
-      const rows = await waitForReview(this.page('getaddressutxos', account.address, { signal,
+      const rows = await waitForReview(this.page('getaddressutxos', account.address, { signal, includePendingSpent: options.allowPendingSpent === true,
         onPage: () => report('outputs', completed, accounts.length, ++pages),
       }), signal);
       this.assertSession(epoch);
@@ -822,7 +890,24 @@ export class WalletService extends EventEmitter {
         const outpoint = `${row.txid}:${row.vout}`;
         if (seen.has(outpoint)) throw new Error('Duplicate RPC funding output.');
         seen.add(outpoint);
-        if (row.status === 'confirmed' && row.mature === true && !this.reserved.has(outpoint)) utxos.push({ ...row, account });
+        const pendingSpender = row.pending_spent_by ?? null;
+        if (pendingSpender !== null && (typeof pendingSpender !== 'string' || !HASH.test(pendingSpender))) throw new Error('Invalid RPC pending spender.');
+        const mature = row.mature === true && (row.coinbase !== true ||
+          (Number.isSafeInteger(row.block_height) && row.block_height >= 0 && this.tip.height - row.block_height + 1 >= 100));
+        if (row.status !== 'confirmed' || !mature) continue;
+        if (pendingSpender !== null) {
+          // Only a fresh identified mempool conflict can override a local
+          // reservation. A checkbox alone never unlocks uncertain broadcasts.
+          if (options.allowPendingSpent === true) pendingCandidates.push({ ...row, account });
+        } else if (!this.reserved.has(outpoint)) utxos.push({ ...row, account });
+      }
+      if (pendingCandidates.length > MAX_PAYMENT_INPUTS) {
+        pendingCandidates.sort((a, b) => {
+          const first = BigInt(a.amount), second = BigInt(b.amount);
+          if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
+          return first > second ? -1 : first < second ? 1 : 0;
+        });
+        pendingCandidates.length = MAX_PAYMENT_INPUTS; exceedsInputLimit = true;
       }
       report('outputs', ++completed, accounts.length, pages);
       // Match the planner's exact-coin preference for fee deduction before
@@ -844,14 +929,28 @@ export class WalletService extends EventEmitter {
         insufficient = error;
       }
     }
+    if (options.allowPendingSpent === true && pendingCandidates.length) {
+      // Prefer an ordinary payment when free coins suffice. Only use pending
+      // inputs after checking all accounts, and disclose selected conflicts.
+      utxos.push(...pendingCandidates);
+      utxos.sort((a, b) => {
+        const first = BigInt(a.amount), second = BigInt(b.amount);
+        if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
+        return first > second ? -1 : first < second ? 1 : 0;
+      });
+      if (utxos.length > MAX_PAYMENT_INPUTS) { exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS; }
+      try { return selectPaymentFunding({ ...options, utxos }).selected; }
+      catch (error) { insufficient = error; }
+    }
     if (exceedsInputLimit) throw new Error('This amount needs too many inputs for one standard transaction. Send smaller amounts in separate payments.');
     throw insufficient ?? new Error('Insufficient verified funds for this payment and its fee');
   }
-  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections, label = '', message = '', subtractFeeFromAmount = false } = {}) {
+  async previewSend({ address, amount: coins, feeRate = this.config.feeRate, domain, expectedConnections, label = '', message = '', subtractFeeFromAmount = false, allowPendingSpent = false } = {}) {
     this.assertSession(); const epoch = this.epoch;
     if (this.session.data.needsRecovery) throw new Error('Wait for recovery discovery to finish before sending.');
     this.cancelSendPreview();
     if (typeof subtractFeeFromAmount !== 'boolean') throw new Error('Choose whether to deduct fees from the payment.');
+    if (typeof allowPendingSpent !== 'boolean') throw new Error('Choose whether to allow replacing pending transactions.');
     const details = validatePaymentDetails({ label, message });
     if (domain === undefined) {
       try { decodeAddress(address, this.config.network); }
@@ -883,7 +982,7 @@ export class WalletService extends EventEmitter {
     try {
       const change = this.publicAccount(this.session.data.changeIndex, 1);
       const output = domain === undefined ? { address, amount: value.toString() } : { domain, amount: value.toString(), expectedConnections, rootVersion: 1, mask: 7 };
-      const options = { outputs: [output], changeAddress: change.address, network: this.config.network, feeRate, subtractFeeFromAmount };
+      const options = { outputs: [output], changeAddress: change.address, network: this.config.network, feeRate, subtractFeeFromAmount, allowPendingSpent };
       const selected = await this.paymentFunding(options, preparation.signal, update => {
         stage = update.stage; progress(update.completed, update.total, update.pages);
       }); check();
@@ -926,9 +1025,11 @@ export class WalletService extends EventEmitter {
       // The selected mask and signed bytes are frozen together for confirmation.
       const received = formatCoinAmount(BigInt(payment.total));
       const changeAdjustment = subtractFeeFromAmount ? formatCoinAmount(value - BigInt(payment.total) - BigInt(payment.fee)) : '0';
-      this.preview = Object.freeze({ ...payment, ...policy, ...details, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: received, requestedAmount: formatCoinAmount(value), changeAdjustment, changeIndex: change.index });
+      const selectedOutpoints = new Set(payment.selected.map(row => `${row.txid}:${row.vout}`));
+      const replacingTxids = Object.freeze([...new Set(selected.filter(row => selectedOutpoints.has(`${row.txid}:${row.vout}`) && row.pending_spent_by).map(row => row.pending_spent_by))]);
+      this.preview = Object.freeze({ ...payment, ...policy, ...details, replacingTxids, previewId: randomUUID(), epoch, expires: Date.now() + 120000, address: domain === undefined ? address : output.domain, amount: received, requestedAmount: formatCoinAmount(value), changeAdjustment, changeIndex: change.index });
       this.recordDiagnostic('payment.prepared', { stage, inputCount: payment.selected.length, durationMs: performance.now() - started });
-      return { previewId: this.preview.previewId, address: this.preview.address, amount: received, requestedAmount: formatCoinAmount(value), subtractFeeFromAmount, changeAdjustment, fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(BigInt(payment.total) + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy, ...details };
+      return { previewId: this.preview.previewId, address: this.preview.address, amount: received, requestedAmount: formatCoinAmount(value), subtractFeeFromAmount, changeAdjustment, replacingTxids: [...replacingTxids], fee: formatCoinAmount(BigInt(payment.fee)), total: formatCoinAmount(BigInt(payment.total) + BigInt(payment.fee)), txid: payment.txid, type: domain === undefined ? 'payment' : 'p2c', ...policy, ...details };
     } catch (error) {
       const cancelled = error?.name === 'AbortError';
       this.recordDiagnostic(cancelled ? 'payment.prepare_cancelled' : 'payment.prepare_failed', { stage, ...(!cancelled ? { error } : {}), durationMs: performance.now() - started });
@@ -989,7 +1090,8 @@ export class WalletService extends EventEmitter {
       // Keep cancellation active through RPC quota/connection waits. RpcClient
       // stops honoring an individual abort once bytes have been handed to the
       // socket, preserving the actual reply or uncertain broadcast outcome.
-      for (const input of preview.selected) this.reserved.add(`${input.txid}:${input.vout}`);
+      const newlyReserved = preview.selected.map(input => `${input.txid}:${input.vout}`).filter(outpoint => !this.reserved.has(outpoint));
+      for (const outpoint of newlyReserved) this.reserved.add(outpoint);
       try {
         const result = await rpc.request('sendrawtransaction', { transaction_hex: preview.hex }, { signal: confirmation.signal });
         if (result?.txid !== preview.txid) throw new Error('RPC returned an unexpected transaction ID.');
@@ -1000,7 +1102,9 @@ export class WalletService extends EventEmitter {
         // proof that no bytes were sent. Never release inputs on a lost reply.
         if (error?.name === 'AbortError' && error.notSent === true && !error.unknownOutcome) {
           if (this.epoch === preview.epoch && this.rpc === rpc) {
-            for (const input of preview.selected) this.reserved.delete(`${input.txid}:${input.vout}`);
+            // A cancelled replacement must preserve reservations belonging to
+            // its original payment, including an earlier uncertain broadcast.
+            for (const outpoint of newlyReserved) this.reserved.delete(outpoint);
           }
           throw Object.assign(new Error('Payment confirmation cancelled. Review the payment again. No transaction was sent.'), { name: 'AbortError' });
         }

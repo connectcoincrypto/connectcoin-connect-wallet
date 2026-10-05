@@ -135,6 +135,7 @@ test('a receipt at index 1025 updates balance and extends watched receive addres
     return method === 'getaddresshistory' && address === 'fixture0i1025' ? [row] : [];
   };
   service.rpc.request = async (method, { address }) => {
+    if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     assert.equal(method, 'getaddressbalance');
     const amount = address === 'fixture0i1025' ? '10000000000' : '0';
     return { tip: TIP, address, unit: 'connects', confirmed: amount,

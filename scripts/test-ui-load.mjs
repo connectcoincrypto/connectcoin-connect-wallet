@@ -81,7 +81,7 @@ try {
     await page.getByRole('heading', { name: mode === 'bounty' ? 'Pay for a connection.' : 'Send ConnectCoin', exact: true }).waitFor();
     assert.equal(await page.locator('.input-suffix').textContent(), 'CONN');
     assert.equal(await page.locator('#send-form .field-label small').first().textContent(), 'Available: 1.0000000001 CONN');
-    assert.match(await page.locator('.advanced-fee .field-help').textContent(), /10,000,000,000 connects = 1 CONN\./);
+    assert.match(await page.locator('.advanced-fee > label.field .field-help').textContent(), /10,000,000,000 connects = 1 CONN\./);
     assert.equal(await page.locator('#send-fee').inputValue(), '1500');
     assert.doesNotMatch(await page.locator('#app').textContent(), /\bCC\b/, `${mode} payment mode must use the CONN monetary ticker.`);
   }

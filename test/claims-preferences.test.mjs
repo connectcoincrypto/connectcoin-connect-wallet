@@ -31,6 +31,7 @@ class Backend extends EventEmitter {
   }
   async request(method, params = {}, { onChunk } = {}) {
     this.calls.push(method);
+    if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     await this.connect();
     const currentTip = this.control.validChain ? tip : { ...tip, chain: 'main' };
     if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {

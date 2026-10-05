@@ -32,6 +32,7 @@ class Backend extends EventEmitter {
   async request(method, params = {}, options = {}) {
     await this.connect();
     this.calls.push({ method, params });
+    if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     if (method.startsWith('subscribe')) {
       const kind = { subscribetip: 'tip', subscribebounties: 'bounties', subscribeaddress: 'address' }[method];
       assert.ok(kind, `Unexpected subscription ${method}`);
