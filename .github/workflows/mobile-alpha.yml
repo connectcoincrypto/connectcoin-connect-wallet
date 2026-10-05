@@ -60,7 +60,16 @@ jobs:
           npm run sync:android
           npm run check:android
       - name: Install pinned Android build toolchain on disposable runner
-        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+        run: |
+          # Hosted images include the SDK but do not guarantee sdkmanager is on PATH.
+          sdkmanager_path="${ANDROID_HOME:?}/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_path" ]]; then
+            mapfile -t managers < <(find "$ANDROID_HOME/cmdline-tools" -mindepth 3 -maxdepth 3 -type f -name sdkmanager | sort -V)
+            sdkmanager_path="${managers[-1]:-}"
+          fi
+          test -x "$sdkmanager_path"
+          printf '%s\n' "$(dirname "$sdkmanager_path")" >> "$GITHUB_PATH"
+          "$sdkmanager_path" --sdk_root="$ANDROID_HOME" 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
       - name: Unit tests, both native architectures, APK and lint
         working-directory: mobile/android
         run: bash ./gradlew --no-daemon --max-workers=2 --console=plain -Dorg.gradle.jvmargs=-Xmx3g :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug :app:lintRelease
