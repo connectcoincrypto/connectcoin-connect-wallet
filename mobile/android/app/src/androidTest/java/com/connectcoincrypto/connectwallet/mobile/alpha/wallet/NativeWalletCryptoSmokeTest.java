@@ -11,6 +11,25 @@ import org.junit.runner.RunWith;
 @RunWith(AndroidJUnit4.class)
 public class NativeWalletCryptoSmokeTest {
     private static final String MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    @Test public void androidUnicodeMnemonicWhitespaceMatchesDesktop() throws Exception {
+        int[] whitespace = {9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197,
+            8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279};
+        for (int code : whitespace) {
+            String separator = Character.toString((char) code);
+            String phrase = separator + MNEMONIC.replace(" ", separator + separator) + separator;
+            assertEquals("Whitespace U+" + Integer.toHexString(code), MNEMONIC, WalletCrypto.normalizeMnemonic(phrase));
+            assertTrue(WalletCrypto.validateMnemonic(phrase));
+        }
+        for (int code : new int[]{0, 8, 14, 28, 31, 133, 6158, 8203, 8288}) {
+            String separator = Character.toString((char) code);
+            assertFalse(WalletCrypto.validateMnemonic(MNEMONIC.replace(" ", separator)));
+            assertFalse(WalletCrypto.validateMnemonic(separator + MNEMONIC + separator));
+        }
+        assertEquals("", WalletCrypto.normalizeMnemonic("\ufeff\u2028\u2029\u1680\t\r\n"));
+        try (VaultSession session = new VaultSession("\ufeff" + MNEMONIC.replace(" ", "\u2028\u00a0") + "\ufeff", "")) {
+            assertEquals("cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e", session.publicAccount(0, 0).getString("address"));
+        }
+    }
     @Test public void androidJniSignsOfficialBip340VectorAndLocks() throws Exception {
         byte[] privateKey = new byte[32]; privateKey[31] = 3;
         try {

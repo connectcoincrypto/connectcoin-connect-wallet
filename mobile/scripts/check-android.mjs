@@ -44,6 +44,7 @@ assert.equal(elements(manifest, 'uses-permission-sdk-23').length, 0);
 assert.equal(elements(manifest, 'uses-permission-sdk-m').length, 0);
 const application = elements(manifest, 'application');
 assert.equal(application.length, 1);
+assert.equal(attr(application[0], 'largeHeap'), 'true', 'The desktop-compatible scrypt allocation needs the larger app heap');
 for (const name of ['allowBackup', 'fullBackupContent', 'usesCleartextTraffic']) {
   assert.equal(attr(application[0], name), 'false', `${name} must stay disabled`);
 }
@@ -52,7 +53,7 @@ assert.equal(attr(application[0], 'icon'), '@mipmap/ic_launcher');
 assert.equal(attr(application[0], 'roundIcon'), '@mipmap/ic_launcher_round');
 assert.notEqual(attr(application[0], 'debuggable'), 'true');
 for (const component of ['provider', 'receiver', 'activity-alias']) {
-  assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the read-only alpha`);
+  assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the native wallet alpha`);
 }
 const services = elements(manifest, 'service');
 assert.equal(services.length, 1);

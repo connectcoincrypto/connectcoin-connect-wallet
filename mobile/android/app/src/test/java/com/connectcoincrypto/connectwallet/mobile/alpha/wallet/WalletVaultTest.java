@@ -5,6 +5,15 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public class WalletVaultTest {
+    @Test public void fixedDesktopKdfHeapBudgetFailsClosedBelow256MiB() {
+        for (long size : new long[]{0, 128L * 1024 * 1024, 192L * 1024 * 1024, WalletVault.MIN_KDF_HEAP_BYTES - 1}) {
+            IllegalStateException error = assertThrows(IllegalStateException.class, () -> WalletVault.requireKdfHeap(size));
+            assertTrue(error.getMessage().contains("256 MiB"));
+            assertTrue(error.getMessage().contains("create or unlock"));
+        }
+        WalletVault.requireKdfHeap(WalletVault.MIN_KDF_HEAP_BYTES);
+        WalletVault.requireKdfHeap(512L * 1024 * 1024);
+    }
     @Test public void decryptsRealDesktopV1EnvelopeWithoutMigration() throws Exception {
         JSONObject actual = WalletVault.decrypt(WalletVault.parse(DesktopVectors.ENVELOPE), DesktopVectors.PASSWORD.toCharArray());
         assertEquals(DesktopVectors.MNEMONIC, actual.getString("mnemonic")); assertEquals("main", actual.getString("network"));

@@ -72,6 +72,7 @@ function Assert-Manifest([string]$Text, [string]$ExpectedId, [string]$BuildVaria
     $applications = @($nodes | Where-Object Name -EQ 'application')
     Require ($applications.Count -eq 1) 'APK must contain exactly one application.'
     $application = $applications[0]
+    Require ($application.Attributes['android:largeHeap'] -match '^(?:true|\(type 0x12\)0xffffffff)$') 'Missing heap request for the unchanged wallet KDF.'
     foreach ($flag in @('android:allowBackup', 'android:fullBackupContent', 'android:usesCleartextTraffic')) {
         Require (Xml-False $application $flag) ('Unsafe or missing merged manifest flag: ' + $flag)
     }
@@ -146,6 +147,7 @@ E: manifest
   E: uses-permission
     A: android:name(0x01010003)="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
   E: application
+    A: android:largeHeap(0x0101035a)=(type 0x12)0xffffffff
     A: android:allowBackup(0x01010280)=(type 0x12)0x0
     A: android:fullBackupContent(0x010104eb)=(type 0x12)0x0
     A: android:usesCleartextTraffic(0x010104ec)=(type 0x12)0x0

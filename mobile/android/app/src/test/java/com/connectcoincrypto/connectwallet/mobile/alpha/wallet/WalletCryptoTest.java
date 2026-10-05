@@ -25,6 +25,26 @@ public class WalletCryptoTest {
         assertThrows(IllegalArgumentException.class, () -> WalletCrypto.mnemonicToSeed(DesktopVectors.MNEMONIC, "x".repeat(1025)));
         assertThrows(IllegalArgumentException.class, () -> new VaultSession(words(12, "abandon"), ""));
     }
+    @Test public void mnemonicWhitespaceMatchesDesktopWithoutJavaRegexFlags() {
+        int[] whitespace = {9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197,
+            8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279};
+        for (int code : whitespace) {
+            String separator = Character.toString((char) code);
+            String phrase = separator + DesktopVectors.MNEMONIC.replace(" ", separator + separator) + separator;
+            assertEquals("Whitespace U+" + Integer.toHexString(code), DesktopVectors.MNEMONIC, WalletCrypto.normalizeMnemonic(phrase));
+            assertTrue(WalletCrypto.validateMnemonic(phrase));
+        }
+        for (int code : new int[]{0, 8, 14, 28, 31, 133, 6158, 8203, 8288}) {
+            String separator = Character.toString((char) code);
+            String phrase = DesktopVectors.MNEMONIC.replace(" ", separator);
+            assertEquals(phrase, WalletCrypto.normalizeMnemonic(phrase));
+            assertFalse(WalletCrypto.validateMnemonic(phrase));
+            assertFalse(WalletCrypto.validateMnemonic(separator + DesktopVectors.MNEMONIC + separator));
+        }
+        assertEquals("", WalletCrypto.normalizeMnemonic("\ufeff\u2028\u2029\u1680\t\r\n"));
+        assertArrayEquals(WalletCrypto.mnemonicToSeed(DesktopVectors.MNEMONIC, ""),
+            WalletCrypto.mnemonicToSeed("\ufeff" + DesktopVectors.MNEMONIC.replace(" ", "\u2028\u00a0") + "\ufeff", ""));
+    }
     @Test public void generatedPhrasesUseFreshEntropyForEverySupportedSize() {
         Set<String> seen = new HashSet<>();
         for (int count : new int[]{12, 18, 24}) for (int i = 0; i < 8; i++) {

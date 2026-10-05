@@ -60,8 +60,7 @@ public final class AlphaSmokeTest {
         assertEquals(APP_ID, context.getPackageName());
         assertFalse("Use a clean emulator installation. Existing public preferences must not be read, removed or queried.",
             context.getSharedPreferences("CapacitorStorage", Context.MODE_PRIVATE).contains(PROFILE_KEY));
-        assertFalse("Use a clean emulator installation without a persisted WebView content override.",
-            context.getSharedPreferences("CapWebViewSettings", Context.MODE_PRIVATE).contains("serverBasePath"));
+        assertNoPersistedContentOverride();
         assertFalse("Use a clean emulator installation without a native wallet.",
             new File(context.getNoBackupFilesDir(), "mobile-wallet-v1.json").exists());
     }
@@ -73,6 +72,20 @@ public final class AlphaSmokeTest {
     private void launch() {
         scenario = ActivityScenario.launch(MainActivity.class);
         assertEquals(Lifecycle.State.RESUMED, scenario.getState());
+        scenario.onActivity(activity -> assertEquals("The runtime must serve bundled assets, never a persisted file path.",
+            Bridge.DEFAULT_WEB_ASSET_DIR, activity.getBridge().getServerBasePath()));
+        assertNoPersistedContentOverride();
+    }
+
+    private void assertNoPersistedContentOverride() {
+        // Capacitor's first-launch isNewBinary() writes serverBasePath="" along
+        // with lastBinaryVersionCode/Name. That is a reset sentinel, not a file
+        // override. Do not clear preferences or accept any nonempty/wrong-type
+        // value: a pre-existing profile must still fail before activity launch.
+        Object path = context.getSharedPreferences("CapWebViewSettings", Context.MODE_PRIVATE)
+            .getAll().get("serverBasePath");
+        assertTrue("Use a clean emulator installation without a persisted WebView content override.",
+            path == null || "".equals(path));
     }
 
     private String evaluate(String expression) throws Exception {

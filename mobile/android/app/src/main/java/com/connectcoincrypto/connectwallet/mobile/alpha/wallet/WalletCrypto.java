@@ -115,7 +115,22 @@ public final class WalletCrypto {
     }
     public static String normalizeMnemonic(String value) {
         if (value == null || value.length() > 1024) throw new IllegalArgumentException("Invalid recovery phrase");
-        return Normalizer.normalize(value, Normalizer.Form.NFKD).trim().toLowerCase(Locale.ROOT).replaceAll("(?U)\\s+", " ");
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFKD).toLowerCase(Locale.ROOT);
+        StringBuilder out = new StringBuilder(normalized.length()); boolean separator = false;
+        for (int i = 0; i < normalized.length(); i++) {
+            char character = normalized.charAt(i);
+            if (mnemonicWhitespace(character)) { separator = out.length() > 0; continue; }
+            if (separator) out.append(' ');
+            out.append(character); separator = false;
+        }
+        return out.toString();
+    }
+    // Match desktop ECMAScript trim()/\s, not Java's broader Unicode classes or
+    // trim()'s control characters. Android ICU rejects Java's inline (?U) flag.
+    private static boolean mnemonicWhitespace(char value) {
+        return value >= 0x0009 && value <= 0x000d || value == 0x0020 || value == 0x00a0
+            || value == 0x1680 || value >= 0x2000 && value <= 0x200a || value == 0x2028
+            || value == 0x2029 || value == 0x202f || value == 0x205f || value == 0x3000 || value == 0xfeff;
     }
     public static boolean validateMnemonic(String value) {
         try {

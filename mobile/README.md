@@ -19,6 +19,8 @@ The new native runtime is TLS-only at **connectcoin4.com:48191** with platform c
 
 This is development code, not a production release. Creating test keys offline is distinct from verifying the entire end-to-end wallet flow on a device. Managed Java strings/garbage collection cannot promise perfect erasure; mutable private buffers are wiped on lock, and the wallet locks when backgrounded. Claims need only a public reward address and may continue separately.
 
+The app requests a larger Android heap for the unchanged desktop scrypt cost (about 128 MiB of working memory). Wallet encryption/unlock requires at least a 256 MiB application heap; unsupported devices fail rather than silently weakening the KDF. The request does not preallocate RAM or guarantee that every device supplies enough memory.
+
 The Android foreground service uses an explicit `specialUse` declaration explaining P2C proof collection. This does not guarantee Google Play policy approval. See the [Android foreground-service rules](https://developer.android.com/develop/background-work/services/fgs/service-types#special-use). No CPU block-mining service is implemented.
 
 iOS currently has **native C++ library compilation checks only**, not an iOS wallet/IPA. Its vault, Swift bridge, UI lifecycle and supported background model remain separate work. Camera QR scanning, biometric unlock, full address discovery/recovery, backup export/import UI and full desktop feature parity also remain unfinished.

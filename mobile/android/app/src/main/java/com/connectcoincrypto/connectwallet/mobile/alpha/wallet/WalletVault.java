@@ -16,6 +16,7 @@ public final class WalletVault {
     private WalletVault() {}
     public static final int MAX_FILE_BYTES = 131072 + 4096;
     private static final int MAX_PLAINTEXT = 65536;
+    static final long MIN_KDF_HEAP_BYTES = 256L * 1024 * 1024;
     private static final String FORMAT = "connectcoin-connect-wallet";
     private static final String KDF_JSON = "{\"name\":\"scrypt\",\"N\":131072,\"r\":8,\"p\":1,\"keyLength\":32}";
 
@@ -73,7 +74,8 @@ public final class WalletVault {
             envelope.put("ciphertext", WalletCrypto.hex(Arrays.copyOfRange(encrypted, 0, encrypted.length - 16)));
             envelope.put("tag", WalletCrypto.hex(Arrays.copyOfRange(encrypted, encrypted.length - 16, encrypted.length)));
             return envelope;
-        } catch (Exception e) { throw new IllegalStateException("Cannot encrypt wallet", e); }
+        } catch (KdfMemoryException e) { throw e; }
+        catch (Exception e) { throw new IllegalStateException("Cannot encrypt wallet", e); }
         finally { WalletCrypto.wipe(plaintext); WalletCrypto.wipe(key); WalletCrypto.wipe(encrypted); }
     }
     public static JSONObject decrypt(JSONObject envelope, char[] password) {
@@ -88,7 +90,8 @@ public final class WalletVault {
             plaintext = cipher.doFinal(encrypted);
             if (plaintext.length > MAX_PLAINTEXT) throw new IllegalArgumentException("Wallet data is too large");
             return validatePayload(new JSONObject(new String(plaintext, StandardCharsets.UTF_8)));
-        } catch (Exception e) { throw new IllegalArgumentException("Cannot unlock wallet: incorrect password or damaged wallet file"); }
+        } catch (KdfMemoryException e) { throw e; }
+        catch (Exception e) { throw new IllegalArgumentException("Cannot unlock wallet: incorrect password or damaged wallet file"); }
         finally { WalletCrypto.wipe(key); WalletCrypto.wipe(plaintext); WalletCrypto.wipe(encrypted); }
     }
     /** Use this instead of JSONObject.toString(): desktop authenticates the KDF object's key order. */
@@ -110,9 +113,23 @@ public final class WalletVault {
             + ",\"cipher\":\"aes-256-gcm\",\"salt\":\"" + envelope.getString("salt") + "\",\"nonce\":\"" + envelope.getString("nonce") + "\"}";
     }
     private static byte[] keyFor(char[] password, byte[] salt) {
+        // All create/import/unlock paths keep the same desktop scrypt cost. A
+        // large-heap request is not guaranteed to be honored by every device.
+        requireKdfHeap(Runtime.getRuntime().maxMemory());
         byte[] bytes = WalletCrypto.utf8(password);
         try { return SCrypt.generate(bytes, salt, 131072, 8, 1, 32); }
+        catch (OutOfMemoryError exhausted) {
+            // Only recover the KDF allocation failure, never arbitrary VM errors.
+            // The caller's finally blocks still wipe passwords and plaintext.
+            throw new KdfMemoryException("Not enough memory for the desktop-compatible wallet KDF. Close other apps and retry; wallet data was not changed.");
+        }
         finally { WalletCrypto.wipe(bytes); }
+    }
+    static void requireKdfHeap(long maximum) {
+        if (maximum < MIN_KDF_HEAP_BYTES) throw new KdfMemoryException("This device provides less than 256 MiB of application heap. It cannot create or unlock the desktop-compatible wallet safely; wallet data was not changed.");
+    }
+    private static final class KdfMemoryException extends IllegalStateException {
+        KdfMemoryException(String message) { super(message); }
     }
     private static void validateEnvelope(JSONObject value) throws org.json.JSONException {
         if (value == null || !FORMAT.equals(value.opt("format")) || !integer(value.opt("version"), 1) || !"aes-256-gcm".equals(value.opt("cipher"))) throw new IllegalArgumentException("Unsupported encrypted wallet format");
