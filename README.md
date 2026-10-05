@@ -6,6 +6,8 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 
 **ConnectCoin mainnet wallet.** It relies on an unencrypted RPC connection and a trusted server for chain state; it does not independently validate consensus.
 
+Mobile development lives separately in [`mobile/`](mobile/README.md), with an Android native wallet/claims alpha and explicit unfinished integration gates. It is not a production replacement for the desktop wallet. The desktop application/version remains unchanged.
+
 ## What you can do
 
 - Create or restore a wallet with **12, 18 or 24 BIP39 recovery words**; 24 is the default.

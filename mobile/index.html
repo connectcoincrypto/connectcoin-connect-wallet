@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#15121d">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+    <title>ConnectWallet Alpha</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <img id="brand-icon" alt="" width="44" height="44">
+        <div><strong>ConnectWallet</strong><span>Mobile · Alpha 1</span></div>
+        <span class="network-badge">MAINNET</span>
+      </header>
+      <main>
+        <p id="preview-notice" class="notice" hidden>Browser preview only. Live RPC queries are available in the Android app.</p>
+        <section id="setup-panel" class="panel">
+          <span class="eyebrow">YOUR FIRST LOOK</span>
+          <h1>Your wallet,<br>on the move.</h1>
+          <p class="secondary">Create a native encrypted wallet, import recovery words, or follow a public address.</p>
+          <p class="notice">Development alpha. Native signing currently covers the first receiving address only, not full HD recovery. Use a separate test wallet, not your primary funded wallet.</p>
+          <div class="native-wallet-actions"><button id="create-wallet" class="primary">Create wallet</button><button id="import-wallet" class="secondary-button">Import recovery phrase</button></div>
+          <button id="open-native-wallet" class="secondary-button" hidden>Unlock existing native wallet</button>
+          <form id="watch-form">
+            <label for="watch-address">Public address or payment link</label>
+            <textarea id="watch-address" rows="3" maxlength="1024" placeholder="cc1p… or connectcoin:…" autocomplete="off" autocapitalize="off" spellcheck="false" required disabled></textarea>
+            <p class="hint">Never paste a recovery phrase or private key. The public address is saved on this device and shared with connectcoin4.com when queried.</p>
+            <button id="watch-submit" class="primary" type="submit" disabled>Watch address</button>
+            <p id="setup-error" class="error" role="alert"></p>
+          </form>
+          <p class="footnote">Only add an address you already control if you intend to receive funds. Watching an address does not give you access to its funds.</p>
+        </section>
+        <section id="wallet-panel" hidden>
+          <div class="section-heading"><span id="account-kind" class="eyebrow">WATCH-ONLY ACCOUNT</span><button id="forget" class="text-button">Remove watched address</button></div>
+          <p id="current-address" class="address"></p>
+          <p id="connection-status" class="hint" role="status"></p>
+          <div id="overview" class="page">
+            <div class="balance-card"><span class="secondary">Confirmed balance</span><h1><span id="balance">—</span> <small>CONN</small></h1><p id="pending" class="hint">Refresh to load balances</p><button id="refresh" class="primary">Refresh</button></div>
+            <div class="section-heading"><h2>Activity</h2><span id="block-height" class="hint"></span></div>
+            <p id="wallet-error" class="error" role="alert"></p>
+            <p id="last-update" class="hint"></p>
+            <ol id="history" class="history"></ol>
+            <p id="empty-history" class="empty">No history loaded yet.</p>
+            <button id="load-more" class="secondary-button" hidden>Load more</button>
+            <p id="history-limit" class="notice" hidden>Showing up to 2,000 loaded transactions, not the complete history. These are not necessarily the most recent transactions of this address.</p>
+            <p class="footnote">Public data comes from an authenticated TLS RPC endpoint. The alpha checks network identity, not blockchain consensus. History pages are ordered by transaction ID; only loaded entries are sorted here. Refresh rechecks previous pages. No unencrypted fallback is used.</p>
+          </div>
+          <div id="receive" class="page" hidden>
+            <h1>Receive</h1><p class="secondary">To the address you are watching.</p>
+            <p id="receive-address" class="address"></p>
+            <div class="request-details">
+              <div class="section-heading"><h2>Payment request</h2><button id="clear-request" class="text-button" type="button">Clear details</button></div>
+              <p class="hint">Optional details change the payment link, not your receiving address.</p>
+              <label for="receive-amount">Amount <span class="hint">Optional · CONN</span></label>
+              <input id="receive-amount" type="text" inputmode="decimal" data-amount autocomplete="off" placeholder="0.00" aria-describedby="amount-help">
+              <p id="amount-help" class="hint">Use a point or comma, up to 10 decimal places. The sender pays the network fee separately.</p>
+              <label for="receive-label">Label <span id="label-count" class="hint">0/100</span></label>
+              <input id="receive-label" type="text" data-text-limit="100" autocomplete="off" placeholder="For example, My shop">
+              <label for="receive-message">Message <span id="message-count" class="hint">0/200</span></label>
+              <textarea id="receive-message" rows="3" data-text-limit="200" placeholder="For example, Order 123"></textarea>
+              <p id="receive-metadata-notice" class="notice"></p>
+            </div>
+            <p id="receive-error" class="error" role="alert"></p>
+            <p id="qr-status" class="hint" role="status"></p>
+            <div id="qr-card" class="qr-card" hidden><img id="receive-qr" width="256" height="256" alt="QR code of the watched address payment link"></div>
+            <label for="receive-uri">Payment link</label>
+            <textarea id="receive-uri" rows="3" readonly spellcheck="false" aria-label="Payment link"></textarea>
+            <button id="copy-link" class="primary" disabled>Copy payment link</button>
+            <p id="copy-status" role="status" class="hint"></p>
+            <p id="receive-ownership" class="notice">Watching an address does not give access to its funds. Confirm ownership before receiving.</p>
+          </div>
+          <div id="send" class="page" hidden>
+            <h1>Send</h1><p class="secondary">Review every address, amount and fee in the native confirmation before signing.</p>
+            <p id="vault-status" class="notice">No native wallet loaded.</p>
+            <button id="unlock-wallet" class="secondary-button">Unlock native wallet</button><button id="lock-wallet" class="text-button">Lock</button>
+            <form id="send-form">
+              <label for="send-address">Recipient address</label><textarea id="send-address" rows="3" maxlength="90" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="cc1p…" required></textarea>
+              <button id="paste-payment" type="button" class="secondary-button">Paste payment link</button>
+              <label for="send-amount">Amount · CONN</label><input id="send-amount" type="text" data-amount inputmode="decimal" autocomplete="off" placeholder="0.00" required>
+              <p class="hint">Fee rate: 1,500 connects/vB. Funds and change use the first receiving address. Pending conflicts require explicit native confirmation.</p>
+              <button id="review-payment" class="primary" type="submit">Review payment</button><p id="send-status" class="error" role="status"></p>
+            </form>
+          </div>
+          <div id="claims" class="page" hidden>
+            <span class="eyebrow">AUTOMATIC CLAIMS</span><h1>You set the limits.</h1>
+            <p class="notice">Claims start only after your confirmation and pay the displayed address. The native engine verifies the certificate and proof, even when the hash misses the target. A locked wallet can continue collecting claims without its private keys.</p>
+            <label class="toggle-row" for="mobile-data"><span><strong>Allow mobile data</strong><small>For claims only. Viewing balances can use either Wi-Fi or mobile data.</small></span><input type="checkbox" id="mobile-data" role="switch"></label>
+            <label class="toggle-row" for="background"><span><strong>Allow background use</strong><small>Continue claims outside the app only when supported by the operating system.</small></span><input type="checkbox" id="background" role="switch"></label>
+            <button id="start-claims" class="primary">Start claims</button><button id="stop-claims" class="secondary-button">Stop claims</button>
+            <p id="claims-status" class="status-pill" role="status">Stopped</p>
+            <dl id="claims-stats" class="claims-stats">
+              <div><dt>Connections attempted</dt><dd id="claims-attempts">0</dd></div><div><dt>Valid proofs</dt><dd id="claims-valid">0</dd></div>
+              <div><dt>Invalid / failed</dt><dd id="claims-invalid">0</dd></div><div><dt>Target reached</dt><dd id="claims-targetHits">0</dd></div>
+              <div><dt>Claims submitted</dt><dd id="claims-submitted">0</dd></div><div><dt>Unknown submissions</dt><dd id="claims-unknown">0</dd></div>
+              <div><dt>Connections / second</dt><dd id="claims-connectionsPerSecond">0</dd></div><div><dt>Eligible bounties</dt><dd id="claims-eligible">0</dd></div>
+            </dl><p id="claims-domain" class="hint"></p><p id="claims-discovery" class="hint"></p><p id="claims-error" class="error" role="status"></p>
+            <p id="claims-receipt" class="address" hidden></p><button id="check-claim" class="secondary-button" hidden>Check previous submission</button>
+            <p class="footnote">Background mode has Android's mandatory service indication and Stop action, without requesting permission for additional notifications. It may be interrupted by the OS and never restarts automatically. iOS execution is not available in this alpha.</p>
+          </div>
+          <nav class="bottom-nav" aria-label="Wallet sections">
+            <button data-page="overview" aria-current="page">Overview</button><button data-page="receive">Receive</button><button data-page="send">Send</button><button data-page="claims">Claims</button>
+          </nav>
+        </section>
+        <p id="global-error" class="error" role="alert"></p>
+      </main>
+    </div>
+    <script type="module" src="/src/app.mjs"></script>
+  </body>
+</html>

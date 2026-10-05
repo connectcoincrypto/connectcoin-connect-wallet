@@ -1,0 +1,8 @@
+{
+  global:
+    Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeCreate;
+    Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeCancel;
+    Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeDestroy;
+    Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeCapture;
+  local: *;
+};

@@ -1,0 +1,92 @@
+{
+  "upstream_repository": "https://github.com/connectcoincrypto/connectcoin",
+  "checkout_head": "addd1951590a6fd6759b5ccfa374c335da938251",
+  "note": "Copied from the local Core checkout; upstream SHA256 records exact source bytes, vendored SHA256 allows only LF normalization. No full node, wallet secrets, or signing included. Public capture adapter derived from wallet/p2c_tls.cpp; verifier and consensus parser unmodified.",
+  "files": [
+    {
+      "path": "COPYING",
+      "upstream_sha256": "30554214b164b16f736ceb2adbcd36f1a440fef5dab8ad14914976a05f6c4506",
+      "vendored_sha256": "b028769f3852a9368ab10bd754ff01ebb741f84a2fa658c9aff82a631bc6ecfc"
+    },
+    {
+      "path": "src/consensus/p2c.cpp",
+      "upstream_sha256": "60a3523bdb6a2285accdc485bdd9c0973d963cb0765d8b152b6ed0c3d0c7888f",
+      "vendored_sha256": "c257cb1b32196c22506a172cf70f7864a9389483c84c41bf14e0319534f909db"
+    },
+    {
+      "path": "src/consensus/p2c.h",
+      "upstream_sha256": "5ba8d3bf59f55772e834d99a93df4fcc1eb8c136d13468ef28946da11c8a1728",
+      "vendored_sha256": "c780f5255a32c02a0331edfb9fcd304844589af2aa6711aef7fb6f0fa3447bcc"
+    },
+    {
+      "path": "src/consensus/p2c_x509.cpp",
+      "upstream_sha256": "5cdfa83166651fccb55da4b8592111416446f357e96adabad1e6db5e8334eed7",
+      "vendored_sha256": "5cdfa83166651fccb55da4b8592111416446f357e96adabad1e6db5e8334eed7"
+    },
+    {
+      "path": "src/consensus/p2c_x509.h",
+      "upstream_sha256": "5ab9faeb3c836432c88b2c8fac069233fcb8505dd94bdff00bd5600ce0cc2c1a",
+      "vendored_sha256": "5ab9faeb3c836432c88b2c8fac069233fcb8505dd94bdff00bd5600ce0cc2c1a"
+    },
+    {
+      "path": "src/consensus/p2c_x509_mutex.h",
+      "upstream_sha256": "25272f545b4bf0c7930fc9b19de20eaf9883e925cae5b7e0cef5d710ff7b775e",
+      "vendored_sha256": "25272f545b4bf0c7930fc9b19de20eaf9883e925cae5b7e0cef5d710ff7b775e"
+    },
+    {
+      "path": "src/consensus/p2c_roots_v1.pem",
+      "upstream_sha256": "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9",
+      "vendored_sha256": "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9"
+    },
+    {
+      "path": "src/crypto/mbedtls_user_config.h",
+      "upstream_sha256": "ede24a05c6c419a330d37d8819b6fa7fe569eb3dd2ca973e4661f982d6bad90a",
+      "vendored_sha256": "ede24a05c6c419a330d37d8819b6fa7fe569eb3dd2ca973e4661f982d6bad90a"
+    },
+    {
+      "path": "src/crypto/mbedtls_rsa_pss.c",
+      "upstream_sha256": "f1af59a021b580d728bb725f06627da3adfb13bbf227258b44159d58338dcf15",
+      "vendored_sha256": "f1af59a021b580d728bb725f06627da3adfb13bbf227258b44159d58338dcf15"
+    },
+    {
+      "path": "src/crypto/mbedtls_rsa_pss.h",
+      "upstream_sha256": "011d3b5b8dc0aeaf68d9cfd4e8830f9b06559936cfa604bb563ee1209fde1edf",
+      "vendored_sha256": "011d3b5b8dc0aeaf68d9cfd4e8830f9b06559936cfa604bb563ee1209fde1edf"
+    },
+    {
+      "path": "src/crypto/mbedtls_x509_root_first.c",
+      "upstream_sha256": "fd465a0ece412304c5c6f8cdb499891057664aa8bc3fb5cc2698baa1330aaa3e",
+      "vendored_sha256": "fd465a0ece412304c5c6f8cdb499891057664aa8bc3fb5cc2698baa1330aaa3e"
+    },
+    {
+      "path": "src/crypto/mbedtls_x509_root_first.h",
+      "upstream_sha256": "2535ed2631785582ad2c7d104388e239e4744e2d32fcffe76fd92a1f4c0c1802",
+      "vendored_sha256": "2535ed2631785582ad2c7d104388e239e4744e2d32fcffe76fd92a1f4c0c1802"
+    },
+    {
+      "path": "src/wallet/p2c_tls_private.c",
+      "upstream_sha256": "106aa2d938e7476351b58525ae5512d69595e5fffd7b6ba0943c874366d1407a",
+      "vendored_sha256": "de7779ea258c02f1ac875c52f41cfe17c6ac85404ae0f3c13340c015e659b136"
+    },
+    {
+      "path": "src/wallet/p2c_tls_private.h",
+      "upstream_sha256": "462d2f903d6345e32694975b495200a7812a55412f92a77a258e729afe3a22aa",
+      "vendored_sha256": "addbb40b0d2a4dd69ecae15eb6eb43a531660be6d17cb99bd53db7d18664ae40"
+    },
+    {
+      "path": "cmake/script/PatchMbedTLSP2CRSAPSS.cmake",
+      "upstream_sha256": "cca9882107b45f8ec1ac5a45d00e8fe89003be9ce780d4aa2cdf594bfdfd0adf",
+      "vendored_sha256": "cca9882107b45f8ec1ac5a45d00e8fe89003be9ce780d4aa2cdf594bfdfd0adf"
+    },
+    {
+      "path": "cmake/script/PatchMbedTLSP2CX509.cmake",
+      "upstream_sha256": "609c014fc57cb737cda9f297d2cfdeb6662270bc3ea9a7cd3baef336b59b8cfb",
+      "vendored_sha256": "609c014fc57cb737cda9f297d2cfdeb6662270bc3ea9a7cd3baef336b59b8cfb"
+    },
+    {
+      "path": "cmake/script/PatchMbedTLSCMakePolicy.cmake",
+      "upstream_sha256": "2ad58ebb8bda521d760800cf7bf9e96d0f16d5d352ec0fae5062e0e16f6dc92b",
+      "vendored_sha256": "2ad58ebb8bda521d760800cf7bf9e96d0f16d5d352ec0fae5062e0e16f6dc92b"
+    }
+  ]
+}
