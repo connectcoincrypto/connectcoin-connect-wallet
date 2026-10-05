@@ -52,6 +52,32 @@ test('trailing separators save integer preferences without changing raw acknowle
   assert.deepEqual(preferenceBatch(config(), host, { rpcReady: true }).patch, {}, 'a hostname must not be interpreted as a numeric input');
 });
 
+test('auto-lock autosave accepts disabled and optional minute values while retaining invalid drafts', () => {
+  for (const raw of ['0', '0.', '0,', '1', '15.', '60,']) {
+    const edits = draft(); edits.settings.autoLockMinutes = raw;
+    const current = { ...config(), autoLockMinutes: 30 };
+    const batch = preferenceBatch(current, edits);
+    assert.deepEqual(batch.patch, { autoLockMinutes: Number(raw.replace(/[.,]$/, '')) });
+    assert.deepEqual(batch.entries, [{ section: 'settings', key: 'autoLockMinutes', raw }]);
+    acknowledgePreferences(edits, batch);
+    assert.deepEqual(edits.settings, {});
+  }
+  for (const raw of ['', ' ', '.', ',', '-1', '61', '0.5', '1.5', '0..', '1e1', 'Infinity', null, undefined]) {
+    const edits = draft(); edits.settings.autoLockMinutes = raw;
+    const batch = preferenceBatch({ ...config(), autoLockMinutes: 0 }, edits);
+    assert.deepEqual(batch, { patch: {}, entries: [] }, `Invalid auto-lock draft: ${String(raw)}`);
+    acknowledgePreferences(edits, batch);
+    assert.equal(edits.settings.autoLockMinutes, raw);
+    assert.ok(Object.hasOwn(edits.settings, 'autoLockMinutes'));
+  }
+  const edits = draft(); edits.settings.autoLockMinutes = '0.';
+  const unchanged = preferenceBatch({ ...config(), autoLockMinutes: 0 }, edits);
+  assert.deepEqual(unchanged.patch, {});
+  assert.equal(unchanged.entries.length, 1, 'an already-saved disabled value must still acknowledge the draft');
+  acknowledgePreferences(edits, unchanged);
+  assert.deepEqual(edits.settings, {});
+});
+
 test('an in-flight save acknowledges only its own draft, then saves the newer preference without overlap', async () => {
   let current = config();
   const edits = draft(), started = deferred(), release = deferred();

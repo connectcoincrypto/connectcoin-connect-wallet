@@ -195,29 +195,92 @@ test('disconnect reconnects and resubscribes, while lock rejects old pushes and 
   assert.ok(s.rpc.calls.some(call => call.method === 'subscribebounties'));
 });
 
-test('security housekeeping no longer polls at 20 seconds but still auto-locks', async t => {
+test('disabled inactivity auto-lock preserves the session, claims and live network updates through long idle periods', async t => {
   const timers = [], original = globalThis.setInterval;
   t.mock.method(globalThis, 'setInterval', (fn, interval, ...args) => {
     timers.push({ fn, interval });
     return original(fn, interval, ...args);
   });
-  const { service: s } = await fixture(t);
+  const { service: s } = await fixture(t, { beforeOpen(service) { service.config.claims.enabled = true; } });
+  clearInterval(s.timer);
   const housekeeping = timers.find(timer => timer.interval === 1000);
   assert.ok(housekeeping, 'Keep security housekeeping independent from RPC refresh');
   assert.ok(!timers.some(timer => timer.interval === 20000));
-  let refreshes = 0;
-  s.refresh = async () => { refreshes++; };
+  assert.equal(s.config.autoLockMinutes, 0);
+  assert.equal(s.engine.enabled, true);
+  const session = s.session, rpc = s.rpc, engine = s.engine;
+  const locks = t.mock.method(s, 'lock');
+  const refreshes = t.mock.method(s, 'refresh');
+  const scans = t.mock.method(s, 'syncBounties');
+  const stops = engine.stops;
   const calls = s.rpc.calls.length, initial = s.lastActivity;
   let now = initial;
   t.mock.method(Date, 'now', () => now);
-  for (let second = 1; second <= 30; second++) { now = initial + second * 1000; housekeeping.fn(); }
-  assert.equal(refreshes, 0);
+  for (const minutes of [0, 1, 15, 60, 24 * 60, 7 * 24 * 60]) {
+    now = initial + minutes * 60000;
+    housekeeping.fn();
+    assert.equal(s.session, session);
+    assert.equal(s.rpc, rpc);
+    assert.equal(s.engine, engine);
+    assert.equal(engine.enabled, true);
+  }
+  assert.equal(locks.mock.callCount(), 0);
+  assert.equal(engine.stops, stops);
+  assert.equal(refreshes.mock.callCount(), 0);
+  assert.equal(scans.mock.callCount(), 0);
   assert.equal(s.rpc.calls.length, calls);
-  now = initial + s.config.autoLockMinutes * 60000 + 1;
-  housekeeping.fn();
-  await until(() => !s.session);
+
+  rpc.notice('address');
+  rpc.notice('bounties');
+  await until(() => refreshes.mock.callCount() > 0 && scans.mock.callCount() > 0,
+    'Address and bounty notifications must still update the unlocked wallet after long inactivity');
+  await settled(s);
+  assert.equal(s.session, session);
+  assert.equal(engine.enabled, true);
+  assert.equal(engine.stops, stops);
+  assert.equal(rpc.generation, 1, 'Idle time must not force a reconnect');
+
+  await s.lock();
+  assert.equal(locks.mock.callCount(), 1, 'Manual lock remains available with inactivity auto-lock disabled');
+  assert.equal(s.session, null);
   assert.equal(s.engine.enabled, false);
-  assert.equal(refreshes, 0);
+  assert.equal(rpc.socket, null);
+});
+
+for (const autoLockMinutes of [1, 15, 60]) test(`optional ${autoLockMinutes}-minute auto-lock respects activity and locks at its deadline`, async t => {
+  let housekeeping;
+  const original = globalThis.setInterval;
+  t.mock.method(globalThis, 'setInterval', (fn, interval, ...args) => {
+    if (interval === 1000) housekeeping = fn;
+    return original(fn, interval, ...args);
+  });
+  const { service: s } = await fixture(t, { beforeOpen(service) {
+    service.config.autoLockMinutes = autoLockMinutes;
+    service.config.claims.enabled = true;
+  } });
+  clearInterval(s.timer);
+  assert.equal(typeof housekeeping, 'function');
+  const session = s.session, rpc = s.rpc;
+  const locks = t.mock.method(s, 'lock');
+  const duration = autoLockMinutes * 60000;
+  let now = s.lastActivity + duration - 1;
+  t.mock.method(Date, 'now', () => now);
+  housekeeping();
+  assert.equal(s.session, session);
+  assert.equal(locks.mock.callCount(), 0);
+  s.activity();
+  assert.equal(s.lastActivity, now);
+  now += duration - 1;
+  housekeeping();
+  assert.equal(s.session, session, 'Activity must restart the configured inactivity deadline');
+  assert.equal(locks.mock.callCount(), 0);
+  now++;
+  housekeeping();
+  await until(() => !s.session);
+  assert.equal(locks.mock.callCount(), 1);
+  assert.equal(s.engine.enabled, false);
+  assert.equal(s.config.claims.enabled, true, 'Locking must preserve the saved claim preference');
+  assert.equal(rpc.socket, null);
 });
 
 test('transient claim startup failures retry without another push or a periodic refresh', async t => {

@@ -57,7 +57,7 @@ const fixture = net.createServer(serve);
 const alternateFixture = net.createServer(serve);
 await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
 await new Promise(resolve => alternateFixture.listen(0, '127.0.0.1', resolve));
-await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'main', rpc: { host: '127.0.0.1', port: fixture.address().port }, autoLockMinutes: 15 }));
+await writeFile(path.join(profile, 'config.json'), JSON.stringify({ version: 1, network: 'main', rpc: { host: '127.0.0.1', port: fixture.address().port } }));
 let application;
 let page;
 const errors = [];
@@ -979,6 +979,13 @@ try {
 
   nextStage('automatic settings persistence and appearance preserve invalid drafts');
   await page.locator('[data-view="settings"]').first().click();
+  assert.equal(await page.locator('#auto-lock').inputValue(), '0', 'A profile without an explicit timeout must default to inactivity locking off.');
+  assert.equal(await page.locator('#auto-lock').getAttribute('min'), '0');
+  assert.equal(await page.locator('#auto-lock').getAttribute('aria-describedby'), 'auto-lock-help');
+  assert.match(await page.locator('#auto-lock-help').textContent(), /0 disables inactivity locking/);
+  assert.match(await page.locator('#auto-lock-help').textContent(), /Suspend still locks the wallet/);
+  assert.match(await page.locator('#auto-lock-help').textContent(), /on Linux, use Lock now/);
+  assert.equal(await page.getByText('Inactivity locking is off.', { exact: false }).isVisible(), true);
   assert.equal(await page.locator('#rpc-host').getAttribute('data-text-limit'), '253');
   assert.equal(await page.locator('#rpc-host').getAttribute('data-text-count'), 'utf16');
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0, 'Settings should expose autosave without a manual Save button.');
@@ -989,6 +996,27 @@ try {
   await pressEnterInPreference('#auto-lock');
   await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.autoLockMinutes === 30);
   await assertPreferenceEnterStayedPut('#auto-lock');
+  const beforeDisabledLock = await page.evaluate(() => window.connectwallet.invoke('getState'));
+  const beforeDisabledLockConnections = connectionCount;
+  await page.locator('#auto-lock').fill('0');
+  await pressEnterInPreference('#auto-lock');
+  await waitForUiCondition(page, async () => {
+    const state = await window.connectwallet.invoke('getState');
+    return state.config.autoLockMinutes === 0 && !state.busy
+      && document.querySelector('#app')?.textContent.includes('Inactivity locking is off.');
+  });
+  await assertPreferenceEnterStayedPut('#auto-lock');
+  const afterDisabledLock = await page.evaluate(() => window.connectwallet.invoke('getState'));
+  assert.equal(afterDisabledLock.phase, 'unlocked');
+  assert.equal(afterDisabledLock.securityEpoch, beforeDisabledLock.securityEpoch);
+  assert.equal(afterDisabledLock.wallet.address, beforeDisabledLock.wallet.address);
+  assert.equal(afterDisabledLock.claims.enabled, beforeDisabledLock.claims.enabled);
+  assert.equal(connectionCount, beforeDisabledLockConnections, 'Disabling inactivity locking must not reconnect RPC.');
+  assert.equal(JSON.parse(await readFile(path.join(profile, 'config.json'), 'utf8')).autoLockMinutes, 0);
+  assert.equal(await page.getByText('Wallet locks after 0 minutes', { exact: false }).count(), 0);
+  assert.equal(await page.locator('#rpc-host').inputValue(), 'https://unfinished.example');
+  await page.locator('#auto-lock').fill('30');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.autoLockMinutes === 30);
   const beforeTheme = await page.evaluate(() => window.connectwallet.invoke('getState'));
   const beforeThemeConnections = connectionCount;
   await selectTheme('dark', { ui: true });
@@ -1025,6 +1053,7 @@ try {
   assert.equal(persistedSettings.rpc.port, alternateFixture.address().port);
   assert.equal(await page.locator('[data-view="settings"][aria-current="page"]').count(), 1, 'RPC preferences save on leaving the fields while the Settings page stays open.');
   nextStage('settings trailing periods save integers and preserve editing');
+  await assertTrailingPeriodPreference('#auto-lock', 0, ['autoLockMinutes']);
   await assertTrailingPeriodPreference('#auto-lock', 31, ['autoLockMinutes']);
   await assertTrailingPeriodPreference('#rpc-port', fixture.address().port, ['rpc', 'port'], { endpoint: true });
   assert.equal(await page.locator('#rpc-host').inputValue(), '127.0.0.1');
@@ -1702,6 +1731,22 @@ try {
   assert.ok(!requests.includes('sendrawtransaction'));
   assert.deepEqual(errors, []);
   assert.deepEqual(failedBrandRequests, [], 'ConnectWallet artwork must remain allowed by the renderer resource policy.');
+  nextStage('OS event handlers still lock with inactivity locking disabled');
+  // Inject Electron events only: do not suspend or lock the machine running
+  // the test. Screen-lock delivery itself is supported on Windows/macOS only.
+  for (const event of ['suspend', ...(['win32', 'darwin'].includes(process.platform) ? ['lock-screen'] : [])]) {
+    await page.locator('#unlock-password').fill(password);
+    await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();
+    await page.locator('[data-view="settings"]').first().click();
+    await page.locator('#auto-lock').fill('0');
+    await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.autoLockMinutes === 0);
+    await application.evaluate(({ powerMonitor }, event) => powerMonitor.emit(event), event);
+    await page.locator('#unlock-password').waitFor();
+    const locked = await page.evaluate(() => window.connectwallet.invoke('getState'));
+    assert.equal(locked.phase, 'locked', `${event} must still lock with inactivity locking disabled.`);
+    assert.equal(locked.config.autoLockMinutes, 0);
+    assert.equal(await page.locator('.seed-word').count(), 0);
+  }
   nextStage('close flushes valid numeric and endpoint drafts');
   await page.locator('#unlock-password').fill(password);
   await page.getByRole('button', { name: 'Unlock wallet', exact: true }).click();

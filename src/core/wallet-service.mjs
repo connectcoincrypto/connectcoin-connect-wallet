@@ -95,7 +95,7 @@ export class WalletService extends EventEmitter {
     this.timer = setInterval(() => {
       if (this.setup && Date.now() > this.setup.expires) { this.setup = null; this.emitState(); }
       if (this.replacement && Date.now() > this.replacement.expires) this.cancelWalletReplacement();
-      if (this.session && Date.now() - this.lastActivity >= this.config.autoLockMinutes * 60000) void this.lock();
+      if (this.session && this.config.autoLockMinutes > 0 && Date.now() - this.lastActivity >= this.config.autoLockMinutes * 60000) void this.lock();
       // Local security housekeeping only. Network updates arrive via RPC subscriptions.
     }, 1000);
     this.timer.unref?.();

@@ -210,7 +210,7 @@ test('disabling and changing limits while offline saves successfully and prevent
   assert.equal(s.engine.enabled, false);
 });
 
-test('auto-lock and fee edits preserve active claims, RPC and saved appearance preferences', async t => {
+test('enabling and disabling auto-lock and fee edits preserve active claims, RPC and saved preferences', async t => {
   const f = await fixture(t, { config: { claims: { enabled: true, lookbackBlocks: 1 }, theme: 'dark', developerMode: true } });
   const s = f.service;
   await unlock(s);
@@ -219,7 +219,22 @@ test('auto-lock and fee edits preserve active claims, RPC and saved appearance p
   const stopped = t.mock.method(engine, 'stop');
   const cleared = t.mock.method(engine, 'clear');
   const encrypted = await readFile(s.vaultFile, 'utf8');
-  await s.saveConfig({ autoLockMinutes: 30 });
+  const connections = f.clients.length, calls = rpc.calls.length;
+  assert.equal(s.config.autoLockMinutes, 0);
+  for (const autoLockMinutes of [30, 0, 1, 0]) {
+    await s.saveConfig({ autoLockMinutes });
+    assert.equal(s.config.autoLockMinutes, autoLockMinutes);
+    assert.equal((await readConfig(f.directory)).autoLockMinutes, autoLockMinutes);
+    assert.equal(s.rpc, rpc);
+    assert.equal(s.engine, engine);
+    assert.equal(engine.enabled, true);
+    assert.equal(s.session, session);
+    assert.equal(s.epoch, epoch);
+    assert.equal(f.clients.length, connections);
+    assert.equal(rpc.calls.length, calls, 'Changing the inactivity preference must not refresh or reconnect RPC');
+    assert.equal(stopped.mock.callCount(), 0);
+    assert.equal(cleared.mock.callCount(), 0);
+  }
   await s.saveConfig({ feeRate: 2000 });
   assert.equal(s.rpc, rpc);
   assert.equal(s.engine, engine);
@@ -232,7 +247,7 @@ test('auto-lock and fee edits preserve active claims, RPC and saved appearance p
   assert.equal(cleared.mock.callCount(), 0);
   assert.equal(await readFile(s.vaultFile, 'utf8'), encrypted);
   assert.deepEqual(await readConfig(f.directory), s.config);
-  assert.equal(s.config.autoLockMinutes, 30);
+  assert.equal(s.config.autoLockMinutes, 0);
   assert.equal(s.config.feeRate, 2000);
   assert.equal(s.config.theme, 'dark');
   assert.equal(s.config.developerMode, true);

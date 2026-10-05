@@ -11,7 +11,7 @@ export const GENESIS = Object.freeze({
 export const DEFAULT_CONFIG = Object.freeze({
   version: 1, network: 'main', rpc: Object.freeze({ host: 'connectcoin4.com', port: 48190 }),
   claims: Object.freeze({ enabled: false, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }),
-  autoLockMinutes: 15, feeRate: 1500, theme: 'system', developerMode: false,
+  autoLockMinutes: 0, feeRate: 1500, theme: 'system', developerMode: false,
 });
 export function validateTheme(theme) {
   if (!['system', 'light', 'dark'].includes(theme)) throw new Error('Choose System, Light or Dark appearance.');
@@ -60,7 +60,7 @@ export function validateConfig(input, { allowRegtest = false, network } = {}) {
       maxConcurrent: integer(merged.claims.maxConcurrent, 1, 256, 'Simultaneous connections'),
       lookbackBlocks: integer(merged.claims.lookbackBlocks, 1, 600, 'Recent blocks'),
     },
-    autoLockMinutes: integer(merged.autoLockMinutes, 1, 60, 'Auto-lock minutes'),
+    autoLockMinutes: integer(merged.autoLockMinutes, 0, 60, 'Auto-lock minutes'),
     feeRate: integer(merged.feeRate, 1201, 100000, 'Fee rate'),
   };
 }

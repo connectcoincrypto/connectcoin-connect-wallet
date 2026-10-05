@@ -27,7 +27,7 @@ export function preferenceBatch(config, draft, { rpcReady = false } = {}) {
   for (const [key, max] of [['maxConnectionsPerSecond', 256], ['maxConcurrent', 256], ['lookbackBlocks', 600]]) {
     if (integer(draft.claims[key], 1, max)) take('claims', key, numeric(draft.claims[key]), config.claims?.[key], 'claims');
   }
-  for (const [key, min, max] of [['autoLockMinutes', 1, 60], ['feeRate', 1201, 100000]]) {
+  for (const [key, min, max] of [['autoLockMinutes', 0, 60], ['feeRate', 1201, 100000]]) {
     if (integer(draft.settings[key], min, max)) take('settings', key, numeric(draft.settings[key]), config[key]);
   }
   if (rpcReady && ['host', 'port'].some(key => Object.hasOwn(draft.settings, key))) {

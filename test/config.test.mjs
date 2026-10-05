@@ -23,6 +23,45 @@ test('endpoint validation supports IPv4/IPv6 and rejects URLs, Unicode control t
   for (const port of [0, 65536, -1, 1.5, '48190', Infinity, NaN]) assert.throws(() => validateRpcEndpoint({ host: 'localhost', port }));
 });
 
+test('inactivity auto-lock defaults off and accepts only integer minutes from zero through sixty', async () => {
+  assert.equal(DEFAULT_CONFIG.autoLockMinutes, 0);
+  assert.equal(validateConfig({}).autoLockMinutes, 0);
+  const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
+  assert.equal(example.autoLockMinutes, 0);
+  for (const autoLockMinutes of [0, 1, 15, 30, 60]) {
+    assert.equal(validateConfig({ autoLockMinutes }).autoLockMinutes, autoLockMinutes);
+  }
+  for (const autoLockMinutes of [-1, 61, 0.5, 1.5, null, undefined, '', '0', '15', false, true, NaN, Infinity, {}, [], 0n]) {
+    assert.throws(() => validateConfig({ autoLockMinutes }), /Auto-lock minutes/);
+  }
+  let accessed = false;
+  assert.throws(() => validateConfig({ get autoLockMinutes() { accessed = true; return 0; } }), /plain/);
+  assert.equal(accessed, false);
+});
+
+test('disabled and explicitly enabled inactivity auto-lock settings survive config writes and reads', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'connectwallet-autolock-config-test-'));
+  try {
+    const file = path.join(directory, 'config.json');
+    assert.equal((await readConfig(directory)).autoLockMinutes, 0);
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).autoLockMinutes, 0);
+    for (const autoLockMinutes of [1, 15, 60, 0]) {
+      const saved = await writeConfig(directory, { autoLockMinutes, theme: 'dark', claims: { enabled: true } });
+      assert.equal(saved.autoLockMinutes, autoLockMinutes);
+      assert.deepEqual(await readConfig(directory), saved);
+      assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), saved);
+    }
+    const legacy = JSON.stringify({ version: 1, theme: 'light' });
+    await writeFile(file, legacy);
+    assert.equal((await readConfig(directory)).autoLockMinutes, 0);
+    assert.equal(await readFile(file, 'utf8'), legacy, 'reading a profile without this preference must not rewrite it');
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
+    assert.ok(path.basename(directory).startsWith('connectwallet-autolock-config-test-'));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('claims default off with 100 starts and concurrent connections without overwriting saved limits', async () => {
   const expected = { enabled: false, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 };
   assert.deepEqual(DEFAULT_CONFIG.claims, expected);
@@ -82,7 +121,7 @@ test('mainnet is the default, test networks require explicit selection and profi
   for (const network of ['mainnet', '', '__proto__', null, 1]) assert.throws(() => validateConfig({ network }), /network/);
   assert.throws(() => validateConfig({ network: 'regtest' }), /development/);
   assert.equal(validateConfig({ network: 'regtest' }, { allowRegtest: true }).network, 'regtest');
-  for (const input of [{ version: 2 }, { autoLockMinutes: 0 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 257 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
+  for (const input of [{ version: 2 }, { autoLockMinutes: -1 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 257 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
 });
 
 test('appearance defaults to the system, accepts only explicit supported preferences and persists', async () => {
