@@ -167,7 +167,8 @@ try {
   await page.mouse.up();
   await page.getByRole('heading', { name: 'Make yourself at home.' }).waitFor();
   assert.doesNotMatch(await page.locator('#app').textContent(), /independent security audit/i);
-  assert.match(await page.locator('#app').textContent(), /This connection is not encrypted\./);
+  assert.doesNotMatch(await page.locator('#app').textContent(), /This connection is not encrypted\./);
+  assert.doesNotMatch(await page.locator('#app').textContent(), /Queried addresses and transactions can be observed or altered in transit/);
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0);
   await waitForLatest();
 
