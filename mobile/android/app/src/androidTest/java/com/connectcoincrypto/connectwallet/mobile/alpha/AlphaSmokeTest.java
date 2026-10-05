@@ -160,8 +160,13 @@ public final class AlphaSmokeTest {
             }
             assertNull(bridge.getPlugin("ReadOnlyRpc"));
             Set<String> wallet = methods(bridge.getPlugin("NativeWallet"));
+            // PluginHandle includes five inherited framework methods as well
+            // as our twelve application methods. Keep the full exact allowlist;
+            // permission methods cannot request undeclared plugin permissions.
+            assertEquals(0, bridge.getPlugin("NativeWallet").getPluginAnnotation().permissions().length);
             assertEquals(new HashSet<>(Arrays.asList("getState", "lock", "create", "importRecovery", "unlock", "reviewPayment",
-                "queryPublic", "claimsState", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission")), wallet);
+                "queryPublic", "claimsState", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission",
+                "addListener", "removeListener", "removeAllListeners", "checkPermissions", "requestPermissions")), wallet);
             for (String id : new String[] { "App", "Network", "Preferences", "SystemBars" }) assertNotNull(bridge.getPlugin(id));
         });
         assertEquals("\"undefined\"", evaluate("typeof window.CapacitorHttpAndroidInterface"));
