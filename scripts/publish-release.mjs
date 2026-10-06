@@ -320,6 +320,19 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.2') {
+    const highlights = [
+      '## New in 1.1.2',
+      '',
+      '- **Automatic Claims scheduling:** a connection waiting for its native start acknowledgment no longer blocks dispatch of every other connection. The native helper continues to enforce the configured connection rate and concurrency limits.',
+      '- A bounded pending-start queue avoids filling the helper with long-delayed requests. Fair/economic scheduling order is reserved at dispatch, so out-of-order acknowledgments do not reorder turns.',
+      '- Recovery probes remain limited per domain/policy across bounty refreshes, cancellation and restarts. Attempt statistics and probe cooldowns still begin only when a connection actually starts.',
+      '- Regression tests cover delayed acknowledgments, rate/concurrency bounds, cancellation, restart, fair ordering and duplicate-probe prevention.',
+      '',
+      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.1') {
     const highlights = [
       '## New in 1.1.1',

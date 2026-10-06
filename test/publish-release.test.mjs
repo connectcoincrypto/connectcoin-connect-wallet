@@ -64,6 +64,22 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.2 release notes describe bounded start admission without overstating performance', () => {
+  const notes = releaseNotes('1.1.2', '5678', sha);
+  for (const text of ['# ConnectWallet 1.1.2', '## New in 1.1.2', 'start acknowledgment',
+    'rate and concurrency limits', 'bounded pending-start queue', 'Recovery probes',
+    'connection actually starts', 'mobile alpha is not included', 'English', 'unsigned',
+    'not Developer-ID signed or notarized', '/blob/v1.1.2/docs/installers.md', sha]) {
+    assert.ok(notes.includes(text), text);
+  }
+  assert.ok(notes.indexOf('## New in 1.1.2') < notes.indexOf('## Downloads'));
+  assert.equal((notes.match(/## New in 1\.1\.2/g) ?? []).length, 1);
+  assert.doesNotMatch(notes, /## New in 1\.1\.1|\d+(?:\.\d+)?%|\d+(?:\.\d+)?x faster/i);
+  for (const version of ['1.1.0', '1.1.1', '1.2.0']) {
+    assert.ok(!releaseNotes(version, '5678', sha).includes('## New in 1.1.2'));
+  }
+});
+
 test('1.1.1 release notes describe the startup, locking and synchronization changes with their limits', () => {
   const notes = releaseNotes('1.1.1', '5678', sha);
   for (const text of [

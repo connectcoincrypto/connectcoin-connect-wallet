@@ -12,6 +12,9 @@ const keyOf = bounty => `${bounty.txid}:${bounty.vout}`;
 const policyOf = job => `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
 const report = (callback, event, details) => { try { Promise.resolve(callback(event, details)).catch(() => {}); } catch { /* Diagnostics never control claims. */ } };
 const DIAGNOSTIC_INTERVAL_MS = 5000, DIAGNOSTIC_SAMPLES_PER_STAGE = 4;
+// Pipeline preparation/IPC without preassigning a long queue at low rates.
+// The helper still spaces actual socket starts; this is not a rate allowance.
+const START_LOOKAHEAD_MS = 100;
 const CANCELLATIONS = Object.freeze({ stop: 'cancelledStop', locked: 'cancelledLocked', suspend: 'cancelledSuspend',
   clear: 'cancelledClear', unavailable: 'cancelledUnavailable', 'window-exit': 'cancelledWindowExit',
   'sibling-proof': 'cancelledSiblingProof', fatal: 'cancelledFatal', other: 'cancelledOther' });
@@ -47,7 +50,7 @@ function injectedPool(generateProof) {
   };
 }
 
-/** One persistent worker pool, with a fresh Core-style assignment per TCP start. */
+/** One persistent worker pool, with bounded Core-style connection assignments. */
 export class ClaimsEngine {
   constructor({ prepare, submit, isUnlocked, poolFactory, generateProof, resourcesPath, onState = () => {}, onDiagnostic = () => {},
     options = {}, retryDelayMs = 30000, maxQueue = 20000, randomIndex = randomInt, getNetReward = bounty => BigInt(bounty.amount), getValidationTime } = {}) {
@@ -61,11 +64,12 @@ export class ClaimsEngine {
     this.domainStats = new Map(); this.dns = new Map(); this.live = new Map(); this.connections = new Map();
     this.connectionPolicy = new ClaimConnectionPolicy();
     this.recoveryJobs = new Map();
+    this.pendingStarts = new Set(); this.pendingRecovery = new Map();
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
     this.waitingPrepare = new Set(); this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
     this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
-    this.nextStart = 0; this.awaitingStart = false; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
+    this.nextStart = 0; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
     this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
     this.diagnosticOperations = new Set(); this.cancellationReasons = new WeakMap();
@@ -158,7 +162,8 @@ export class ClaimsEngine {
     this.tasks.add(tracked); return tracked;
   }
   eligible(job) { return !job.unavailable && !job.retired && !job.winner && !job.budgetExceeded; }
-  ready(job) { return this.eligible(job) && !job.preparing && !job.waitingPrepare; }
+  ready(job) { return this.eligible(job) && !job.preparing && !job.waitingPrepare &&
+    !(job.recoveryProbe && this.pendingRecovery.has(policyOf(job))); }
   drawIndex(length) {
     const value = this.randomIndex(length);
     if (!Number.isSafeInteger(value) || value < 0 || value >= length) throw new Error('Invalid claim random index');
@@ -335,7 +340,7 @@ export class ClaimsEngine {
     if (!this.enabled) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     if (this.haltReason !== 'fatal') this.haltReason = reason;
     if (this.stopping) return this.stopping;
-    this.generation++; this.awaitingStart = false;
+    this.generation++;
     for (const controller of this.controllers) this.cancelOperation(controller, reason);
     const pool = this.pool; this.pool = null; this.poolReady = null;
     this.notify({ status, domain: null });
@@ -345,6 +350,7 @@ export class ClaimsEngine {
     })();
     this.stopping = pending.finally(() => {
       this.stopping = null; this.dns.clear(); this.scheduler.domainGates.clear();
+      this.pendingStarts.clear(); this.pendingRecovery.clear(); this.nextStart = 0;
       for (const job of this.waitingPrepare) job.waitingPrepare = false;
       this.waitingPrepare.clear(); this.waitingDns.clear(); this.dirty = true;
       const reason = this.haltReason; this.haltReason = null;
@@ -396,7 +402,15 @@ export class ClaimsEngine {
     if (!this.enabled || this.paused || generation !== this.generation) return;
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
-      if (this.awaitingStart || this.connections.size >= this.options.concurrency) {
+      // At least two pending starts let one slow admission be bypassed. The
+      // lookahead is bounded independently of active captures: at 1/s, never
+      // queue hundreds of requests behind the helper's 45-second IPC deadline.
+      // Only the production/helper contract guarantees socket pacing. Legacy
+      // adapters without that gate retain their single-start handshake: pacing
+      // dispatch alone could let delayed starts bunch together above the limit.
+      const pendingLimit = this.pool.pacesStarts ? Math.min(this.options.concurrency, Math.max(2,
+        Math.ceil(this.options.connectionsPerSecond * START_LOOKAHEAD_MS / 1000))) : 1;
+      if (this.pendingStarts.size >= pendingLimit || this.connections.size >= this.options.concurrency) {
         this.schedule(this.nextProofDue() - Date.now()); return;
       }
       const selection = this.nextReady();
@@ -419,7 +433,7 @@ export class ClaimsEngine {
       if (!dns.ok) { this.scheduler.setDomainReady(job.bounty.domain, true, { due: dns.expires }); continue; }
       const delay = this.nextStart - performance.now();
       if (delay > 0) { this.schedule(delay); return; }
-      this.dispatch(selection, generation); return; // Wait for real TCP-start ACK, not capture completion.
+      this.dispatch(selection, generation);
     }
   }
   cachePrepared(key, prepared) {
@@ -518,6 +532,9 @@ export class ClaimsEngine {
     const recoveryProbe = !isWorthAttempting(job.rawPriority, this.connectionRate(job));
     if (recoveryProbe) {
       if (!job.recoveryProbe || !isWorthAttempting(job.rawPriority, 5)) { this.dirty = true; this.wakeRequested = true; return; }
+      if (this.pendingRecovery.has(policyOf(job))) {
+        this.scheduler.setReady(key, false); return;
+      }
       // A delayed TCP-start acknowledgement may belong to a different bounty
       // than the current probe representative. Consult policy state, not the
       // representative's cached deadline, before spending another connection.
@@ -529,9 +546,16 @@ export class ClaimsEngine {
     }
     const controller = new AbortController(), token = ++this.nextToken;
     const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime() } : {}) });
-    const request = { job, controller, token, started: false, observed: false, recoveryProbe };
+    const request = { job, controller, token, generation, policy: policyOf(job), started: false, observed: false, recoveryProbe };
     const operation = this.beginOperation('capture', controller);
-    this.connections.set(token, request); this.controllers.add(controller); this.awaitingStart = true;
+    this.connections.set(token, request); this.controllers.add(controller); this.pendingStarts.add(token);
+    if (recoveryProbe) {
+      this.pendingRecovery.set(request.policy, request); this.scheduler.setReady(key, false);
+    }
+    // Reserve turns in dispatch order, not callback arrival order. A failure
+    // before TCP spends no attempt/EMA/probe cooldown, but cannot rewind turns
+    // already reserved by other concurrent requests.
+    this.scheduler.commit(selection);
     const pool = this.pool;
     let stage = 'proof', operationStarted = performance.now();
     const valid = () => generation === this.generation && this.enabled && !this.paused && this.isUnlocked() && !controller.signal.aborted && !job.unavailable && this.queue.get(key) === job;
@@ -539,20 +563,14 @@ export class ClaimsEngine {
       onStarted: () => {
         if (request.started) throw new Error('Duplicate connection start');
         this.countDiagnostic('attempts');
-        request.started = true; this.scheduler.commit(selection); this.awaitingStart = false;
+        request.started = true;
         if (request.recoveryProbe) {
-          const policy = policyOf(job), due = this.connectionPolicy.probeStarted(policy);
-          job.probeDue = due;
-          const representative = this.recoveryJobs.get(policy);
-          if (representative) {
-            representative.probeDue = due;
-            this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
-          }
+          job.probeDue = this.connectionPolicy.probeStarted(request.policy);
         }
-        // The native pool gates actual TCP starts with a high-resolution timer.
-        // Avoid a second Windows JS timer (~15 ms on some systems) capping it
-        // near 65/s. Offline/custom adapters may delegate pacing to this fallback.
-        this.nextStart = pool.pacesStarts ? 0 : performance.now() + 1000 / this.options.connectionsPerSecond;
+        this.releaseStart(request);
+        // Never add a second JavaScript timer to the production helper's own
+        // high-resolution socket gate. Only legacy/offline adapters need it.
+        if (generation === this.generation) this.nextStart = pool.pacesStarts ? 0 : performance.now() + 1000 / this.options.connectionsPerSecond;
         this.notify({ attempts: this.state.attempts + 1,
           ...(generation === this.generation && this.enabled && !this.paused
             ? { status: 'searching', domain: context.domain, lastError: null } : {}) }); this.kick();
@@ -588,10 +606,22 @@ export class ClaimsEngine {
       }
     }).finally(() => {
       this.finishOperation(operation);
-      if (!request.started) this.awaitingStart = false;
+      this.releaseStart(request);
       this.connections.delete(token); this.controllers.delete(controller);
     });
     void this.track(job, task);
+  }
+  releaseStart(request) {
+    this.pendingStarts.delete(request.token);
+    const policy = request.policy;
+    if (this.pendingRecovery.get(policy) !== request) return;
+    this.pendingRecovery.delete(policy);
+    const representative = this.recoveryJobs.get(policy);
+    if (representative && request.generation === this.generation) {
+      // A catalog refresh may replace the reserved bounty, not its policy.
+      representative.probeDue = this.connectionPolicy.probeDue(policy);
+      this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
+    }
   }
   nextProofDue() {
     if (this.submitting.size >= 4) return Infinity; // A completion will wake queued submissions.
