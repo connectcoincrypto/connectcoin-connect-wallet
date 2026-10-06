@@ -148,16 +148,32 @@ test('long capacity waits debit quota at transmission, not at the expired origin
     ['getaddressbalance', { address: 'fixtureaddress' }], ['getaddressutxos', { address: 'fixtureaddress' }], ['subscribetip', {}]];
   const holding = kinds.flatMap(args => [observed(f.client.request(...args)), observed(f.client.request(...args))]);
   await until(() => f.requests.length === 12);
+  const transmitted = [], write = f.client.socket.write;
+  t.mock.method(f.client.socket, 'write', function (encoded, ...args) {
+    const request = JSON.parse(encoded);
+    if (request.method === 'getaddresshistory') {
+      // Capture the quota debit at the real client write boundary. Server
+      // data callbacks can be delayed/coalesced on a busy runner, making
+      // correctly spaced transmissions appear to arrive too close together.
+      const debitedAt = f.client.history.get(request.method)?.at(-1);
+      assert.ok(Number.isFinite(debitedAt), 'each transmission must have a quota debit');
+      transmitted.push({ id: request.id, debitedAt });
+    }
+    return write.call(this, encoded, ...args);
+  });
   const queued = Array.from({ length: 3 }, () => observed(f.client.request('getaddresshistory', { address: 'fixtureaddress' })));
   await until(() => f.client.capacityWaiters.length === 3);
   await sleep(140); // Greater than the full quota window while all slots are busy.
   assert.equal(f.client.history.has('getaddresshistory'), false);
   for (let n = 0; n < 12; n++) f.answer(n);
-  await until(() => f.requests.length === 14);
+  await until(() => f.requests.length >= 14);
   assert.equal(f.client.capacityReservations, 0); // The rate-limited third read holds no slot.
   f.answer(12); f.answer(13);
   await until(() => f.requests.length === 15);
-  assert.ok(f.requests[14].at - f.requests[12].at >= 90);
+  assert.deepEqual(transmitted.map(row => row.id), f.requests.slice(12).map(row => row.request.id));
+  assert.equal(transmitted.length, 3);
+  assert.ok(transmitted[2].debitedAt - transmitted[0].debitedAt >= f.client.windowMs,
+    'the third transmitted request must consume quota in a new window');
   f.answer(14);
   assert.ok((await Promise.all([...holding, ...queued])).every(result => result.value === true));
 });
