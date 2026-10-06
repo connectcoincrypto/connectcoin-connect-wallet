@@ -177,7 +177,7 @@ test('stop cancels started and unacknowledged admissions and late acknowledgemen
   assert.equal(f.requests.length, 4); assert.equal(f.engine.snapshot().active, 0); assert.equal(f.active, 0);
 });
 
-test('adapters without native socket pacing retain serialized acknowledgements and their rate interval', async t => {
+test('adapters without native pacing retain serialized acknowledgements and recover delayed starts', async t => {
   let now = 0; t.mock.method(performance, 'now', () => now);
   const f = fixture(t, { concurrency: 4, rate: 10, pacesStarts: false });
   const advance = async milliseconds => { now += milliseconds; t.mock.timers.tick(milliseconds); await settle(); };
@@ -190,10 +190,73 @@ test('adapters without native socket pacing retain serialized acknowledgements a
   await advance(1); assert.equal(f.requests.length, 2);
   await advance(1000); assert.equal(f.requests.length, 2, 'the fallback still waits for its second real start');
   f.requests[1].start();
-  await advance(99); assert.equal(f.requests.length, 2);
-  await advance(1); assert.equal(f.requests.length, 3);
-  assert.deepEqual(f.requests.map(request => request.dispatchedAt), [0, 350, 1450]);
+  await settle(); assert.equal(f.requests.length, 3, 'late starts recover the shared schedule instead of adding a new full interval');
+  assert.equal(f.engine.nextStart, 450, 'advance the prior deadline before applying the one-second bound');
+  assert.deepEqual(f.requests.map(request => request.dispatchedAt), [0, 350, 1350]);
   assert.equal(f.engine.snapshot().attempts, 2); assert.equal(f.peak, 3);
+});
+
+for (const rate of [1, 7, 10, 50, 100, 256]) {
+  for (const offset of [-0.000001, 0, 0.000001]) {
+    test(`fallback ${rate}/s advances before its one-second debt boundary (${offset}ms)`, async t => {
+      let now = 0; t.mock.method(performance, 'now', () => now);
+      const f = fixture(t, { concurrency: 4, rate, pacesStarts: false });
+      f.ready(ordinary()); f.engine.start(); await settle();
+      f.requests[0].start(); await settle();
+      const interval = 1000 / rate;
+      assert.equal(f.engine.nextStart, interval);
+      now = interval; f.engine.kick(); await settle();
+      assert.equal(f.requests.length, 2);
+      now = 2 * interval + 1000 + offset;
+      f.requests[1].start(); await settle();
+      assert.ok(Math.abs(f.engine.nextStart - Math.max(2 * interval, now - 1000)) < 1e-9);
+      assert.ok(f.engine.nextStart >= now - 1000, 'debt never exceeds one second after a start');
+      assert.equal(f.engine.snapshot().attempts, 2, 'admission does not invent a TCP acknowledgement');
+    });
+  }
+}
+
+test('fallback discards true idle credit but preserves an unexpired deadline', async t => {
+  let now = 0; t.mock.method(performance, 'now', () => now);
+  const f = fixture(t, { rate: 10, pacesStarts: false });
+  f.ready(ordinary()); f.engine.start(); await settle(); f.requests[0].start(); await settle();
+  f.engine.clear(); await settle();
+  now = 50; f.ready(ordinary()); await settle(); f.engine.kick(); await settle();
+  assert.equal(f.requests.length, 1, 'clearing work cannot bypass the future rate deadline');
+  now = 3000; f.engine.kick(); await settle();
+  assert.equal(f.requests.length, 2); f.requests[1].start(); await settle();
+  assert.equal(f.engine.nextStart, 3100, 'idle time cannot become a one-second catch-up burst');
+  assert.equal(f.requests.length, 2);
+});
+
+test('a cancelled late fallback start cannot consume the pending idle reset', async t => {
+  let now = 0; t.mock.method(performance, 'now', () => now);
+  const f = fixture(t, { concurrency: 1, rate: 10, holdAbort: true, pacesStarts: false });
+  f.ready(ordinary()); f.engine.start(); await settle();
+  f.engine.clear(); await settle();
+  assert.equal(f.requests[0].callbacks.signal.aborted, true);
+  f.requests[0].start(); await settle();
+  assert.equal(f.engine.snapshot().attempts, 1, 'the cancelled request still reports its real start');
+  now = 5000; f.ready(ordinary()); f.engine.kick(); await settle();
+  assert.equal(f.requests.length, 1, 'the cancelled request still occupies capacity until drained');
+  f.requests[0].finish(); await settle();
+  assert.equal(f.requests.length, 2); f.requests[1].start(); await settle();
+  assert.equal(f.engine.nextStart, 5100, 'the next live admission rebases after the idle interval');
+  assert.equal(f.engine.snapshot().attempts, 2);
+});
+
+test('cancelled-only fallback capacity does not bridge idle after removing its bounty', async t => {
+  let now = 0; t.mock.method(performance, 'now', () => now);
+  const f = fixture(t, { concurrency: 1, rate: 10, holdAbort: true, pacesStarts: false });
+  const first = row(1, 'alpha.example');
+  f.ready([first]); f.engine.start(); await settle();
+  f.requests[0].start(); await settle(); f.engine.remove(first.txid, first.vout); await settle();
+  assert.equal(f.requests[0].callbacks.signal.aborted, true);
+  now = 5000; f.ready([row(2, 'beta.example')]); f.engine.kick(); await settle();
+  assert.equal(f.requests.length, 1);
+  f.requests[0].finish(); await settle(); f.requests[1].start(); await settle();
+  assert.equal(f.engine.nextStart, 5100);
+  assert.equal(f.requests.length, 2, 'resumed work must not inherit cancelled-only capacity debt');
 });
 
 test('restart after draining stop can fill fresh slots without retaining old pending admissions', async t => {

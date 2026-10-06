@@ -69,7 +69,7 @@ export class ClaimsEngine {
     this.waitingPrepare = new Set(); this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
     this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
-    this.nextStart = 0; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
+    this.nextStart = 0; this.startIdle = true; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
     this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
     this.diagnosticOperations = new Set(); this.cancellationReasons = new WeakMap();
@@ -305,6 +305,7 @@ export class ClaimsEngine {
     this.notify(); this.kick();
   }
   clear({ preserveSelection = false } = {}) {
+    this.startIdle = true;
     for (const job of this.queue.values()) job.unavailable = true;
     this.queue.clear(); this.completed.clear();
     this.recoveryJobs.clear();
@@ -350,7 +351,7 @@ export class ClaimsEngine {
     })();
     this.stopping = pending.finally(() => {
       this.stopping = null; this.dns.clear(); this.scheduler.domainGates.clear();
-      this.pendingStarts.clear(); this.pendingRecovery.clear(); this.nextStart = 0;
+      this.pendingStarts.clear(); this.pendingRecovery.clear(); this.nextStart = 0; this.startIdle = true;
       for (const job of this.waitingPrepare) job.waitingPrepare = false;
       this.waitingPrepare.clear(); this.waitingDns.clear(); this.dirty = true;
       const reason = this.haltReason; this.haltReason = null;
@@ -411,10 +412,18 @@ export class ClaimsEngine {
       const pendingLimit = this.pool.pacesStarts ? Math.min(this.options.concurrency, Math.max(2,
         Math.ceil(this.options.connectionsPerSecond * START_LOOKAHEAD_MS / 1000))) : 1;
       if (this.pendingStarts.size >= pendingLimit || this.connections.size >= this.options.concurrency) {
+        // Cancelled requests can still occupy capacity while their callbacks
+        // drain. They cannot bridge an idle period into the next live run.
+        if (!this.pool.pacesStarts && [...this.connections.values()].every(request => request.controller.signal.aborted)) this.startIdle = true;
         this.schedule(this.nextProofDue() - Date.now()); return;
       }
       const selection = this.nextReady();
-      if (!selection) { this.notify({ status: 'waiting' }); this.schedule(Math.min(this.scheduler.nextDue(), this.nextProofDue()) - Date.now()); return; }
+      if (!selection) {
+        // No runnable or live capture demand: idle time does not earn credit.
+        // Capacity/ACK waits above retain the shared phase instead.
+        if (![...this.connections.values()].some(request => !request.controller.signal.aborted)) this.startIdle = true;
+        this.notify({ status: 'waiting' }); this.schedule(Math.min(this.scheduler.nextDue(), this.nextProofDue()) - Date.now()); return;
+      }
       const [key, job] = selection;
       if (!this.ready(job)) { this.scheduler.remove(key); continue; }
       if (!job.prepared) {
@@ -570,7 +579,17 @@ export class ClaimsEngine {
         this.releaseStart(request);
         // Never add a second JavaScript timer to the production helper's own
         // high-resolution socket gate. Only legacy/offline adapters need it.
-        if (generation === this.generation) this.nextStart = pool.pacesStarts ? 0 : performance.now() + 1000 / this.options.connectionsPerSecond;
+        if (generation === this.generation) {
+          if (pool.pacesStarts) this.nextStart = 0;
+          else {
+            const now = performance.now();
+            if (this.startIdle) this.nextStart = Math.max(this.nextStart, now);
+            this.nextStart = Math.max(this.nextStart + 1000 / this.options.connectionsPerSecond, now - 1000);
+            // Count late real starts, but cancelled old work must not consume
+            // the pending idle reset belonging to the next live admission.
+            if (!controller.signal.aborted && !job.unavailable && this.queue.get(key) === job) this.startIdle = false;
+          }
+        }
         this.notify({ attempts: this.state.attempts + 1,
           ...(generation === this.generation && this.enabled && !this.paused
             ? { status: 'searching', domain: context.domain, lastError: null } : {}) }); this.kick();

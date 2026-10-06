@@ -64,6 +64,24 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.3 release notes describe bounded-debt pacing and retain distribution disclosures', () => {
+  const notes = releaseNotes('1.1.3', '5678', sha);
+  for (const text of ['# ConnectWallet 1.1.3', '## New in 1.1.3', 'configured connection rate',
+    'one second of scheduling debt', 'Genuine idle periods do not bank extra credit',
+    'preserves a still-future deadline and recent start-permit history within the running helper', 'global concurrency limit',
+    'configured-rate rolling limit on TCP-start permits', 'without an additional JavaScript rate timer',
+    'Actual throughput still depends on system and network conditions', 'mobile alpha is not included',
+    'English', 'unsigned', 'not Developer-ID signed or notarized', 'SHA256SUMS',
+    '/blob/v1.1.3/docs/installers.md', '/actions/runs/5678', sha]) assert.ok(notes.includes(text), text);
+  assert.ok(notes.indexOf('## New in 1.1.3') < notes.indexOf('## Downloads'));
+  assert.equal((notes.match(/## New in 1\.1\.3/g) ?? []).length, 1);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.doesNotMatch(notes, /## New in 1\.1\.[012]|\d+(?:\.\d+)?%|\d+(?:\.\d+)?x faster/i);
+  for (const version of ['1.1.0', '1.1.1', '1.1.2', '1.2.0']) {
+    assert.ok(!releaseNotes(version, '5678', sha).includes('## New in 1.1.3'));
+  }
+});
+
 test('1.1.2 release notes describe bounded start admission without overstating performance', () => {
   const notes = releaseNotes('1.1.2', '5678', sha);
   for (const text of ['# ConnectWallet 1.1.2', '## New in 1.1.2', 'start acknowledgment',

@@ -135,6 +135,8 @@ class ClaimsService:
         self.active_dns = 0
         self.next_start = 0.0
         self.next_connection = 0.0
+        self.start_idle = self.connection_idle = True
+        self.connection_starts = deque()
         self.closed = False
         # Two resolver slots cannot occupy the TLS capacity. The same executor
         # serves all domains/bounties for the entire unlocked claims session.
@@ -201,6 +203,10 @@ class ClaimsService:
                 budget.successes = max(budget.successes, int(successes))
                 budget.users += 1
                 self.budgets.move_to_end(bounty_id)
+                # An empty or cancelled-only session earns no pacing credit.
+                # Active captures and queued attempts both keep demand alive.
+                if not any(item.kind == "attempt" and not item.control.cancelled() for item in self.jobs.values()):
+                    self.start_idle = self.connection_idle = True
             self.last_id = identifier
             self.jobs[identifier] = job
             self.pending.append(job)
@@ -280,7 +286,13 @@ class ClaimsService:
                     budget = self.budgets[job.bounty_id]
                     if budget.successes == MAX_UINT64 or budget.successes * (budget.target + 1) > (1 << 257):
                         raise BudgetExhausted()
-                    self.next_start = time.monotonic() + 1.0 / self.rate
+                    now = time.monotonic()
+                    if self.start_idle:
+                        self.next_start = max(self.next_start, now)
+                        self.start_idle = False
+                    # Advance the shared phase first, then bound debt to one
+                    # second. Late timer wakes do not add a fresh interval.
+                    self.next_start = max(self.next_start + 1.0 / self.rate, now - 1.0)
                     return
             # Python 3.11+ sleep uses a high-resolution Windows waitable timer;
             # Lock/Condition timed waits can round to ~15 ms and cap 100/s at 65/s.
@@ -299,18 +311,29 @@ class ClaimsService:
         self.emit({"type": "started", "id": job.identifier})
 
     def _connecting(self, job):
-        # Keep actual TCP starts spaced even when IPC delayed several already
-        # reserved start reports. The pre-report gate remains necessary to avoid
-        # flooding the desktop with acknowledgements for rate-waiting requests.
+        # IPC can delay already reserved start reports. Apply the same bounded
+        # phase to TCP start permits, with a separate rolling configured-rate
+        # ceiling. The socket connect follows this hook.
+        # The pre-report gate bounds acknowledgements waiting on IPC.
         # Neither local wait belongs to the network deadline or EMA duration.
         while True:
             with self.condition:
                 if self.closed or job.control.cancelled():
                     raise CaptureCancelled("TLS capture cancelled")
                 now = time.monotonic()
-                delay = self.next_connection - now
+                while self.connection_starts and self.connection_starts[0] + 1.0 <= now:
+                    self.connection_starts.popleft()
+                ready = self.next_connection
+                if len(self.connection_starts) >= self.rate:
+                    ready = max(ready, self.connection_starts[0] + 1.0)
+                delay = ready - now
                 if delay <= 0:
-                    self.next_connection = now + 1.0 / self.rate
+                    now = time.monotonic()
+                    if self.connection_idle:
+                        self.next_connection = max(self.next_connection, now)
+                        self.connection_idle = False
+                    self.next_connection = max(self.next_connection + 1.0 / self.rate, now - 1.0)
+                    self.connection_starts.append(now)
                     job.started_at = now
                     return
             time.sleep(min(delay, 0.010))

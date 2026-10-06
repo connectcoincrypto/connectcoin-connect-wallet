@@ -320,6 +320,19 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.3') {
+    const highlights = [
+      '## New in 1.1.3',
+      '',
+      '- **Automatic Claims pacing:** shared scheduling deadlines now advance by the interval for the configured connection rate, compensating for delayed timer wakeups and native start acknowledgments instead of accumulating their delay on every connection.',
+      '- Catch-up keeps at most one second of scheduling debt. Genuine idle periods do not bank extra credit. Idle/cancellation handling preserves a still-future deadline and recent start-permit history within the running helper.',
+      '- The native helper retains the global concurrency limit and a separate configured-rate rolling limit on TCP-start permits. The production path uses native pacing without an additional JavaScript rate timer; the compatibility fallback uses the same bounded-debt schedule.',
+      '- Regression tests cover multiple configured rates, coarse timers, delayed acknowledgments, debt boundaries, cancellation, idle periods and concurrency. Actual throughput still depends on system and network conditions.',
+      '',
+      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.2') {
     const highlights = [
       '## New in 1.1.2',
