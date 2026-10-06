@@ -622,20 +622,23 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(set(call.args[0] for call in h.capture.call_args_list), set(endpoints))
             self.assertEqual(h.resolve.call_count, 2)
 
-    def test_actual_tcp_start_rate_survives_delayed_start_reports_without_burst(self):
-        with Fixture(connectionsPerSecond=10) as h:
-            clock = [100.0]
+    def test_actual_tcp_start_gate_recovers_delayed_start_reports(self):
+        with Fixture(connectionsPerSecond=10) as h, PacingClock() as clock:
             jobs = [service.Job(index, "attempt") for index in range(3)]
-            with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]), \
-                 patch.object(service.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + max(seconds, 0.001))):
-                # All three reports became ready after a delayed pipe; the
-                # independent network gate still spaces their actual connects.
-                for job in jobs: h.service._connecting(job)
-            self.assertGreaterEqual(jobs[1].started_at - jobs[0].started_at, 0.0999)
-            self.assertGreaterEqual(jobs[2].started_at - jobs[1].started_at, 0.0999)
+            h.service._connecting(jobs[0])
+            # Reports delayed behind IPC retain the shared phase; they do not
+            # each add another complete interval once the pipe is available.
+            clock.now += 0.25
+            for job in jobs[1:]: h.service._connecting(job)
+            self.assertEqual([job.started_at for job in jobs], [100.0, 100.25, 100.25])
+            self.assertAlmostEqual(h.service.next_connection, 100.3, places=11)
+            self.assertEqual(clock.sleeps, [])
+            phase, history = h.service.next_connection, tuple(h.service.connection_starts)
             cancelled = service.Job(4, "attempt")
             cancelled.control.cancel()
             with self.assertRaises(CaptureCancelled): h.service._connecting(cancelled)
+            self.assertEqual(h.service.next_connection, phase)
+            self.assertEqual(tuple(h.service.connection_starts), history)
 
     def test_service_completes_handshake_and_measures_after_start_acknowledgement(self):
         with Fixture() as h:
@@ -762,20 +765,62 @@ class ServiceTests(unittest.TestCase):
             release.set(); server_thread.join(4)
 
     def test_global_start_rate_is_shared_across_domains(self):
-        times = []
-        with Fixture(connectionsPerSecond=20, concurrency=2) as h:
-            h.resolve_domain()
-            h.resolve_domain(2, "other.example")
+        rate = 20
+        # Drive the real attempt/capture hooks in a deterministic worker order.
+        # Host preemption must not turn this into an adjacent-wall-time-gap test:
+        # bounded catch-up intentionally permits gaps shorter than 1 / rate.
+        with patch.object(service.ClaimsService, "_schedule"), \
+             Fixture(connectionsPerSecond=rate, concurrency=2) as h, \
+             PacingClock(quantum=0.015625) as clock:
+            for identifier, domain in enumerate(("example.com", "other.example"), 1):
+                h.service._resolve(service.Job(identifier, "resolve", domain=domain))
+            identifiers = list(range(3, 2 * rate + 6))
+            for identifier in identifiers:
+                h.attempt(identifier, bounty=identifier,
+                          domain="other.example" if identifier % 2 == 0 else "example.com")
+            admissions, permits = [], []
+            before_start, connecting = h.service._before_start, h.service._connecting
+            def before(job):
+                previous, idle = h.service.next_start, h.service.start_idle
+                before_start(job)
+                admissions.append((job.domain, clock.now, previous, idle, h.service.next_start))
+            def connect(job):
+                previous, idle = h.service.next_connection, h.service.connection_idle
+                connecting(job)
+                permits.append((job.domain, job.started_at, previous, idle, h.service.next_connection))
+                if len(permits) == 1:
+                    clock.now += 0.25  # Preemption after the permit was granted.
             original_emit = h.service.emit_callback
             def emit(frame):
-                if frame["type"] == "started": times.append(time.monotonic())
+                if frame["type"] == "started" and frame["id"] == 4:
+                    clock.now += 2.25  # Delayed IPC exceeds the one-second debt cap.
                 original_emit(frame)
             h.service.emit_callback = emit
-            for identifier in (3, 4, 5):
-                h.attempt(identifier, bounty=identifier, domain="other.example" if identifier == 4 else "example.com")
-            for identifier in (3, 4, 5): h.wait("attempt", identifier)
-            self.assertEqual(len(times), 3)
-            self.assertTrue(all(right - left >= 0.040 for left, right in zip(times, times[1:])))
+            with patch.object(h.service, "_before_start", side_effect=before), \
+                 patch.object(h.service, "_connecting", side_effect=connect):
+                while h.service.pending:
+                    job = h.service.pending.popleft()
+                    job.running = True
+                    h.service.active_tls += 1
+                    h.service._run(job)
+            results = [frame for frame in h.frames if frame["type"] == "attempt"]
+            self.assertEqual([frame["id"] for frame in results], identifiers)
+            self.assertTrue(all(frame["verified"] for frame in results))
+            self.assertEqual(h.capture.call_count, len(identifiers))
+            for observations in (admissions, permits):
+                self.assertEqual(len(observations), len(identifiers))
+                self.assertEqual({row[0] for row in observations}, {"example.com", "other.example"})
+                self.assertEqual([row[3] for row in observations], [True] + [False] * (len(identifiers) - 1))
+                for _, now, previous, idle, phase in observations:
+                    expected = max((max(previous, now) if idle else previous) + 1.0 / rate, now - 1.0)
+                    self.assertAlmostEqual(phase, expected, places=11)
+            times = [row[1] for row in permits]
+            self.assertTrue(any(right == left for left, right in zip(times, times[1:])))
+            # Check the combined domains' permit stream, independently of the
+            # internal deque. Observer/ACK timestamps are not socket permits.
+            for index, now in enumerate(times):
+                self.assertLessEqual(sum(then + 1.0 > now for then in times[:index + 1]), rate)
+            self.assertTrue(clock.sleeps)
 
     def test_global_concurrency_and_cancellation_are_per_attempt(self):
         release = threading.Event()
@@ -875,7 +920,7 @@ class ServiceTests(unittest.TestCase):
                 # clock rate accuracy. Expire the previous synthetic slot so
                 # OS sleep granularity cannot add 4-16 seconds to 1,100 mocks.
                 # Keep the real start hook (including budget/cancel checks);
-                # the dedicated cross-domain rate test still uses real time.
+                # the cross-domain test checks deterministic phase and quota.
                 with h.service.condition:
                     h.service.next_start = 0
                     h.service.next_connection = 0
