@@ -320,6 +320,20 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.4') {
+    const highlights = [
+      '## New in 1.1.4',
+      '',
+      '- **Address-driven wallet updates:** address subscriptions now request `changes_only:true` and require explicit server acknowledgment. Relevant address notifications trigger validated balance and transaction updates instead of refreshing every address on every block.',
+      '- **Local confirmation updates:** ordinary chain-tip notifications update the displayed height and confirmations of already-confirmed transactions without querying address balances, history, UTXOs or journal deltas. Pending transactions remain unconfirmed until an address update establishes their inclusion. Display-only updates never change spendable funds or advance synchronization cursors.',
+      '- **Reconnect and reorganization protection:** interrupted or old-chain reads cannot publish obsolete snapshots. Reconnection and chain reorganizations revalidate wallet data before resuming confirmation projection; delayed responses cannot move the displayed height behind a newer tip on the same chain.',
+      '- **RPC compatibility:** automatic address updates require a server supporting acknowledged changes-only subscriptions. Older servers show a warning and retain startup/manual reads; use **Refresh** to update balances and transactions. There is no silent fallback to per-block address polling. Subscription-capacity warnings also identify when manual refresh is needed for untracked addresses.',
+      '- Automatic Claims bounty discovery remains independent of balance/history updates. On compatible servers, changes to spendable funds such as coinbase maturity are delivered as address events.',
+      '',
+      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.3') {
     const highlights = [
       '## New in 1.1.3',

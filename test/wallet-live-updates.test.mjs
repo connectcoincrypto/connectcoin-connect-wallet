@@ -39,7 +39,7 @@ class Backend extends EventEmitter {
       const key = `${kind}:${params.address ?? ''}`;
       if (!this.subscriptions.has(key)) this.subscriptions.set(key, { kind, address: params.address,
         subscription_id: `sub-${this.generation}-${this.subscriptions.size}` });
-      return { ...this.subscriptions.get(key), tip, cursor: 'journal-0' };
+      return { ...this.subscriptions.get(key), tip, cursor: 'journal-0', ...(kind === 'address' ? { changes_only: true } : {}) };
     }
     if (method === 'unsubscribe') {
       const entry = [...this.subscriptions].find(([, value]) => value.subscription_id === params.subscription_id);
@@ -416,6 +416,7 @@ test('disconnect during a held refresh forces another read after reconnect even 
     return result;
   };
   const pending = s.refresh();
+  const cancelled = assert.rejects(pending, { name: 'AbortError', code: 'ABORT_ERR' });
   await until(() => held);
   s.liveUpdates.retryDelay = 5;
   s.liveUpdates.retryMinMs = 5;
@@ -424,7 +425,7 @@ test('disconnect during a held refresh forces another read after reconnect even 
   await until(() => rpc.generation === 2 && rpc.subscriptions.size === s.accounts.length + 2);
   // Complete an old address snapshot only after the reconnect catch-up signal.
   // Its old revision must not acknowledge changes which happened in the gap.
-  gate.resolve(); await pending;
+  gate.resolve(); await cancelled;
   await until(() => s.balance?.confirmed === '1', 'Reconnect catch-up was incorrectly consumed by the stale held refresh');
   assert.equal(s.tip.hash, tip.hash);
 });

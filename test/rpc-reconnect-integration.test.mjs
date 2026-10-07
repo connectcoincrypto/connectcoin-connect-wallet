@@ -32,6 +32,10 @@ async function fixture(t) {
         if (request.method === 'getchaintip') result = tip;
         else if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(request.method)) {
           result = { subscription_id: `${connection}-${request.method}-${request.params.address ?? ''}`, tip, cursor: 'isolated-cursor' };
+          if (request.method === 'subscribeaddress') {
+            assert.equal(request.params.changes_only, true);
+            result.changes_only = true;
+          }
         } else assert.fail(`Unexpected request in the read-only fixture: ${request.method}`);
         socket.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, result })}\n`);
       }

@@ -64,6 +64,46 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.4 release notes describe address-driven synchronization with compatibility and safety limits', () => {
+  const notes = releaseNotes('1.1.4', '5678', sha);
+  for (const text of [
+    '# ConnectWallet 1.1.4', '## New in 1.1.4', '`changes_only:true`', 'explicit server acknowledgment',
+    'ordinary chain-tip notifications', 'already-confirmed transactions',
+    'without querying address balances, history, UTXOs or journal deltas',
+    'Pending transactions remain unconfirmed until an address update establishes their inclusion',
+    'Display-only updates never change spendable funds or advance synchronization cursors',
+    'old-chain reads cannot publish obsolete snapshots', 'revalidate wallet data',
+    'Older servers show a warning and retain startup/manual reads', 'use **Refresh**',
+    'no silent fallback to per-block address polling', 'manual refresh is needed for untracked addresses',
+    'bounty discovery remains independent', 'coinbase maturity', 'mobile alpha is not included',
+    'No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format',
+    'Close ConnectWallet before upgrading', 'same Windows installer family',
+    'Claims are disabled by default', 'Installers use English', 'Windows downloads are unsigned',
+    'not Developer-ID signed or notarized', 'SHA256SUMS', 'four platform manifests',
+    'trusted server over an unencrypted RPC connection', 'does not independently validate blockchain consensus',
+    '/blob/v1.1.4/docs/installers.md', '/blob/v1.1.4/README.md', '/actions/runs/5678', sha,
+  ]) assert.ok(notes.includes(text), text);
+  assert.ok(notes.indexOf('## New in 1.1.4') < notes.indexOf('## Downloads'));
+  assert.equal((notes.match(/## New in 1\.1\.4/g) ?? []).length, 1);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.doesNotMatch(notes, /## New in 1\.1\.[0123]|\d+(?:\.\d+)?%|\d+(?:\.\d+)?x faster/i);
+  for (const version of ['1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.2.0']) {
+    assert.ok(!releaseNotes(version, '5678', sha).includes('## New in 1.1.4'));
+  }
+});
+
+test('adding 1.1.4 release notes preserves all previously published 1.1.x notes exactly', () => {
+  const hashes = {
+    '1.1.0': '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd',
+    '1.1.1': 'dbba98f4dcf0919efd294e87972288f8a03022c3fe5b4214d138153b0964d175',
+    '1.1.2': '5b82dec2d732d18c3132d7f6719c6029e41437ff96a60ab00dc580a94385ee02',
+    '1.1.3': '24f12824b3fcda9b49dcee8f654fe58bdb85a2368541add2b3cd5e003a9da216',
+  };
+  for (const [version, expectedHash] of Object.entries(hashes)) {
+    assert.equal(createHash('sha256').update(releaseNotes(version, '5678', sha)).digest('hex'), expectedHash, version);
+  }
+});
+
 test('1.1.3 release notes describe bounded-debt pacing and retain distribution disclosures', () => {
   const notes = releaseNotes('1.1.3', '5678', sha);
   for (const text of ['# ConnectWallet 1.1.3', '## New in 1.1.3', 'configured connection rate',

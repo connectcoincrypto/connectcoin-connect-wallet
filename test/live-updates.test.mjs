@@ -5,6 +5,7 @@ import { LiveUpdates } from '../src/core/live-updates.mjs';
 import { GENESIS } from '../src/core/config.mjs';
 
 const tip = { chain: 'testnet4', genesis_hash: GENESIS.testnet4, height: 1, hash: 'a'.repeat(64), mediantime: 100 };
+const addressReply = subscription_id => ({ subscription_id, tip, cursor: 'c', changes_only: true });
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 class FakeRpc extends EventEmitter {
@@ -13,7 +14,7 @@ class FakeRpc extends EventEmitter {
   async request(method, params, options) {
     const call = { method, params, options }; this.calls.push(call);
     if (this.handler) { const result = await this.handler(call); if (result !== undefined) return result; }
-    return { subscription_id: `id${++this.next}`, tip, cursor: 'opaque_cursor' };
+    return { subscription_id: `id${++this.next}`, tip, cursor: 'opaque_cursor', ...(method === 'subscribeaddress' ? { changes_only: true } : {}) };
   }
   disconnect() { this.up = false; this.emit('disconnected'); }
 }
@@ -35,6 +36,7 @@ function setup(options = {}) {
 test('base subscriptions precede addresses, catch up after readiness and never poll on success', async () => {
   const s = setup(); s.live.start(); await flush();
   assert.deepEqual(s.rpc.calls.map(c => c.method), ['subscribetip', 'subscribebounties', 'subscribeaddress']);
+  assert.deepEqual(s.rpc.calls[2].params, { address: 'abcdefgh1', changes_only: true });
   assert.deepEqual(s.changes[0], { wallet: true, bounties: true, reset: false, catchup: true });
   assert.deepEqual(s.changes[1], { wallet: true, bounties: false, reset: false, catchup: true });
   assert.equal(s.timers.size, 0);
@@ -46,7 +48,7 @@ test('notifications are validated and translated to wakeups, not applied as stat
   const s = setup(); s.live.start(); await flush(); s.changes.length = 0;
   s.notify('tip'); s.notify('bounties'); s.notify('address:abcdefgh1');
   assert.deepEqual(s.changes, [
-    { wallet: true, bounties: true, reset: false, catchup: false },
+    { tip, wallet: false, bounties: true, reset: false, catchup: false },
     { wallet: false, bounties: true, reset: false, catchup: false },
     { wallet: true, bounties: false, reset: false, catchup: false },
   ]);
@@ -57,7 +59,7 @@ test('notifications are validated and translated to wakeups, not applied as stat
   s.notify('bounties', { cursor: '' }); s.notify('bounties', { cursor: 'a'.repeat(4097) }); s.notify('bounties', { changes: {} });
   assert.equal(s.changes.length, 0); assert.equal(s.errors.length, 1);
   s.notify('tip', { reorg: true }); s.notify('bounties', { resync_required: true, changes: undefined });
-  assert.equal(s.changes.length, 2); assert.ok(s.changes.every(change => change.reset && change.bounties));
+  assert.equal(s.changes.length, 2); assert.ok(s.changes.every(change => change.wallet && change.reset && change.bounties));
   s.live.close();
 });
 
@@ -116,7 +118,7 @@ test('address capacity stops retries and preserves tip and bounty subscriptions'
   assert.match(s.errors[0].message, /Refresh/); assert.equal(s.timers.size, 0);
   for (let i = 0; i < 20; i++) s.live.updateAddresses(); await flush();
   assert.equal(s.rpc.calls.filter(c => c.method === 'subscribeaddress').length, 1);
-  s.changes.length = 0; s.notify('tip'); assert.ok(s.changes[0].wallet && s.changes[0].bounties); s.live.close();
+  s.changes.length = 0; s.notify('tip'); assert.equal(s.changes[0].wallet, false); assert.equal(s.changes[0].bounties, true); s.live.close();
 });
 
 test('address changes unsubscribe stale addresses and subscribe replacements', async () => {
@@ -126,7 +128,7 @@ test('address changes unsubscribe stale addresses and subscribe replacements', a
   assert.equal(s.live.registrations.has('address:abcdefgh1'), false);
   assert.equal(s.live.registrations.has('address:abcdefgh2'), true);
   assert.deepEqual(s.rpc.calls.slice(3).map(c => [c.method, c.params]), [
-    ['unsubscribe', { subscription_id: old }], ['subscribeaddress', { address: 'abcdefgh2' }],
+    ['unsubscribe', { subscription_id: old }], ['subscribeaddress', { address: 'abcdefgh2', changes_only: true }],
   ]); s.live.close();
 });
 
@@ -165,9 +167,9 @@ test('address catch-ups are batched, while base tip changes remain immediate', a
   s.setAddresses(['address000', 'address001', 'newaddress']); s.live.updateAddresses(); await flush();
   s.changes.length = 0; s.notify('address:address000');
   assert.equal(s.changes.length, 0); assert.equal(s.timers.size, 1);
-  s.notify('tip'); assert.deepEqual(s.changes, [{ wallet: true, bounties: true, reset: false, catchup: false }]);
+  s.notify('tip'); assert.deepEqual(s.changes, [{ tip, wallet: false, bounties: true, reset: false, catchup: false }]);
   s.fire(); assert.deepEqual(s.changes[1], { wallet: true, bounties: false, reset: false, catchup: false });
-  pending.resolve({ subscription_id: 'new-id', tip, cursor: 'c' }); await flush();
+  pending.resolve(addressReply('new-id')); await flush();
   assert.equal(s.timers.size, 0); s.live.close();
 });
 
@@ -192,7 +194,7 @@ test('closing while a batched address notification waits cancels that wakeup', a
 });
 
 test('subscription identifiers are opaque bounded text, not assumed UUIDs', async () => {
-  const s = setup(); s.rpc.handler = call => ({ subscription_id: `${call.method}:${call.params.address ?? ''}`, tip, cursor: 'c' });
+  const s = setup(); s.rpc.handler = call => ({ subscription_id: `${call.method}:${call.params.address ?? ''}`, tip, cursor: 'c', changes_only: true });
   s.live.start(); await flush(); assert.equal(s.live.registrations.size, 3);
   s.changes.length = 0; s.notify('tip'); assert.equal(s.changes.length, 1); s.live.close();
 });
@@ -204,7 +206,7 @@ test('watchAddress waits for the address subscription before the caller reads hi
   let read = false;
   const watched = s.live.watchAddress('abcdefgh1').then(result => { read = true; return result; });
   await flush(); assert.equal(read, false);
-  pending.resolve({ subscription_id: 'watched', tip, cursor: 'c' });
+  pending.resolve(addressReply('watched'));
   assert.equal(await watched, true); assert.equal(read, true);
   assert.ok(s.changes.every(change => change.catchup));
   const count = s.rpc.calls.length; assert.equal(await s.live.watchAddress('abcdefgh1'), true);
@@ -219,7 +221,7 @@ test('watchAddress handles an address discovered after a running batch snapshot'
   s.live.start(); await flush();
   s.setAddresses(['abcdefgh1', 'abcdefgh2']);
   const watched = s.live.watchAddress('abcdefgh2');
-  pending.resolve({ subscription_id: 'earlier', tip, cursor: 'c' });
+  pending.resolve(addressReply('earlier'));
   assert.equal(await watched, true);
   assert.equal(s.rpc.calls.filter(call => call.method === 'subscribeaddress').length, 2);
   assert.ok(s.live.registrations.has('address:abcdefgh2')); s.live.close();
@@ -241,7 +243,7 @@ test('real address notifications merged with subscription catch-ups stay real', 
   s.rpc.handler = call => call.method === 'subscribeaddress' && call.params.address === 'abcdefgh3' ? pending.promise : undefined;
   s.live.updateAddresses(); await flush();
   s.notify('address:abcdefgh1');
-  pending.resolve({ subscription_id: 'last', tip, cursor: 'c' }); await flush();
+  pending.resolve(addressReply('last')); await flush();
   assert.equal(s.changes.length, 1); assert.equal(s.changes[0].catchup, false);
   assert.equal(s.changes[0].wallet, true); s.live.close();
 });
@@ -302,13 +304,14 @@ test('address registrations run at most two at once after both serial base subsc
   baseTip.resolve({ subscription_id: 'base-tip', tip, cursor: 'c' }); await flush();
   assert.deepEqual(s.rpc.calls.map(call => call.method), ['subscribetip', 'subscribebounties']);
   baseBounties.resolve({ subscription_id: 'base-bounties', tip, cursor: 'c' }); await flush();
-  assert.equal(pending.length, 2); assert.equal(active, 2);
-  const target = s.live.watchAddress('address1');
-  pending[1].reply.resolve({ subscription_id: 'address1', tip, cursor: 'c' });
-  assert.equal(await target, true); await flush();
+  assert.equal(pending.length, 1); assert.equal(active, 1, 'Probe capability before opening parallel address watches');
+  pending[0].reply.resolve(addressReply('address0')); await flush();
   assert.equal(pending.length, 3); assert.equal(active, 2);
-  pending[0].reply.resolve({ subscription_id: 'address0', tip, cursor: 'c' }); await flush();
-  for (let i = 2; i < 5; i++) { pending[i].reply.resolve({ subscription_id: `address${i}`, tip, cursor: 'c' }); await flush(); }
+  const target = s.live.watchAddress('address1');
+  pending[1].reply.resolve(addressReply('address1'));
+  assert.equal(await target, true); await flush();
+  assert.equal(pending.length, 4); assert.equal(active, 2);
+  for (let i = 2; i < 5; i++) { pending[i].reply.resolve(addressReply(`address${i}`)); await flush(); }
   assert.equal(peak, 2); assert.equal(active, 0); assert.equal(s.live.registrations.size, 7);
   assert.equal(new Set(s.rpc.calls.filter(call => call.method === 'subscribeaddress').map(call => call.params.address)).size, 5);
   assert.equal(s.errors.length, 0); assert.equal(s.live.running, null); s.live.close();
@@ -323,11 +326,11 @@ test('delayed replies reserve subscription capacity without overshooting or doub
   };
   s.live.start(); await flush();
   assert.equal(calls, 98); assert.equal(pending.length, 2); assert.equal(s.live.registrations.size, 98);
-  pending[0].resolve({ subscription_id: 'delayed97', tip, cursor: 'c' }); await flush();
+  pending[0].resolve(addressReply('delayed97')); await flush();
   assert.equal(calls, 98); assert.equal(s.live.registrations.size, 99);
   assert.equal(s.errors.length, 0, 'Capacity is finalized only after the sibling registration drains');
   assert.ok(s.live.running);
-  pending[1].resolve({ subscription_id: 'delayed98', tip, cursor: 'c' }); await flush();
+  pending[1].resolve(addressReply('delayed98')); await flush();
   assert.equal(calls, 98); assert.equal(s.live.registrations.size, 100);
   assert.equal(s.errors.length, 1); assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_CAPACITY');
   assert.equal(s.live.running, null); assert.equal(s.timers.size, 0); s.live.close();
@@ -335,56 +338,59 @@ test('delayed replies reserve subscription capacity without overshooting or doub
 
 for (const siblingFails of [false, true]) test(`ordinary registration failure drains its ${siblingFails ? 'failing' : 'successful'} sibling before retry`, async () => {
   const s = setup(), pending = [];
-  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.live.start(); await flush();
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3', 'abcdefgh4']);
   s.rpc.handler = call => {
     if (call.method !== 'subscribeaddress') return;
     const reply = deferred(); pending.push(reply); return reply.promise;
   };
-  s.live.start(); await flush(); assert.equal(pending.length, 2);
+  s.live.updateAddresses(); await flush(); assert.equal(pending.length, 2);
   const firstError = new Error('first failure'); pending[0].reject(firstError); await flush();
   assert.equal(pending.length, 2); assert.ok(s.live.running); assert.equal(s.errors.length, 0); assert.equal(s.timers.size, 0);
   if (siblingFails) pending[1].reject(new Error('sibling failure'));
-  else pending[1].resolve({ subscription_id: 'surviving-address', tip, cursor: 'c' });
+  else pending[1].resolve(addressReply('surviving-address'));
   await flush();
   assert.equal(s.errors.length, 1); assert.equal(s.errors[0], firstError);
   assert.equal(s.live.running, null); assert.equal(s.timers.size, 1);
-  assert.equal(s.live.registrations.size, siblingFails ? 2 : 3);
+  assert.equal(s.live.registrations.size, siblingFails ? 3 : 4);
   assert.equal(s.live.addressBatch, false);
   s.rpc.handler = undefined; s.fire(); await flush();
-  assert.equal(s.live.registrations.size, 5); assert.equal(s.timers.size, 0); s.live.close();
+  assert.equal(s.live.registrations.size, 6); assert.equal(s.timers.size, 0); s.live.close();
 });
 
 test('server capacity failure stops scheduling and drains the sibling without retry or duplicate warnings', async () => {
   const s = setup(), pending = [];
-  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.live.start(); await flush();
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3', 'abcdefgh4']);
   s.rpc.handler = call => {
     if (call.method !== 'subscribeaddress') return;
     const reply = deferred(); pending.push(reply); return reply.promise;
   };
-  s.live.start(); await flush();
+  s.live.updateAddresses(); await flush();
   pending[0].reject(Object.assign(new Error('capacity'), { code: -32005 })); await flush();
   assert.equal(pending.length, 2); assert.equal(s.errors.length, 0); assert.ok(s.live.running);
-  pending[1].resolve({ subscription_id: 'accepted-address', tip, cursor: 'c' }); await flush();
-  assert.equal(s.live.registrations.size, 3); assert.equal(s.errors.length, 1);
+  pending[1].resolve(addressReply('accepted-address')); await flush();
+  assert.equal(s.live.registrations.size, 4); assert.equal(s.errors.length, 1);
   assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_CAPACITY'); assert.equal(s.timers.size, 0);
-  assert.equal(await s.live.watchAddress('abcdefgh3'), false);
+  assert.equal(await s.live.watchAddress('abcdefgh4'), false);
   s.live.updateAddresses(); await flush(); assert.equal(pending.length, 2); s.live.close();
 });
 
 for (const action of ['close', 'reconnect']) test(`${action} invalidates both in-flight registrations and drains old workers before new work`, async () => {
   const s = setup(), pending = [];
+  s.live.start(); await flush();
   s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
   s.rpc.handler = call => {
     if (call.method !== 'subscribeaddress') return;
     const reply = deferred(); pending.push({ reply, signal: call.options.signal }); return reply.promise;
   };
-  s.live.start(); await flush(); assert.equal(pending.length, 2);
+  s.live.updateAddresses(); await flush(); assert.equal(pending.length, 2);
   if (action === 'close') s.live.close(); else { s.rpc.disconnect(); await s.rpc.connect(); }
   assert.ok(pending.every(item => item.signal.aborted));
   s.rpc.handler = undefined;
   pending[0].reply.resolve({ subscription_id: 'old-address', tip, cursor: 'c' }); await flush();
   assert.equal(s.live.registrations.size, 0); assert.ok(s.live.running);
-  assert.equal(s.rpc.calls.length, 4, 'The next generation must wait for both old workers to settle');
+  assert.equal(s.rpc.calls.length, 5, 'The next generation must wait for both old workers to settle');
   pending[1].reply.reject(new Error('old failure')); await flush();
   assert.equal(s.live.ids.has('old-address'), false); assert.equal(s.errors.length, 0);
   assert.equal(s.live.running, null); assert.equal(s.timers.size, 0);
@@ -401,7 +407,7 @@ test('aborting one watchAddress waiter preserves the shared subscription and oth
   controller.abort(); await cancelled;
   assert.equal(s.live.addressWaiters.size, 1); assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
   assert.equal(s.rpc.calls.find(call => call.method === 'subscribeaddress').options.signal.aborted, false);
-  pending.resolve({ subscription_id: 'shared-address', tip, cursor: 'c' }); assert.equal(await watched, true); await flush();
+  pending.resolve(addressReply('shared-address')); assert.equal(await watched, true); await flush();
   assert.equal(s.live.addressWaiters.size, 0); assert.equal(s.errors.length, 0); s.live.close();
 });
 
@@ -410,9 +416,127 @@ test('watchAddress removes abort listeners on successful registration and reject
   s.rpc.handler = call => call.method === 'subscribeaddress' ? pending.promise : undefined;
   s.live.start(); await flush();
   const watched = s.live.watchAddress('abcdefgh1', { signal: controller.signal });
-  pending.resolve({ subscription_id: 'ready-address', tip, cursor: 'c' }); assert.equal(await watched, true);
+  pending.resolve(addressReply('ready-address')); assert.equal(await watched, true);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0); assert.equal(s.live.addressWaiters.size, 0);
   controller.abort();
   await assert.rejects(s.live.watchAddress('abcdefgh1', { signal: controller.signal }), { name: 'AbortError' });
   assert.equal(s.live.addressWaiters.size, 0); await flush(); assert.equal(s.errors.length, 0); s.live.close();
+});
+
+for (const code of [-32601, -32602]) test(`legacy address capability error ${code} permits baseline reads and warns once per connection`, async () => {
+  const s = setup(), pending = deferred();
+  s.setAddresses(['abcdefgh1', 'abcdefgh2', 'abcdefgh3']);
+  s.rpc.handler = call => call.method === 'subscribeaddress' ? pending.promise : undefined;
+  s.live.start();
+  const baseline = s.live.watchAddress('abcdefgh3');
+  await flush();
+  assert.equal(s.rpc.calls.filter(call => call.method === 'subscribeaddress').length, 1);
+  pending.reject(Object.assign(new Error('Unsupported subscription parameter'), { code }));
+  assert.equal(await baseline, false); await flush();
+  assert.equal(s.live.baseReady, true); assert.equal(s.live.registrations.size, 2);
+  assert.equal(s.errors.length, 1); assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_UNSUPPORTED');
+  assert.match(s.errors[0].message, /Refresh/); assert.equal(s.timers.size, 0);
+  for (let i = 0; i < 10; i++) {
+    s.live.updateAddresses();
+    assert.equal(await s.live.watchAddress('abcdefgh1'), false);
+  }
+  await flush();
+  assert.equal(s.rpc.calls.filter(call => call.method === 'subscribeaddress').length, 1);
+  assert.equal(s.errors.length, 1); assert.equal(s.timers.size, 0);
+  s.changes.length = 0;
+  s.notify('tip', { tip: { ...tip, height: 2, hash: 'b'.repeat(64) } }); s.notify('bounties');
+  assert.ok(s.changes.every(change => !change.wallet && change.bounties));
+  assert.equal(s.changes[0].tip.height, 2);
+  s.notify('tip', { reorg: true });
+  assert.equal(s.changes.at(-1).wallet, true); assert.equal(s.changes.at(-1).reset, true);
+  s.live.close();
+});
+
+for (const ack of [undefined, false, 1, 'true', null]) test(`address subscriptions require literal true ACK, rejecting ${String(ack)}`, async () => {
+  const s = setup();
+  s.rpc.handler = call => {
+    if (call.method === 'subscribeaddress') return { subscription_id: 'legacy-address', tip, cursor: 'c', ...(ack === undefined ? {} : { changes_only: ack }) };
+  };
+  s.live.start();
+  assert.equal(await s.live.watchAddress('abcdefgh1'), false); await flush();
+  assert.equal(s.live.ids.has('legacy-address'), false);
+  assert.equal(s.errors.length, 1); assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_UNSUPPORTED');
+  assert.deepEqual(s.rpc.calls.at(-1).params, { subscription_id: 'legacy-address' });
+  assert.equal(s.rpc.calls.at(-1).method, 'unsubscribe');
+  s.changes.length = 0;
+  s.rpc.emit('notification', { subscription_id: 'legacy-address', kind: 'address', address: 'abcdefgh1', refresh: true, tip });
+  s.notify('tip');
+  assert.equal(s.changes.length, 1); assert.equal(s.changes[0].wallet, false);
+  assert.equal(s.timers.size, 0); s.live.close();
+});
+
+test('manual reads do not wait for cleanup of an unacknowledged legacy subscription', async () => {
+  const s = setup(), cleanup = deferred();
+  s.rpc.handler = call => {
+    if (call.method === 'subscribeaddress') return { subscription_id: 'legacy-address', tip, cursor: 'c' };
+    if (call.method === 'unsubscribe') return cleanup.promise;
+  };
+  s.live.start();
+  assert.equal(await s.live.watchAddress('abcdefgh1'), false); await flush();
+  assert.ok(s.live.running);
+  assert.equal(s.live.addressWaiters.size, 0);
+  cleanup.reject(new Error('Legacy cleanup failed')); await flush();
+  assert.equal(s.errors.length, 1); assert.equal(s.timers.size, 0);
+  assert.equal(s.live.running, null); s.live.close();
+});
+
+test('reconnect resets legacy capability and probes once before restoring automatic address updates', async () => {
+  const s = setup();
+  s.setAddresses(['abcdefgh1', 'abcdefgh2']);
+  s.rpc.handler = call => { if (call.method === 'subscribeaddress') throw Object.assign(new Error('old endpoint'), { code: -32602 }); };
+  s.live.start(); await flush();
+  assert.equal(await s.live.watchAddress('abcdefgh1'), false);
+  s.rpc.disconnect(); s.fire(); await flush();
+  assert.equal(s.errors.length, 2, 'Each connection gets one capability warning');
+  assert.equal(s.rpc.calls.filter(call => call.method === 'subscribeaddress').length, 2);
+  s.rpc.handler = undefined;
+  s.rpc.disconnect(); s.fire(); await flush();
+  assert.equal(s.live.addressCapability, true);
+  assert.equal(await s.live.watchAddress('abcdefgh1'), true);
+  assert.equal(await s.live.watchAddress('abcdefgh2'), true);
+  assert.equal(s.live.registrations.size, 4); assert.equal(s.timers.size, 0);
+  s.changes.length = 0; s.notify('tip'); s.notify('address:abcdefgh2');
+  assert.deepEqual(s.changes.map(change => change.wallet), [false, true]);
+  assert.equal(s.errors.length, 2); s.live.close();
+});
+
+test('a stale unsupported reply cannot disable a new connection', async () => {
+  const s = setup(), stale = deferred();
+  s.rpc.handler = call => call.method === 'subscribeaddress' ? stale.promise : undefined;
+  s.live.start(); await flush();
+  s.rpc.disconnect(); s.rpc.handler = undefined; await s.rpc.connect();
+  stale.reject(Object.assign(new Error('old endpoint'), { code: -32602 })); await flush();
+  assert.equal(s.live.addressCapability, true); assert.equal(s.errors.length, 0);
+  assert.equal(await s.live.watchAddress('abcdefgh1'), true); assert.equal(s.timers.size, 0); s.live.close();
+});
+
+test('releasing an address slot restores automatic updates for a previously untracked address', async () => {
+  const s = setup(), addresses = Array.from({ length: 99 }, (_, i) => `address${String(i).padStart(3, '0')}`);
+  s.setAddresses(addresses); s.live.start(); await flush();
+  assert.equal(await s.live.watchAddress(addresses[98]), false);
+  assert.equal(s.errors[0].code, 'LIVE_UPDATE_ADDRESS_CAPACITY');
+  s.setAddresses(addresses.slice(1));
+  assert.equal(await s.live.watchAddress(addresses[98]), false);
+  s.live.updateAddresses(); await flush();
+  assert.equal(await s.live.watchAddress(addresses[98]), true);
+  assert.equal(s.live.registrations.size, 100); assert.equal(s.live.addressCapacity, false);
+  assert.equal(s.errors.length, 1); assert.equal(s.timers.size, 0);
+  s.live.close();
+});
+
+test('capacity exhaustion is reset on reconnect without restoring per-block wallet refreshes', async () => {
+  const s = setup();
+  s.rpc.handler = call => { if (call.method === 'subscribeaddress') throw Object.assign(new Error('capacity'), { code: -32005 }); };
+  s.live.start(); await flush(); assert.equal(await s.live.watchAddress('abcdefgh1'), false);
+  s.rpc.handler = undefined; s.rpc.disconnect(); s.fire(); await flush();
+  assert.equal(await s.live.watchAddress('abcdefgh1'), true);
+  assert.equal(s.live.addressCapacity, false); assert.equal(s.live.addressCapability, true);
+  s.changes.length = 0; s.notify('tip'); s.notify('address:abcdefgh1');
+  assert.deepEqual(s.changes.map(change => change.wallet), [false, true]);
+  assert.equal(s.errors.length, 1); assert.equal(s.timers.size, 0); s.live.close();
 });

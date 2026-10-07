@@ -9,7 +9,7 @@ const PARAMS = Object.freeze({
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
   gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
-  subscribebounties: [], subscribeaddress: ['address'], subscribetip: [], unsubscribe: ['subscription_id'],
+  subscribebounties: [], subscribeaddress: ['address', 'changes_only'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
 const PLAIN = value => value !== null && typeof value === 'object' && !Array.isArray(value) && [null, Object.prototype].includes(Object.getPrototypeOf(value));
@@ -27,7 +27,7 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor' && key !== 'include_pending_spent') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only') throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
@@ -35,6 +35,10 @@ export function validateRpcParams(method, params) {
     const value = descriptor.value;
     if (key === 'include_pending_spent') {
       if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
+      clean[key] = value; continue;
+    }
+    if (key === 'changes_only') {
+      if (typeof value !== 'boolean') throw new Error('Invalid RPC address change option.');
       clean[key] = value; continue;
     }
     if (key === 'addresses') {

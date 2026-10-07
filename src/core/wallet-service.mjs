@@ -113,6 +113,7 @@ export class WalletService extends EventEmitter {
     this.rpc?.close(); this.refreshing = null; this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.tip = null;
+    this.confirmationTip = null; this.confirmationsStale = false; this.walletChainRevision = 0;
     this.liveUpdateWarning = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
     this.walletUpdateRevision = 0; this.walletReadRevision = -1;
@@ -139,12 +140,25 @@ export class WalletService extends EventEmitter {
         const current = this.accounts.filter(account => account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
         return [...new Set([...current, ...this.accounts, ...this.accountCache.values()].map(account => account.address))];
       },
-      onChange: ({ wallet, bounties, reset, catchup }) => {
+      onChange: ({ wallet, bounties, reset, catchup, tip }) => {
         if (!active()) return;
+        const previous = this.confirmationTip ?? this.tip;
+        // A rollback/same-height replacement is a reset even if a server omitted
+        // its reorg flag. Ordinary height growth changes display counters only.
+        reset ||= Boolean(tip && previous && (tip.height < previous.height ||
+          tip.height === previous.height && tip.hash !== previous.hash));
         if (reset) {
+          wallet = true; bounties = true;
+          this.walletChainRevision++;
+          this.confirmationTip = tip ? { ...tip } : null; this.tip = tip ? { ...tip } : null;
+          this.confirmationsStale = true;
+          this.addressSync = null; this.addressSyncPending = null;
           // Reject an in-flight pre-reorg snapshot before it can resume workers.
           this.claimRevision++; this.claimCursor = null; this.claimBlocks.clear();
           this.claimSuspending = this.engine.suspend();
+        } else if (tip) {
+          this.observeConfirmationTip(tip);
+          this.emitState();
         }
         if (bounties) this.bountyUpdates.request();
         // Refresh subscribes before reading each address. Its registration
@@ -158,7 +172,7 @@ export class WalletService extends EventEmitter {
       },
       onError: error => {
         if (!active()) return;
-        if (error.code === 'LIVE_UPDATE_ADDRESS_CAPACITY') this.liveUpdateWarning = error.message;
+        if (['LIVE_UPDATE_ADDRESS_CAPACITY', 'LIVE_UPDATE_ADDRESS_UNSUPPORTED'].includes(error.code)) this.liveUpdateWarning = error.message;
         this.error = error.message;
         this.recordDiagnostic('wallet.subscription_failed', { stage: 'request', error });
         this.emitState();
@@ -176,7 +190,9 @@ export class WalletService extends EventEmitter {
       this.claimsResumePending = Boolean(this.session && this.config.claims.enabled && !this.claimsReviewRequired);
       this.claimRevision++; this.claimToggleGeneration++;
       this.walletUpdateRevision++;
+      this.walletChainRevision++; this.confirmationsStale = true;
       this.tip = null;
+      this.confirmationTip = null;
       this.network.status = 'offline';
       this.cancelSendPreview();
       this.claimSuspending = this.engine?.stop(); this.emitState();
@@ -216,8 +232,14 @@ export class WalletService extends EventEmitter {
       replacementMode: !this.session && this.replacement && this.replacement.epoch === this.epoch && this.replacement.expires > Date.now() ? this.replacement.mode : null,
       wallet: this.session ? { name: this.session.data.name, address: current?.address ?? '', path: current?.path,
         qrDataUrl: this.qrDataUrl, balance: this.balance, recovering: Boolean(this.recovering), addressCount: this.accounts.length } : null,
-      network: { ...this.network, host: this.config.rpc.host, port: this.config.rpc.port },
-      config: structuredClone(this.config), history: this.session ? this.history.map(row => ({ ...row, ...this.session.data.paymentDetails?.[row.txid] })) : [],
+      network: { ...this.network, ...(this.confirmationTip ? { height: this.confirmationTip.height } : {}), host: this.config.rpc.host, port: this.config.rpc.port },
+      config: structuredClone(this.config), history: this.session ? this.history.map(row => ({ ...row,
+        // This is a display projection, not an address-cache/cursor update and
+        // never evidence that a pending transaction was mined or funds changed.
+        ...(this.confirmationTip && !this.confirmationsStale && row.status === 'confirmed' &&
+          Number.isSafeInteger(row.blockHeight) && row.blockHeight >= 0 && row.blockHeight <= this.confirmationTip.height
+          ? { confirmations: this.confirmationTip.height - row.blockHeight + 1 } : {}),
+        ...this.session.data.paymentDetails?.[row.txid] })) : [],
       claims: { ...this.claimInfo, enabled: Boolean(this.engine?.enabled), available: this.claimInfo.queued ?? 0,
         lastErrorDiagnostic: this.claimInfo.lastErrorDiagnostic === true,
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
@@ -243,6 +265,16 @@ export class WalletService extends EventEmitter {
     try { this.diagnostics?.record(event, { ...details, height: this.network.height }); } catch { /* Logging never controls the wallet. */ }
   }
   activity() { this.lastActivity = Date.now(); }
+  observeConfirmationTip(value) {
+    const tip = validateTip(value, this.config.network);
+    // A read begun before a newer push must not move the displayed height back.
+    if (!this.confirmationTip || tip.height > this.confirmationTip.height || tip.hash === this.confirmationTip.hash) {
+      this.confirmationTip = { ...tip };
+    }
+  }
+  checkWalletChain(revision) {
+    if (revision !== this.walletChainRevision) throw Object.assign(new Error('Wallet snapshot invalidated by a chain reorganization.'), { name: 'AbortError', code: 'ABORT_ERR' });
+  }
   assertSession(epoch = this.epoch) { if (!this.session || epoch !== this.epoch) throw new Error('Wallet locked or changed; please try again after unlocking.'); }
   assertReplacement(replacementId, mode) {
     const value = this.replacement;
@@ -610,9 +642,10 @@ export class WalletService extends EventEmitter {
     this.emitState(); return this.refreshing;
   }
   async refreshInternal(epoch) {
-    await this.ensureNetwork(); this.assertSession(epoch);
+    const chainRevision = this.walletChainRevision;
+    await this.ensureNetwork(); this.assertSession(epoch); this.checkWalletChain(chainRevision);
     const updateRevision = this.walletUpdateRevision;
-    if (!this.session.data.needsRecovery && this.addressChangesSupported !== false && await this.refreshAddressChanges(epoch, updateRevision)) return this.getState();
+    if (!this.session.data.needsRecovery && this.addressChangesSupported !== false && await this.refreshAddressChanges(epoch, updateRevision, chainRevision)) return this.getState();
     const rpc = this.rpc, recoveryTipHash = this.tip.hash;
     const emptyAddresses = this.session.data.needsRecovery ? await this.recoverAddresses(epoch) : null;
     // Reuse only fully exhausted empty discovery results inside this refresh.
@@ -666,12 +699,7 @@ export class WalletService extends EventEmitter {
       // revealed a changed tip. Re-read all addresses, with no recovery cache.
       if (!stableRecoveryTip) return this.refreshInternal(epoch);
     }
-    this.utxos = utxos;
-    this.balance = Object.fromEntries(Object.entries(totals).map(([key,value]) => [key, formatSigned(value)]));
-    this.history = [...history.values()].sort((a,b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
-      txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
-      amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
-    }));
+    this.checkWalletChain(chainRevision);
     if (highestReceive !== this.session.data.lastUsedReceive || highestChange !== this.session.data.lastUsedChange) {
       const readAddresses = new Set(this.accounts.map(account => account.address));
       this.session.data.lastUsedReceive = highestReceive; this.session.data.lastUsedChange = highestChange;
@@ -681,7 +709,15 @@ export class WalletService extends EventEmitter {
         this.walletUpdateRevision++; this.walletUpdates?.request();
       }
     }
-    this.assertSession(epoch); this.error = null; this.emitState();
+    this.assertSession(epoch); this.checkWalletChain(chainRevision);
+    this.utxos = utxos;
+    this.balance = Object.fromEntries(Object.entries(totals).map(([key,value]) => [key, formatSigned(value)]));
+    this.history = [...history.values()].sort((a,b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
+      txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
+      amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
+    }));
+    this.observeConfirmationTip(this.tip); this.confirmationsStale = false;
+    this.error = null; this.emitState();
     this.walletReadRevision = Math.max(this.walletReadRevision, updateRevision);
     // Bounty discovery has its own event queue; address RPC latency must not gate it.
     this.liveUpdates?.updateAddresses();
@@ -690,10 +726,11 @@ export class WalletService extends EventEmitter {
     if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
     return this.getState();
   }
-  async refreshAddressChanges(epoch, updateRevision) {
+  async refreshAddressChanges(epoch, updateRevision, chainRevision = this.walletChainRevision) {
     const rpc = this.rpc, accounts = [...this.accounts], addresses = accounts.map(account => account.address), key = addressSetKey(addresses);
     const check = () => {
       this.assertSession(epoch);
+      this.checkWalletChain(chainRevision);
       if (rpc !== this.rpc) throw Object.assign(new Error('Address synchronization cancelled after the RPC connection changed.'), { name: 'AbortError', code: 'ABORT_ERR' });
     };
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -753,6 +790,7 @@ export class WalletService extends EventEmitter {
           txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
           amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
         }));
+        this.observeConfirmationTip(candidate.tip); this.confirmationsStale = false;
         this.walletReadRevision = Math.max(this.walletReadRevision, updateRevision);
         this.error = null; this.emitState(); this.liveUpdates?.updateAddresses();
         if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();

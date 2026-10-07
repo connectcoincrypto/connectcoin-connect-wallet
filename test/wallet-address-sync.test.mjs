@@ -24,7 +24,7 @@ class Backend extends EventEmitter {
       if (this.legacy) throw Object.assign(new Error('Method not found'), { code: -32601 });
       return await this.delta?.(params) ?? { tip: this.tip, unit: 'connects', changes: [], next_cursor: `journal-${++this.serial}`, has_more: false, through_sequence: 0, journal_epoch: 1 };
     }
-    if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return { subscription_id: `${method}-${params.address ?? 'global'}`, tip: this.tip, cursor: 'journal-start' };
+    if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return { subscription_id: `${method}-${params.address ?? 'global'}`, tip: this.tip, cursor: 'journal-start', ...(method === 'subscribeaddress' ? { changes_only: true } : {}) };
     if (method === 'getchaintip') return this.tip;
     if (method === 'getaddresshistory') {
       await this.beforeHistory?.(params, options);
@@ -60,7 +60,7 @@ async function settled(service) {
   assert.fail('Isolated synchronization did not settle');
 }
 
-test('201-row/41-address wallet downloads baseline once; each tip or address push fetches one delta', async t => {
+test('201-row/41-address wallet handles 100 new tips locally; only an address push fetches a delta', async t => {
   const { service, rpc } = await fixture(t);
   service.liveUpdates.start(); await service.refresh(); await settled(service);
   assert.equal(counts(rpc).getaddresshistory, 43);
@@ -71,7 +71,19 @@ test('201-row/41-address wallet downloads baseline once; each tip or address pus
   assert.equal(service.balance.confirmed, '0.0000000201');
   const startupMethods = rpc.calls.filter(c => !c.method.startsWith('subscribe')).map(c => c.method);
   assert.ok(startupMethods.indexOf('getaddresschanges') < startupMethods.indexOf('getaddresshistory'));
-  for (const kind of ['tip', 'tip', 'address']) {
+  const cache = service.addressSync, balance = service.balance, utxos = service.utxos;
+  for (let index = 0; index < 100; index++) {
+    rpc.calls = []; rpc.tip = { ...rpc.tip, height: rpc.tip.height + 1, hash: hash(rpc.tip.height + 1) };
+    const sub = service.liveUpdates.registrations.get('tip');
+    rpc.emit('notification', { subscription_id: sub.id, kind: 'tip', tip: rpc.tip, reorg: false });
+    await settled(service);
+    assert.deepEqual(counts(rpc), {});
+    assert.equal(service.getState().history[0].confirmations, 3 + index);
+    assert.equal(service.getState().network.height, rpc.tip.height);
+    assert.equal(service.addressSync, cache); assert.equal(service.addressSync.tip.height, 999);
+    assert.equal(service.balance, balance); assert.equal(service.utxos, utxos);
+  }
+  for (const kind of ['address']) {
     rpc.calls = []; rpc.tip = { ...rpc.tip, height: rpc.tip.height + 1, hash: hash(rpc.tip.height + 1) };
     const sub = service.liveUpdates.registrations.get(kind === 'tip' ? 'tip' : `address:${rpc.used}`);
     rpc.emit('notification', { subscription_id: sub.id, kind, tip: rpc.tip, ...(kind === 'address' ? { address: rpc.used, refresh: true } : {}) });
@@ -79,6 +91,75 @@ test('201-row/41-address wallet downloads baseline once; each tip or address pus
     assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
     assert.equal(service.history.length, 201);
   }
+});
+
+test('pending transactions remain unconfirmed on a tip push and legacy data reads are not repeated', async t => {
+  const { service, rpc } = await fixture(t, { legacy: true });
+  service.liveUpdates.start(); await service.refresh(); await settled(service);
+  service.history.push({ txid: hash(2001), status: 'pending', blockHeight: null, confirmations: 0, amount: '1' });
+  const balance = service.balance;
+  rpc.calls = []; rpc.tip = { ...rpc.tip, height: 1000, hash: hash(1000) };
+  const sub = service.liveUpdates.registrations.get('tip');
+  rpc.emit('notification', { subscription_id: sub.id, kind: 'tip', tip: rpc.tip });
+  await settled(service);
+  assert.deepEqual(counts(rpc), {});
+  assert.equal(service.getState().history[0].confirmations, 3);
+  assert.equal(service.getState().history.at(-1).confirmations, 0);
+  assert.equal(service.getState().history.at(-1).status, 'pending');
+  assert.equal(service.balance, balance);
+});
+
+test('a tip arriving during a delta read updates display without invalidating its cursor or queuing another read', async t => {
+  const { service, rpc } = await fixture(t);
+  service.liveUpdates.start(); await service.refresh(); await settled(service);
+  const entered = deferred(), release = deferred(); t.after(release.resolve);
+  rpc.delta = async () => {
+    const result = { tip: rpc.tip, unit: 'connects', changes: [], next_cursor: 'held-cursor', has_more: false, through_sequence: 0, journal_epoch: 1 };
+    entered.resolve(); await release.promise; return result;
+  };
+  rpc.calls = [];
+  const pending = service.refresh(); await entered.promise;
+  rpc.tip = { ...rpc.tip, height: 1000, hash: hash(1000) };
+  rpc.emit('notification', { subscription_id: service.liveUpdates.registrations.get('tip').id, kind: 'tip', tip: rpc.tip });
+  assert.equal(service.getState().history[0].confirmations, 3);
+  release.resolve(); await pending; await settled(service);
+  assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+  assert.equal(service.addressSync.tip.height, 999);
+  assert.equal(service.addressSync.batches[0].cursor, 'held-cursor');
+  assert.equal(service.getState().history[0].confirmations, 3);
+  assert.equal(service.getState().network.height, 1000);
+});
+
+test('same-height replacement or rollback triggers revalidation even without a reorg flag', async t => {
+  const { service, rpc } = await fixture(t);
+  service.liveUpdates.start(); await service.refresh(); await settled(service);
+  for (const next of [{ ...rpc.tip, hash: hash(9000) }, { ...rpc.tip, height: 998, hash: hash(998) }]) {
+    rpc.calls = []; rpc.tip = next;
+    rpc.emit('notification', { subscription_id: service.liveUpdates.registrations.get('tip').id, kind: 'tip', tip: rpc.tip });
+    await settled(service);
+    assert.equal(counts(rpc).getaddresshistory, 43);
+    assert.equal(service.getState().history[0].confirmations, rpc.tip.height - 998 + 1);
+    assert.equal(service.confirmationsStale, false);
+  }
+});
+
+test('a reorg rejects an already-running old-chain delta instead of publishing it after the reset', async t => {
+  const { service, rpc } = await fixture(t);
+  service.liveUpdates.start(); await service.refresh(); await settled(service);
+  const entered = deferred(), release = deferred(); t.after(release.resolve);
+  rpc.delta = async () => {
+    rpc.delta = null;
+    const result = { tip: rpc.tip, unit: 'connects', changes: [], next_cursor: 'obsolete', has_more: false, through_sequence: 0, journal_epoch: 1 };
+    entered.resolve(); await release.promise; return result;
+  };
+  const pending = service.refresh();
+  const rejected = assert.rejects(pending, { name: 'AbortError', code: 'ABORT_ERR' });
+  await entered.promise;
+  rpc.tip = { ...rpc.tip, hash: hash(9001) };
+  rpc.emit('notification', { subscription_id: service.liveUpdates.registrations.get('tip').id, kind: 'tip', tip: rpc.tip, reorg: true });
+  release.resolve(); await rejected; await settled(service);
+  assert.notEqual(service.addressSync.batches[0].cursor, 'obsolete');
+  assert.equal(service.addressSync.tip.hash, hash(9001));
 });
 
 test('baseline race is closed by journal replay before first publication', async t => {

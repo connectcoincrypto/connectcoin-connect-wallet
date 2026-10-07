@@ -21,6 +21,7 @@ class Backend extends EventEmitter {
     if (method === 'getaddresschanges') throw Object.assign(new Error('Legacy fixture'), { code: -32601 });
     if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
       subscription_id: `${method}-${params.address ?? 'global'}`, tip: this.tip, cursor: 'fixture-journal',
+      ...(method === 'subscribeaddress' ? { changes_only: true } : {}),
     };
     if (method === 'unsubscribe') return { removed: true };
     if (method === 'getchaintip') return this.chainTip?.() ?? this.tip;

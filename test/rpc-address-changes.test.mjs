@@ -23,3 +23,21 @@ test('pending-spent inclusion is optional and must be a boolean on UTXO reads on
   for (const value of [null, 1, 'true', {}]) assert.throws(() => validateRpcParams('getaddressutxos', { address: 'syntheticaddress', include_pending_spent: value }));
   assert.throws(() => validateRpcParams('getaddresshistory', { address: 'syntheticaddress', include_pending_spent: true }));
 });
+
+test('address subscriptions copy the optional changes-only boolean and reject coercions or accessors', () => {
+  const request = { address: 'syntheticaddress', changes_only: true };
+  const params = validateRpcParams('subscribeaddress', request);
+  request.changes_only = false;
+  assert.deepEqual(params, { address: 'syntheticaddress', changes_only: true });
+  assert.deepEqual(validateRpcParams('subscribeaddress', request), { address: 'syntheticaddress', changes_only: false });
+  assert.deepEqual(validateRpcParams('subscribeaddress', { address: 'syntheticaddress' }), { address: 'syntheticaddress' });
+  for (const changes_only of [undefined, null, 0, 1, 'true', {}, []]) {
+    assert.throws(() => validateRpcParams('subscribeaddress', { address: 'syntheticaddress', changes_only }), /Invalid RPC address change option/);
+  }
+  let getterCalls = 0;
+  assert.throws(() => validateRpcParams('subscribeaddress', {
+    address: 'syntheticaddress', get changes_only() { getterCalls++; return true; },
+  }), /plain data/);
+  assert.equal(getterCalls, 0);
+  assert.throws(() => validateRpcParams('getaddressbalance', { address: 'syntheticaddress', changes_only: true }), /Unexpected/);
+});
