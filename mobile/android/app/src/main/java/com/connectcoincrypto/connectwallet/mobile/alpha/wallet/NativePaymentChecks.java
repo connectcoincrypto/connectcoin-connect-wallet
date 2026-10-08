@@ -58,17 +58,36 @@ public final class NativePaymentChecks {
     /** Response is an ordered prefix followed by explicit remaining IDs, not an unordered complete batch. */
     public static JSONArray transactions(JSONObject response, JSONArray requested, JSONObject anchor) throws Exception {
         fields(response, "tip", "transactions", "remaining"); sameTip(anchor, response.getJSONObject("tip"));
+        return checkedTransactions(response, requested, false, () -> {});
+    }
+    public interface Check { void check() throws Exception; }
+    /** Parent transactions are immutable by txid. Their response may have a newer
+     * mainnet tip than the UTXO inventory; spendability is rechecked separately.
+     * Validate the entire original encoding before retaining only stripped hex. */
+    public static JSONArray fundingTransactions(JSONObject response, JSONArray requested) throws Exception {
+        return fundingTransactions(response, requested, () -> {});
+    }
+    public static JSONArray fundingTransactions(JSONObject response, JSONArray requested, Check check) throws Exception {
+        fields(response, "tip", "transactions", "remaining"); tip(response.getJSONObject("tip"));
+        return checkedTransactions(response, requested, true, check);
+    }
+    private static JSONArray checkedTransactions(JSONObject response, JSONArray requested, boolean stripped, Check check) throws Exception {
+        check.check();
         require(requested.length() > 0 && requested.length() <= 32); Set<String> ids = new HashSet<>();
         for (int i = 0; i < requested.length(); i++) require(ids.add(hash(requested.get(i))));
         JSONArray transactions = response.getJSONArray("transactions"), remaining = response.getJSONArray("remaining");
         require(transactions.length() > 0 && transactions.length() + remaining.length() == requested.length());
-        long bytes = 0;
+        for (int i = 0; i < remaining.length(); i++) require(requested.getString(i + transactions.length()).equals(hash(remaining.get(i))));
+        long bytes = 0; JSONArray result = new JSONArray();
         for (int i = 0; i < transactions.length(); i++) {
+            check.check();
             JSONObject item = transactions.getJSONObject(i); fields(item, "txid", "hex"); require(requested.getString(i).equals(hash(item.opt("txid"))));
             String hex = string(item.opt("hex")); bytes += hex.length(); require(bytes <= 8_000_000 && hex.length() >= 20 && hex.length() % 2 == 0 && hex.matches("[0-9a-fA-F]+"));
-            require(NativeTransactions.txid(NativeTransactions.parse(hex)).equals(item.getString("txid")));
+            JSONObject transaction = NativeTransactions.parse(hex);
+            require(NativeTransactions.txid(transaction).equals(item.getString("txid")));
+            if (stripped) result.put(new JSONObject().put("txid", item.getString("txid")).put("hex", WalletCrypto.hex(NativeTransactions.serialize(transaction, false))));
         }
-        for (int i = 0; i < remaining.length(); i++) require(requested.getString(i + transactions.length()).equals(hash(remaining.get(i))));
-        return transactions;
+        check.check();
+        return stripped ? result : transactions;
     }
 }

@@ -2,17 +2,17 @@
 // not a user profile/address/seed. Three read-only calls, no retries or broadcasts.
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bech32m } from '@scure/base';
-import tls from 'node:tls';
+import net from 'node:net';
 import { RPC_ENDPOINT, validateTip, validateBalance, validateHistory } from '../src/model.mjs';
 
 const address = bech32m.encode('cc', [1, ...bech32m.toWords(secp256k1.Point.BASE.toBytes(true).slice(1))]);
 async function request(method, params) {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host: RPC_ENDPOINT.host, servername: RPC_ENDPOINT.host, port: RPC_ENDPOINT.port, rejectUnauthorized: true });
+    const socket = net.createConnection({ host: RPC_ENDPOINT.host, port: RPC_ENDPOINT.port });
     let data = Buffer.alloc(0), settled = false;
     const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); socket.destroy(); error ? reject(error) : resolve(value); };
-    const timer = setTimeout(() => finish(new Error('Authenticated TLS RPC timed out; no plaintext fallback.')), 40000);
-    socket.once('secureConnect', () => socket.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })}\n`));
+    const timer = setTimeout(() => finish(new Error('The desktop-compatible TCP RPC timed out.')), 40000);
+    socket.once('connect', () => socket.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })}\n`));
     socket.on('error', error => finish(error)); socket.once('end', () => finish(new Error('Incomplete RPC response.')));
     socket.on('data', chunk => {
       data = Buffer.concat([data, chunk]); if (data.length > 2 * 1024 * 1024) return finish(new Error('Oversized RPC response.'));

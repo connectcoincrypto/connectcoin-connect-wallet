@@ -2,7 +2,6 @@ package com.connectcoincrypto.connectwallet.mobile.alpha;
 
 import android.os.Bundle;
 import android.net.Uri;
-import android.view.WindowManager;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
@@ -16,8 +15,25 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 public class MainActivity extends BridgeActivity {
+    private final NativePaymentInput.Mailbox paymentLinks = new NativePaymentInput.Mailbox();
+
+    NativePaymentInput.Mailbox paymentLinks() { return paymentLinks; }
+
+    @Override public void onUserInteraction() {
+        super.onUserInteraction();
+        Bridge current = getBridge();
+        if (current == null) return;
+        com.getcapacitor.PluginHandle handle = current.getPlugin("NativeWallet");
+        if (handle != null && handle.getInstance() instanceof NativeWalletPlugin) {
+            ((NativeWalletPlugin) handle.getInstance()).userInteraction();
+        }
+    }
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        // Bound and consume the launch URI before Capacitor copies Intent.data
+        // into Bridge.intentUri. Only this Activity's one-shot public mailbox remains.
+        NativePaymentInputPlugin.consumeIntent(getIntent(), paymentLinks);
         // Capacitor registers its core plugins first, then these custom classes.
         // Replace unused generic network/cookie/content-path capabilities before
         // it exports the bridge or loads bundled content. No node_modules patch.
@@ -25,15 +41,15 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(BundledWebView.class);
         registerPlugin(DisabledCookies.class);
         registerPlugin(NativeWalletPlugin.class);
+        registerPlugin(NativePaymentInputPlugin.class);
+        registerPlugin(NativeExplorerPlugin.class);
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     }
 
     private static void restrictWebView(Bridge bridge) {
         // No file/content proxy, even for a compromised bundled renderer. The
         // plugin calls this BEFORE the framework's first loadUrl. A guard added
         // only after super.onCreate leaves the first document racing the setup.
-        bridge.getActivity().getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         bridge.getWebView().getSettings().setAllowFileAccess(false);
         bridge.getWebView().getSettings().setAllowContentAccess(false);
         bridge.setWebViewClient(new BridgeWebViewClient(bridge) {

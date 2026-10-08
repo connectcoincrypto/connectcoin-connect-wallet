@@ -1,6 +1,18 @@
 // These preferences govern claims only. Read-only balance/history synchronization
 // must not use this policy as a network permission check.
 export const DEFAULT_CLAIMS_POLICY = Object.freeze({ allowMobileData: false, allowBackground: false });
+export const DEFAULT_CLAIMS_LIMITS = Object.freeze({ connectionsPerSecondLimit: 100, concurrency: 100 });
+
+export function parseClaimsLimits(options = {}) {
+  const integer = value => {
+    if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value);
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 100) {
+      throw new Error('Enter whole numbers from 1 to 100 for both limits.');
+    }
+    return value;
+  };
+  return { connectionsPerSecondLimit: integer(options?.connectionsPerSecondLimit), concurrency: integer(options?.concurrency) };
+}
 
 export function evaluateClaimsPolicy(options = {}) {
   const denied = reason => ({ allowed: false, reason });

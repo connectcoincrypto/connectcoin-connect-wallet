@@ -1,10 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_CLAIMS_POLICY, evaluateClaimsPolicy } from '../src/claims-policy.mjs';
+import { DEFAULT_CLAIMS_POLICY, DEFAULT_CLAIMS_LIMITS, evaluateClaimsPolicy, parseClaimsLimits } from '../src/claims-policy.mjs';
 
 const ready = { enabled: true, connected: true, connectionType: 'wifi', appActive: true,
   nativeClaimsAvailable: true, nativeBackgroundAvailable: false, platform: 'android' };
 const denied = (patch, reason) => assert.deepEqual(evaluateClaimsPolicy({ ...ready, ...patch }), { allowed: false, reason });
+
+test('connection ceilings default to 100 independently from boolean claims permissions', () => {
+  assert.deepEqual(DEFAULT_CLAIMS_LIMITS, { connectionsPerSecondLimit: 100, concurrency: 100 });
+  assert.ok(Object.isFrozen(DEFAULT_CLAIMS_LIMITS));
+  assert.deepEqual(parseClaimsLimits({ connectionsPerSecondLimit: '100', concurrency: '1' }), { connectionsPerSecondLimit: 100, concurrency: 1 });
+  assert.deepEqual(parseClaimsLimits({ connectionsPerSecondLimit: 2, concurrency: 99, allowBackground: true }), { connectionsPerSecondLimit: 2, concurrency: 99 });
+});
+
+test('connection ceilings reject absent, coerced, fractional and out-of-range values', () => {
+  for (const value of [undefined, null, false, true, '', ' ', '1e2', '1.0', '-1', '+1', ' 1', '1 ', 'abc', 0, 101, -1, 1.1, NaN, Infinity, {}, []]) {
+    assert.throws(() => parseClaimsLimits({ ...DEFAULT_CLAIMS_LIMITS, concurrency: value }), /whole numbers/);
+    assert.throws(() => parseClaimsLimits({ ...DEFAULT_CLAIMS_LIMITS, connectionsPerSecondLimit: value }), /whole numbers/);
+  }
+  assert.throws(() => parseClaimsLimits(), /whole numbers/);
+  assert.throws(() => parseClaimsLimits(null), /whole numbers/);
+});
 
 test('claims opt-ins are immutable and off by default; missing capabilities fail closed', () => {
   assert.deepEqual(DEFAULT_CLAIMS_POLICY, { allowMobileData: false, allowBackground: false });

@@ -20,8 +20,10 @@ public final class NativeClaimsSmokeTest {
     @Test public void packagedLibraryAndCancellationFailBeforeDns() {
         long handle = NativeClaims.createCancellationHandle();
         assertTrue(handle > 0);
+        assertFalse(NativeClaims.hasStarted(handle));
         try {
             NativeClaims.cancel(handle);
+            assertFalse(NativeClaims.hasStarted(handle));
             try {
                 NativeClaims.captureAndVerify("example.com", "00".repeat(32), "ff".repeat(32), 1, 7, 1800000000L, 100, handle);
                 fail("Cancelled work must not start DNS or connect.");
@@ -31,6 +33,8 @@ public final class NativeClaimsSmokeTest {
         } finally { NativeClaims.destroyHandle(handle); }
         NativeClaims.cancel(handle);
         NativeClaims.destroyHandle(handle);
+        assertFalse(NativeClaims.hasStarted(handle));
+        assertFalse(NativeClaims.hasStarted(0));
     }
 
     @Test public void invalidPublicContextIsRejectedBeforeDns() {
@@ -40,6 +44,7 @@ public final class NativeClaimsSmokeTest {
                 NativeClaims.captureAndVerify("127.0.0.1", "00".repeat(32), "ff".repeat(32), 1, 7, 1800000000L, 100, handle);
                 fail("IP literals must never be used as destinations.");
             } catch (IllegalStateException expected) { assertEquals("CLAIM_CONTEXT", expected.getMessage()); }
+            assertFalse(NativeClaims.hasStarted(handle));
         } finally { NativeClaims.destroyHandle(handle); }
     }
 

@@ -22,3 +22,11 @@ test('preview cannot operate native controls and an in-flight unlock can be canc
     { startDisabled: true, stopDisabled: true, lockDisabled: true });
   assert.equal(nativeControlState({ native: true, address: '', claims: null, locked: true, busy: true }).lockDisabled, false);
 });
+
+test('wallet file and security operations are explicit native actions and never interrupt another busy action', () => {
+  for (const action of ['importWallet', 'exportWallet', 'changePassword', 'viewRecoveryPhrase']) {
+    assert.deepEqual(nativeActionState(action, true, false), { allowed: true, ownsBusy: true });
+    assert.deepEqual(nativeActionState(action, true, true), { allowed: false, ownsBusy: true });
+    assert.deepEqual(nativeActionState(action, false, false), { allowed: false, ownsBusy: true });
+  }
+});

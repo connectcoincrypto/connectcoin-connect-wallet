@@ -50,6 +50,13 @@ function Xml-False($Node, [string]$Name) {
     $value = $Node.Attributes[$Name]
     return $null -ne $value -and $value -match '^(?:false|\(type 0x12\)0x0)$'
 }
+function Xml-True($Node, [string]$Name) {
+    $value = $Node.Attributes[$Name]
+    return $null -ne $value -and $value -match '^(?:true|\(type 0x12\)0xffffffff)$'
+}
+function Xml-Children($Nodes, $Parent, [string]$Name) {
+    return @($Nodes | Where-Object { $_.Name -eq $Name -and [object]::ReferenceEquals($_.Parent, $Parent) })
+}
 function Resource-Table([string]$Text) {
     $resources = @{}; $current = $null
     foreach ($line in ($Text -split "`n")) {
@@ -83,14 +90,42 @@ function Assert-Manifest([string]$Text, [string]$ExpectedId, [string]$BuildVaria
     $permissions = @($nodes | Where-Object { $_.Name -like 'uses-permission*' } | ForEach-Object { Xml-String $_ 'android:name' })
     $internalPermission = $ExpectedId + '.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
     $platformPermissions = @($permissions | Where-Object { $_ -ne $internalPermission } | Sort-Object -Unique)
-    Require (($platformPermissions -join ',') -eq 'android.permission.ACCESS_NETWORK_STATE,android.permission.FOREGROUND_SERVICE,android.permission.FOREGROUND_SERVICE_SPECIAL_USE,android.permission.INTERNET') 'Unexpected or missing APK platform permissions.'
+    Require (($platformPermissions -join ',') -eq 'android.permission.ACCESS_NETWORK_STATE,android.permission.CAMERA,android.permission.FOREGROUND_SERVICE,android.permission.FOREGROUND_SERVICE_SPECIAL_USE,android.permission.INTERNET') 'Unexpected or missing APK platform permissions.'
     if ($permissions -contains $internalPermission) {
         $declared = @($nodes | Where-Object { $_.Name -eq 'permission' -and (Xml-String $_ 'android:name') -eq $internalPermission })
         Require ($declared.Count -eq 1 -and $declared[0].Attributes['android:protectionLevel'] -match '^(?:0x00000002|\(type 0x11\)0x2)$') 'AndroidX internal receiver permission must be signature-protected.'
     }
     $activities = @($nodes | Where-Object Name -EQ 'activity')
-    Require ($activities.Count -eq 1) 'Unexpected merged activity count.'
-    Require ((Xml-String $activities[0] 'android:name') -eq ($ExpectedId + '.MainActivity')) 'Unexpected launcher activity.'
+    Require ($activities.Count -eq 2) 'Expected only launcher/payment-link and internal QR activities.'
+    $mainActivities = @($activities | Where-Object { (Xml-String $_ 'android:name') -eq ($ExpectedId + '.MainActivity') })
+    $scannerActivities = @($activities | Where-Object { (Xml-String $_ 'android:name') -eq ($ExpectedId + '.PaymentQrCaptureActivity') })
+    Require ($mainActivities.Count -eq 1 -and $scannerActivities.Count -eq 1) 'Unexpected launcher or scanner activity.'
+    $mainActivity = $mainActivities[0]; $scannerActivity = $scannerActivities[0]
+    Require (Xml-True $mainActivity 'android:exported') 'The launcher/payment-link activity must be exported.'
+    Require (Xml-False $scannerActivity 'android:exported') 'The QR activity must not be exported.'
+    Require (@(Xml-Children $nodes $scannerActivity 'intent-filter').Count -eq 0) 'The internal QR scanner must not have intent filters.'
+    $filters = @(Xml-Children $nodes $mainActivity 'intent-filter')
+    Require ($filters.Count -eq 2) 'MainActivity must have exactly launcher and connectcoin payment filters.'
+    $seenActions = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($filter in $filters) {
+        Require (@($nodes | Where-Object { [object]::ReferenceEquals($_.Parent, $filter) -and $_.Name -notin @('action', 'category', 'data') }).Count -eq 0) 'Unexpected nested activity URL scope.'
+        $actions = @(Xml-Children $nodes $filter 'action')
+        Require ($actions.Count -eq 1) 'Each entry point must have exactly one action.'
+        $action = Xml-String $actions[0] 'android:name'
+        Require ($seenActions.Add($action)) 'Duplicate activity entry point.'
+        $categories = @((Xml-Children $nodes $filter 'category') | ForEach-Object { Xml-String $_ 'android:name' } | Sort-Object)
+        $data = @(Xml-Children $nodes $filter 'data')
+        if ($action -eq 'android.intent.action.MAIN') {
+            Require (($categories -join ',') -eq 'android.intent.category.LAUNCHER' -and $data.Count -eq 0) 'Unexpected launcher intent scope.'
+        } elseif ($action -eq 'android.intent.action.VIEW') {
+            Require (($categories -join ',') -eq 'android.intent.category.BROWSABLE,android.intent.category.DEFAULT') 'Unexpected payment-link categories.'
+            Require ($data.Count -eq 1 -and $data[0].Attributes.Count -eq 1 -and (Xml-String $data[0] 'android:scheme') -eq 'connectcoin') 'Only connectcoin payment URLs may open the wallet; no broad URL, host, path or MIME handlers.'
+        } else { throw 'Unexpected external activity action.' }
+    }
+    Require (@($nodes | Where-Object Name -EQ 'data').Count -eq 1) 'Unexpected additional external URL scope.'
+    $features = @($nodes | Where-Object Name -EQ 'uses-feature')
+    Require ((($features | ForEach-Object { Xml-String $_ 'android:name' } | Sort-Object) -join ',') -eq 'android.hardware.camera,android.hardware.camera.any,android.hardware.camera.autofocus,android.hardware.camera.flash,android.hardware.camera.front,android.hardware.screen.landscape,android.hardware.wifi') 'Unexpected hardware or missing optional pinned-scanner feature declarations.'
+    foreach ($feature in $features) { Require (Xml-False $feature 'android:required') 'Camera hardware must remain optional.' }
     Require (@($nodes | Where-Object Name -EQ 'activity-alias').Count -eq 0) 'Unexpected activity alias.'
     $services = @($nodes | Where-Object Name -EQ 'service')
     Require ($services.Count -eq 1) 'Expected exactly the claims service.'
@@ -103,7 +138,9 @@ function Assert-Manifest([string]$Text, [string]$ExpectedId, [string]$BuildVaria
         if ($node.Name -eq 'receiver') {
             Require ((Xml-String $node 'android:name') -eq 'androidx.profileinstaller.ProfileInstallReceiver' -and (Xml-String $node 'android:permission') -eq 'android.permission.DUMP') 'Unexpected or unprotected receiver.'
         }
-        if ($node.Name -eq 'action') { Require ((Xml-String $node 'android:name') -ne 'android.intent.action.VIEW') 'Unexpected external URL handler.' }
+        if ($node.Name -eq 'action' -and (Xml-String $node 'android:name') -eq 'android.intent.action.VIEW') {
+            Require ($null -ne $node.Parent -and [object]::ReferenceEquals($node.Parent.Parent, $mainActivity)) 'Unexpected external URL handler.'
+        }
     }
     return @{ PlatformPermissions = $platformPermissions; InternalSignaturePermission = ($permissions -contains $internalPermission); Application = $application }
 }
@@ -146,6 +183,29 @@ E: manifest
     A: android:name(0x01010003)="android.permission.FOREGROUND_SERVICE"
   E: uses-permission
     A: android:name(0x01010003)="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+  E: uses-permission
+    A: android:name(0x01010003)="android.permission.CAMERA"
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.camera"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.camera.any"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.camera.autofocus"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.camera.flash"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.camera.front"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.screen.landscape"
+    A: android:required(0x0101028e)=(type 0x12)0x0
+  E: uses-feature
+    A: android:name(0x01010003)="android.hardware.wifi"
+    A: android:required(0x0101028e)=(type 0x12)0x0
   E: application
     A: android:largeHeap(0x0101035a)=(type 0x12)0xffffffff
     A: android:allowBackup(0x01010280)=(type 0x12)0x0
@@ -155,6 +215,24 @@ E: manifest
     A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff
     E: activity
       A: android:name(0x01010003)="com.example.alpha.MainActivity"
+      A: android:exported(0x01010010)=(type 0x12)0xffffffff
+      E: intent-filter
+        E: action
+          A: android:name(0x01010003)="android.intent.action.MAIN"
+        E: category
+          A: android:name(0x01010003)="android.intent.category.LAUNCHER"
+      E: intent-filter
+        E: action
+          A: android:name(0x01010003)="android.intent.action.VIEW"
+        E: category
+          A: android:name(0x01010003)="android.intent.category.DEFAULT"
+        E: category
+          A: android:name(0x01010003)="android.intent.category.BROWSABLE"
+        E: data
+          A: android:scheme(0x01010027)="connectcoin"
+    E: activity
+      A: android:name(0x01010003)="com.example.alpha.PaymentQrCaptureActivity"
+      A: android:exported(0x01010010)=(type 0x12)0x0
     E: service
       A: android:name(0x01010003)="com.example.alpha.ClaimsService"
       A: android:exported(0x01010010)=(type 0x12)0x0
@@ -163,7 +241,22 @@ E: manifest
     $null = Assert-Manifest $fixture 'com.example.alpha' 'debug'
     $modernFixture = $fixture.Replace('A: android:', 'A: http://schemas.android.com/apk/res/android:').Replace('(type 0x12)0x0', 'false').Replace('(type 0x12)0xffffffff', 'true')
     $null = Assert-Manifest $modernFixture 'com.example.alpha' 'debug'
-    foreach ($bad in @($fixture.Replace('android.permission.INTERNET', 'android.permission.POST_NOTIFICATIONS'), $fixture.Replace('android:allowBackup(0x01010280)=(type 0x12)0x0', 'android:allowBackup(0x01010280)=(type 0x12)0xffffffff'))) {
+    $badFixtures = @(
+        $fixture.Replace('android.permission.INTERNET', 'android.permission.POST_NOTIFICATIONS'),
+        $fixture.Replace('android.permission.CAMERA', 'android.permission.VIBRATE'),
+        $fixture.Replace('android:allowBackup(0x01010280)=(type 0x12)0x0', 'android:allowBackup(0x01010280)=(type 0x12)0xffffffff'),
+        $fixture.Replace('android:scheme(0x01010027)="connectcoin"', 'android:scheme(0x01010027)="https"'),
+        $fixture.Replace('android:scheme(0x01010027)="connectcoin"', 'android:scheme(0x01010027)="*"'),
+        $fixture.Replace('android:scheme(0x01010027)="connectcoin"', "android:scheme(0x01010027)=`"connectcoin`"`n          A: android:host(0x01010028)=`"*`""),
+        $fixture.Replace('android.intent.category.BROWSABLE', 'android.intent.category.LAUNCHER'),
+        $fixture.Replace('android.intent.action.VIEW', 'android.intent.action.SEND'),
+        $fixture.Replace('com.example.alpha.PaymentQrCaptureActivity', 'com.journeyapps.barcodescanner.CaptureActivity'),
+        $fixture.Replace('android:exported(0x01010010)=(type 0x12)0x0', 'android:exported(0x01010010)=(type 0x12)0xffffffff'),
+        $fixture.Replace('android:required(0x0101028e)=(type 0x12)0x0', 'android:required(0x0101028e)=(type 0x12)0xffffffff')
+    )
+    # Change only the scanner export bit; a service error must not mask this regression.
+    $badFixtures += [regex]::Replace($fixture, '(PaymentQrCaptureActivity"\s+A: android:exported\(0x01010010\)=)\(type 0x12\)0x0', '${1}(type 0x12)0xffffffff')
+    foreach ($bad in $badFixtures) {
         $rejected = $false
         try { $null = Assert-Manifest $bad 'com.example.alpha' 'debug' } catch { $rejected = $true }
         Require $rejected 'Manifest negative self-test failed.'

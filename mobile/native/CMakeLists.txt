@@ -10,13 +10,14 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 option(CONNECTWALLET_NATIVE_TESTS "Build offline public-proof tests" OFF)
+option(CONNECTWALLET_WALLET_CORE "Build native-only Apple wallet cryptography" OFF)
 include(FetchContent)
 set(CORE "${CMAKE_CURRENT_SOURCE_DIR}/vendor/core")
 set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
-set(MBEDTLS_USER_CONFIG_FILE "${CORE}/src/crypto/mbedtls_user_config.h" CACHE FILEPATH "" FORCE)
+set(MBEDTLS_USER_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/include/mbedtls_mobile_config.h" CACHE FILEPATH "" FORCE)
 # Keep the FetchContent identifier short: Gradle's Windows .cxx staging path is
 # already deep, and populate stamp paths otherwise exceed classic MAX_PATH.
 FetchContent_Declare(mbed
@@ -29,6 +30,7 @@ include("${CORE}/cmake/script/PatchMbedTLSP2CRSAPSS.cmake")
 include("${CORE}/cmake/script/PatchMbedTLSP2CX509.cmake")
 foreach(component mbedcrypto mbedx509 mbedtls)
   target_include_directories(${component} PRIVATE "${CORE}/src/crypto")
+  target_include_directories(${component} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 endforeach()
 target_sources(mbedcrypto PRIVATE "${CORE}/src/crypto/mbedtls_rsa_pss.c")
 file(SHA256 "${CORE}/src/consensus/p2c_roots_v1.pem" ROOT_HASH)
@@ -37,10 +39,13 @@ if(NOT ROOT_HASH STREQUAL "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f73
 endif()
 file(READ "${CORE}/src/consensus/p2c_roots_v1.pem" ROOT_PEM)
 configure_file(roots.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/consensus/p2c_roots_v1.pem.h" @ONLY)
+include(cmake/ThreadLocalVerifier.cmake)
 add_library(connectwallet_p2c STATIC
   src/public_claims.cpp
+  src/apple_claims.cpp
+  src/crypto_runtime.cpp
   "${CORE}/src/consensus/p2c.cpp"
-  "${CORE}/src/consensus/p2c_x509.cpp"
+  "${MOBILE_VERIFIER}"
   "${CORE}/src/wallet/p2c_tls_private.c")
 target_include_directories(connectwallet_p2c PUBLIC include compat "${CORE}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(connectwallet_p2c PRIVATE "${mbed_SOURCE_DIR}/library")
@@ -57,6 +62,13 @@ endif()
 if(ANDROID)
   add_library(connectwallet_claims SHARED src/jni.cpp)
   target_link_libraries(connectwallet_claims PRIVATE connectwallet_p2c)
+  # The installable alpha uses debug signing, but its native crypto must not
+  # benchmark an unoptimized build. Target options follow Mbed TLS's own Debug
+  # -O0 flags, so -O2 wins for every native component without disabling checks,
+  # assertions or debug symbols. Keep host sanitizer/debug builds unchanged.
+  foreach(component everest p256m mbedcrypto mbedx509 mbedtls connectwallet_p2c connectwallet_claims)
+    target_compile_options(${component} PRIVATE -O2)
+  endforeach()
   target_link_options(connectwallet_claims PRIVATE "-Wl,-z,max-page-size=16384")
   # Do not interpose C++/Mbed TLS symbols on other app libraries (for example
   # the independently packaged secp256k1 signer). Expose only this JNI facade.
@@ -75,4 +87,15 @@ if(CONNECTWALLET_NATIVE_TESTS)
   add_test(NAME public_proof_offline COMMAND p2c_native_test)
   add_executable(p2c_test_cli tests/test_cli.cpp)
   target_link_libraries(p2c_test_cli PRIVATE connectwallet_p2c)
+  add_executable(apple_bridge_test tests/apple_bridge_test.cpp)
+  target_link_libraries(apple_bridge_test PRIVATE connectwallet_p2c)
+  if(MSVC)
+    target_compile_options(apple_bridge_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(apple_bridge_test PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME apple_claims_c_bridge COMMAND apple_bridge_test)
+endif()
+if(CONNECTWALLET_WALLET_CORE)
+  include(cmake/WalletCore.cmake)
 endif()

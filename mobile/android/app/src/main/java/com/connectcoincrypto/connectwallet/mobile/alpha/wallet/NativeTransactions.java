@@ -5,8 +5,11 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -17,8 +20,17 @@ import org.json.JSONObject;
  */
 public final class NativeTransactions {
     public static final long COIN = 10_000_000_000L, MAX_MONEY = 1_000_000_000_000_000_000L;
-    public static final int MAX_PROOF = 65536, MAX_PAYMENT_INPUTS = 256;
-    private static final int MAX_TX_BYTES = 4_000_000, MAX_WEIGHT = 400_000;
+    // 1,738 native P2PK inputs and one P2PK output fit Core's 400,000 weight
+    // limit. A wallet may have many more candidates than a payment will spend.
+    public static final int MAX_PROOF = 65536, MAX_PAYMENT_INPUTS = 1738, MAX_PAYMENT_CANDIDATES = 50000;
+    private static final int MAX_TX_BYTES = 4_000_000;
+    static final int MAX_WEIGHT = 400_000;
+    private static final String PAYMENT_WEIGHT_ERROR = "Payment exceeds standard weight. Enter a smaller amount instead of using all balance.";
+    /** Only this failure permits an ordinary payment to become independent parts. */
+    public static final class PaymentTooLarge extends IllegalArgumentException {
+        public PaymentTooLarge() { super(PAYMENT_WEIGHT_ERROR); }
+    }
+    private static void paymentSize(boolean valid) { if (!valid) throw new PaymentTooLarge(); }
     private NativeTransactions() {}
     private static void write(ByteArrayOutputStream stream, byte[] bytes) { stream.write(bytes, 0, bytes.length); }
     private static String zeros(int length) { char[] chars = new char[length]; Arrays.fill(chars, '0'); return new String(chars); }
@@ -108,21 +120,69 @@ public final class NativeTransactions {
         JSONObject tx = new JSONObject().put("version", version).put("inputs", inputs).put("outputs", outputs).put("locktime", r.integer(4));
         require(r.position == r.data.length && Arrays.equals(serialize(tx, true), r.data), "Noncanonical or trailing transaction bytes."); return tx;
     }
-    public static JSONObject verifyFunding(JSONObject utxo, String expectedKey) throws Exception {
-        JSONObject parent = parse(utxo.getString("rawTransaction")); require(txid(parent).equals(utxo.getString("txid")), "Funding ID does not match the original transaction.");
-        long index = utxo.getLong("vout"); require(index >= 0 && index < parent.getJSONArray("outputs").length(), "Funding output does not exist.");
-        JSONObject output = parent.getJSONArray("outputs").getJSONObject((int)index);
+    private static final class FundingParent {
+        final JSONObject transaction;
+        final String id;
+        FundingParent(String raw) throws Exception { transaction = parse(raw); id = txid(transaction); }
+    }
+    private static JSONObject checkFundingOutput(JSONObject utxo, String expectedKey, FundingParent parent) throws Exception {
+        require(parent.id.equals(utxo.getString("txid")), "Funding ID does not match the original transaction.");
+        long index = utxo.getLong("vout"); require(index >= 0 && index < parent.transaction.getJSONArray("outputs").length(), "Funding output does not exist.");
+        JSONObject output = parent.transaction.getJSONArray("outputs").getJSONObject((int)index);
         require(amount(output.getString("amount")) == amount(utxo.getString("amount")), "Funding amount does not match the original transaction.");
         if (expectedKey != null) require(output.getInt("type") == 1 && output.getString("publicKey").equals(expectedKey), "Funding output is not owned by this key.");
         return output;
     }
-    public static byte[] signatureHash(JSONObject tx, JSONArray spent, int index) throws Exception {
-        JSONArray inputs = tx.getJSONArray("inputs"), outputs = tx.getJSONArray("outputs"); require(index >= 0 && index < inputs.length() && spent.length() == inputs.length(), "Missing signing inputs.");
-        ByteArrayOutputStream prevouts = new ByteArrayOutputStream(), amounts = new ByteArrayOutputStream(), locks = new ByteArrayOutputStream(), sequences = new ByteArrayOutputStream(), outputData = new ByteArrayOutputStream();
-        for (int i = 0; i < inputs.length(); i++) { write(prevouts, outpoint(inputs.getJSONObject(i))); write(amounts, le(amount(spent.getJSONObject(i).getString("amount")), 8)); write(locks, outputPayload(spent.getJSONObject(i))); write(sequences, le(inputs.getJSONObject(i).getLong("sequence"), 4)); }
-        for (int i = 0; i < outputs.length(); i++) write(outputData, outputBytes(outputs.getJSONObject(i)));
-        return WalletCrypto.taggedHash("TapSighash", concat(new byte[]{0, 0}, le(tx.getLong("version"), 4), le(tx.getLong("locktime"), 4), WalletCrypto.sha256(prevouts.toByteArray()), WalletCrypto.sha256(amounts.toByteArray()), WalletCrypto.sha256(locks.toByteArray()), WalletCrypto.sha256(sequences.toByteArray()), WalletCrypto.sha256(outputData.toByteArray()), new byte[]{0}, le(index, 4)));
+    public static JSONObject verifyFunding(JSONObject utxo, String expectedKey) throws Exception {
+        return checkFundingOutput(utxo, expectedKey, new FundingParent(utxo.getString("rawTransaction")));
     }
+    @FunctionalInterface public interface FundingCheck { void check() throws Exception; }
+    @FunctionalInterface public interface FundingOwner { String publicKey(JSONObject input) throws Exception; }
+    public static void verifyFundingBatch(JSONArray selected, String expectedKey) throws Exception {
+        verifyFundingBatch(selected, expectedKey, () -> {});
+    }
+    /** Internal native review helper, never a WebView method. Cache only the
+     * parse/identity work; authenticate every selected output independently. */
+    public static void verifyFundingBatch(JSONArray selected, String expectedKey, FundingCheck check) throws Exception {
+        require(expectedKey != null, "Missing funding ownership key.");
+        verifyFundingBatch(selected, input -> expectedKey, check);
+    }
+    /** The owner resolver is native-owned and must bind each input path to the
+     * current wallet; renderer/RPC ownership claims are never accepted. */
+    public static void verifyFundingBatch(JSONArray selected, FundingOwner owner, FundingCheck check) throws Exception {
+        require(selected.length() > 0 && selected.length() <= MAX_PAYMENT_INPUTS, PAYMENT_WEIGHT_ERROR);
+        require(owner != null, "Missing funding ownership resolver.");
+        Map<String, FundingParent> parents = new HashMap<>(); HashSet<String> seen = new HashSet<>();
+        for (int i = 0; i < selected.length(); i++) {
+            check.check(); JSONObject input = selected.getJSONObject(i);
+            require(seen.add(WalletCrypto.hex(outpoint(input))), "Duplicate funding output.");
+            String raw = input.getString("rawTransaction"); FundingParent parent = parents.get(raw);
+            if (parent == null) { parent = new FundingParent(raw); parents.put(raw, parent); }
+            String expectedKey = owner.publicKey(input);
+            require(expectedKey != null, "Missing funding ownership key.");
+            checkFundingOutput(input, expectedKey, parent);
+        }
+        check.check();
+    }
+    private static final class PaymentSignatureHashes {
+        final byte[] prefix;
+        final int inputCount;
+        PaymentSignatureHashes(JSONObject tx, JSONArray spent) throws Exception {
+            JSONArray inputs = tx.getJSONArray("inputs"), outputs = tx.getJSONArray("outputs"); inputCount = inputs.length();
+            require(inputCount > 0 && spent.length() == inputCount, "Missing signing inputs.");
+            ByteArrayOutputStream prevouts = new ByteArrayOutputStream(), amounts = new ByteArrayOutputStream(), locks = new ByteArrayOutputStream(), sequences = new ByteArrayOutputStream(), outputData = new ByteArrayOutputStream();
+            for (int i = 0; i < inputs.length(); i++) { write(prevouts, outpoint(inputs.getJSONObject(i))); write(amounts, le(amount(spent.getJSONObject(i).getString("amount")), 8)); write(locks, outputPayload(spent.getJSONObject(i))); write(sequences, le(inputs.getJSONObject(i).getLong("sequence"), 4)); }
+            for (int i = 0; i < outputs.length(); i++) write(outputData, outputBytes(outputs.getJSONObject(i)));
+            // Native typed-output SIGHASH_DEFAULT: snapshot the common digest only
+            // for this synchronous signing operation, never across plan mutations.
+            prefix = concat(new byte[]{0, 0}, le(tx.getLong("version"), 4), le(tx.getLong("locktime"), 4), WalletCrypto.sha256(prevouts.toByteArray()), WalletCrypto.sha256(amounts.toByteArray()), WalletCrypto.sha256(locks.toByteArray()), WalletCrypto.sha256(sequences.toByteArray()), WalletCrypto.sha256(outputData.toByteArray()), new byte[]{0});
+        }
+        byte[] forInput(int index) {
+            require(index >= 0 && index < inputCount, "Missing signing inputs.");
+            return WalletCrypto.taggedHash("TapSighash", concat(prefix, le(index, 4)));
+        }
+    }
+    public static byte[] signatureHash(JSONObject tx, JSONArray spent, int index) throws Exception { return new PaymentSignatureHashes(tx, spent).forInput(index); }
     public static String claimChallenge(JSONObject tx) throws Exception { return WalletCrypto.hex(WalletCrypto.taggedHash("ConnectCoin/P2C/claim/v1", concat(reverse(fixed(txid(tx), 32)), le(0, 4)))); }
     public static long claimFee(int feeRate) { feeRate(feeRate); return (long)((92 * 4 + 2 + 1 + compact(MAX_PROOF).length + MAX_PROOF + 3) / 4) * feeRate; }
     public static JSONObject prepareClaim(JSONObject bounty, String parentHex, String rewardAddress, int rate) throws Exception {
@@ -168,46 +228,118 @@ public final class NativeTransactions {
      * Candidate metadata is not trusted: raw parents and derived ownership are
      * checked AGAIN before signing by signPayment below. */
     public static JSONObject planPayment(JSONArray candidates, JSONArray destinations, String changeAddress, int rate, boolean deductFee) throws Exception {
-        feeRate(rate); require(candidates.length() > 0 && candidates.length() <= MAX_PAYMENT_INPUTS && destinations.length() > 0 && destinations.length() <= 100 && (!deductFee || destinations.length() == 1), "Invalid mobile payment size.");
+        feeRate(rate); require(candidates.length() > 0 && candidates.length() <= MAX_PAYMENT_CANDIDATES && destinations.length() > 0 && destinations.length() <= 100 && (!deductFee || destinations.length() == 1), "Invalid mobile payment size.");
         JSONArray recipients = new JSONArray(); long requested = 0;
         for (int i = 0; i < destinations.length(); i++) { JSONObject output = recipient(destinations.getJSONObject(i)); recipients.put(output); requested = Math.addExact(requested, amount(output.getString("amount"))); } amount(Long.toString(requested));
         JSONObject changeOutput = new JSONObject().put("type", 1).put("amount", "0").put("publicKey", WalletCrypto.hex(WalletCrypto.decodeAddress(changeAddress)));
-        List<JSONObject> sorted = new ArrayList<>(); HashSet<String> seen = new HashSet<>();
-        for (int i = 0; i < candidates.length(); i++) { JSONObject candidate = new JSONObject(candidates.getJSONObject(i).toString()); amount(candidate.getString("amount")); require(seen.add(candidate.getString("txid") + ":" + candidate.getLong("vout")), "Duplicate funding output."); sorted.add(candidate); }
+        List<PaymentCandidate> sorted = new ArrayList<>(); HashSet<String> seen = new HashSet<>();
+        for (int i = 0; i < candidates.length(); i++) {
+            JSONObject candidate = candidates.getJSONObject(i); long value = amount(candidate.getString("amount"));
+            require(seen.add(WalletCrypto.hex(outpoint(candidate))), "Duplicate funding output."); sorted.add(new PaymentCandidate(candidate, value));
+        }
         final long wanted = requested;
-        sorted.sort((a,b) -> { long av = amount(a.optString("amount")), bv = amount(b.optString("amount")); if (deductFee && (av == wanted) != (bv == wanted)) return av == wanted ? -1 : 1; return Long.compare(bv, av); });
+        sorted.sort((a,b) -> { if (deductFee && (a.value == wanted) != (b.value == wanted)) return a.value == wanted ? -1 : 1; return Long.compare(b.value, a.value); });
+        PaymentSize size = new PaymentSize(recipients, changeOutput); long changeDust = dust(changeOutput);
         JSONArray selected = new JSONArray(), inputs = new JSONArray(); long sum = 0, fee = -1, change = 0, total = requested; JSONObject tx = new JSONObject().put("version", 2).put("locktime", 0).put("inputs", inputs).put("outputs", recipients);
-        for (JSONObject candidate : sorted) {
-            selected.put(candidate); sum = Math.addExact(sum, amount(candidate.getString("amount"))); amount(Long.toString(sum));
+        for (PaymentCandidate funding : sorted) {
+            int count = inputs.length() + 1;
+            paymentSize(count <= MAX_PAYMENT_INPUTS && size.weight(count, false) <= MAX_WEIGHT);
+            JSONObject candidate = snapshotCandidate(funding.metadata);
+            selected.put(candidate); sum = Math.addExact(sum, funding.value); amount(Long.toString(sum));
             inputs.put(new JSONObject().put("txid", candidate.getString("txid")).put("vout", candidate.getLong("vout")).put("scriptSig", "").put("sequence", 0xfffffffdL).put("witness", new JSONArray().put(zeros(128))));
             if (deductFee) {
                 if (sum < requested) continue;
-                long remaining = sum - requested; change = remaining == 0 ? 0 : Math.max(remaining, dust(changeOutput));
+                long remaining = sum - requested; change = remaining == 0 ? 0 : Math.max(remaining, changeDust);
+                paymentSize(size.weight(count, change > 0) <= MAX_WEIGHT);
                 JSONArray outputs = new JSONArray(recipients.toString()); if (change > 0) outputs.put(new JSONObject(changeOutput.toString()).put("amount", Long.toString(change)));
-                tx.put("outputs", outputs); fee = (long)vsize(tx) * rate; total = requested - fee - (change - remaining);
+                tx.put("outputs", outputs); fee = (long)size.vsize(count, change > 0) * rate; total = requested - fee - (change - remaining);
                 require(total >= dust(outputs.getJSONObject(0)), "Payment after fee is below dust."); outputs.getJSONObject(0).put("amount", Long.toString(total)); break;
             }
-            JSONArray withChange = new JSONArray(recipients.toString()).put(changeOutput); tx.put("outputs", withChange); long candidateChange = sum - requested - (long)vsize(tx) * rate;
-            if (candidateChange >= dust(changeOutput)) { change = candidateChange; fee = (long)vsize(tx) * rate; withChange.put(withChange.length() - 1, new JSONObject(changeOutput.toString()).put("amount", Long.toString(change))); break; }
-            tx.put("outputs", recipients); long minimum = (long)vsize(tx) * rate;
+            long withChangeFee = (long)size.vsize(count, true) * rate, candidateChange = sum - requested - withChangeFee;
+            if (candidateChange >= changeDust) {
+                paymentSize(size.weight(count, true) <= MAX_WEIGHT);
+                change = candidateChange; fee = withChangeFee;
+                tx.put("outputs", new JSONArray(recipients.toString()).put(new JSONObject(changeOutput.toString()).put("amount", Long.toString(change)))); break;
+            }
+            long minimum = (long)size.vsize(count, false) * rate;
             if (sum >= requested + minimum) { fee = sum - requested; break; }
         }
         require(fee >= 0, "Insufficient funds for payment and fee."); require(fee <= COIN, "Fee exceeds the 1 CONN safety limit.");
-        require(serialize(tx, false).length * 3 + serialize(tx, true).length <= MAX_WEIGHT, "Payment exceeds standard weight.");
-        return new JSONObject().put("transaction", tx).put("selected", selected).put("fee", Long.toString(fee)).put("total", Long.toString(total)).put("requestedTotal", Long.toString(requested)).put("inputTotal", Long.toString(sum)).put("change", Long.toString(change)).put("vsize", vsize(tx));
+        int weight = serialize(tx, false).length * 3 + serialize(tx, true).length;
+        paymentSize(weight <= MAX_WEIGHT);
+        require((weight + 3) / 4 == size.vsize(inputs.length(), change > 0), "Payment size differs from its fee estimate.");
+        return new JSONObject().put("transaction", tx).put("selected", selected).put("fee", Long.toString(fee)).put("total", Long.toString(total)).put("requestedTotal", Long.toString(requested)).put("inputTotal", Long.toString(sum)).put("change", Long.toString(change)).put("vsize", (weight + 3) / 4);
+    }
+    private static final class PaymentCandidate {
+        final JSONObject metadata; final long value;
+        PaymentCandidate(JSONObject metadata, long value) { this.metadata = metadata; this.value = value; }
+    }
+    private static JSONObject snapshotCandidate(JSONObject candidate) throws Exception {
+        // Strings are immutable, including large raw parents shared by many
+        // outputs. Preserve them while independently snapshotting mutable JSON.
+        JSONObject copy = new JSONObject(); Iterator<String> keys = candidate.keys();
+        while (keys.hasNext()) {
+            String key = keys.next(); Object value = candidate.get(key);
+            if (value instanceof JSONObject) value = new JSONObject(value.toString());
+            else if (value instanceof JSONArray) value = new JSONArray(value.toString());
+            copy.put(key, value);
+        }
+        return copy;
+    }
+    static final class PaymentSize {
+        final int recipientCount, recipientBytes, changeBytes;
+        PaymentSize(JSONArray recipients, JSONObject changeOutput) throws Exception {
+            recipientCount = recipients.length(); int total = 0;
+            for (int i = 0; i < recipientCount; i++) total += outputBytes(recipients.getJSONObject(i)).length;
+            recipientBytes = total; changeBytes = outputBytes(changeOutput).length;
+        }
+        int weight(int inputs, boolean change) {
+            // Native P2PK inputs have 41 stripped bytes and one 64-byte Schnorr
+            // signature: 66 witness bytes. Include CompactSize and marker/flag.
+            int base = 8 + compact(inputs).length + 41 * inputs + compact(recipientCount + (change ? 1 : 0)).length + recipientBytes + (change ? changeBytes : 0);
+            return base * 4 + 2 + 66 * inputs;
+        }
+        int vsize(int inputs, boolean change) { return (weight(inputs, change) + 3) / 4; }
     }
     public static JSONObject signPayment(JSONObject plan, VaultSession session) throws Exception {
+        return signPayment(plan, session, () -> {});
+    }
+    /** Signing remains on the worker; a caller can revoke its held session
+     * between inputs without locking the UI for the whole transaction. */
+    public static JSONObject signPayment(JSONObject plan, VaultSession session, FundingCheck check) throws Exception {
+        check.check();
         JSONObject tx = new JSONObject(plan.getJSONObject("transaction").toString()); JSONArray selected = plan.getJSONArray("selected"), spent = new JSONArray();
+        require(selected.length() > 0 && selected.length() <= MAX_PAYMENT_INPUTS, PAYMENT_WEIGHT_ERROR);
         require(tx.getJSONArray("inputs").length() == selected.length(), "Payment plan changed."); long inputTotal = 0, outputTotal = 0;
+        int plannedWeight = serialize(tx, false).length * 3 + serialize(tx, true).length;
+        require(plannedWeight <= MAX_WEIGHT, PAYMENT_WEIGHT_ERROR);
+        Map<String, FundingParent> parents = new HashMap<>(); Map<String, JSONObject> accounts = new HashMap<>();
         for (int i = 0; i < selected.length(); i++) {
-            JSONObject input = selected.getJSONObject(i), account = session.publicAccount(input.getInt("index"), input.getInt("change"));
+            check.check();
+            JSONObject input = selected.getJSONObject(i); int index = input.getInt("index"), change = input.getInt("change");
+            String path = change + ":" + index; JSONObject account = accounts.get(path);
+            if (account == null) { account = session.publicAccount(index, change); accounts.put(path, account); }
             require(Arrays.equals(outpoint(input), outpoint(tx.getJSONArray("inputs").getJSONObject(i))), "Selected input changed.");
-            JSONObject output = verifyFunding(input, account.getString("publicKey")); spent.put(output); inputTotal = Math.addExact(inputTotal, amount(output.getString("amount")));
+            String raw = input.getString("rawTransaction"); FundingParent parent = parents.get(raw);
+            if (parent == null) { parent = new FundingParent(raw); parents.put(raw, parent); }
+            // Cached parsing never replaces per-selected-output identity,
+            // amount, index or derived-ownership authentication.
+            JSONObject output = checkFundingOutput(input, account.getString("publicKey"), parent); spent.put(output); inputTotal = Math.addExact(inputTotal, amount(output.getString("amount"))); amount(Long.toString(inputTotal));
         }
         for (int i = 0; i < tx.getJSONArray("outputs").length(); i++) outputTotal = Math.addExact(outputTotal, amount(tx.getJSONArray("outputs").getJSONObject(i).getString("amount")));
-        require(inputTotal - outputTotal == amount(plan.getString("fee")) && inputTotal - outputTotal <= COIN && vsize(tx) == plan.getInt("vsize"), "Payment totals changed.");
-        for (int i = 0; i < selected.length(); i++) { JSONObject input = selected.getJSONObject(i); byte[] signature = session.signDigest(signatureHash(tx, spent, i), input.getInt("index"), input.getInt("change")); tx.getJSONArray("inputs").getJSONObject(i).put("witness", new JSONArray().put(WalletCrypto.hex(signature))); }
-        require(vsize(tx) == plan.getInt("vsize"), "Signed payment size changed.");
-        return new JSONObject().put("hex", WalletCrypto.hex(serialize(tx, true))).put("txid", txid(tx)).put("fee", plan.getString("fee"));
+        require(inputTotal - outputTotal == amount(plan.getString("fee")) && inputTotal - outputTotal <= COIN && (plannedWeight + 3) / 4 == plan.getInt("vsize"), "Payment totals changed.");
+        check.check();
+        PaymentSignatureHashes hashes = new PaymentSignatureHashes(tx, spent);
+        for (int i = 0; i < selected.length(); i++) {
+            check.check(); JSONObject input = selected.getJSONObject(i);
+            byte[] signature = session.signDigest(hashes.forInput(i), input.getInt("index"), input.getInt("change"));
+            tx.getJSONArray("inputs").getJSONObject(i).put("witness", new JSONArray().put(WalletCrypto.hex(signature)));
+            check.check();
+        }
+        byte[] signed = serialize(tx, true); int signedWeight = serialize(tx, false).length * 3 + signed.length;
+        require(signedWeight <= MAX_WEIGHT, PAYMENT_WEIGHT_ERROR);
+        require((signedWeight + 3) / 4 == plan.getInt("vsize"), "Signed payment size changed.");
+        check.check();
+        return new JSONObject().put("hex", WalletCrypto.hex(signed)).put("txid", txid(tx)).put("fee", plan.getString("fee"));
     }
 }

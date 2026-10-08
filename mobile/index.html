@@ -11,45 +11,103 @@
     <div class="app">
       <header class="topbar">
         <img id="brand-icon" alt="" width="44" height="44">
-        <div><strong>ConnectWallet</strong><span>Mobile · Alpha 1</span></div>
-        <span class="network-badge">MAINNET</span>
+        <div class="brand-copy"><strong>ConnectWallet</strong><span>Mobile · Alpha 1 <span class="network-badge">MAINNET</span></span></div>
+        <button id="open-settings" class="settings-button" type="button" aria-label="Settings" aria-controls="settings-panel" aria-expanded="false" title="Settings"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7"><path d="m9 3-.6 2.3-2 .9-2-.6-2 3.4 1.6 1.7v2.5L2.4 15l2 3.4 2-.6 2 .9L9 21h4l.6-2.3 2-.9 2 .6 2-3.4-1.6-1.8v-2.5l1.6-1.7-2-3.4-2 .6-2-.9L13 3z"/><circle cx="11" cy="12" r="3.3"/></svg></button>
       </header>
       <main>
         <p id="preview-notice" class="notice" hidden>Browser preview only. Live RPC queries are available in the Android app.</p>
+        <p id="payment-input-error" class="error payment-paste-error" role="status" aria-live="polite" aria-atomic="true"></p>
+        <section id="settings-panel" class="panel" hidden aria-labelledby="settings-title">
+          <button id="settings-back" class="text-button settings-back" type="button">← Back</button>
+          <h1 id="settings-title" tabindex="-1">Settings</h1>
+          <p class="secondary">Make ConnectWallet feel right for you.</p>
+          <form id="settings-form" novalidate>
+            <label for="settings-theme">Appearance</label>
+            <select id="settings-theme" disabled><option value="dark">Dark</option><option value="light">Light</option><option value="system">Use device theme</option></select>
+            <label for="settings-lock-mode">Lock while the app is open</label>
+            <select id="settings-lock-mode" aria-describedby="settings-lock-help" disabled><option value="never">Never while open</option><option value="timer">After inactivity</option></select>
+            <div id="settings-lock-minutes-row" hidden>
+              <label for="settings-lock-minutes">Inactivity · minutes</label>
+              <input id="settings-lock-minutes" type="number" inputmode="numeric" min="1" max="1440" step="1" value="5" aria-describedby="settings-lock-help" disabled>
+            </div>
+            <p id="settings-lock-help" class="hint">Never while open is the default. The wallet still locks when you leave the app or turn off the screen. An inactivity timer can be 1–1,440 minutes.</p>
+            <fieldset class="settings-server">
+              <legend>RPC server · mainnet</legend>
+              <label for="settings-rpc-host">Server hostname</label>
+              <input id="settings-rpc-host" type="text" maxlength="253" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="connectcoin4.com" aria-describedby="settings-server-help" disabled>
+              <label for="settings-rpc-port">TCP port</label>
+              <input id="settings-rpc-port" type="number" inputmode="numeric" min="1" max="65535" step="1" aria-describedby="settings-server-help" disabled>
+              <p id="settings-server-help" class="hint">Use a public DNS hostname and a port from 1–65,535. This connection uses TCP. Mainnet verification stays enabled.</p>
+              <p class="notice">Changing servers needs native confirmation and locks your wallet. Stop Automatic Claims first. Balances and activity will reload from the new server; your wallet and backup stay safe.</p>
+              <button id="settings-default-server" class="text-button" type="button" disabled>Use default server</button>
+            </fieldset>
+            <p id="settings-error" class="error" role="alert"></p>
+            <p id="settings-status" class="hint" role="status" aria-live="polite"></p>
+            <button id="save-settings" class="primary" type="submit" disabled>Save settings</button>
+            <button id="retry-settings" class="secondary-button" type="button" hidden>Reload settings</button>
+          </form>
+          <section class="settings-security" aria-labelledby="settings-security-title">
+            <h2 id="settings-security-title">Security &amp; backup</h2>
+            <p id="wallet-security-help" class="hint">Authenticate in the native dialog to change your password or view your recovery phrase.</p>
+            <div class="native-wallet-actions">
+              <button id="change-wallet-password" class="secondary-button" type="button" aria-describedby="wallet-security-help" disabled>Change wallet password</button>
+              <button id="view-recovery-phrase" class="secondary-button" type="button" aria-describedby="wallet-security-help" disabled>View recovery phrase</button>
+            </div>
+            <p id="wallet-security-error" class="error" role="alert"></p>
+            <p id="wallet-security-status" class="hint" role="status" aria-live="polite"></p>
+          </section>
+        </section>
         <section id="setup-panel" class="panel">
           <span class="eyebrow">YOUR FIRST LOOK</span>
           <h1>Your wallet,<br>on the move.</h1>
-          <p class="secondary">Create a native encrypted wallet, import recovery words, or follow a public address.</p>
-          <p class="notice">Development alpha. Native signing currently covers the first receiving address only, not full HD recovery. Use a separate test wallet, not your primary funded wallet.</p>
-          <div class="native-wallet-actions"><button id="create-wallet" class="primary">Create wallet</button><button id="import-wallet" class="secondary-button">Import recovery phrase</button></div>
+          <p class="secondary">Create an encrypted wallet or import a recovery phrase or encrypted wallet file.</p>
+          <p class="notice">Development alpha. Recover receiving and change addresses from your recovery phrase. Keep a verified backup before replacing a wallet.</p>
+          <div class="native-wallet-actions">
+            <button id="create-wallet" class="primary" disabled>Create wallet</button>
+            <button id="import-recovery" class="secondary-button" disabled>Import recovery phrase</button>
+            <button id="import-wallet" class="secondary-button" disabled>Import wallet file</button>
+          </div>
           <button id="open-native-wallet" class="secondary-button" hidden>Unlock existing native wallet</button>
-          <form id="watch-form">
-            <label for="watch-address">Public address or payment link</label>
-            <textarea id="watch-address" rows="3" maxlength="1024" placeholder="cc1p… or connectcoin:…" autocomplete="off" autocapitalize="off" spellcheck="false" required disabled></textarea>
-            <p class="hint">Never paste a recovery phrase or private key. The public address is saved on this device and shared with connectcoin4.com when queried.</p>
-            <button id="watch-submit" class="primary" type="submit" disabled>Watch address</button>
-            <p id="setup-error" class="error" role="alert"></p>
-          </form>
-          <p class="footnote">Only add an address you already control if you intend to receive funds. Watching an address does not give you access to its funds.</p>
+        </section>
+        <section id="background-claims" class="panel" hidden>
+          <h2>Automatic Claims</h2>
+          <p class="secondary">An Automatic Claims session is active. You can stop it without unlocking your wallet.</p>
+          <p id="background-claims-status" class="hint" role="status"></p>
+          <button id="stop-background-claims" class="secondary-button">Stop claims</button>
         </section>
         <section id="wallet-panel" hidden>
-          <div class="section-heading"><span id="account-kind" class="eyebrow">WATCH-ONLY ACCOUNT</span><button id="forget" class="text-button">Remove watched address</button></div>
+          <div class="section-heading"><span id="account-kind" class="eyebrow">NATIVE WALLET · FIRST ADDRESS</span></div>
           <p id="current-address" class="address"></p>
           <p id="connection-status" class="hint" role="status"></p>
+          <section id="hd-panel" class="card" hidden aria-label="HD address recovery">
+            <p id="hd-status" class="hint" role="status"></p>
+            <div id="wallet-load-progress" class="wallet-load-progress" hidden>
+              <p id="wallet-load-progress-text" class="hint" role="status" aria-live="polite" aria-atomic="true"></p>
+              <progress id="wallet-load-progress-bar" max="1" value="0" aria-labelledby="wallet-load-progress-text"></progress>
+            </div>
+            <p class="hint">Discovery checks both branches until 20 consecutive addresses have no history. Addresses issued by this wallet remain tracked.</p>
+            <button id="recover-addresses" type="button" class="text-button">Rescan addresses</button>
+            <p id="hd-error" class="error" role="status"></p>
+          </section>
+          <p id="watch-coverage" class="notice" hidden role="status"></p>
+          <p id="cached-state-status" class="notice" hidden role="status"></p>
+          <p id="partial-state-status" class="notice" hidden role="status"></p>
           <div id="overview" class="page">
-            <div class="balance-card"><span class="secondary">Confirmed balance</span><h1><span id="balance">—</span> <small>CONN</small></h1><p id="pending" class="hint">Refresh to load balances</p><button id="refresh" class="primary">Refresh</button></div>
-            <div class="section-heading"><h2>Activity</h2><span id="block-height" class="hint"></span></div>
+            <div class="balance-card"><span id="balance-label" class="secondary">Confirmed balance</span><h1><span id="balance">—</span> <small>CONN</small></h1><p id="pending" class="hint">Refresh to load balances</p><button id="refresh" class="primary">Refresh</button></div>
+            <div class="section-heading"><h2 id="activity-title" tabindex="-1">Activity</h2><span id="block-height" class="hint"></span></div>
             <p id="wallet-error" class="error" role="alert"></p>
             <p id="last-update" class="hint"></p>
             <ol id="history" class="history"></ol>
             <p id="empty-history" class="empty">No history loaded yet.</p>
             <button id="load-more" class="secondary-button" hidden>Load more</button>
             <p id="history-limit" class="notice" hidden>Showing up to 2,000 loaded transactions, not the complete history. These are not necessarily the most recent transactions of this address.</p>
-            <p class="footnote">Public data comes from an authenticated TLS RPC endpoint. The alpha checks network identity, not blockchain consensus. History pages are ordered by transaction ID; only loaded entries are sorted here. Refresh rechecks previous pages. No unencrypted fallback is used.</p>
+            <p class="footnote">History pages are ordered by transaction ID; only loaded entries are sorted here. Refresh rechecks previous pages.</p>
           </div>
           <div id="receive" class="page" hidden>
-            <h1>Receive</h1><p class="secondary">To the address you are watching.</p>
+            <h1>Receive</h1><p class="secondary">To your wallet's receiving address.</p>
             <p id="receive-address" class="address"></p>
+            <p id="receive-path" class="hint"></p>
+            <button id="new-receive-address" type="button" class="secondary" hidden>New address</button>
             <div class="request-details">
               <div class="section-heading"><h2>Payment request</h2><button id="clear-request" class="text-button" type="button">Clear details</button></div>
               <p class="hint">Optional details change the payment link, not your receiving address.</p>
@@ -64,23 +122,81 @@
             </div>
             <p id="receive-error" class="error" role="alert"></p>
             <p id="qr-status" class="hint" role="status"></p>
-            <div id="qr-card" class="qr-card" hidden><img id="receive-qr" width="256" height="256" alt="QR code of the watched address payment link"></div>
+            <div id="qr-card" class="qr-card" hidden><img id="receive-qr" width="256" height="256" alt="QR code of your wallet payment link"></div>
             <label for="receive-uri">Payment link</label>
             <textarea id="receive-uri" rows="3" readonly spellcheck="false" aria-label="Payment link"></textarea>
             <button id="copy-link" class="primary" disabled>Copy payment link</button>
             <p id="copy-status" role="status" class="hint"></p>
-            <p id="receive-ownership" class="notice">Watching an address does not give access to its funds. Confirm ownership before receiving.</p>
+            <p id="receive-ownership" class="notice">This address belongs to your native wallet. Earlier receiving addresses remain valid. Keep your recovery backup safe.</p>
           </div>
           <div id="send" class="page" hidden>
             <h1>Send</h1><p class="secondary">Review every address, amount and fee in the native confirmation before signing.</p>
             <p id="vault-status" class="notice">No native wallet loaded.</p>
             <button id="unlock-wallet" class="secondary-button">Unlock native wallet</button><button id="lock-wallet" class="text-button">Lock</button>
-            <form id="send-form">
+            <div id="payment-batch-loading" class="notice" role="status" hidden>Loading saved payment results…</div>
+            <div id="payment-batch-load-error" hidden><p id="payment-batch-load-error-text" class="error" role="status"></p><button id="payment-batch-reload" class="secondary-button" type="button">Reload payment result</button></div>
+            <section id="payment-batch" class="payment-batch" aria-labelledby="payment-batch-title" hidden>
+              <h2 id="payment-batch-title" tabindex="-1">Payment result</h2>
+              <p id="payment-batch-status" class="notice" role="status"></p>
+              <dl class="transaction-fields">
+                <div><dt>Sending wallet</dt><dd id="payment-batch-wallet" class="batch-identifier"></dd></div>
+                <div><dt>Recipient</dt><dd id="payment-batch-address" class="batch-identifier"></dd></div>
+                <div><dt>Requested amount</dt><dd id="payment-batch-requested"></dd></div>
+                <div><dt>Planned recipient total</dt><dd id="payment-batch-total"></dd></div>
+                <div><dt>Total planned network fees</dt><dd id="payment-batch-fee"></dd></div>
+                <div id="payment-batch-kept-row" hidden><dt>Planned amount kept as change</dt><dd id="payment-batch-kept"></dd></div>
+              </dl>
+              <p id="payment-batch-outcome" class="hint"></p>
+              <p class="hint">Submitted transactions are awaiting confirmation. Explorer results may take time to appear.</p>
+              <ol id="payment-batch-transactions" class="payment-batch-transactions"></ol>
+              <button id="payment-batch-refresh" type="button" class="text-button">Reload saved result</button>
+              <p id="payment-batch-action-error" class="error" role="status"></p>
+              <p id="payment-batch-acknowledge-help" class="hint"></p>
+              <button id="payment-batch-dismiss" type="button" class="secondary-button">Close batch result</button>
+            </section>
+            <form id="send-form" novalidate>
               <label for="send-address">Recipient address</label><textarea id="send-address" rows="3" maxlength="90" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="cc1p…" required></textarea>
-              <button id="paste-payment" type="button" class="secondary-button">Paste payment link</button>
+              <div class="payment-input-actions">
+                <div>
+                <button id="paste-payment" type="button" class="secondary-button" aria-describedby="payment-paste-error">Paste payment link</button>
+                <p id="payment-paste-error" class="error payment-paste-error" role="status" aria-live="polite" aria-atomic="true"></p>
+                </div>
+                <button id="scan-payment" type="button" class="secondary-button" aria-describedby="payment-paste-error">Scan payment QR</button>
+              </div>
+              <p id="send-request-details" class="hint payment-details" hidden></p>
               <label for="send-amount">Amount · CONN</label><input id="send-amount" type="text" data-amount inputmode="decimal" autocomplete="off" placeholder="0.00" required>
-              <p class="hint">Fee rate: 1,500 connects/vB. Funds and change use the first receiving address. Pending conflicts require explicit native confirmation.</p>
+              <div class="send-balance-row"><span id="send-available" class="hint">Refresh to check available balance.</span><button id="send-refresh-balance" type="button" class="text-button">Refresh balance</button><button id="send-use-all" type="button" class="text-button" disabled>Use all balance</button></div>
+              <p id="send-balance-status" class="hint" role="status"></p>
+              <label class="toggle-row" for="send-deduct-fees"><span><strong>Deduct fees from payment</strong><small>The mining fee comes out of the amount above. Review how much the recipient receives before confirming.</small></span><input id="send-deduct-fees" type="checkbox"></label>
+              <p id="send-all-hint" class="hint" hidden>Using the displayed available balance, with fees deducted. Immature and pending funds are excluded. If available funds change or are reserved, refresh and review again.</p>
+              <details class="send-fee-settings"><summary>Advanced fee settings</summary>
+                <label for="send-fee-rate">Fee rate · connects / virtual byte</label><input id="send-fee-rate" type="text" data-amount data-numeric="integer" data-integer-digits="6" inputmode="numeric" autocomplete="off" value="1500" aria-describedby="send-fee-help" required>
+                <p id="send-fee-help" class="hint">1,201–100,000 connects/vB. Applies to this Send payment. 10,000,000,000 connects = 1 CONN. The native confirmation shows the exact fee and any change.</p>
+              </details>
+              <p id="send-funding-hint" class="hint">Funds can use all recovered wallet addresses. Change uses a separate native change address. Pending conflicts require explicit native confirmation.</p>
+              <p id="send-progress" class="hint" role="status" hidden>Verifying funds and preparing the native confirmation… No funds are sent until you confirm.</p>
               <button id="review-payment" class="primary" type="submit">Review payment</button><p id="send-status" class="error" role="status"></p>
+            </form>
+          </div>
+          <div id="p2c" class="page" hidden>
+              <h1>Pay-to-Connect</h1>
+              <p class="secondary">Fund a public reward for a valid TLS connection proof to a website. Automatic Claims users compete to collect it.</p>
+              <p id="p2c-vault-status" class="notice">No native wallet loaded.</p>
+              <p id="p2c-batch-notice" class="notice" hidden>Review the saved payment result in Send before starting another payment.</p>
+              <button id="p2c-unlock-wallet" class="secondary-button">Unlock native wallet</button><button id="p2c-lock-wallet" class="text-button">Lock</button>
+            <form id="p2c-form">
+              <label for="p2c-domain">Website domain</label><input id="p2c-domain" type="text" maxlength="253" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="example.com" aria-describedby="p2c-domain-help" required>
+              <p id="p2c-domain-help" class="hint">Domain only, without https:// or a path. Use ASCII or punycode for international domains.</p>
+              <label for="p2c-amount">Public reward · CONN</label><input id="p2c-amount" type="text" data-amount inputmode="decimal" autocomplete="off" placeholder="0.00" required>
+              <label for="p2c-expected">Expected connections</label><input id="p2c-expected" type="text" data-amount data-numeric="integer" data-integer-digits="78" inputmode="numeric" autocomplete="off" value="1" aria-describedby="p2c-expected-help" required>
+              <p id="p2c-expected-help" class="hint">A positive whole number. This sets the average number of valid candidates needed to meet the target, not a guaranteed connection count.</p>
+              <p class="notice">This is not a payment to the website owner. Any eligible claimer can collect the reward. Confirmed rewards cannot be cancelled or refunded by this wallet.</p>
+              <p id="p2c-probe-help" class="hint">When you review, the app contacts the website to check its RSA-PSS support, with a 3-second network budget. Verified support selects RSA-PSS only; otherwise, all supported ECDSA / RSA-PSS schemes remain allowed. The native confirmation shows the result. One successful check does not guarantee future availability or every server behind the domain.</p>
+              <p class="hint">Mining fees are added at 1,500 connects/vB; change returns to your wallet's change branch.</p>
+              <p id="p2c-balance-status" class="hint" role="status" hidden></p>
+              <p id="p2c-progress" class="hint" role="status" hidden>Verifying funds and checking the domain’s RSA-PSS support before native confirmation… No funds are sent until you confirm.</p>
+              <button id="review-p2c" class="primary" type="submit">Review P2C reward</button><p id="p2c-status" class="error" role="status"></p>
+              <button id="p2c-open-claims" class="text-button" type="button">Want to collect rewards? Open Automatic Claims</button>
             </form>
           </div>
           <div id="claims" class="page" hidden>
@@ -88,24 +204,69 @@
             <p class="notice">Claims start only after your confirmation and pay the displayed address. The native engine verifies the certificate and proof, even when the hash misses the target. A locked wallet can continue collecting claims without its private keys.</p>
             <label class="toggle-row" for="mobile-data"><span><strong>Allow mobile data</strong><small>For claims only. Viewing balances can use either Wi-Fi or mobile data.</small></span><input type="checkbox" id="mobile-data" role="switch"></label>
             <label class="toggle-row" for="background"><span><strong>Allow background use</strong><small>Continue claims outside the app only when supported by the operating system.</small></span><input type="checkbox" id="background" role="switch"></label>
+            <form id="claims-limits-form" class="claims-limits" novalidate>
+              <h3>Connection limits</h3>
+              <div class="claims-limits-fields">
+                <div><label for="claims-rate-limit">Maximum connections / second</label><input id="claims-rate-limit" type="number" inputmode="numeric" min="1" max="100" step="1" value="100" aria-describedby="claims-limits-hint" disabled></div>
+                <div><label for="claims-concurrency">Maximum simultaneous connections</label><input id="claims-concurrency" type="number" inputmode="numeric" min="1" max="100" step="1" value="100" aria-describedby="claims-limits-hint" disabled></div>
+              </div>
+              <p id="claims-limits-hint" class="hint">1–100 each. These are ceilings, not a guaranteed connection rate. Higher limits can use more battery and data.</p>
+              <button id="apply-claims-limits" class="secondary-button" type="submit" disabled>Apply limits</button>
+              <p id="claims-limits-status" class="hint" role="status"></p><p id="claims-limits-error" class="error" role="status"></p>
+            </form>
             <button id="start-claims" class="primary">Start claims</button><button id="stop-claims" class="secondary-button">Stop claims</button>
             <p id="claims-status" class="status-pill" role="status">Stopped</p>
             <dl id="claims-stats" class="claims-stats">
               <div><dt>Connections attempted</dt><dd id="claims-attempts">0</dd></div><div><dt>Valid proofs</dt><dd id="claims-valid">0</dd></div>
               <div><dt>Invalid / failed</dt><dd id="claims-invalid">0</dd></div><div><dt>Target reached</dt><dd id="claims-targetHits">0</dd></div>
               <div><dt>Claims submitted</dt><dd id="claims-submitted">0</dd></div><div><dt>Unknown submissions</dt><dd id="claims-unknown">0</dd></div>
-              <div><dt>Connections / second</dt><dd id="claims-connectionsPerSecond">0</dd></div><div><dt>Eligible bounties</dt><dd id="claims-eligible">0</dd></div>
+              <div><dt>Actual connections / second (last 10s)</dt><dd id="claims-connectionsPerSecond">0</dd></div><div><dt>Active connections</dt><dd id="claims-activeConnections">0</dd></div>
+              <div><dt>Eligible bounties</dt><dd id="claims-eligible">0</dd></div>
             </dl><p id="claims-domain" class="hint"></p><p id="claims-discovery" class="hint"></p><p id="claims-error" class="error" role="status"></p>
             <p id="claims-receipt" class="address" hidden></p><button id="check-claim" class="secondary-button" hidden>Check previous submission</button>
-            <p class="footnote">Background mode has Android's mandatory service indication and Stop action, without requesting permission for additional notifications. It may be interrupted by the OS and never restarts automatically. iOS execution is not available in this alpha.</p>
           </div>
           <nav class="bottom-nav" aria-label="Wallet sections">
-            <button data-page="overview" aria-current="page">Overview</button><button data-page="receive">Receive</button><button data-page="send">Send</button><button data-page="claims">Claims</button>
+            <button data-page="overview" aria-current="page">Overview</button><button data-page="receive">Receive</button><button data-page="send">Send</button><button data-page="p2c" title="Pay-to-Connect">P2C</button><button data-page="claims" title="Automatic Claims">Claims</button>
           </nav>
+        </section>
+        <section id="wallet-files" class="request-details" hidden aria-labelledby="wallet-files-title">
+          <h2 id="wallet-files-title">Wallet backup</h2>
+          <p class="hint">Save an encrypted wallet file. Keep its password and your recovery phrase safe. Only encrypted wallet data is exported.</p>
+          <div class="native-wallet-actions">
+            <button id="export-wallet" type="button" class="secondary-button" disabled>Export wallet file</button>
+            <button id="manage-import-wallet" type="button" class="secondary-button" hidden disabled>Import wallet file</button>
+          </div>
+          <p id="wallet-file-status" class="hint" role="status" aria-live="polite"></p>
+          <p id="wallet-file-error" class="error" role="status" aria-live="polite"></p>
         </section>
         <p id="global-error" class="error" role="alert"></p>
       </main>
     </div>
+    <dialog id="transaction-details" class="transaction-dialog" aria-labelledby="transaction-title">
+      <div class="section-heading transaction-heading">
+        <h2 id="transaction-title">Transaction details</h2>
+        <button id="transaction-close" class="text-button" type="button" aria-label="Close transaction details" autofocus>Close</button>
+      </div>
+      <p class="eyebrow">CONNECTCOIN · MAINNET</p>
+      <p id="transaction-stale" class="notice" hidden>Last known details. Status and confirmations may be out of date until the wallet reconnects and updates.</p>
+      <dl class="transaction-fields">
+        <div><dt>Status</dt><dd id="transaction-status"></dd></div>
+        <div><dt>Confirmations</dt><dd id="transaction-confirmations"></dd></div>
+        <div><dt>Net balance change</dt><dd id="transaction-net"></dd></div>
+        <div><dt id="transaction-received-label">Received by this address</dt><dd id="transaction-received"></dd></div>
+        <div><dt id="transaction-spent-label">Spent from this address</dt><dd id="transaction-spent"></dd></div>
+        <div><dt id="transaction-address-label">Wallet address</dt><dd id="transaction-address" class="transaction-hash"></dd></div>
+        <div><dt>Transaction ID</dt><dd id="transaction-id" class="transaction-hash"></dd></div>
+      </dl>
+      <dl id="transaction-block" class="transaction-fields">
+        <div><dt>Block height</dt><dd id="transaction-block-height"></dd></div>
+        <div><dt>Block hash</dt><dd id="transaction-block-hash" class="transaction-hash"></dd></div>
+      </dl>
+      <p id="transaction-scope-note" class="hint">Amounts show this address's part of the transaction. Received includes any change returned to it; net change is not the transaction fee.</p>
+      <button id="transaction-open-explorer" type="button" class="primary">Open in explorer ↗</button>
+      <p class="hint">explorer.connectcoincrypto.com · opens in your browser</p>
+      <p id="transaction-explorer-error" class="error" role="status"></p>
+    </dialog>
     <script type="module" src="/src/app.mjs"></script>
   </body>
 </html>

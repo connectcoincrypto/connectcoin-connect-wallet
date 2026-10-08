@@ -50,3 +50,16 @@ Copyright (c) 2000-2026 The Legion of the Bouncy Castle Inc.
 MIT; the dependency's complete license is preserved in the APK at
 META-INF/LICENSE.md, unchanged from the published bcprov-jdk18on-1.86.jar.
 Source: https://github.com/bcgit/bc-java/blob/r1rv86/LICENSE.md
+
+Android QR scanner (unmodified Maven dependencies)
+
+JourneyApps ZXing Android Embedded 4.3.0:
+Copyright Journey Mobile, Inc. and ZXing contributors. Apache-2.0.
+Source: https://github.com/journeyapps/zxing-android-embedded/tree/v4.3.0
+License: ZXING-APACHE-2.0.txt, upstream COPYING.
+
+ZXing Core 3.4.1:
+Copyright ZXing authors. Apache-2.0.
+Source: https://github.com/zxing/zxing/tree/zxing-3.4.1
+License: ZXING-APACHE-2.0.txt (Apache License, Version 2.0).
+Only QR decoding is enabled by the native scanner activity; no barcode image is saved.

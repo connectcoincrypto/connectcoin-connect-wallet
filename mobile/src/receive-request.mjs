@@ -3,7 +3,7 @@ import { buildPaymentUri, parsePaymentUri, validatePaymentDetails,
   PAYMENT_LABEL_MAX_LENGTH, PAYMENT_MESSAGE_MAX_LENGTH, PAYMENT_URI_MAX_LENGTH } from '../../src/core/payment-uri.mjs';
 import { normalizeAmountInput } from '../../src/ui/amount-input.mjs';
 import { numericInputValue } from '../../src/ui/numeric-value.mjs';
-import { parseWatchAddress } from './model.mjs';
+import { parseMainnetAddress } from './model.mjs';
 
 export const RECEIVE_REQUEST_LIMITS = Object.freeze({
   label: PAYMENT_LABEL_MAX_LENGTH,
@@ -44,7 +44,7 @@ function checkedText(value, name, multiline = false) {
 
 export function createReceiveRequest(options = {}) {
   const { address, amount = '', label = '', message = '' } = requestFields(options);
-  const canonicalAddress = parseWatchAddress(address);
+  const canonicalAddress = parseMainnetAddress(address);
   if (typeof amount !== 'string' || amount.length > 64) {
     throw new Error('Enter a CONN amount using a decimal point and at most 10 decimal places.');
   }

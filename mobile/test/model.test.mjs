@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bech32, bech32m } from '@scure/base';
-import { MAINNET_GENESIS, RPC_ENDPOINT, parseWatchAddress, formatConn, validateTip,
+import { DEFAULT_CONFIG } from '../../src/core/config.mjs';
+import { MAINNET_GENESIS, RPC_ENDPOINT, parseMainnetAddress, formatConn, validateTip,
   validateBalance, validateHistory, mergeHistory } from '../src/model.mjs';
 
 // Public curve points only: no private keys, seed phrases, vault or network.
@@ -22,17 +23,18 @@ const history = (items = [confirmed(), pending()]) => ({ address, tip: tip(), un
 
 test('mainnet constants are pinned and endpoint immutable', () => {
   assert.equal(MAINNET_GENESIS, '30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e');
-  assert.deepEqual(RPC_ENDPOINT, { host: 'connectcoin4.com', port: 48191, tls: true });
+  assert.deepEqual(RPC_ENDPOINT, { host: 'connectcoin4.com', port: 48190, tls: false });
+  assert.deepEqual({ host: RPC_ENDPOINT.host, port: RPC_ENDPOINT.port }, DEFAULT_CONFIG.rpc);
   assert.ok(Object.isFrozen(RPC_ENDPOINT));
 });
 
-test('watch addresses accept canonical, uppercase and validated payment URIs', () => {
+test('mainnet addresses accept canonical, uppercase and validated payment URIs', () => {
   for (const input of [address, `  ${address}  `, address.toUpperCase(), `connectcoin:${address}?amount=1.2345678901&label=Public%20test&message=Hello`, `CONNECTCOIN:${address.toUpperCase()}`]) {
-    assert.equal(parseWatchAddress(input), address);
+    assert.equal(parseMainnetAddress(input), address);
   }
 });
 
-test('watch addresses reject invalid checksum, curve, version, size, encoding and network', () => {
+test('mainnet addresses reject invalid checksum, curve, version, size, encoding and network', () => {
   const words = [1, ...bech32m.toWords(publicKey)];
   const bad = [address.slice(0, -1) + (address.endsWith('q') ? 'p' : 'q'),
     bech32m.encode('tcc', words), bech32m.encode('ccrt', words), bech32.encode('cc', words),
@@ -40,12 +42,12 @@ test('watch addresses reject invalid checksum, curve, version, size, encoding an
     bech32m.encode('cc', [1, ...bech32m.toWords(new Uint8Array(31))]),
     bech32m.encode('cc', [1, ...bech32m.toWords(new Uint8Array(33))]),
     'CC' + address.slice(2), '', {}, null, 123, `${address}\n<script>`, address + '\u202e', 'x'.repeat(1025)];
-  for (const input of bad) assert.throws(() => parseWatchAddress(input), /valid ConnectCoin mainnet address/);
+  for (const input of bad) assert.throws(() => parseMainnetAddress(input), /valid ConnectCoin mainnet address/);
 });
 
-test('watch URI parsing rejects unsafe or malformed metadata without echoing it', () => {
+test('mainnet URI parsing rejects unsafe or malformed metadata without echoing it', () => {
   for (const suffix of ['?amount=-1', '?amount=1.00000000001', '?req-unsafe=secret', '?address=other', '?label=%FF', '?amount=1&amount=2', '?message=%3Cscript%3E&network=testnet4']) {
-    assert.throws(() => parseWatchAddress(`connectcoin:${address}${suffix}`), error => !error.message.includes('secret') && !error.message.includes('<script>'));
+    assert.throws(() => parseMainnetAddress(`connectcoin:${address}${suffix}`), error => !error.message.includes('secret') && !error.message.includes('<script>'));
   }
 });
 

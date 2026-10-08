@@ -1,6 +1,8 @@
 package com.connectcoincrypto.connectwallet.mobile.alpha.wallet;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -40,6 +42,9 @@ public final class WalletVault {
                     if (!(value instanceof Integer || value instanceof Long) || ((Number) value).longValue() < (field.startsWith("lastUsed") ? -1 : 0) || ((Number) value).longValue() > Integer.MAX_VALUE) throw new IllegalArgumentException("Invalid wallet address index");
                 }
             }
+            for (String field : new String[]{"needsRecovery", "scanLookahead", "mobileHdRecovered"}) {
+                if (payload.has(field) && !(payload.opt(field) instanceof Boolean)) throw new IllegalArgumentException("Invalid wallet recovery state");
+            }
             String serialized = payload.toString();
             if (serialized == null || serialized.length() > MAX_PLAINTEXT || serialized.getBytes(StandardCharsets.UTF_8).length > MAX_PLAINTEXT) throw new IllegalArgumentException("Wallet data is too large");
             JSONObject copy = new JSONObject(serialized);
@@ -60,28 +65,65 @@ public final class WalletVault {
         finally { WalletCrypto.wipe(bytes); }
     }
     public static JSONObject encrypt(JSONObject payload, char[] password) {
-        validatePassword(password);
-        byte[] plaintext = validatePayload(payload).toString().getBytes(StandardCharsets.UTF_8);
-        byte[] salt = new byte[32], nonce = new byte[12], key = null, encrypted = null;
-        WalletCrypto.RANDOM.nextBytes(salt); WalletCrypto.RANDOM.nextBytes(nonce);
-        try {
-            JSONObject envelope = new JSONObject().put("format", FORMAT).put("version", 1).put("kdf", new JSONObject(KDF_JSON))
-                .put("cipher", "aes-256-gcm").put("salt", WalletCrypto.hex(salt)).put("nonce", WalletCrypto.hex(nonce));
-            key = keyFor(password, salt);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
-            cipher.updateAAD(header(envelope).getBytes(StandardCharsets.UTF_8)); encrypted = cipher.doFinal(plaintext);
-            envelope.put("ciphertext", WalletCrypto.hex(Arrays.copyOfRange(encrypted, 0, encrypted.length - 16)));
-            envelope.put("tag", WalletCrypto.hex(Arrays.copyOfRange(encrypted, encrypted.length - 16, encrypted.length)));
-            return envelope;
-        } catch (KdfMemoryException e) { throw e; }
-        catch (Exception e) { throw new IllegalStateException("Cannot encrypt wallet", e); }
-        finally { WalletCrypto.wipe(plaintext); WalletCrypto.wipe(key); WalletCrypto.wipe(encrypted); }
+        try (UpdateSession session = createForUpdate(payload, password)) { return session.envelope(); }
     }
     public static JSONObject decrypt(JSONObject envelope, char[] password) {
+        try (UpdateSession session = openForUpdate(envelope, password)) { return session.payload(); }
+    }
+    /** Native-only unlocked state. It never retains the password and must be closed on lock. */
+    public static final class UpdateSession implements AutoCloseable {
+        @FunctionalInterface public interface Writer { void write(JSONObject envelope) throws Exception; }
+        private byte[] key;
+        private final String salt;
+        private JSONObject payload, envelope;
+        private boolean saving;
+        private UpdateSession(byte[] key, String salt, JSONObject payload, JSONObject envelope) {
+            this.key = key; this.salt = salt; this.payload = payload; this.envelope = envelope;
+        }
+        private void requireOpen() { if (key == null) throw new IllegalStateException("Wallet is locked"); }
+        public synchronized JSONObject payload() { requireOpen(); return copy(payload); }
+        public synchronized JSONObject envelope() { requireOpen(); return copy(envelope); }
+        /** Publish metadata only after durable storage succeeds. A fresh nonce is generated for every attempt. */
+        public void save(JSONObject next, Writer writer) throws Exception {
+            JSONObject candidate = validatePayload(next); final byte[] localKey;
+            synchronized (this) {
+                requireOpen();
+                if (saving) throw new IllegalStateException("A wallet update is already in progress");
+                // Metadata updates must never silently turn an existing vault into a different wallet.
+                for (String field : new String[]{"mnemonic", "passphrase", "network"}) {
+                    if (!java.util.Objects.equals(payload.opt(field), candidate.opt(field))) throw new IllegalArgumentException("Wallet identity cannot change during an update");
+                }
+                saving = true; localKey = key.clone();
+            }
+            try {
+                JSONObject encrypted = encryptWithKey(candidate, localKey, salt);
+                synchronized (this) { requireOpen(); }
+                writer.write(copy(encrypted));
+                synchronized (this) { requireOpen(); payload = candidate; envelope = encrypted; }
+            } finally {
+                WalletCrypto.wipe(localKey);
+                synchronized (this) { saving = false; }
+            }
+        }
+        /** No disk/network wait on the UI lock path; an in-flight writer must also check its lifecycle fence. */
+        @Override public synchronized void close() {
+            WalletCrypto.wipe(key); key = null; payload = null; envelope = null;
+        }
+    }
+    public static UpdateSession createForUpdate(JSONObject payload, char[] password) {
+        validatePassword(password); JSONObject clean = validatePayload(payload);
+        byte[] salt = new byte[32], key = null; WalletCrypto.RANDOM.nextBytes(salt);
+        try {
+            key = keyFor(password, salt);
+            String saltHex = WalletCrypto.hex(salt);
+            JSONObject envelope = encryptWithKey(clean, key, saltHex);
+            UpdateSession result = new UpdateSession(key, saltHex, clean, envelope); key = null; return result;
+        } finally { WalletCrypto.wipe(key); WalletCrypto.wipe(salt); }
+    }
+    public static UpdateSession openForUpdate(JSONObject envelope, char[] password) {
         byte[] key = null, plaintext = null, encrypted = null;
         try {
-            validatePassword(password); validateEnvelope(envelope);
+            validatePassword(password); envelope = copy(envelope); validateEnvelope(envelope);
             key = keyFor(password, WalletCrypto.fromHex(envelope.getString("salt")));
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, WalletCrypto.fromHex(envelope.getString("nonce"))));
@@ -89,10 +131,30 @@ public final class WalletVault {
             encrypted = WalletCrypto.concat(WalletCrypto.fromHex(envelope.getString("ciphertext")), WalletCrypto.fromHex(envelope.getString("tag")));
             plaintext = cipher.doFinal(encrypted);
             if (plaintext.length > MAX_PLAINTEXT) throw new IllegalArgumentException("Wallet data is too large");
-            return validatePayload(new JSONObject(new String(plaintext, StandardCharsets.UTF_8)));
+            JSONObject clean = validatePayload(StrictWalletJson.object(strictUtf8(plaintext)));
+            UpdateSession result = new UpdateSession(key, envelope.getString("salt"), clean, envelope); key = null; return result;
         } catch (KdfMemoryException e) { throw e; }
         catch (Exception e) { throw new IllegalArgumentException("Cannot unlock wallet: incorrect password or damaged wallet file"); }
         finally { WalletCrypto.wipe(key); WalletCrypto.wipe(plaintext); WalletCrypto.wipe(encrypted); }
+    }
+    private static JSONObject encryptWithKey(JSONObject payload, byte[] key, String salt) {
+        byte[] plaintext = payload.toString().getBytes(StandardCharsets.UTF_8), nonce = new byte[12], encrypted = null;
+        WalletCrypto.RANDOM.nextBytes(nonce);
+        try {
+            JSONObject envelope = new JSONObject().put("format", FORMAT).put("version", 1).put("kdf", new JSONObject(KDF_JSON))
+                .put("cipher", "aes-256-gcm").put("salt", salt).put("nonce", WalletCrypto.hex(nonce));
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+            cipher.updateAAD(header(envelope).getBytes(StandardCharsets.UTF_8)); encrypted = cipher.doFinal(plaintext);
+            envelope.put("ciphertext", WalletCrypto.hex(Arrays.copyOfRange(encrypted, 0, encrypted.length - 16)));
+            envelope.put("tag", WalletCrypto.hex(Arrays.copyOfRange(encrypted, encrypted.length - 16, encrypted.length)));
+            return envelope;
+        } catch (Exception e) { throw new IllegalStateException("Cannot encrypt wallet", e); }
+        finally { WalletCrypto.wipe(plaintext); WalletCrypto.wipe(nonce); WalletCrypto.wipe(encrypted); }
+    }
+    private static JSONObject copy(JSONObject value) {
+        try { if (value == null) throw new IllegalArgumentException("Missing wallet data"); return new JSONObject(value.toString()); }
+        catch (org.json.JSONException e) { throw new IllegalArgumentException("Invalid wallet data"); }
     }
     /** Use this instead of JSONObject.toString(): desktop authenticates the KDF object's key order. */
     public static String serialize(JSONObject envelope) {
@@ -105,8 +167,18 @@ public final class WalletVault {
     public static JSONObject parse(String json) {
         try {
             if (json == null || json.length() > MAX_FILE_BYTES || json.getBytes(StandardCharsets.UTF_8).length > MAX_FILE_BYTES) throw new IllegalArgumentException("Unsafe or oversized wallet file");
-            JSONObject value = new JSONObject(json); validateEnvelope(value); return value;
+            JSONObject value = StrictWalletJson.object(json); validateEnvelope(value); return value;
         } catch (org.json.JSONException e) { throw new IllegalArgumentException("Invalid encrypted wallet format"); }
+    }
+    public static JSONObject parse(byte[] encoded) {
+        if (encoded == null || encoded.length == 0 || encoded.length > MAX_FILE_BYTES) throw new IllegalArgumentException("Unsafe or oversized wallet file");
+        return parse(strictUtf8(encoded));
+    }
+    private static String strictUtf8(byte[] encoded) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(encoded)).toString();
+        } catch (java.nio.charset.CharacterCodingException invalid) { throw new IllegalArgumentException("Invalid wallet file encoding"); }
     }
     private static String header(JSONObject envelope) throws org.json.JSONException {
         return "{\"format\":\"" + FORMAT + "\",\"version\":1,\"kdf\":" + KDF_JSON

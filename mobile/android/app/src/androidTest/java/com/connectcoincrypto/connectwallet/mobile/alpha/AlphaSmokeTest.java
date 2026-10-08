@@ -4,7 +4,9 @@ import static org.junit.Assert.*;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.FeatureInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
@@ -27,6 +29,7 @@ import java.lang.reflect.Field;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -40,7 +43,7 @@ import org.xmlpull.v1.XmlPullParser;
 
 /**
  * Bundled-app smoke tests for a CLEAN, isolated Android emulator only.
- * No watched address is installed and no foreground RPC is submitted. This
+ * No wallet or legacy watched address is installed and no foreground RPC is submitted. This
  * deliberately refuses a saved profile rather than deleting user preferences.
  * Active-socket cancellation and wire behavior are covered by RpcTransportTest
  * on loopback; here we verify the actual Android lifecycle reaches that transport.
@@ -100,7 +103,7 @@ public final class AlphaSmokeTest {
     private void awaitReadyUi() throws Exception {
         long deadline = SystemClock.elapsedRealtime() + 15000;
         do {
-            if ("true".equals(evaluate("Boolean(document.getElementById('watch-submit') && !document.getElementById('watch-submit').disabled)"))) return;
+            if ("true".equals(evaluate("document.documentElement.dataset.ready === 'true'"))) return;
             Thread.sleep(100);
         } while (SystemClock.elapsedRealtime() < deadline);
         fail("The bundled UI did not initialize. Check WebView >=105, native plugin initialization and packaged assets.");
@@ -134,13 +137,21 @@ public final class AlphaSmokeTest {
         JSONObject ui = new JSONObject(evaluate("({language:document.documentElement.lang,title:document.title," +
             "origin:location.origin,platform:window.Capacitor.getPlatform(),setupVisible:!document.getElementById('setup-panel').hidden," +
             "walletHidden:document.getElementById('wallet-panel').hidden,previewHidden:document.getElementById('preview-notice').hidden," +
-            "claims:document.getElementById('claims-status').textContent,error:document.getElementById('global-error').textContent})"));
+            "claims:document.getElementById('claims-status').textContent,error:document.getElementById('global-error').textContent," +
+            "watchControls:document.querySelectorAll('#watch-form,#watch-address,#watch-submit,#forget').length," +
+            "createEnabled:Boolean(document.getElementById('create-wallet') && !document.getElementById('create-wallet').disabled)," +
+            "importRecoveryEnabled:Boolean(document.getElementById('import-recovery') && !document.getElementById('import-recovery').disabled)," +
+            "importFileEnabled:Boolean(document.getElementById('import-wallet') && !document.getElementById('import-wallet').disabled)})"));
         assertEquals("en", ui.getString("language"));
         assertEquals("ConnectWallet Alpha", ui.getString("title"));
         assertEquals("https://localhost", ui.getString("origin"));
         assertEquals("android", ui.getString("platform"));
         assertTrue(ui.getBoolean("setupVisible")); assertTrue(ui.getBoolean("walletHidden"));
         assertTrue(ui.getBoolean("previewHidden"));
+        assertEquals("Mobile must not expose an arbitrary watched-address entry point.", 0, ui.getInt("watchControls"));
+        assertTrue("A fresh wallet must offer native creation.", ui.getBoolean("createEnabled"));
+        assertTrue("A fresh wallet must offer a separate native recovery-phrase import.", ui.getBoolean("importRecoveryEnabled"));
+        assertTrue("A fresh wallet must offer a separate native wallet-file import.", ui.getBoolean("importFileEnabled"));
         assertTrue(ui.getString("claims").toLowerCase(Locale.ROOT).contains("stopped")); assertEquals("", ui.getString("error"));
         assertFalse(context.getSharedPreferences("CapacitorStorage", Context.MODE_PRIVATE).contains(PROFILE_KEY));
     }
@@ -161,12 +172,25 @@ public final class AlphaSmokeTest {
             assertNull(bridge.getPlugin("ReadOnlyRpc"));
             Set<String> wallet = methods(bridge.getPlugin("NativeWallet"));
             // PluginHandle includes five inherited framework methods as well
-            // as our twelve application methods. Keep the full exact allowlist;
+            // as our application methods. Keep the full exact allowlist;
             // permission methods cannot request undeclared plugin permissions.
             assertEquals(0, bridge.getPlugin("NativeWallet").getPluginAnnotation().permissions().length);
-            assertEquals(new HashSet<>(Arrays.asList("getState", "lock", "create", "importRecovery", "unlock", "reviewPayment",
-                "queryPublic", "claimsState", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission",
+            assertEquals(new HashSet<>(Arrays.asList("getState", "lock", "create", "importRecovery", "importWallet", "exportWallet", "unlock", "reviewPayment", "reviewP2C",
+                "queryPublic", "watchAccount", "readPaymentClipboard", "newAddress", "recoverAddresses", "claimsState", "claimsLimits", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission",
                 "addListener", "removeListener", "removeAllListeners", "checkPermissions", "requestPermissions")), wallet);
+            PluginHandle paymentInput = bridge.getPlugin("NativePaymentInput");
+            assertNotNull(paymentInput);
+            assertEquals(NativePaymentInputPlugin.class, paymentInput.getInstance().getClass());
+            assertEquals("Only an explicit scanner activity may ask for camera permission.", 0,
+                paymentInput.getPluginAnnotation().permissions().length);
+            assertEquals(new HashSet<>(Arrays.asList("scanPaymentQr", "takePaymentLink", "addListener", "removeListener",
+                "removeAllListeners", "checkPermissions", "requestPermissions")), methods(paymentInput));
+            PluginHandle explorer = bridge.getPlugin("NativeExplorer");
+            assertNotNull(explorer);
+            assertEquals(NativeExplorerPlugin.class, explorer.getInstance().getClass());
+            assertEquals(0, explorer.getPluginAnnotation().permissions().length);
+            assertEquals(new HashSet<>(Arrays.asList("openTransaction", "addListener", "removeListener",
+                "removeAllListeners", "checkPermissions", "requestPermissions")), methods(explorer));
             for (String id : new String[] { "App", "Network", "Preferences", "SystemBars" }) assertNotNull(bridge.getPlugin(id));
         });
         assertEquals("\"undefined\"", evaluate("typeof window.CapacitorHttpAndroidInterface"));
@@ -218,23 +242,34 @@ public final class AlphaSmokeTest {
 
     @Test public void mergedPackageHasEnglishIdentityAndNoNotificationPromptPermission() throws Exception {
         PackageInfo info = context.getPackageManager().getPackageInfo(APP_ID,
-            PackageManager.GET_PERMISSIONS | PackageManager.GET_PROVIDERS | PackageManager.GET_ACTIVITIES);
+            PackageManager.GET_PERMISSIONS | PackageManager.GET_PROVIDERS | PackageManager.GET_ACTIVITIES | PackageManager.GET_CONFIGURATIONS);
         assertEquals("1.0.0-alpha.1", info.versionName);
         Set<String> requested = new HashSet<>(Arrays.asList(info.requestedPermissions));
         // AndroidX may merge its own signature permission for non-exported dynamic receivers.
         requested.remove(APP_ID + ".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION");
-        assertEquals(new HashSet<>(Arrays.asList(Manifest.permission.INTERNET, Manifest.permission.ACCESS_NETWORK_STATE,
+        assertEquals(new HashSet<>(Arrays.asList(Manifest.permission.INTERNET, Manifest.permission.ACCESS_NETWORK_STATE, Manifest.permission.CAMERA,
             Manifest.permission.FOREGROUND_SERVICE, "android.permission.FOREGROUND_SERVICE_SPECIAL_USE")), requested);
         assertFalse(requested.contains("android.permission.POST_NOTIFICATIONS"));
         assertEquals(0, info.applicationInfo.flags & ApplicationInfo.FLAG_ALLOW_BACKUP);
         assertEquals(0, info.applicationInfo.flags & ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC);
         assertNotEquals(0, info.applicationInfo.icon);
         if (info.providers != null) for (android.content.pm.ProviderInfo provider : info.providers) assertFalse(provider.exported);
-        boolean launcherFound = false;
-        for (android.content.pm.ActivityInfo activity : info.activities) if (activity.name.equals(MainActivity.class.getName())) {
-            launcherFound = true; assertTrue(activity.exported);
+        assertEquals("The library's generic scanner must not survive the manifest merge.", 2, info.activities.length);
+        Set<String> activities = new HashSet<>();
+        for (android.content.pm.ActivityInfo activity : info.activities) {
+            activities.add(activity.name);
+            assertEquals("Only the launcher/payment-link activity may be exported.", MainActivity.class.getName().equals(activity.name), activity.exported);
         }
-        assertTrue(launcherFound);
+        assertEquals(new HashSet<>(Arrays.asList(MainActivity.class.getName(), PaymentQrCaptureActivity.class.getName())), activities);
+        Set<String> features = new HashSet<>();
+        for (FeatureInfo feature : info.reqFeatures) {
+            features.add(feature.name);
+            assertEquals("Camera/scanner hardware is optional, never an installation prerequisite.", 0,
+                feature.flags & FeatureInfo.FLAG_REQUIRED);
+        }
+        assertEquals(new HashSet<>(Arrays.asList("android.hardware.camera", "android.hardware.camera.any",
+            "android.hardware.camera.autofocus", "android.hardware.camera.front", "android.hardware.camera.flash",
+            "android.hardware.screen.landscape", "android.hardware.wifi")), features);
         Configuration portuguese = new Configuration(context.getResources().getConfiguration());
         portuguese.setLocale(Locale.forLanguageTag("pt-BR"));
         Context localized = context.createConfigurationContext(portuguese);
@@ -242,10 +277,30 @@ public final class AlphaSmokeTest {
         assertEquals("ConnectWallet Alpha", localized.getString(R.string.title_activity_main));
     }
 
+    @Test public void paymentLinksResolveOnlyToMainActivityAndNeverToTheInternalScanner() {
+        PackageManager manager = context.getPackageManager();
+        Intent payment = new Intent(Intent.ACTION_VIEW, Uri.parse("connectcoin:cc1p?amount=1"))
+            .addCategory(Intent.CATEGORY_BROWSABLE).setPackage(APP_ID);
+        List<android.content.pm.ResolveInfo> handlers = manager.queryIntentActivities(payment, PackageManager.MATCH_DEFAULT_ONLY);
+        assertEquals(1, handlers.size());
+        assertEquals(MainActivity.class.getName(), handlers.get(0).activityInfo.name);
+        assertTrue(handlers.get(0).activityInfo.exported);
+        for (String url : new String[] { "https://example.com", "http://example.com", "file:///anything", "content://anything",
+                "javascript:alert(1)", "intent://anything", "bitcoin:bc1p", "ethereum:0x123" }) {
+            Intent unrelated = new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE).setPackage(APP_ID);
+            assertTrue("Unexpected external URL scope: " + url,
+                manager.queryIntentActivities(unrelated, PackageManager.MATCH_DEFAULT_ONLY).isEmpty());
+        }
+        assertTrue("The generic scanner action must not be registered.",
+            manager.queryIntentActivities(new Intent("com.google.zxing.client.android.SCAN").setPackage(APP_ID),
+                PackageManager.MATCH_DEFAULT_ONLY).isEmpty());
+    }
+
     @Test public void privateFileAndContentProxiesAreBlockedByActualWebViewFetch() throws Exception {
         launch(); awaitReadyUi();
         scenario.onActivity(activity -> {
-            assertNotEquals(0, activity.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE);
+            assertEquals("Screenshots must remain available", 0,
+                activity.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE);
             assertFalse(activity.getBridge().getWebView().getSettings().getAllowFileAccess());
             assertFalse(activity.getBridge().getWebView().getSettings().getAllowContentAccess());
             assertFalse(activity.getBridge().getConfig().isResolveServiceWorkerRequests());

@@ -18,6 +18,15 @@ public class WalletVaultTest {
         JSONObject actual = WalletVault.decrypt(WalletVault.parse(DesktopVectors.ENVELOPE), DesktopVectors.PASSWORD.toCharArray());
         assertEquals(DesktopVectors.MNEMONIC, actual.getString("mnemonic")); assertEquals("main", actual.getString("network"));
         assertEquals("caf\u00e9 \ud83d\udd11", actual.getString("passphrase")); assertEquals(7, actual.getInt("receiveIndex")); assertEquals(3, actual.getInt("changeIndex"));
+        // Unlock must use the saved passphrase even though new/import dialogs
+        // no longer offer that field. This fixed address is the desktop's
+        // nonempty-passphrase vector for m/44'/0'/0'/1/0, not a native oracle.
+        try (VaultSession restored = new VaultSession(actual.getString("mnemonic"), actual.optString("passphrase", ""));
+             VaultSession withoutPassphrase = new VaultSession(actual.getString("mnemonic"), "")) {
+            String address = restored.publicAccount(0, 1).getString("address");
+            assertEquals("cc1plyra2xkx5va3m5djztl8eqfakdz2w3u4plquss6clyv3jzjwc8aqyuq2dt", address);
+            assertNotEquals(withoutPassphrase.publicAccount(0, 1).getString("address"), address);
+        }
     }
     @Test public void randomizedEncryptionRoundTripsWithExactOrderedPortableHeader() throws Exception {
         JSONObject payload = WalletVault.newPayload("Public test fixture", DesktopVectors.MNEMONIC, "");

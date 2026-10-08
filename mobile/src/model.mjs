@@ -4,7 +4,7 @@ import { bech32m } from '@scure/base';
 import { parseClipboardPaymentText } from '../../src/core/payment-uri.mjs';
 
 export const MAINNET_GENESIS = '30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e';
-export const RPC_ENDPOINT = Object.freeze({ host: 'connectcoin4.com', port: 48191, tls: true });
+export const RPC_ENDPOINT = Object.freeze({ host: 'connectcoin4.com', port: 48190, tls: false });
 
 const COIN = 10_000_000_000n;
 const MAX_MONEY = 100_000_000n * COIN;
@@ -51,7 +51,7 @@ function money(value, signed = false) {
   return amount;
 }
 
-export function parseWatchAddress(text) {
+export function parseMainnetAddress(text) {
   try {
     const { address } = parseClipboardPaymentText(text);
     const decoded = bech32m.decode(address, 90);
@@ -87,7 +87,7 @@ export function validateTip(result) {
 }
 
 function addressEnvelope(result, address) {
-  const canonical = parseWatchAddress(address);
+  const canonical = parseMainnetAddress(address);
   if (result.address !== canonical || result.unit !== 'connects') invalid();
   return { address: canonical, tip: validateTip(result.tip), unit: 'connects' };
 }
@@ -122,12 +122,12 @@ function historyItem(value, tip) {
     confirmations, received: received.toString(), spent: spent.toString(), balance_delta: delta.toString() };
 }
 
-export function validateHistory(result, address) {
+export function validateHistory(result, address, { allowEmptyContinuation = false } = {}) {
   record(result, ['address', 'tip', 'unit', 'live', 'items', 'next_cursor']);
   const validated = addressEnvelope(result, address);
   if (result.live !== true || !Array.isArray(result.items) || result.items.length > MAX_PAGE) invalid();
   if (result.next_cursor !== null && (typeof result.next_cursor !== 'string' || result.next_cursor.length > 1024 ||
-      !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(result.next_cursor) || result.items.length === 0)) invalid();
+      !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(result.next_cursor) || !allowEmptyContinuation && result.items.length === 0)) invalid();
   const items = Array.from(result.items, item => historyItem(item, validated.tip));
   if (new Set(items.map(item => item.txid)).size !== items.length) invalid();
   return { ...validated, live: true, items, next_cursor: result.next_cursor };

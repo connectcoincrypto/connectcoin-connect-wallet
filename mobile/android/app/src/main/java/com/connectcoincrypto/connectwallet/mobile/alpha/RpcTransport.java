@@ -249,7 +249,7 @@ public final class RpcTransport implements AutoCloseable {
             return (JSONObject) result;
     }
 
-    // Shared syntax validation only. The native TLS client has its own broader
+    // Shared syntax validation only. The native full-wallet client has its own broader
     // method allowlist; the public read-only bridge above remains unchanged.
     static JSONObject parseObject(String text) throws RpcFailure {
         try { new JsonSyntax(text).validate(); return new JSONObject(text); }

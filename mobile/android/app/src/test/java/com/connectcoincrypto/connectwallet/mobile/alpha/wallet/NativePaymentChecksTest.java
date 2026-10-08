@@ -59,4 +59,17 @@ public class NativePaymentChecksTest {
         assertThrows(IllegalArgumentException.class, () -> NativePaymentChecks.transactions(forged, ids, tip()));
         assertThrows(IllegalArgumentException.class, () -> NativePaymentChecks.transactions(response, new JSONArray().put(id).put(id), tip()));
     }
+    @Test public void immutableFundingMayAdvanceTipButNeverChangeNetworkOrCanonicalIdentity() throws Exception {
+        JSONObject attached = fixture().getJSONObject("attached"); String id = attached.getString("txid"); JSONArray ids = new JSONArray().put(id);
+        JSONObject response = new JSONObject().put("tip", tip().put("height", 121).put("hash", "cc".repeat(32)).put("mediantime", 1700000001))
+            .put("transactions", new JSONArray().put(new JSONObject().put("txid", id).put("hex", attached.getString("hex")))).put("remaining", new JSONArray());
+        assertThrows(IllegalArgumentException.class, () -> NativePaymentChecks.transactions(response, ids, tip()));
+        JSONArray compact = NativePaymentChecks.fundingTransactions(response, ids);
+        assertEquals(fixture().getJSONObject("claim").getString("hex"), compact.getJSONObject(0).getString("hex"));
+        assertEquals(attached.getString("hex"), response.getJSONArray("transactions").getJSONObject(0).getString("hex"));
+        JSONObject wrongNetwork = new JSONObject(response.toString()); wrongNetwork.getJSONObject("tip").put("genesis_hash", "00".repeat(32));
+        assertThrows(IllegalArgumentException.class, () -> NativePaymentChecks.fundingTransactions(wrongNetwork, ids));
+        JSONObject noncanonical = new JSONObject(response.toString()); noncanonical.getJSONArray("transactions").getJSONObject(0).put("hex", attached.getString("hex") + "00");
+        assertThrows(IllegalArgumentException.class, () -> NativePaymentChecks.fundingTransactions(noncanonical, ids));
+    }
 }
