@@ -123,7 +123,8 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         if error is NativeWalletCancelled || error is CancellationError { call.reject("Cancelled", "CANCELLED"); return }
         // Cocoa/provider errors can contain filesystem paths. Only deliberate
         // WalletCore errors are eligible for renderer-visible explanations.
-        let text = (error as? WalletError)?.message ?? "The native wallet action could not complete. Please try again."
+        let text = (error as? WalletError)?.message ?? (error as? WalletFileReadError)?.errorDescription
+            ?? "The native wallet action could not complete. Please try again."
         let code = ["STORAGE_UNCERTAIN", "BUSY", "NATIVE_BUSY", "RECOVERY_ACTIVE", "RECOVERY_BUSY"].contains(text) ? text : "WALLET_ERROR"
         call.reject(text, code)
     }

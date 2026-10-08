@@ -5,6 +5,7 @@ import WebKit
 final class WalletBridgeViewController: CAPBridgeViewController {
     private let restrictedUIDelegate = WalletWebUIDelegate()
     private var scriptGuard: WalletScriptGuard?
+    private var bundledWebConfiguration: WKWebViewConfiguration?
     override func instanceDescriptor() -> InstanceDescriptor {
         // Do not inherit a previously persisted WebView serverBasePath.
         let descriptor = InstanceDescriptor()
@@ -14,12 +15,24 @@ final class WalletBridgeViewController: CAPBridgeViewController {
         return descriptor
     }
 
+    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+        let configuration = super.webViewConfiguration(for: instanceConfiguration)
+        // WKWebViewConfiguration has no unregister operation: setting nil for
+        // an already registered scheme throws an Objective-C exception. Copy
+        // the configured base BEFORE Capacitor installs its general file proxy.
+        let bundled = configuration.copy() as! WKWebViewConfiguration
+        bundled.setURLSchemeHandler(WalletBundledAssetHandler(), forURLScheme: "capacitor")
+        bundledWebConfiguration = bundled
+        return configuration
+    }
+
     override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
-        // Public hook runs after Capacitor configures its handler, before the
-        // WKWebView is constructed. Replace that handler, never its delegate.
-        configuration.setURLSchemeHandler(nil, forURLScheme: "capacitor")
-        configuration.setURLSchemeHandler(WalletBundledAssetHandler(), forURLScheme: "capacitor")
-        return super.webView(with: frame, configuration: configuration)
+        guard let bundled = bundledWebConfiguration else { preconditionFailure("Missing bundled WebView configuration") }
+        bundledWebConfiguration = nil
+        // Preserve Capacitor's scripts/message delegate, but never attach its
+        // unrestricted scheme handler to a live WebView.
+        bundled.userContentController = configuration.userContentController
+        return super.webView(with: frame, configuration: bundled)
     }
 
     override func capacitorDidLoad() {

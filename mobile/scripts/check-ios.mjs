@@ -19,7 +19,8 @@ assert.equal(capacitor.server.url, undefined, 'Only packaged web assets may run.
 assert.match(spm, /exact: "8\.5\.2"/);
 assert.match(project, /PBXFileSystemSynchronizedRootGroup/);
 assert.match(project, /relativePath = \.\.\/WalletCore;/);
-assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.0;/);
+assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.4;/);
+assert.doesNotMatch(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.0;/);
 assert.match(scene, /rootViewController = WalletBridgeViewController\(\)/);
 for (const plugin of ['NativeWalletPlugin', 'NativePaymentInputPlugin', 'NativeExplorerPlugin']) {
   assert.ok(bridge.includes(`registerPluginInstance(${plugin}())`), `${plugin} must be registered`);
@@ -28,6 +29,8 @@ for (const plugin of ['WalletDisabledHttp', 'WalletDisabledCookies', 'WalletBund
   assert.ok(bridge.includes(`registerPluginInstance(${plugin}())`), `${plugin} must restrict built-in capabilities`);
 }
 assert.match(bridge, /setURLSchemeHandler\(WalletBundledAssetHandler\(\)/);
+assert.doesNotMatch(bridge, /setURLSchemeHandler\(nil/, 'WebKit cannot unregister an existing scheme handler.');
+assert.match(bridge, /configuration\.copy\(\) as! WKWebViewConfiguration/);
 assert.match(bridge, /webView\?\.uiDelegate = restrictedUIDelegate/);
 assert.match(project, /PrivacyInfo\.xcprivacy in Resources/);
 assert.match(plist, /<string>connectcoin<\/string>/);

@@ -112,6 +112,22 @@ final class WalletEncryptedFileReaderTests: XCTestCase {
         let file = directory.appendingPathComponent("wallet.json"), valid = Data(DesktopCryptoVectors.envelope.utf8)
         try valid.write(to: file)
         XCTAssertEqual(try WalletEncryptedFileReader.readFile(file, check: {}), valid)
+        let atLimit = valid + Data(repeating: 32, count: WalletVault.maxFileBytes - valid.count)
+        try atLimit.write(to: file)
+        XCTAssertEqual(try WalletEncryptedFileReader.readFile(file, check: {}), atLimit)
+        try valid.write(to: file)
+        var checks = 0
+        XCTAssertThrowsError(try WalletEncryptedFileReader.readFile(file, check: {
+            checks += 1
+            if checks == 4 {
+                // Grow the same inode after fstat but before the first read.
+                let writer = try FileHandle(forWritingTo: file)
+                defer { try? writer.close() }
+                _ = try writer.seekToEnd()
+                try writer.write(contentsOf: Data(repeating: 32, count: WalletVault.maxFileBytes + 1 - valid.count))
+            }
+        }))
+        try valid.write(to: file)
         XCTAssertThrowsError(try WalletEncryptedFileReader.readFile(file, check: { throw CancellationError() }))
         XCTAssertThrowsError(try WalletEncryptedFileReader.readFile(directory, check: {}))
         XCTAssertThrowsError(try WalletEncryptedFileReader.readFile(URL(string: "https://example.invalid/wallet.json")!, check: {}))

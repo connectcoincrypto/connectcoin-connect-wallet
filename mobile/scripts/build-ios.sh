@@ -25,7 +25,7 @@ build_native() {
     -DCONNECTWALLET_WALLET_CORE=ON -DCMAKE_OSX_ARCHITECTURES="$arch")
   if [[ "$sdk" != host ]]; then
     cmake_args+=(-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk"
-      -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=15.4 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY)
   else
     cmake_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0)
   fi
@@ -78,7 +78,7 @@ build_app() {
 smoke_simulator() (
   # A new owned Simulator has no user wallets or credentials. The Debug-only
   # launch argument is enforced by native code to deny all network transports.
-  local runtime device simulator
+  local runtime device simulator test_status=0
   runtime="$(xcrun simctl list runtimes -j | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{const r=JSON.parse(s).runtimes.filter(x=>x.isAvailable&&x.identifier.includes(".iOS-")).sort((a,b)=>b.version.localeCompare(a.version,undefined,{numeric:true}))[0];if(!r)process.exit(1);console.log(r.identifier)})')"
   device="$(xcrun simctl list devicetypes -j | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{const d=JSON.parse(s).devicetypes.filter(x=>x.name.startsWith("iPhone"));const v=d.find(x=>x.name==="iPhone 17 Pro")||d.find(x=>x.name==="iPhone 16 Pro")||d.at(-1);if(!v)process.exit(1);console.log(v.identifier)})')"
   simulator="$(xcrun simctl create "ConnectWallet-CI-$RANDOM" "$device" "$runtime")"
@@ -92,9 +92,44 @@ smoke_simulator() (
     -derivedDataPath "$native_root/iphonesimulator/DerivedData" \
     -resultBundlePath "$artifact_dir/WalletUISmoke.xcresult" -parallel-testing-enabled NO \
     ARCHS="$(uname -m)" ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-    CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= test
-  xcrun xcresulttool export attachments --path "$artifact_dir/WalletUISmoke.xcresult" \
-    --output-path "$artifact_dir/ui-screenshots"
+    CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= test || test_status=$?
+  # Preserve the failing test's exit status while making its diagnostics usable
+  # without Xcode. This Simulator contains only disposable public test fixtures.
+  local result="$artifact_dir/WalletUISmoke.xcresult" diagnostics="$artifact_dir/ui-diagnostics"
+  mkdir -p "$diagnostics"
+  if [[ -d "$result" ]]; then
+    xcrun xcresulttool export attachments --path "$result" \
+      --output-path "$artifact_dir/ui-screenshots" >"$diagnostics/attachments-export.log" 2>&1 || true
+    xcrun xcresulttool export diagnostics --path "$result" \
+      --output-path "$diagnostics/xcresult" >"$diagnostics/diagnostics-export.log" 2>&1 || true
+    xcrun xcresulttool get test-results summary --path "$result" \
+      >"$diagnostics/test-summary.json" 2>"$diagnostics/test-summary-error.log" || true
+    xcrun xcresulttool get test-results tests --path "$result" \
+      >"$diagnostics/tests.json" 2>"$diagnostics/tests-error.log" || true
+    xcrun xcresulttool get log --path "$result" --type console \
+      >"$diagnostics/test-console.log" 2>"$diagnostics/test-console-error.log" || true
+  fi
+  xcrun simctl io "$simulator" screenshot "$diagnostics/simulator-final.png" \
+    >"$diagnostics/screenshot.log" 2>&1 || true
+  xcrun simctl spawn "$simulator" log show --last 10m --style compact \
+    --predicate 'process == "App" OR eventMessage CONTAINS "com.connectcoincrypto.connectwallet.mobile.alpha"' \
+    >"$diagnostics/app-system.log" 2>"$diagnostics/app-system-error.log" || true
+  # Do not scan arbitrary host data: copy only App crash reports from the owned
+  # simulator and this disposable CI user's diagnostic directory.
+  local reports report_dir report
+  reports="$diagnostics/crashes"
+  mkdir -p "$reports"
+  for report_dir in "$HOME/Library/Developer/CoreSimulator/Devices/$simulator/data/Library/Logs/CrashReporter" \
+    "$HOME/Library/Logs/DiagnosticReports"; do
+    [[ -d "$report_dir" ]] || continue
+    while IFS= read -r -d '' report; do
+      cp "$report" "$reports/$(basename "$report")" || true
+    done < <(find "$report_dir" -maxdepth 1 -type f \( -name 'App-*.ips' -o -name 'App_*.crash' \) -print0)
+  done
+  if [[ "$test_status" != 0 ]]; then
+    printf 'Simulator UI test failed with exit status %s; diagnostics preserved in %s\n' "$test_status" "$diagnostics" >&2
+  fi
+  exit "$test_status"
 )
 
 node native/tools/check-provenance.mjs

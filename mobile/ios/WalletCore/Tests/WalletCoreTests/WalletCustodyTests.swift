@@ -2,6 +2,21 @@ import Foundation
 import XCTest
 @testable import WalletCore
 
+private actor ActivityTransitionPause {
+    private var paused: CheckedContinuation<Void,Never>?
+    private var entered: CheckedContinuation<Void,Never>?
+    func hold() async {
+        await withCheckedContinuation { continuation in
+            paused = continuation; entered?.resume(); entered = nil
+        }
+    }
+    func waitUntilHeld() async {
+        if paused != nil { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func release() { paused?.resume(); paused = nil }
+}
+
 /// These paths stop before HD discovery and never connect to an RPC endpoint.
 final class WalletCustodyTests: XCTestCase {
     private func directory() -> URL {
@@ -10,6 +25,25 @@ final class WalletCustodyTests: XCTestCase {
     private func original(_ store: DurableWalletStore) throws -> Data {
         try store.saveVault(WalletVault.parse(DesktopCryptoVectors.envelope))
         return try XCTUnwrap(store.read(.vault,maxBytes:WalletVault.maxFileBytes))
+    }
+    func testOlderBackgroundCleanupCannotDisableNewForegroundPolicyAndTimer() async throws {
+        let folder = directory(); defer { try? FileManager.default.removeItem(at:folder) }
+        let runtime = MobileWalletRuntime(directory:folder), pause = ActivityTransitionPause()
+        await runtime.setActive(true)
+        let initialTimer = await runtime.hasInactivityTimer; XCTAssertTrue(initialTimer)
+        // Park exactly where closing an older HD actor can suspend. Resume the
+        // foreground completely before allowing that old cleanup to continue.
+        let background = Task { await runtime.setActive(false,afterLock:{ await pause.hold() }) }
+        await pause.waitUntilHeld()
+        await runtime.setActive(true)
+        let resumedTimer = await runtime.hasInactivityTimer; XCTAssertTrue(resumedTimer)
+        await pause.release(); await background.value
+        let retainedTimer = await runtime.hasInactivityTimer; XCTAssertTrue(retainedTimer)
+        // This native operation requires claims.foreground == true, and writes
+        // only the isolated fixture's local policy (no capture or RPC request).
+        _ = try await runtime.perform("claimsLimits",["connectionsPerSecondLimit":1,"concurrency":1])
+        await runtime.setActive(false)
+        let stoppedTimer = await runtime.hasInactivityTimer; XCTAssertFalse(stoppedTimer)
     }
     func testUnsupportedImportedHdRangeCannotOverwriteExistingWallet() async throws {
         let folder = directory(); defer { try? FileManager.default.removeItem(at:folder) }

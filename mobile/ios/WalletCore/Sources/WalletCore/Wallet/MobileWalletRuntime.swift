@@ -25,6 +25,7 @@ public actor MobileWalletRuntime {
     private var publicHd: JSONObject = [:], lastPayment: JSONObject?
     private var paymentReceiptError: Error?
     private var active = false, paymentBusy = false, custodyBusy = false
+    private var activityRevision: UInt64 = 0
     private var paymentPermit: RpcBroadcastPermit?
     private var endpointChanging = false
     private var rpcGeneration: UInt64 = 0
@@ -71,11 +72,31 @@ public actor MobileWalletRuntime {
     private func emit(_ name: String, _ data: JSONObject) { eventHandler?(name, data) }
     public func noteUserInteraction() { lastInteraction = ProcessInfo.processInfo.systemUptime }
     public func setActive(_ value: Bool) async {
+        await setActive(value, afterLock:nil)
+    }
+    // Internal suspension seam exercises an old HD close finishing after a new
+    // foreground transition, without timing-dependent tests or live RPC traffic.
+    func setActive(_ value: Bool, afterLock: (() async -> Void)?) async {
+        activityRevision &+= 1; let revision = activityRevision
         active = value; rpc.setActive(value)
-        if !value { _ = await lock(); await claims.setActive(false); await subscriptions?.stop(); inactivity?.cancel(); inactivity = nil }
-        else {
+        if !value {
+            // Security revocation and timer cancellation precede the first await.
+            // An older cleanup must never cancel a newer foreground timer/watch.
+            let (_, old) = revoke(); inactivity?.cancel(); inactivity = nil
+            await old?.close(); await afterLock?()
+            guard revision == activityRevision && !active else { return }
+            await claims.setActive(false)
+            guard revision == activityRevision && !active else { return }
+            await subscriptions?.stop()
+            guard revision == activityRevision && !active else { return }
+            let state = (try? await publicState()) ?? ["locked":true]
+            guard revision == activityRevision && !active else { return }
+            emit("walletStateChanged",state)
+        } else {
             await claims.setActive(true)
+            guard revision == activityRevision && active else { return }
             noteUserInteraction(); await refreshSubscriptions()
+            guard revision == activityRevision && active else { return }
             if inactivity == nil { inactivity = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -84,6 +105,7 @@ public actor MobileWalletRuntime {
             } }
         }
     }
+    var hasInactivityTimer: Bool { inactivity != nil }
     private func checkInactivity() async {
         let minutes = settings["autoLockMinutes"] as? Int ?? 0
         if active && minutes > 0 && signing != nil && ProcessInfo.processInfo.systemUptime - lastInteraction >= Double(minutes * 60) { _ = await lock() }

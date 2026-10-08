@@ -23,7 +23,7 @@ RPC defaults to `connectcoin4.com:48190`, using the existing plaintext TCP mainn
 
 ## Build
 
-Requirements: macOS, Xcode 26 or newer with iOS Simulator runtime, Node.js 24+, CMake and Ninja. Minimum application deployment target is iOS 15; Swift package host tests target macOS 13+. The dependency is pinned to Capacitor 8.5.2, including its Swift package. Windows can check source policy and build the web assets but cannot compile or run UIKit/Xcode.
+Requirements: macOS, Xcode 26 or newer with iOS Simulator runtime, Node.js 24+, CMake and Ninja. Minimum application deployment target is iOS 15.4, matching the packaged UI's Safari features (`Object.hasOwn`, `Array.at`, and native HTML dialogs); Swift package host tests target macOS 13+. The dependency is pinned to Capacitor 8.5.2, including its Swift package. Windows can check source policy and build the web assets but cannot compile or run UIKit/Xcode.
 
 From `mobile/`:
 
