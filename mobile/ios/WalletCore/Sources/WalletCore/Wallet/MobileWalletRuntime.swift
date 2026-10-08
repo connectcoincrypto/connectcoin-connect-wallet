@@ -15,6 +15,7 @@ public actor MobileWalletRuntime {
     }()
     private let fence = WalletLifecycleFence()
     private let storeResult: Result<DurableWalletStore, Error>
+    private let claimsReceiptURL: URL?
     private var settings: JSONObject = ["theme": "dark", "autoLockMinutes": 0, "rpcHost": "connectcoin4.com", "rpcPort": 48190]
     private var settingsError: String?
     private var rpc: MobileRpcClient
@@ -23,7 +24,7 @@ public actor MobileWalletRuntime {
     private var signing: VaultSession?, update: NativeVaultUpdateSession?, hd: NativeHdWallet?
     private var publicHd: JSONObject = [:], lastPayment: JSONObject?
     private var paymentReceiptError: Error?
-    private var active = false, paymentBusy = false
+    private var active = false, paymentBusy = false, custodyBusy = false
     private var paymentPermit: RpcBroadcastPermit?
     private var endpointChanging = false
     private var rpcGeneration: UInt64 = 0
@@ -45,6 +46,8 @@ public actor MobileWalletRuntime {
 
     public init(directory: URL? = nil) {
         storeResult = Result { try DurableWalletStore(directory: directory) }
+        if case .success(let storage) = storeResult { claimsReceiptURL = storage.claimsReceiptURL }
+        else { claimsReceiptURL = directory?.appendingPathComponent("claims-public-receipt-v1.json") }
         if case .success(let storage) = storeResult {
             do {
                 if let bytes = try storage.read(.settings, maxBytes: 4096) { settings = try Self.validateSettings(JSON.decode(bytes, maxBytes: 4096)) }
@@ -54,7 +57,7 @@ public actor MobileWalletRuntime {
             }
         }
         let endpoint = (try? TcpEndpoint(settings["rpcHost"] as? String ?? "connectcoin4.com", settings["rpcPort"] as? Int ?? 48190)) ?? (try! TcpEndpoint())
-        let client = MobileRpcClient(endpoint: endpoint); rpc = client; claims = MobileClaimsEngine(rpc: client)
+        let client = MobileRpcClient(endpoint: endpoint); rpc = client; claims = MobileClaimsEngine(rpc: client, receiptURL: claimsReceiptURL)
         if case .success(let storage) = storeResult {
             do {
                 if let data = try storage.read(.payment, maxBytes: MobilePaymentReceipt.MAX_BYTES) {
@@ -112,41 +115,83 @@ public actor MobileWalletRuntime {
     private func live(_ token: UInt64) throws { try Task.checkCancellation(); try fence.check(token); try walletRequire(active, "Open the wallet to continue") }
     public func unlock(password: String) async throws {
         try requireValidSettings()
-        try walletRequire(active && !paymentBusy, "Finish the current payment first")
+        try beginCustody(); defer { custodyBusy = false }
         let token = try await revokeForOperation(), envelope = try store().readVault()
         let candidate = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
         do { try live(token); try await adopt(candidate, token: token) } catch { candidate.close(); throw error }
     }
-    private func adopt(_ candidate: NativeVaultUpdateSession, token: UInt64) async throws {
+    private func adopt(_ candidate: NativeVaultUpdateSession, token: UInt64, lockAfterCommit: Bool = false, beforePublish: (() async throws -> Void)? = nil) async throws {
         try live(token)
         let payload = try candidate.payload(), next = try VaultSession(mnemonic: payload.string("mnemonic"), passphrase: payload.string("passphrase"))
         let store = try self.store(), fence = self.fence
         do {
             let nextHd = try NativeHdWallet(session: next, vault: candidate, persist: { value in try fence.commit(token) { try store.saveVault(value) } })
             let snapshot = await nextHd.snapshot()
+            // Validate and derive the entire supported HD state before replacing
+            // any saved vault. A valid desktop vault may exceed iOS capacity.
+            try live(token); try await beforePublish?()
+            if lockAfterCommit {
+                try live(token); next.lock(); candidate.close(); await nextHd.close(); try live(token)
+                publicHd = snapshot; emit("walletStateChanged", try await publicState()); await refreshSubscriptions(); return
+            }
             try live(token); signing = next; update = candidate; hd = nextHd; publicHd = snapshot
             try live(token); noteUserInteraction(); emit("walletStateChanged", try await publicState())
             await refreshSubscriptions(); startRecovery(nextHd, token)
         } catch { next.lock(); candidate.close(); throw error }
     }
-    public func installMnemonic(_ mnemonic: String, password: String, replace: Bool, imported: Bool) async throws -> JSONObject {
+    private func beginCustody() throws {
+        try walletRequire(active && !paymentBusy && !custodyBusy && !endpointChanging, "Finish the current native wallet operation")
+        custodyBusy = true
+    }
+    private func verifiedReplacement(_ storage: DurableWalletStore, replace: Bool, backup: Data?) throws {
+        if storage.exists(.vault) {
+            try walletRequire(replace && backup != nil, "Save and verify an encrypted backup before replacing this wallet")
+            let saved = try storage.read(.vault, maxBytes: WalletVault.maxFileBytes)
+            try walletRequire(saved == backup, "The wallet changed after backup. Save a fresh encrypted backup before replacing it")
+        } else { try walletRequire(backup == nil, "The saved wallet changed. Review replacement again") }
+    }
+    private func stopClaimsForReplacement(_ token: UInt64) async throws {
+        try live(token); await claims.stop()
+        for _ in 0..<150 {
+            try live(token)
+            if await claims.canChangeEndpoint() { return }
+            try await Task.sleep(nanoseconds:100_000_000)
+        }
+        throw WalletError("Wait for the previous claims operation to finish before replacing this wallet")
+    }
+    private func commitCustody(_ storage: DurableWalletStore, _ envelope: JSONObject, _ token: UInt64) throws {
+        do { try fence.commit(token) { try live(token); try storage.saveVault(envelope) } }
+        catch {
+            // A failure after rename cannot honestly promise rollback. Clear the
+            // old receiving address and preserve every encrypted backup/password.
+            publicHd = [:]
+            emit("walletStateChanged", ["locked":true,"account":NSNull(),"accounts":[],"walletId":NSNull()])
+            throw WalletError("Wallet save could not be confirmed. Keep the old encrypted backup and both passwords. Reopen and authenticate the saved wallet before receiving or sending funds")
+        }
+    }
+    public func installMnemonic(_ mnemonic: String, password: String, replace: Bool, imported: Bool, replacementBackup: Data? = nil) async throws -> JSONObject {
         try requireValidSettings()
-        try walletRequire(active && !paymentBusy, "Finish the current payment first")
-        let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
+        try beginCustody(); defer { custodyBusy = false }
+        let storage = try store(); try verifiedReplacement(storage, replace:replace, backup:replacementBackup)
         let token = try await revokeForOperation()
         let candidate = try await Task.detached { () throws -> NativeVaultUpdateSession in
             var payload = try WalletVault.newPayload(mnemonic: mnemonic); payload["needsRecovery"] = true
             return try WalletVault.createForUpdate(payload, password: password)
         }.value
         do {
-            try live(token); try fence.commit(token) { try storage.saveVault(candidate.envelope()) }
-            publicHd = [:]; try await adopt(candidate, token: token); return try await publicState()
+            try await adopt(candidate, token: token, beforePublish: {
+                try await self.stopClaimsForReplacement(token)
+                try self.fence.commit(token) {
+                    try self.verifiedReplacement(storage, replace:replace, backup:replacementBackup)
+                    try self.commitCustody(storage, candidate.envelope(), token)
+                }
+            }); return try await publicState()
         } catch { candidate.close(); throw error }
     }
-    public func importEnvelope(_ data: Data, password: String, replace: Bool) async throws -> JSONObject {
+    public func importEnvelope(_ data: Data, password: String, replace: Bool, replacementBackup: Data? = nil) async throws -> JSONObject {
         try requireValidSettings()
-        try walletRequire(active && !paymentBusy, "Finish the current payment first")
-        let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
+        try beginCustody(); defer { custodyBusy = false }
+        let storage = try store(); try verifiedReplacement(storage, replace:replace, backup:replacementBackup)
         let envelope = try WalletVault.parse(data); let token = try await revokeForOperation()
         let candidate = try await Task.detached { () throws -> NativeVaultUpdateSession in
             let session = try WalletVault.openForUpdate(envelope, password: password)
@@ -154,29 +199,42 @@ public actor MobileWalletRuntime {
             try session.save(payload, writer: { _ in }); return session
         }.value
         do {
-            try live(token); try fence.commit(token) { try storage.saveVault(candidate.envelope()) }
-            publicHd = [:]; try await adopt(candidate, token: token); return try await publicState()
+            try await adopt(candidate, token: token, beforePublish: {
+                try await self.stopClaimsForReplacement(token)
+                try self.fence.commit(token) {
+                    try self.verifiedReplacement(storage, replace:replace, backup:replacementBackup)
+                    try self.commitCustody(storage, candidate.envelope(), token)
+                }
+            }); return try await publicState()
         } catch { candidate.close(); throw error }
     }
     public func exportEnvelope(password: String) async throws -> Data {
-        let token = fence.token(), envelope = try store().readVault()
+        let token = fence.token(), storage = try store()
+        guard let bytes = try storage.read(.vault, maxBytes:WalletVault.maxFileBytes) else { throw WalletError("No wallet has been saved") }
+        let envelope = try WalletVault.parse(bytes)
         let valid = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
-        defer { valid.close() }; try live(token); return try Data(WalletVault.serialize(envelope).utf8)
+        defer { valid.close() }; try live(token)
+        try walletRequire(try storage.read(.vault, maxBytes:WalletVault.maxFileBytes) == bytes, "The wallet changed during authentication. Export a fresh backup")
+        return bytes
     }
     public func recoveryPhrase(password: String) async throws -> String {
+        try await recoverySecrets(password:password).mnemonic
+    }
+    public func recoverySecrets(password: String) async throws -> (mnemonic: String, passphrase: String) {
         let token = fence.token(), envelope = try store().readVault()
         let valid = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
-        defer { valid.close() }; try live(token); return try valid.payload().string("mnemonic")
+        defer { valid.close() }; try live(token)
+        let payload = try valid.payload(); return (try payload.string("mnemonic"),try payload.string("passphrase"))
     }
     public func changePassword(old: String, new: String) async throws -> JSONObject {
         try requireValidSettings()
-        try walletRequire(active && !paymentBusy, "Finish the current payment first")
+        try beginCustody(); defer { custodyBusy = false }
         let token = try await revokeForOperation(), envelope = try store().readVault()
         let changed = try await Task.detached { try WalletVault.changePassword(envelope, currentPassword: old, newPassword: new) }.value
         let candidate = try await Task.detached { try WalletVault.openForUpdate(changed, password: new) }.value
         do {
-            try live(token); try fence.commit(token) { try store().saveVault(changed) }
-            try await adopt(candidate, token: token); return try await publicState()
+            try await adopt(candidate, token: token, lockAfterCommit:true, beforePublish: { try self.commitCustody(self.store(), changed, token) })
+            return try await publicState()
         } catch { candidate.close(); throw error }
     }
     private func startRecovery(_ owner: NativeHdWallet, _ token: UInt64) {
@@ -213,9 +271,12 @@ public actor MobileWalletRuntime {
     public func perform(_ method: String, _ params: JSONObject = [:]) async throws -> JSONObject {
         switch method {
         case "getState": return try await publicState()
-        case "getSettings": return ["settings": settings, "settingsError": settingsError.map { $0 as Any } ?? NSNull()]
-        case "getRecoverySnapshots": return await hd?.recoverySnapshots() ?? ["groups": []]
-        case "watchAccount": await refreshSubscriptions(); return try await publicState()
+        case "getSettings": return settings
+        case "getRecoverySnapshots": return await hd?.recoverySnapshots() ?? ["walletId":publicHd["walletId"] ?? NSNull(),"groups": []]
+        case "watchAccount":
+            await refreshSubscriptions()
+            var coverage = await subscriptions?.state() ?? ["connected":false,"coverageLimited":false,"watched":0,"total":0]
+            coverage["address"] = publicHd["walletId"] ?? NSNull(); return coverage
         case "lock": return await lock()
         case "newAddress":
             guard let hd else { throw WalletError("Unlock the wallet first") }
@@ -245,33 +306,38 @@ public actor MobileWalletRuntime {
         case "saveSettings":
             let next = try Self.validateSettings(params)
             let endpointChanged = settings["rpcHost"] as? String != next["rpcHost"] as? String || settings["rpcPort"] as? Int != next["rpcPort"] as? Int
-            try walletRequire(active && !paymentBusy && approval == nil, "Finish the current payment before changing settings")
+            try walletRequire(active && !paymentBusy && !custodyBusy && approval == nil, "Finish the current payment before changing settings")
             paymentBusy = true; endpointChanging = endpointChanged
             defer { paymentBusy = false; endpointChanging = false }
             if endpointChanged { try walletRequire(await claims.canChangeEndpoint(), "Wait for claim submission before changing RPC") }
             if endpointChanged {
-                let token = fence.token(), storage = try store()
+                // Revoke old endpoint recovery and every publication token before
+                // awaiting replacement. Public ownership remains watch-only.
+                let token = try await revokeForOperation(), storage = try store()
                 await claims.close(); await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
                 do {
                     let replacement = try await rpc.replaceEndpoint(TcpEndpoint(next.string("rpcHost"), Int(next.integer("rpcPort"))), persist: { [fence] in
                         try fence.commit(token) { try storage.write(.settings, JSON.encode(next)) }
                     })
-                    settings = next; rpc = replacement
+                    settings = next; rpc = replacement; rpc.setActive(active)
                 } catch {
-                    claims = MobileClaimsEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions(); throw error
+                    claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions(); throw error
                 }
-                claims = MobileClaimsEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions()
+                claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions()
+                emit("walletStateChanged", try await publicState())
             } else { try store().write(.settings, JSON.encode(next)); settings = next }
             settingsError = nil
-            return ["settings": settings, "endpointChanged": endpointChanged, "settingsError": NSNull()]
+            return ["settings": settings, "endpointChanged": endpointChanged, "settingsError": NSNull(),"state":try await publicState()]
         case "getPaymentBatch":
             if !paymentBusy, let receipt = try store().receipt() { try store().saveReservations(MobilePaymentBatch.reconcileNotSent(receipt, store().reservations())) }
             let summary = try MobilePaymentBatch.pendingSummary(store().receipt())
             return ["batch": summary.map { $0 as Any } ?? NSNull()]
         case "dismissPaymentBatch":
-            try walletRequire(!paymentBusy && params.count == 1, "Wait for the current payment")
-            if let receipt = try store().receipt() { try store().saveReceipt(MobilePaymentBatch.acknowledge(receipt, params.string("batchId"))) }
-            return ["batch": NSNull()]
+            try walletRequire(active && !paymentBusy && !custodyBusy && params.count == 1, "Wait for the current payment")
+            let batchID = try params.string("batchId")
+            guard let receipt = try store().receipt() else { throw WalletError("No saved payment batch to acknowledge") }
+            try store().saveReceipt(MobilePaymentBatch.acknowledge(receipt, batchID))
+            return ["dismissed":true,"batchId":batchID]
         case "cancelPayment": paymentPermit?.cancel(); approval?.inventory.discard(); approval = nil; return [:]
         case "claimsState": return ["state": await claims.state()]
         case "claimsPolicy": return ["state": try await claims.policy(params)]
@@ -281,7 +347,7 @@ public actor MobileWalletRuntime {
             if ProcessInfo.processInfo.arguments.contains("--wallet-ui-smoke") { throw WalletError("Claims are disabled in offline UI tests") }
             #endif
             try requireValidSettings()
-            try walletRequire(params.count == 1 && active, "Invalid claims start")
+            try walletRequire(params.count == 1 && active && !custodyBusy && !endpointChanging, "Invalid claims start during a wallet operation")
             let address = try params.string("address")
             try walletRequire((publicHd["accounts"] as? [JSONObject] ?? []).contains { $0["address"] as? String == address }, "Claims must use your native wallet address")
             try await claims.start(address: address); return ["state": await claims.state()]
@@ -294,7 +360,7 @@ public actor MobileWalletRuntime {
     public func preparePayment(_ params: JSONObject, p2c: Bool = false) async throws -> JSONObject {
         try requireValidSettings()
         try requirePaymentReceipt()
-        try walletRequire(active && !paymentBusy && approval == nil, "Finish the current native wallet operation")
+        try walletRequire(active && !paymentBusy && !custodyBusy && approval == nil, "Finish the current native wallet operation")
         guard let hd, let signing, !signing.isLocked else { throw WalletError("Unlock the wallet first") }
         let token = fence.token(), rpc = self.rpc, fence = self.fence
         paymentBusy = true; defer { paymentBusy = false }

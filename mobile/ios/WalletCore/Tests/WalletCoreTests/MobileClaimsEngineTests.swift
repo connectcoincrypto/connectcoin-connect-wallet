@@ -1,6 +1,12 @@
 import XCTest
 @testable import WalletCore
 
+private final class ClaimsOfflineWire: RpcWire {
+    func start(queue: DispatchQueue, ready: @escaping () -> Void, receive: @escaping (Data) -> Void, failed: @escaping () -> Void) { failed() }
+    func send(_ bytes: Data, completed: @escaping (Bool) -> Void) { XCTFail("Offline claims test attempted a network write"); completed(false) }
+    func cancel() {}
+}
+
 final class MobileClaimsEngineTests: XCTestCase {
     private let address = "cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e"
     private let txid = String(repeating: "ab", count: 32)
@@ -15,7 +21,7 @@ final class MobileClaimsEngineTests: XCTestCase {
         for status in ["pending", "unknown"] {
             let url = try location()
             try ClaimsPublicStore.write(["txid": txid, "status": status], to: url)
-            let rpc = MobileRpcClient(); defer { rpc.close() }
+            let rpc = MobileRpcClient(factory: { ClaimsOfflineWire() }); defer { rpc.close() }
             let engine = MobileClaimsEngine(rpc: rpc, receiptURL: url)
             await engine.setActive(true)
             do { try await engine.start(address: address); XCTFail("Indeterminate submission restarted") }
@@ -33,7 +39,7 @@ final class MobileClaimsEngineTests: XCTestCase {
     func testMalformedOrOversizedReceiptFailsClosed() async throws {
         for contents in [Data("{}".utf8), Data(repeating: 32, count: ClaimsPublicStore.maximumBytes + 1)] {
             let url = try location(); try contents.write(to: url)
-            let rpc = MobileRpcClient(); defer { rpc.close() }
+            let rpc = MobileRpcClient(factory: { ClaimsOfflineWire() }); defer { rpc.close() }
             let engine = MobileClaimsEngine(rpc: rpc, receiptURL: url)
             await engine.setActive(true)
             do { try await engine.start(address: address); XCTFail("Invalid receipt restarted") }
@@ -43,7 +49,7 @@ final class MobileClaimsEngineTests: XCTestCase {
     }
 
     func testDurablePolicyRestoresLimitsAndCannotEnableBackground() async throws {
-        let url = try location(), rpc = MobileRpcClient(); defer { rpc.close() }
+        let url = try location(), rpc = MobileRpcClient(factory: { ClaimsOfflineWire() }); defer { rpc.close() }
         let first = MobileClaimsEngine(rpc: rpc, receiptURL: url)
         await first.setActive(true)
         _ = try await first.policy(["allowMobileData": true, "allowBackground": false])

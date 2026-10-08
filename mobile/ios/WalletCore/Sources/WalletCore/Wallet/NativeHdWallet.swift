@@ -74,7 +74,20 @@ public actor NativeHdWallet {
             var payload = try vault.payload(); payload[branch == 0 ? "lastUsedReceive" : "lastUsedChange"] = index
             payload["scanLookahead"] = true; try save(payload)
             if branch == 0 { lastReceive = index } else { lastChange = index }; return true
-        } catch { complete = false; self.error = "HD range extension is incomplete. Rescan addresses."; throw error }
+        } catch {
+            complete = false; groups = []; self.error = "HD range extension is incomplete. Rescan addresses."
+            // Do not let the next unlock treat the old range as complete after
+            // failing to retain newly observed activity. Keep the original
+            // failure if storage or the lifecycle fence also rejects this mark.
+            if !closed && !session.isLocked {
+                do {
+                    var payload = try vault.payload()
+                    payload["needsRecovery"] = true; payload["mobileHdRecovered"] = false
+                    try save(payload)
+                } catch { }
+            }
+            throw error
+        }
     }
     public func close() { closed = true; groups = []; vault.close() }
 

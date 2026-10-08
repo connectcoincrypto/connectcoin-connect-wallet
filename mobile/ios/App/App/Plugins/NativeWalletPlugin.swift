@@ -103,16 +103,29 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         let params = parameters(call)
         Task {
             do { call.resolve(try await runtime.perform(method, params)) }
-            catch { reject(call, error) }
+            catch {
+                if method == "queryPublic" { rejectPublicRead(call, error) }
+                else { reject(call, error) }
+            }
         }
     }
 
+    private func rejectPublicRead(_ call: CAPPluginCall, _ error: Error) {
+        let allowed = ["-32011", "-32029", "-32030", "-32001", "RPC_TIMEOUT", "RPC_CANCELLED"]
+        let failure = error as? RpcFailure
+        let code = failure.map { !$0.unknownOutcome && allowed.contains($0.code) ? $0.code : "RPC_UNAVAILABLE" } ?? "RPC_UNAVAILABLE"
+        // These codes drive journal resynchronization/quota handling in the
+        // shared renderer. Never forward server-provided error text or data.
+        call.reject("The public wallet query could not complete. Refresh or retry when the connection is available.", code)
+    }
+
     private func reject(_ call: CAPPluginCall, _ error: Error) {
-        if error is NativeWalletCancelled || error is CancellationError { call.resolve(["cancelled": true]); return }
+        if error is NativeWalletCancelled || error is CancellationError { call.reject("Cancelled", "CANCELLED"); return }
         // Cocoa/provider errors can contain filesystem paths. Only deliberate
         // WalletCore errors are eligible for renderer-visible explanations.
         let text = (error as? WalletError)?.message ?? "The native wallet action could not complete. Please try again."
-        call.reject(text, "WALLET_ERROR")
+        let code = ["STORAGE_UNCERTAIN", "BUSY", "NATIVE_BUSY", "RECOVERY_ACTIVE", "RECOVERY_BUSY"].contains(text) ? text : "WALLET_ERROR"
+        call.reject(text, code)
     }
 
     @MainActor private func begin(_ call: CAPPluginCall,
@@ -150,7 +163,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         operation = nil; operationCall = nil
         operationTask?.cancel(); operationTask = nil
         nativeUI?.cancel()
-        call?.resolve(["cancelled": true])
+        call?.reject("Cancelled", "CANCELLED")
         Task { _ = try? await runtime.perform("cancelPayment", [:]) }
     }
 
@@ -170,7 +183,17 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
     }
     @objc func getRecoverySnapshots(_ call: CAPPluginCall) { simple(call, "getRecoverySnapshots") }
     @objc func watchAccount(_ call: CAPPluginCall) { simple(call, "watchAccount") }
-    @objc func getSettings(_ call: CAPPluginCall) { simple(call, "getSettings") }
+    @objc func getSettings(_ call: CAPPluginCall) {
+        guard requireEmpty(call) else { return }
+        Task { @MainActor in
+            do { let value = try await runtime.perform("getSettings"); applyAppearance(value); call.resolve(value) }
+            catch { reject(call, error) }
+        }
+    }
+    @MainActor private func applyAppearance(_ result: JSONObject) {
+        let theme = ((result["settings"] as? JSONObject) ?? result)["theme"] as? String
+        bridge?.viewController?.view.window?.overrideUserInterfaceStyle = theme == "dark" ? .dark : theme == "light" ? .light : .unspecified
+    }
     @objc func recoverAddresses(_ call: CAPPluginCall) { simple(call, "recoverAddresses") }
     @objc func newAddress(_ call: CAPPluginCall) { simple(call, "newAddress") }
     @objc func getPaymentBatch(_ call: CAPPluginCall) { simple(call, "getPaymentBatch") }
@@ -179,7 +202,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
     @objc func claimsState(_ call: CAPPluginCall) { simple(call, "claimsState") }
     @objc func claimsPolicy(_ call: CAPPluginCall) { simple(call, "claimsPolicy", empty: false) }
     @objc func claimsLimits(_ call: CAPPluginCall) { simple(call, "claimsLimits", empty: false) }
-    @objc func claimsStart(_ call: CAPPluginCall) { simple(call, "claimsStart") }
+    @objc func claimsStart(_ call: CAPPluginCall) { simple(call, "claimsStart", empty: false) }
     @objc func claimsStop(_ call: CAPPluginCall) { simple(call, "claimsStop") }
     @objc func claimsCheckSubmission(_ call: CAPPluginCall) { simple(call, "claimsCheckSubmission") }
 
@@ -192,14 +215,17 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         let params = parameters(call)
         Task { @MainActor in
             self.begin(call) {
+                let endpoint = try TcpEndpoint(params.string("rpcHost"), Int(params.integer("rpcPort", min: 1, max: 65535)))
                 let before = try await self.runtime.perform("getSettings", [:])
-                if before["rpcHost"] as? String != params["rpcHost"] as? String ||
-                    String(describing: before["rpcPort"] ?? "") != String(describing: params["rpcPort"] ?? "") {
+                if before["rpcHost"] as? String != endpoint.hostname ||
+                    (try before.integer("rpcPort")) != Int64(endpoint.port) {
                     try await self.ui.confirm(title: "Change RPC server",
-                        message: "Use \(params["rpcHost"] as? String ?? ""):\(params["rpcPort"] ?? "")?\n\nThe wallet will stop claims, cancel pending payment preparation and verify the new server before showing its data.",
+                        message: "Use \(endpoint.hostname):\(endpoint.port)?\n\nThe wallet must finish existing work, then locks and verifies the new server before showing its data.",
                         button: "Change server")
                 }
-                return try await self.runtime.perform("saveSettings", params)
+                let result = try await self.runtime.perform("saveSettings", params)
+                self.applyAppearance(result)
+                return result
             }
         }
     }
@@ -225,9 +251,9 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         return values["password"] ?? ""
     }
 
-    @MainActor private func authorizeReplacement() async throws -> Bool {
+    @MainActor private func authorizeReplacement() async throws -> Data? {
         let state = try await runtime.publicState()
-        guard state["exists"] as? Bool == true else { return false }
+        guard state["exists"] as? Bool == true else { return nil }
         let password = try await password(title: "Back up current wallet",
             message: "Before replacing this wallet, authenticate and save a verified encrypted backup. The current wallet stays unchanged until the new wallet is ready.", button: "Choose backup destination")
         let encrypted = try await runtime.exportEnvelope(password: password)
@@ -235,7 +261,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         try await ui.confirm(title: "Replace current wallet?",
             message: "The encrypted backup was saved and verified. Continue to create or import the replacement wallet. Keep the old password and recovery phrase with your backup.",
             button: "Continue with replacement", destructive: true)
-        return true
+        return encrypted
     }
 
     @objc func create(_ call: CAPPluginCall) {
@@ -260,7 +286,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
                         ? nil : "The words do not match. Check your written backup."
                 }
                 let values = try await self.newPassword(title: "Encrypt your wallet", message: "Choose a password of at least 12 characters. This protects the wallet file on this device.")
-                return try await self.runtime.installMnemonic(mnemonic, password: values, replace: replacement, imported: false)
+                return try await self.runtime.installMnemonic(mnemonic, password: values, replace: replacement != nil, imported: false, replacementBackup: replacement)
             }
         }
     }
@@ -287,7 +313,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
                 }
                 defer { values.removeAll() }
                 let password = try await self.newPassword(title: "Encrypt imported wallet", message: "Choose a new password to protect this recovery on the device.")
-                return try await self.runtime.installMnemonic(values["mnemonic"] ?? "", password: password, replace: replacement, imported: true)
+                return try await self.runtime.installMnemonic(values["mnemonic"] ?? "", password: password, replace: replacement != nil, imported: true, replacementBackup: replacement)
             }
         }
     }
@@ -300,7 +326,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
                 let encrypted = try await self.ui.importEncrypted()
                 let password = try await self.password(title: "Unlock imported backup",
                     message: "Enter the password used to encrypt the selected wallet file.", button: "Import wallet")
-                return try await self.runtime.importEnvelope(encrypted, password: password, replace: replacement)
+                return try await self.runtime.importEnvelope(encrypted, password: password, replace: replacement != nil, replacementBackup: replacement)
             }
         }
     }
@@ -353,9 +379,17 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         Task { @MainActor in
             self.begin(call) {
                 let password = try await self.password(title: "View recovery phrase", message: "Authenticate in a private place. Anyone who sees these words can spend your funds.", button: "Show phrase")
-                var phrase = try await self.runtime.recoveryPhrase(password: password)
-                defer { phrase = "" }
-                try await self.ui.confirm(title: "Your recovery phrase", message: phrase + "\n\nKeep these words private. Close this screen when finished.", button: "Done")
+                var secrets = try await self.runtime.recoverySecrets(password: password)
+                defer { secrets = ("", "") }
+                let phrase = secrets.mnemonic.split(separator: " ").enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+                let extra = secrets.passphrase.isEmpty ? "" : "\n\nBIP39 passphrase (required to restore these accounts):\n" + secrets.passphrase + "\n\nThis is separate from your wallet file password. Keep an encrypted backup; phrase-only import does not accept this passphrase."
+                let token = self.operation
+                let timeout = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 60_000_000_000)
+                    if !Task.isCancelled, let self, self.operation == token { self.nativeUI?.cancel() }
+                }
+                defer { timeout.cancel() }
+                try await self.ui.confirm(title: "Your recovery phrase", message: phrase + extra + "\n\nKeep these secrets private. This screen closes after 60 seconds.", button: "Done")
                 return ["viewed": true]
             }
         }

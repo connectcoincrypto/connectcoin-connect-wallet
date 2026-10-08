@@ -19,6 +19,7 @@ final class WalletLifecycleFence {
 public final class DurableWalletStore: MobilePaymentBatchStore {
     public enum File: String { case vault = "wallet.enc.json", settings = "settings.json", reservations = "reservations.json", receipt = "payment-batch.json", payment = "last-payment.json" }
     private let directory: URL
+    var claimsReceiptURL: URL { directory.appendingPathComponent("claims-public-receipt-v1.json") }
     private let mutex = NSRecursiveLock()
     public init(directory: URL? = nil) throws {
         self.directory = try directory ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("ConnectWallet", isDirectory: true)

@@ -38,6 +38,7 @@ final class WalletSmokeTests: XCTestCase {
         app.webViews.buttons["Settings"].tap()
         let back = app.webViews.buttons["← Back"]
         XCTAssertTrue(back.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.webViews.staticTexts["Settings are saved on this device."].waitForExistence(timeout: 10))
         snapshot(app, "Packaged wallet settings")
         back.tap()
         XCTAssertTrue(create.waitForExistence(timeout: 10))

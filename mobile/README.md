@@ -1,8 +1,10 @@
 # ConnectWallet mobile development alpha
 
-Android-first development target, isolated from desktop and installed as `com.connectcoincrypto.connectwallet.mobile.alpha`. Version `1.0.0-alpha.1`, English UI. The desktop build remains unchanged.
+Android and iOS development targets, isolated from desktop and installed as `com.connectcoincrypto.connectwallet.mobile.alpha`. Version `1.0.0-alpha.1`, English UI. The desktop build remains unchanged. The native iOS app, build instructions, platform differences and acceptance limits are documented in [ios/README.md](ios/README.md).
 
-## Implemented in source
+## Android reference feature set
+
+The detailed behaviors in this section describe the Android reference implementation. iOS shares the packaged UI and transaction/vault formats, with native Swift/C++ implementations; Android Activity, document-provider and foreground-service behavior must not be assumed to apply to UIKit. See the iOS notes for its foreground-only claims, document picker, lifecycle and verification status.
 
 - **General settings:** a separate Settings screen is accessible before unlocking, with Dark/Light/System appearance, a public DNS hostname and TCP port for the mainnet RPC server, and an optional native inactivity timer. Defaults are Dark, `connectcoin4.com:48190`, and **0 minutes: never auto-lock while the app is active**. A positive duration from 1 to 1,440 minutes counts real native touch/key activity, including confirmation dialogs, not RPC traffic or claims. Backgrounding still locks the wallet. Settings are saved as one native preference record. A server change requires native confirmation of the endpoint, refuses active wallet recovery/operations or unsettled claims/broadcasts, locks the wallet, replaces both query and subscription connections, and revokes previous endpoint reads, cursors and funding selections. Claims do not start automatically; existing unknown-outcome receipts and RPC quotas/cooldowns are retained. Public display caches are scoped by endpoint and wallet identity. Theme/timer-only changes do not reconnect or re-scan the wallet. Native dialogs follow the selected appearance too.
 - **Spend verified addresses during balance sync:** after native HD address discovery is complete, each fully loaded history/UTXO address can join an explicitly partial balance after replaying its original journal checkpoint. Remaining addresses continue loading with the same 16-worker and per-minute limits. Send and P2C may use only the verified, funded subset; **Use all verified balance** freezes that source-address selection instead of silently including addresses found later. Native preparation independently re-reads and authenticates those funds, so its own checks can still wait for RPC quota. Saved display data is never spendable, partial balances never replace the complete persisted snapshot, and cancellation/reorg/failure revokes partial availability. No server change is required.
@@ -48,7 +50,7 @@ The app requests a larger Android heap for the unchanged desktop scrypt cost (ab
 
 The Android foreground service uses an explicit `specialUse` declaration explaining P2C proof collection. This does not guarantee Google Play policy approval. See the [Android foreground-service rules](https://developer.android.com/develop/background-work/services/fgs/service-types#special-use). No CPU block-mining service is implemented.
 
-iOS currently has **native C++ library compilation checks only**, not an iOS wallet/IPA. Its vault, Swift bridge, UI lifecycle and supported background model remain separate work. Biometric unlock and full desktop feature parity also remain unfinished. Native document-picker and encrypted-file import/export flows still need acceptance testing on a physical Android device.
+iOS now has a Capacitor/Swift app host, native wallet/HD/payment/claims runtime, UIKit-only secret entry and native document/camera integrations. Its separate CI builds real unsigned Simulator/device `.app` bundles, runs Swift tests and a disposable offline Simulator UI smoke test. These are development artifacts, not signed IPAs, TestFlight or App Store releases. Claims run only while the iOS app is visible; there is no iOS background-claims entitlement or service. Biometric unlock is not implemented. Native document-picker, recovery and lifecycle flows still require physical-device acceptance on both platforms.
 
 ## Build and verify
 
@@ -70,6 +72,8 @@ cd android
 Windows packaging verification uses `scripts/build-android.ps1 -SdkRoot <sdk> -JavaHome <jdk>`. SDK and JDK may live under ignored `.tools/`; scripts do not change global Windows configuration. Debug APKs are test-signed. Release APKs are unsigned compilation checks, not installable releases. Never commit keystores or user wallets.
 
 The `mobile-alpha` branch workflow builds Android, runs isolated emulator instrumentation and cross-checks public native proofs on Linux/macOS; it also compiles static iOS device/simulator libraries. It uploads temporary Actions artifacts only, without a tag, GitHub Release or store publication.
+
+The separate `ios-wallet.yml` workflow handles the complete iOS app on macOS with Xcode 26+, including native static linking, Swift vectors, Simulator UIKit/WKWebView smoke tests and unsigned device compilation. See [iOS build and verification](ios/README.md). Merely adding a test does not establish that it passed: use the workflow result for the exact commit and retain its test report/artifacts.
 
 `native/tools/check-provenance.mjs` verifies vendored Core sources. `native/tests/test_oracle.py` uses the pinned desktop verifier and ephemeral public test certificates on loopback, including ECDSA/RSA/PSS restrictions and invalid cases. Native/JVM and UI tests must not touch real wallets or send public transactions.
 

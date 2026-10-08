@@ -4,7 +4,8 @@ import XCTest
 private final class HdWire: RpcWire {
     var queue: DispatchQueue!, receive: ((Data) -> Void)?
     let positive: String?, legacy: Bool
-    let tip: JSONObject = ["hash": String(repeating: "a", count: 64), "height": 123, "mediantime": 1_700_000_000]
+    let tip: JSONObject = ["chain": "main", "genesis_hash": NativePaymentChecks.GENESIS,
+                           "hash": String(repeating: "a", count: 64), "height": 123, "mediantime": 1_700_000_000]
     let lock = NSLock()
     var counts: [String: Int] = [:]
     init(positive: String? = nil, legacy: Bool = false) { self.positive = positive; self.legacy = legacy }
@@ -77,9 +78,30 @@ final class HdWalletTests: XCTestCase {
     func testHistoryRejectsMalformedMonetaryAndConfirmationData() throws {
         let address = try WalletCrypto.encodeAddress(WalletCrypto.fromHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
         var row: JSONObject = ["txid": String(repeating: "b", count: 64), "status": "confirmed", "block_height": 123, "block_hash": String(repeating: "a", count: 64), "confirmations": 1, "received": "100", "spent": "30", "balance_delta": "70"]
-        func page(_ row: JSONObject) -> JSONObject { ["tip": ["hash": String(repeating: "a", count: 64), "height": 123, "mediantime": 0], "address": address, "unit": "connects", "live": true, "items": [row], "next_cursor": NSNull()] }
+        func page(_ row: JSONObject) -> JSONObject { ["tip": ["chain": "main", "genesis_hash": NativePaymentChecks.GENESIS, "hash": String(repeating: "a", count: 64), "height": 123, "mediantime": 0], "address": address, "unit": "connects", "live": true, "items": [row], "next_cursor": NSNull()] }
         XCTAssertTrue(try NativeHdWallet.historyUsed(page(row), address))
         row["balance_delta"] = "71"; XCTAssertThrowsError(try NativeHdWallet.historyUsed(page(row), address))
         row["balance_delta"] = "70"; row["confirmations"] = 2; XCTAssertThrowsError(try NativeHdWallet.historyUsed(page(row), address))
+    }
+
+    func testFailedRangeExtensionPersistsRecoveryRequirement() async throws {
+        var payload = try WalletVault.newPayload(mnemonic: words)
+        payload["needsRecovery"] = false; payload["mobileHdRecovered"] = true; payload["scanLookahead"] = true
+        let vault = try WalletVault.createForUpdate(payload, password: "ios-fixture-password")
+        let session = try VaultSession(mnemonic: words, passphrase: "")
+        defer { session.lock(); vault.close() }
+        var writes = 0
+        let hd = try NativeHdWallet(session: session, vault: vault, persist: { _ in
+            writes += 1
+            if writes == 1 { throw WalletError("Fixture storage failure") }
+        })
+        let first = try session.publicAccount(index: 0, change: 0).string("address")
+        do { _ = try await hd.observeUsed(first); XCTFail("Range extension should fail") } catch { }
+        let state = await hd.snapshot()
+        XCTAssertFalse(try state.object("hd").boolean("complete"))
+        XCTAssertEqual(writes, 2)
+        XCTAssertTrue(try vault.payload().boolean("needsRecovery"))
+        XCTAssertFalse(try vault.payload().boolean("mobileHdRecovered"))
+        do { try await hd.requireReady(); XCTFail("Incomplete HD range must not permit payments") } catch { }
     }
 }

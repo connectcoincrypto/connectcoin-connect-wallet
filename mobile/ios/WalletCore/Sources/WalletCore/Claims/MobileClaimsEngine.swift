@@ -354,8 +354,23 @@ public actor MobileClaimsEngine {
         if ["CLAIMS_WRONG_NETWORK", "CLAIMS_CAPACITY", "CLAIMS_RPC_DATA", "CLAIMS_NATIVE_DATA", "CLAIMS_RECEIPT_UNAVAILABLE"].contains(lastError) {
             stop(); status = "error"; healthy = false
         } else {
-            retryAt = now() + max(code == "-32029" ? 60 : 5, Double((error as? RpcFailure)?.retryAfterMs ?? 0) / 1000)
+            retryAt = now() + max(code == "-32029" ? 60 : 5, min(60, Double(max(0, (error as? RpcFailure)?.retryAfterMs ?? 0)) / 1000))
             nextDiscovery = 0; status = "retrying"
+            // Only these explicitly transient read failures preserve a fresh
+            // catalog. Invalid/expired cursors must revoke stale proof work now,
+            // without cancelling a transaction whose bytes already went out.
+            let transient = (error as? RpcFailure).map {
+                !$0.unknownOutcome && ["RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "-32029", "-32030"].contains($0.code)
+            } ?? false
+            if !transient {
+                healthy = false; epoch &+= 1; cancelCaptures(); resetAdmission(); acknowledgeStarts(); invalidateQueued()
+                if code == "-32011" {
+                    catalog.removeAll(); blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); scheduler.clear()
+                    cursor = nil; tip = nil; catalogAt = 0; dirty = true
+                }
+                maintenanceTask?.cancel(); maintenanceTask = nil
+                if allowed { launchMaintenance() }
+            }
         }
     }
     private func available(_ key: String) -> Bool { guard let row = catalog[key] else { return false }; return row.supported && row.state == "available" && !retired.contains(key) }
