@@ -36,8 +36,8 @@ public struct TcpEndpoint: Equatable {
     public init(_ hostname: String = "connectcoin4.com", _ port: Int = 48190) throws {
         let host = hostname.lowercased()
         try walletRequire(host.count <= 253 && (1...65535).contains(port) && host.contains(".") &&
-            host.range(of: "^[a-z0-9.-]+$", options: .regularExpression) != nil &&
-            host.range(of: "^[0-9.]+$", options: .regularExpression) == nil &&
+            host.range(of: "\\A[a-z0-9.-]+\\z", options: .regularExpression) != nil &&
+            host.range(of: "\\A[0-9.]+\\z", options: .regularExpression) == nil &&
             ![".local", ".localhost", ".internal"].contains(where: host.hasSuffix), "A public DNS hostname is required")
         for label in host.split(separator: ".", omittingEmptySubsequences: false) {
             try walletRequire(!label.isEmpty && label.count <= 63 && !label.hasPrefix("-") && !label.hasSuffix("-"), "Invalid RPC hostname")
@@ -200,15 +200,17 @@ public final class MobileRpcClient: @unchecked Sendable {
     public func close() { queue.async { self.retired = true; self.active = false; self.failWire("RPC_CANCELLED") } }
     /// Native settings transition: no broadcast may overlap replacement. Public
     /// reads are revoked and quota/cooldown timestamps survive the endpoint swap.
-    public func replaceEndpoint(_ endpoint: TcpEndpoint) async throws -> MobileRpcClient {
-        try await replacing(factory: { NetworkRpcWire(endpoint) })
+    public func replaceEndpoint(_ endpoint: TcpEndpoint, persist: @escaping () throws -> Void = {}) async throws -> MobileRpcClient {
+        try await replacing(factory: { NetworkRpcWire(endpoint) }, persist:persist)
     }
-    func replacing(factory: @escaping () -> RpcWire) async throws -> MobileRpcClient {
+    func replacing(factory: @escaping () -> RpcWire, persist: @escaping () throws -> Void = {}) async throws -> MobileRpcClient {
         try await withCheckedThrowingContinuation { continuation in queue.async {
             guard !self.retired, !self.jobs.values.contains(where: { $0.method == "sendrawtransaction" }) else {
                 continuation.resume(throwing: RpcFailure("RPC_BUSY")); return
             }
             let successor = MobileRpcClient(factory:factory,subscriptions:self.subscriptions,window:self.window,now:self.now)
+            do { try persist() }
+            catch { successor.close(); continuation.resume(throwing:error); return }
             let history = self.history, cooldowns = self.cooldowns, active = self.active
             self.retired = true; self.active = false; self.failWire("RPC_CANCELLED")
             successor.queue.async {
@@ -310,11 +312,13 @@ public final class MobileRpcClient: @unchecked Sendable {
         epoch &+= 1; let token = epoch
         let next = factory(); wire = next; connectStarted = now()
         next.start(queue: queue, ready: { [weak self] in
-            guard let self, self.epoch == token else { return }; self.ready = true; self.connectStarted = nil; self.pump()
+            guard let self else { return }; self.queue.async {
+                guard self.epoch == token else { return }; self.ready = true; self.connectStarted = nil; self.pump()
+            }
         }, receive: { [weak self] bytes in
-            guard let self, self.epoch == token else { return }; self.receive(bytes)
+            guard let self else { return }; self.queue.async { guard self.epoch == token else { return }; self.receive(bytes) }
         }, failed: { [weak self] in
-            guard let self, self.epoch == token else { return }; self.failWire("RPC_UNAVAILABLE")
+            guard let self else { return }; self.queue.async { guard self.epoch == token else { return }; self.failWire("RPC_UNAVAILABLE") }
         })
     }
     private func receive(_ bytes: Data) {
@@ -349,7 +353,7 @@ public final class MobileRpcClient: @unchecked Sendable {
             let result = try message.object("result")
             if job.method == "getblockbounties" {
                 let streamID = try result.string("stream_id")
-                try walletRequire(result.count == 1 && streamID.range(of: "^[A-Za-z0-9_.-]{1,100}$", options: .regularExpression) != nil && !jobs.values.contains { $0.streamID == streamID }, "RPC_PROTOCOL")
+                try walletRequire(result.count == 1 && streamID.range(of: "\\A[A-Za-z0-9_.-]{1,100}\\z", options: .regularExpression) != nil && !jobs.values.contains { $0.streamID == streamID }, "RPC_PROTOCOL")
                 job.streamID = streamID
             } else {
                 if job.method == "sendrawtransaction" { try walletRequire(result.count == 1 && Self.hash(try result.string("txid")), "RPC_PROTOCOL") }
@@ -405,7 +409,7 @@ public final class MobileRpcClient: @unchecked Sendable {
         }
         pump()
     }
-    public static func hash(_ value: String) -> Bool { value.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil }
+    public static func hash(_ value: String) -> Bool { value.range(of: "\\A[0-9a-fA-F]{64}\\z", options: .regularExpression) != nil }
     public static func validateParams(_ method: String, _ params: JSONObject, subscriptions: Bool = false) throws -> JSONObject {
         let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": [],
             "getaddressbalance": ["address"], "getaddresshistory": ["address", "cursor"],

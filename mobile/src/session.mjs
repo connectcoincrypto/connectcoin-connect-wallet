@@ -10,7 +10,7 @@ export function publicError(error) {
   if (String(error?.code) === '-32029' || error?.code === 'RATE_LIMIT') return 'Too many requests. Wait one minute before trying again.';
   if (String(error?.code) === '-32011') return 'History changed. Refresh to start a new page sequence.';
   if (String(error?.code) === '-32001') return 'The node is not ready. Try again later.';
-  if (error?.code === 'UNAVAILABLE') return 'Live queries require the Android app. Browser preview has no RPC connection.';
+  if (error?.code === 'UNAVAILABLE') return 'Live queries require the mobile app. Browser preview has no RPC connection.';
   return 'Could not verify the server response. Check your connection and try again.';
 }
 

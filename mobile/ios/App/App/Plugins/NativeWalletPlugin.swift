@@ -5,7 +5,7 @@ import WalletCore
 /// Secrets enter UIKit only. JavaScript cannot call sign/confirm, supply a
 /// password/seed, choose a file path, or bypass the native payment review.
 @objc(NativeWalletPlugin)
-public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
+public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRecognizerDelegate {
     public let identifier = "NativeWalletPlugin"
     public let jsName = "NativeWallet"
     public let pluginMethods = [
@@ -24,6 +24,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
     private var confirmedPayment = false
     private var observers: [NSObjectProtocol] = []
     private var privacyCover: UIView?
+    private var interactionRecognizers: [UIGestureRecognizer] = []
 
     @MainActor private var ui: WalletNativeUI {
         if nativeUI == nil { nativeUI = WalletNativeUI() }
@@ -34,6 +35,17 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
     public override func load() {
         Task { @MainActor [weak self] in
             guard let self = self else { return }
+            if let view = self.bridge?.viewController?.view {
+                let tap = UITapGestureRecognizer(target: self, action: #selector(self.noteInteraction))
+                let pan = UIPanGestureRecognizer(target: self, action: #selector(self.noteInteraction))
+                self.interactionRecognizers = [tap, pan]
+                for gesture in self.interactionRecognizers {
+                    gesture.cancelsTouchesInView = false
+                    gesture.delaysTouchesBegan = false
+                    gesture.delegate = self
+                    view.addGestureRecognizer(gesture)
+                }
+            }
             await self.runtime.setEventHandler { [weak self] name, data in
                 DispatchQueue.main.async { self?.notifyListeners(name, data: data) }
             }
@@ -73,6 +85,10 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 
+    @objc private func noteInteraction() { Task { await runtime.noteUserInteraction() } }
+    public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                                  shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+
     private func requireEmpty(_ call: CAPPluginCall) -> Bool {
         guard call.options.count == 0 else {
             call.reject("This wallet action does not accept options.", "INVALID_ARGUMENT"); return false
@@ -110,6 +126,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
         operationTask = Task { @MainActor [weak self] in
             guard let self = self else { return }
             do {
+                await self.runtime.noteUserInteraction()
                 let result = try await action()
                 if self.operation == token { call.resolve(result) }
             } catch {
@@ -354,12 +371,16 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin {
                     let review = try await self.runtime.preparePayment(params, p2c: p2c)
                     guard let lines = review["lines"] as? [String], !lines.isEmpty,
                           lines.joined(separator: "\n").utf8.count <= 32768 else { throw WalletError("The payment review could not be verified.") }
-                    try await self.ui.confirm(title: p2c ? "Review P2C reward" : "Review payment",
+                    let requiresReplacement = review["requiresReplacement"] as? Bool == true
+                    let approval = try await self.ui.form(title: p2c ? "Review P2C reward" : "Review payment",
                         message: lines.joined(separator: "\n\n") + "\n\nConfirming signs and submits the transaction. Verify the recipient and every amount above.",
-                        button: p2c ? "Confirm reward" : "Confirm payment")
+                        fields: requiresReplacement ? [.init(key: "replace", label: "I approve replacing the conflicting pending transaction(s).", checkbox: true)] : [],
+                        button: p2c ? "Confirm reward" : "Confirm payment") { values in
+                            requiresReplacement && values["replace"] != "true" ? "Approve the pending transaction replacement or cancel this payment." : nil
+                        }
                     try Task.checkCancellation()
                     self.confirmedPayment = true
-                    return try await self.runtime.confirmPayment()
+                    return try await self.runtime.confirmPayment(allowReplacement: approval["replace"] == "true")
                 } catch {
                     _ = try? await self.runtime.perform("cancelPayment", [:])
                     throw error

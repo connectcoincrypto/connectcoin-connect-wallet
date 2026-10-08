@@ -21,10 +21,13 @@ import { parsePaymentBatch, parsePaymentBatchResponse, parsePaymentBatchDismissa
 import { claimsErrorText } from './claims-diagnostics.mjs';
 import { createTransactionDetails } from './transaction-details.mjs';
 import { DEFAULT_SETTINGS, parseSettings, rpcEndpoint, resolvedTheme } from './settings.mjs';
+import { nativeCapabilities } from './platform.mjs';
 import './styles.css';
 
 const $ = id => document.getElementById(id);
-const native = Capacitor.getPlatform() === 'android';
+const platform = Capacitor.getPlatform();
+const capabilities = nativeCapabilities(platform);
+const native = capabilities.wallet;
 const wallet = registerPlugin('NativeWallet');
 const paymentInput = registerPlugin('NativePaymentInput');
 const explorer = registerPlugin('NativeExplorer');
@@ -103,7 +106,7 @@ function renderSettings() {
   $('view-recovery-phrase').disabled = securityDisabled;
   $('change-wallet-password').textContent = nativeOperation === 'changePassword' ? 'Confirm in the native dialog…' : 'Change wallet password';
   $('view-recovery-phrase').textContent = nativeOperation === 'viewRecoveryPhrase' ? 'Open in the native dialog…' : 'View recovery phrase';
-  $('wallet-security-help').textContent = !native ? 'Security and backup actions are available in the Android app.'
+  $('wallet-security-help').textContent = !native ? 'Security and backup actions are available in the mobile app.'
     : !vault.exists ? 'Create or import a wallet to manage its password and recovery phrase.'
       : 'Authenticate in the native dialog to change your password or view your recovery phrase.';
 }
@@ -127,7 +130,7 @@ async function loadSettings() {
     settings = parseSettings(result); settingsKnown = true;
     if (activeRpcEndpoint !== rpcEndpoint(settings)) invalidateEndpoint(rpcEndpoint(settings));
     applyTheme();
-    $('settings-status').textContent = native ? 'Settings are saved on this device.' : 'Browser preview only. Preferences stay in this browser; locking and RPC require Android.';
+    $('settings-status').textContent = native ? 'Settings are saved on this device.' : 'Browser preview only. Preferences stay in this browser; locking and RPC require the mobile app.';
   } catch {
     $('settings-error').textContent = 'Could not load saved settings. Reload to try again.';
     $('settings-status').textContent = '';
@@ -279,7 +282,7 @@ const session = new HdWalletSession({
   writeCache: writePublicSnapshot,
   readRecoverySnapshots: async () => native && !endpointSwitching ? wallet.getRecoverySnapshots() : null,
   query: async (method, params) => {
-    if (!native) throw Object.assign(new Error('Android required'), { code: 'UNAVAILABLE' });
+    if (!native) throw Object.assign(new Error('Native mobile app required'), { code: 'UNAVAILABLE' });
     if (endpointSwitching) throw Object.assign(new Error('Server is changing'), { code: 'RPC_INACTIVE' });
     const endpoint = activeRpcEndpoint;
     const owned = new Set((vault.accountScope === 'hd-wallet' ? vault.accounts : [vault.account])?.map(item => item.address));
@@ -508,9 +511,11 @@ function renderClaims() {
   const controls = nativeControlState({ native, address: session.state.address, claims, locked: vault.locked, busy: nativeBusy });
   const status = evaluateClaimsPolicy({ enabled: claims?.enabled === true, ...policy, connected: environment.connected,
     connectionType: environment.connectionType, appActive: environment.active,
-    nativeClaimsAvailable: native, nativeBackgroundAvailable: native, platform: Capacitor.getPlatform() });
+    nativeClaimsAvailable: capabilities.claims, nativeBackgroundAvailable: capabilities.backgroundClaims, platform });
   $('mobile-data').checked = policy.allowMobileData;
   $('background').checked = policy.allowBackground;
+  $('background').disabled = !capabilities.backgroundClaims;
+  $('background').closest('label').hidden = platform === 'ios';
   $('claims-status').textContent = !native ? 'Preview · native claims not available' : claims ? `${claims.policyStatus} · ${claims.status}` : status.reason;
   $('start-claims').disabled = controls.startDisabled;
   $('stop-claims').disabled = controls.stopDisabled;
@@ -995,7 +1000,7 @@ $('settings-form').addEventListener('submit', async event => {
         ? { ...result.state, locked: true } : result.state);
     }
     applyTheme();
-    $('settings-status').textContent = !native ? 'Saved in this browser preview. Locking and RPC require Android.'
+    $('settings-status').textContent = !native ? 'Saved in this browser preview. Locking and RPC require the mobile app.'
       : changesEndpoint ? 'Settings saved. Wallet locked; reconnecting to the selected server.' : 'Settings saved.';
   } catch (error) {
     if (error?.code === 'CANCELLED') $('settings-status').textContent = 'Server change cancelled. Your draft has not been saved.';
@@ -1211,7 +1216,7 @@ $('scan-payment').addEventListener('click', async () => {
     acceptPaymentRequest(request);
   } catch (error) {
     if (current()) {
-      if (error?.code === 'CAMERA_PERMISSION_DENIED') showPaymentPasteError('Camera permission is needed to scan a payment QR. Allow it in Android settings or paste the payment link.');
+      if (error?.code === 'CAMERA_PERMISSION_DENIED') showPaymentPasteError('Camera permission is needed to scan a payment QR. Allow it in device settings or paste the payment link.');
       else if (error?.code && error.code !== 'INVALID_PAYMENT_LINK') showPaymentPasteError('Could not open the camera. Try again or paste the payment link.');
       else showPaymentInputError();
     }

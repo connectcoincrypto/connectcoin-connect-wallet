@@ -12,6 +12,7 @@ final class WalletNativeUI: NSObject, UIDocumentPickerDelegate {
         let label: String
         var secure = false
         var multiline = false
+        var checkbox = false
     }
     weak var presenter: UIViewController?
     private var formController: WalletFormController?
@@ -172,7 +173,10 @@ private final class WalletFormController: UIViewController, UITextFieldDelegate 
             title.font = .preferredFont(forTextStyle: .headline); title.adjustsFontForContentSizeCategory = true
             stack.addArrangedSubview(title)
             let input: UIView
-            if field.multiline {
+            if field.checkbox {
+                let toggle = UISwitch(); toggle.isOn = false
+                input = toggle
+            } else if field.multiline {
                 let text = UITextView(); text.font = .preferredFont(forTextStyle: .body)
                 text.adjustsFontForContentSizeCategory = true
                 text.autocorrectionType = .no; text.autocapitalizationType = .none; text.spellCheckingType = .no
@@ -213,7 +217,8 @@ private final class WalletFormController: UIViewController, UITextFieldDelegate 
     @objc private func submit() {
         var values: [String: String] = [:]
         for (key, input) in inputs {
-            values[key] = (input as? UITextField)?.text ?? (input as? UITextView)?.text ?? ""
+            if let toggle = input as? UISwitch { values[key] = toggle.isOn ? "true" : "false" }
+            else { values[key] = (input as? UITextField)?.text ?? (input as? UITextView)?.text ?? "" }
         }
         guard let problem = validate(values) else { finish(.success(values)); return }
         errorLabel.text = problem

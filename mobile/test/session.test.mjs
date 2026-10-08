@@ -297,7 +297,7 @@ test('quota failures surface a safe message and are not retried automatically', 
   }
   assert.doesNotMatch(publicError(new Error('<script>hostile</script>')), /script|hostile/);
   assert.match(publicError({ code: '-32001' }), /node is not ready/);
-  assert.match(publicError({ code: 'UNAVAILABLE' }), /Android app/);
+  assert.match(publicError({ code: 'UNAVAILABLE' }), /mobile app/);
 });
 
 test('two initial account loads with delayed cancellation query only the final address', async () => {

@@ -119,7 +119,8 @@ async function fakeNative(page, options = {}) {
       NativeExplorer: ['openTransaction'],
       Network: ['getStatus', 'removeListener'], App: ['getState', 'minimizeApp', 'removeListener'], Preferences: ['get', 'set'],
     };
-    window.androidBridge = {};
+    if (options.platform === 'ios') window.webkit = { messageHandlers: { bridge: {} } };
+    else window.androidBridge = {};
     window.Capacitor = {
       PluginHeaders: Object.entries(methods).map(([name, list]) => ({ name, methods: [
         ...list.map(name => ({ name, rtype: 'promise' })),
@@ -342,6 +343,20 @@ async function openReceive(page) {
   await expect(page.locator('#copy-link')).toBeEnabled();
   await expect(page.locator('#receive-qr')).toBeVisible();
 }
+
+test('iOS uses the native wallet bridge with Send, P2C and foreground claims', async ({ page }) => {
+  await openNativeWallet(page, { platform: 'ios' });
+  await expect(page.locator('#preview-notice')).toBeHidden();
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(page.locator('#send-address')).toBeEnabled();
+  await page.getByRole('button', { name: 'P2C', exact: true }).click();
+  await expect(page.locator('#p2c-domain')).toBeEnabled();
+  await page.getByRole('button', { name: 'Claims', exact: true }).click();
+  await expect(page.locator('#start-claims')).toBeEnabled();
+  await expect(page.locator('#background')).toBeHidden();
+  await expect(page.locator('#background')).toBeDisabled();
+  expect(await page.evaluate(() => window.testNative.calls.some(call => call.plugin === 'NativeWallet' && call.method === 'getState'))).toBe(true);
+});
 
 async function walletDraftSnapshot(page) {
   return page.evaluate(() => ({
