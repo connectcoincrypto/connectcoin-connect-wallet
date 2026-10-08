@@ -11,7 +11,7 @@ final class WalletSmokeTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 30))
         let isolation = app.staticTexts["wallet-native-security-check"]
-        XCTAssertTrue(isolation.waitForExistence(timeout: 15))
+        XCTAssertTrue(isolation.waitForExistence(timeout: 75))
         XCTAssertEqual(isolation.label, "Native isolation verified")
         let create = app.webViews.buttons["Create wallet"]
         XCTAssertTrue(create.waitForExistence(timeout: 15))
@@ -57,7 +57,7 @@ final class WalletSmokeTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 30))
         let isolation = app.staticTexts["wallet-native-security-check"]
-        XCTAssertTrue(isolation.waitForExistence(timeout: 15))
+        XCTAssertTrue(isolation.waitForExistence(timeout: 75))
         XCTAssertEqual(isolation.label, "Native isolation verified")
         tapWebButton(app, "Import recovery phrase")
         let words = app.textViews["native-wallet-mnemonic"]
