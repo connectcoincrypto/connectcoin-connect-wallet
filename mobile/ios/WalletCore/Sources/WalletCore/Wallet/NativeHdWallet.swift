@@ -7,6 +7,7 @@ public actor NativeHdWallet {
     private let vault: NativeVaultUpdateSession
     private let persist: (JSONObject) throws -> Void
     private var paths: [String: JSONObject] = [:]
+    private var orderedAccounts: [JSONObject]?
     private var receiveIndex: Int, changeIndex: Int, lastReceive: Int, lastChange: Int
     private var complete: Bool, recovering = false, closed = false, scanned = 0
     private var error = "", groups: [JSONObject] = []
@@ -34,14 +35,19 @@ public actor NativeHdWallet {
         try check(); let key = "\(branch):\(index)"
         if let value = paths[key] { return value }
         try walletRequire(paths.count < Self.maxAccounts && index <= Int(Int32.max), "HD recovery exceeds this device's address limit; use ConnectWallet desktop")
-        let value = try session.publicAccount(index: index, change: branch); paths[key] = value; return value
+        let value = try session.publicAccount(index: index, change: branch)
+        paths[key] = value; orderedAccounts = nil; return value
     }
     public func snapshot() -> JSONObject {
-        let ordered = paths.values.sorted {
-            let a = $0["change"] as? Int ?? 0, b = $1["change"] as? Int ?? 0
-            return a == b ? ($0["index"] as? Int ?? 0) < ($1["index"] as? Int ?? 0) : a < b
+        // Native path records are immutable after derivation. Swift arrays and
+        // dictionaries preserve value semantics across public snapshot copies.
+        if orderedAccounts == nil {
+            orderedAccounts = paths.values.sorted {
+                let a = $0["change"] as? Int ?? 0, b = $1["change"] as? Int ?? 0
+                return a == b ? ($0["index"] as? Int ?? 0) < ($1["index"] as? Int ?? 0) : a < b
+            }
         }
-        return ["walletId": walletID, "account": paths["0:\(receiveIndex)"] ?? [:], "accounts": ordered,
+        return ["walletId": walletID, "account": paths["0:\(receiveIndex)"] ?? [:], "accounts": orderedAccounts!,
                 "hd": ["complete": complete, "recovering": recovering, "scanned": scanned,
                        "receiveIndex": receiveIndex, "changeIndex": changeIndex, "lastUsedReceive": lastReceive,
                        "lastUsedChange": lastChange, "error": error, "errorCode": errorCode,
@@ -82,6 +88,7 @@ public actor NativeHdWallet {
             if branch == 0 { lastReceive = index } else { lastChange = index }; return true
         } catch {
             complete = false; groups = []; self.error = "HD range extension is incomplete. Rescan addresses."
+            recoveryState = "failed"; errorCode = "HD_RANGE_EXTENSION"; retryAfterMs = 0
             // Do not let the next unlock treat the old range as complete after
             // failing to retain newly observed activity. Keep the original
             // failure if storage or the lifecycle fence also rejects this mark.
@@ -135,6 +142,8 @@ public actor NativeHdWallet {
         var next = [0, 0], gaps = [0, 0], used = [lastReceive, lastChange], done = [false, false]
         let minimum = [max(receiveIndex, lastReceive + Self.gap), max(changeIndex, lastChange + Self.gap)]
         var retainedBytes = 0, legacy = false
+        var journalEpoch: Int64?
+        var nextResultProgress = environment.now()
         do {
             var payload: JSONObject
             do { payload = try vault.payload(); payload["needsRecovery"] = true; try save(payload) }
@@ -164,10 +173,14 @@ public actor NativeHdWallet {
                 var checkpoint: JSONObject?
                 if !legacy {
                     do {
+                        let expectedEpoch = journalEpoch
                         checkpoint = try await retries.call("getaddresschanges", ["addresses": addresses], reader: { method, params in
                             let value = try await reader(method, params)
-                            try Self.validateWatermark(value); return value
+                            try Self.validateWatermark(value)
+                            if let expectedEpoch, try value.integer("journal_epoch") != expectedEpoch { throw HdRecoveryFailure.rescan }
+                            return value
                         })
+                        journalEpoch = try checkpoint!.integer("journal_epoch")
                     }
                     catch let failure as RpcFailure where failure.code == "-32601" { legacy = true; groups = []; retainedBytes = 0 }
                 }
@@ -208,6 +221,7 @@ public actor NativeHdWallet {
                             }
                         }
                         results[result.0] = (result.1, retainGroup ? result.2 : nil)
+                        let previousScanned = scanned
                         // Publish only each branch's validated contiguous prefix.
                         // Out-of-order replies remain buffered until their gap is
                         // justified; retries never reset pages or gap counters.
@@ -221,7 +235,14 @@ public actor NativeHdWallet {
                                 if index >= minimum[branch] && gaps[branch] >= Self.gap { done[branch] = true }
                             }
                         }
-                        await progress(snapshot()); try check()
+                        // Coalesce fast replies before copying the full public
+                        // account list across the bridge. Group boundaries and
+                        // retry/error/completion transitions remain immediate.
+                        let now = environment.now()
+                        if scanned > previousScanned && now >= nextResultProgress {
+                            nextResultProgress = now + 0.25
+                            await progress(snapshot()); try check()
+                        }
                         if submitted < members.count { enqueue(submitted); submitted += 1 }
                     }
                 }

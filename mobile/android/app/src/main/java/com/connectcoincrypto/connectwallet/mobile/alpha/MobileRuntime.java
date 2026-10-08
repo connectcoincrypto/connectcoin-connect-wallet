@@ -23,6 +23,7 @@ final class MobileRuntime {
     private MobileWalletSettings.Settings settings;
     private boolean foreground, service, allowMobile, allowBackground, requested;
     private String policyStatus = "stopped";
+    private final java.util.concurrent.CopyOnWriteArrayList<Runnable> recoveryNetworkListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private MobileRuntime(Context context) {
         this.context = context;
         receipts = context.getSharedPreferences("claims-public-receipt", Context.MODE_PRIVATE);
@@ -53,6 +54,9 @@ final class MobileRuntime {
         } catch (RuntimeException | LinkageError error) { engine.close(); throw error; }
     }
     synchronized MobileWalletSettings.Settings settings() { return settings; }
+    // Listeners only enqueue work. No wallet/lifecycle locks may be acquired here.
+    void addRecoveryNetworkListener(Runnable listener) { recoveryNetworkListeners.add(listener); }
+    void removeRecoveryNetworkListener(Runnable listener) { recoveryNetworkListeners.remove(listener); }
     synchronized boolean canChangeEndpoint() {
         return !requested && claims.canChangeEndpoint() && rpc.canChangeEndpoint();
     }
@@ -160,8 +164,9 @@ final class MobileRuntime {
         boolean unmetered = caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) && !connectivity.isActiveNetworkMetered();
         boolean backgroundAllowed = allowBackground && service;
         policyStatus = !requested ? "stopped" : !online ? "offline" : !allowMobile && !unmetered ? "mobile-data-disabled" : !foreground && !backgroundAllowed ? "background-paused" : "allowed";
-        rpc.setActive(online && (foreground || requested && backgroundAllowed && (allowMobile || unmetered)));
+        rpc.setActive(online && (foreground || requested && backgroundAllowed && (allowMobile || unmetered)), !online);
         claims.setAllowed(requested && "allowed".equals(policyStatus));
+        for (Runnable listener : recoveryNetworkListeners) listener.run();
     }
     synchronized JSONObject snapshot() {
         try { return claims.snapshot().put("policyStatus", policyStatus).put("allowMobileData", allowMobile)

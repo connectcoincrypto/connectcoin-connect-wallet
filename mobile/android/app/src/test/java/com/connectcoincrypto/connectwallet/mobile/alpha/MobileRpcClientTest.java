@@ -482,6 +482,17 @@ public class MobileRpcClientTest {
             }); MobileRpcClient client = server.client(3000)) {
                 MobileRpcClient.RpcFailure error = error(mode.equals("broadcast-id") ? client.broadcast(HEX) : client.call("getchaintip", new JSONObject()), "RPC_PROTOCOL");
                 assertEquals(mode.equals("broadcast-id"), error.unknownOutcome);
+                assertFalse(error.transportLoss); assertFalse(HdRecoveryReader.retryable(error));
+            }
+        }
+    }
+
+    @Test public void eofRetainsInternalTransportLossReasonWithoutChangingBroadcastBehavior() throws Exception {
+        for (boolean broadcast : new boolean[]{false, true}) {
+            try (Server server = new Server((request, socket) -> null); MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(broadcast ? client.broadcast(HEX) : client.call("getaddresshistory", params()), "RPC_PROTOCOL");
+                assertTrue(failure.transportLoss); assertEquals(broadcast, failure.unknownOutcome);
+                assertEquals(!broadcast, HdRecoveryReader.retryable(failure)); assertEquals(1, server.requests.get());
             }
         }
     }

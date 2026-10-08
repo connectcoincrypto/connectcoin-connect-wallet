@@ -12,7 +12,7 @@ private final class HdIntegrationClock: @unchecked Sendable {
 }
 
 private actor HdRecoveryReader {
-    enum Failure { case pageOnce, invalidPage, journalReset, none }
+    enum Failure { case pageOnce, invalidPage, journalReset, epochReset, tipAdvance, none }
     let target: String, failure: Failure
     let tip: JSONObject = ["chain": "main", "genesis_hash": NativePaymentChecks.GENESIS,
                            "hash": String(repeating: "a", count: 64), "height": 123, "mediantime": 1_700_000_000]
@@ -21,7 +21,12 @@ private actor HdRecoveryReader {
     func read(_ method: String, _ params: JSONObject) throws -> JSONObject {
         calls[method, default: 0] += 1
         if method == "getaddresschanges" {
-            return ["tip": tip, "unit": "connects", "changes": [], "next_cursor": "checkpoint.0", "has_more": false, "through_sequence": 0, "journal_epoch": 1]
+            let epoch = failure == .epochReset && calls[method, default: 0] > 1 ? 2 : 1
+            var currentTip = tip
+            if failure == .tipAdvance && calls[method, default: 0] > 1 {
+                currentTip["hash"] = String(repeating: "c", count: 64); currentTip["height"] = 124
+            }
+            return ["tip": currentTip, "unit": "connects", "changes": [], "next_cursor": "checkpoint.0", "has_more": false, "through_sequence": 0, "journal_epoch": epoch]
         }
         XCTAssertEqual(method, "getaddresshistory")
         let address = try params.string("address"), cursor = params["cursor"] as? String ?? "first"
@@ -31,7 +36,12 @@ private actor HdRecoveryReader {
             if failure == .journalReset { throw RpcFailure("-32011") }
             if failure == .pageOnce && cursor == "page.2" && pages[key] == 1 { throw RpcFailure("RPC_UNAVAILABLE") }
         }
-        return ["tip": tip, "unit": "connects", "live": true, "address": address, "items": [],
+        let items: [JSONObject] = (failure == .epochReset || failure == .tipAdvance) && address == target ? [
+            ["txid": String(repeating: "b", count: 64), "status": "confirmed", "block_height": 123,
+             "block_hash": String(repeating: "a", count: 64), "confirmations": 1,
+             "received": "1", "spent": "0", "balance_delta": "1"]
+        ] : []
+        return ["tip": tip, "unit": "connects", "live": true, "address": address, "items": items,
                 "next_cursor": failure == .pageOnce && address == target && cursor == "first" ? "page.2" as Any : NSNull()]
     }
     func record(_ state: JSONObject) { states.append(state) }
@@ -110,5 +120,63 @@ final class HdRecoveryRetryIntegrationTests: XCTestCase {
         XCTAssertFalse(try state.object("hd").string("error").contains("private path"))
         XCTAssertTrue(try vault.payload().boolean("needsRecovery"))
         do { try await hd.requireReady(); XCTFail("Sending must remain blocked") } catch { }
+    }
+
+    func testChangedJournalEpochBetweenGroupsRequiresExplicitRescan() async throws {
+        let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
+        let target = try signing.publicAccount(index: 0, change: 0).string("address")
+        let reader = HdRecoveryReader(target, .epochReset), clock = HdIntegrationClock()
+        do {
+            try await hd.recover(reader: { try await reader.read($0, $1) }, environment: clock.environment,
+                                 progress: { await reader.record($0) })
+            XCTFail("Groups from different journal epochs must not be combined")
+        } catch let failure as HdRecoveryFailure { XCTAssertEqual(failure.code, "HD_RESCAN_REQUIRED") }
+        let (calls, _, states) = await reader.captured(), state = await hd.snapshot(), cache = await hd.recoverySnapshots()
+        XCTAssertEqual(calls["getaddresschanges"], 2)
+        XCTAssertEqual(calls["getaddresshistory"], 40)
+        XCTAssertEqual(try state.object("hd").integer("scanned"), 40)
+        XCTAssertEqual(try state.object("hd").string("errorCode"), "HD_RESCAN_REQUIRED")
+        XCTAssertFalse(try states.contains { try $0.object("hd").boolean("complete") })
+        XCTAssertTrue(try cache.array("groups").isEmpty)
+        XCTAssertTrue(try vault.payload().boolean("needsRecovery"))
+    }
+
+    func testOrdinaryTipAdvanceWithinSameEpochAllowsRecovery() async throws {
+        let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
+        let target = try signing.publicAccount(index: 0, change: 0).string("address")
+        let reader = HdRecoveryReader(target, .tipAdvance), clock = HdIntegrationClock()
+        try await hd.recover(reader: { try await reader.read($0, $1) }, environment: clock.environment, progress: { _ in })
+        let (calls, _, _) = await reader.captured(), state = await hd.snapshot(), cache = await hd.recoverySnapshots()
+        XCTAssertEqual(calls["getaddresschanges"], 2)
+        XCTAssertEqual(calls["getaddresshistory"], 41)
+        XCTAssertTrue(try state.object("hd").boolean("complete"))
+        XCTAssertEqual(try cache.array("groups").count, 2)
+    }
+
+    func testFastResponsesCoalesceProgressAndRefreshImmutableAccountSnapshots() async throws {
+        let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
+        let before = await hd.snapshot()
+        let reader = HdRecoveryReader("", .none), clock = HdIntegrationClock()
+        try await hd.recover(reader: { try await reader.read($0, $1) }, environment: clock.environment,
+                             progress: { await reader.record($0) })
+        let (calls, _, states) = await reader.captured(), after = await hd.snapshot()
+        XCTAssertEqual(calls["getaddresshistory"], 40)
+        XCTAssertLessThanOrEqual(states.count, 6, "A fixed clock permits only one intermediate result publication, plus boundaries")
+        let progress = try states.map { try $0.object("hd").integer("scanned") }
+        XCTAssertEqual(progress, progress.sorted())
+        XCTAssertTrue(progress.contains { $0 > 0 && $0 < 40 })
+        XCTAssertEqual(progress.last, 40)
+        XCTAssertTrue(try XCTUnwrap(states.last).object("hd").boolean("complete"))
+        XCTAssertEqual(try before.array("accounts").count, 2)
+        let accounts = try after.array("accounts").map { try JSON.object($0) }
+        XCTAssertEqual(accounts.count, 40)
+        for (offset, account) in accounts.enumerated() {
+            XCTAssertEqual(try account.integer("change"), Int64(offset / 20))
+            XCTAssertEqual(try account.integer("index"), Int64(offset % 20))
+        }
+        var changedCopy = accounts
+        changedCopy[0]["address"] = "renderer-copy"
+        let unchanged = await hd.snapshot()
+        XCTAssertEqual(try JSON.object(unchanged.array("accounts")[0]).string("address"), try accounts[0].string("address"))
     }
 }

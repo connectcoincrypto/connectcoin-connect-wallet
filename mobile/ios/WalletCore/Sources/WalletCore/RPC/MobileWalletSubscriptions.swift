@@ -19,6 +19,7 @@ private final class SubscriptionMailbox: @unchecked Sendable {
 public actor MobileWalletSubscriptions {
     private let makeClient: () -> MobileRpcClient
     private let emit: (JSONObject) -> Void
+    private let validateAddress: (String) throws -> Void
     private var client: MobileRpcClient?
     private var current: Task<Void, Never>?
     private var generation: UInt64 = 0
@@ -31,9 +32,12 @@ public actor MobileWalletSubscriptions {
     private var lastMessage = ProcessInfo.processInfo.systemUptime
     public init(endpoint: TcpEndpoint, emit: @escaping (JSONObject) -> Void) {
         makeClient = { MobileRpcClient(endpoint:endpoint,subscriptions:true) }; self.emit = emit
+        validateAddress = { _ = try WalletCrypto.decodeAddress($0) }
     }
-    init(makeClient: @escaping () -> MobileRpcClient, emit: @escaping (JSONObject) -> Void) {
-        self.makeClient = makeClient; self.emit = emit
+    init(makeClient: @escaping () -> MobileRpcClient,
+         validateAddress: @escaping (String) throws -> Void = { _ = try WalletCrypto.decodeAddress($0) },
+         emit: @escaping (JSONObject) -> Void) {
+        self.makeClient = makeClient; self.validateAddress = validateAddress; self.emit = emit
     }
     public func state() -> JSONObject { ["connected": connected, "coverageLimited": identifiers.count < addresses.count, "watched": identifiers.count, "total": addresses.count] }
     public func stop() {
@@ -41,9 +45,11 @@ public actor MobileWalletSubscriptions {
         client?.close(); client = nil; connected = false; registering = false; identifiers = [:]; pending = []; tipID = ""
     }
     public func configure(_ walletID: String, _ addresses: [String]) throws {
-        try walletRequire(!addresses.isEmpty && addresses.count <= 10_000 && Set(addresses).count == addresses.count && addresses.contains(walletID), "Invalid native subscription scope")
-        for address in addresses { _ = try WalletCrypto.decodeAddress(address) }
+        // Exact equality with our previously validated value-type scope is
+        // safe before validation. HD progress/countdowns reuse this same scope.
         if self.walletID == walletID && self.addresses == addresses && current != nil { return }
+        try walletRequire(!addresses.isEmpty && addresses.count <= 10_000 && Set(addresses).count == addresses.count && addresses.contains(walletID), "Invalid native subscription scope")
+        for address in addresses { try validateAddress(address) }
         stop(); self.walletID = walletID; self.addresses = addresses; attempt = 0
         let token = generation; current = Task { await self.run(token) }
     }

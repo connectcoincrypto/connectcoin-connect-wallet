@@ -40,6 +40,9 @@ public final class NativeHdWallet implements AutoCloseable {
     private JSONArray recoverySnapshots = new JSONArray();
     private int receiveIndex, changeIndex, lastUsedReceive, lastUsedChange, scanned;
     private String walletId, error = "";
+    private String recoveryState = "paused", errorCode = "";
+    private long retryAfterMs, retryDeadlineMs;
+    private int retryAttempt;
     private boolean complete, recovering, updating;
     private volatile boolean closed;
 
@@ -53,6 +56,7 @@ public final class NativeHdWallet implements AutoCloseable {
         lastUsedReceive = payload.optInt("lastUsedReceive", -1); lastUsedChange = payload.optInt("lastUsedChange", -1);
         complete = Boolean.TRUE.equals(payload.opt("mobileHdRecovered")) && Boolean.FALSE.equals(payload.opt("needsRecovery"))
             && Boolean.TRUE.equals(payload.opt("scanLookahead"));
+        recoveryState = complete ? "complete" : "paused";
         // Public accounts survive lock; native private branches and the update key do not.
         walletId = derive(0, 0, () -> {}).getString("address");
         buildRange(payload.optBoolean("scanLookahead", false), () -> {});
@@ -85,9 +89,41 @@ public final class NativeHdWallet implements AutoCloseable {
     static final class RecoveryLimitException extends IllegalStateException {
         RecoveryLimitException(String message) { super(message); }
     }
+    static final class RecoveryStorageException extends Exception {
+        RecoveryStorageException(Exception cause) { super("Address discovery could not save wallet data. Check storage and retry recovery.", cause); }
+    }
+    static final class RecoveryRefreshException extends Exception {
+        RecoveryRefreshException() { super("Address history changed during discovery. Retry recovery to refresh the scan."); }
+    }
     private static RecoveryLimitException resourceLimit() { return new RecoveryLimitException("HD recovery exceeds this device's address resource limit. Recovery is incomplete; use ConnectWallet desktop for this wallet."); }
     private static String recoveryError(Exception failure) {
-        return failure instanceof RecoveryLimitException ? failure.getMessage() : "HD address recovery is incomplete. Check your connection and retry recovery.";
+        switch (recoveryCode(failure)) {
+            case "HD_RESOURCE_LIMIT": return failure.getMessage();
+            case "HD_STORAGE": return "Address discovery could not save wallet data. Check storage and retry recovery.";
+            case "HD_VALIDATION": return "The node returned invalid address data. Check the RPC endpoint and retry recovery.";
+            case "HD_REFRESH_REQUIRED": return "Address history changed during discovery. Retry recovery to refresh the scan.";
+            case "HD_INVALID_REQUEST": return "Address discovery could not make a valid request. Check the wallet version and retry recovery.";
+            case "HD_RETRY_EXHAUSTED": return "Address discovery could not reconnect. Check your connection and retry recovery.";
+            case "HD_CANCELLED": return "Address discovery paused. Unlock the wallet to resume.";
+            default: return "HD address recovery is incomplete. Check your connection and retry recovery.";
+        }
+    }
+    private static String recoveryCode(Exception failure) {
+        if (failure instanceof RecoveryLimitException) return "HD_RESOURCE_LIMIT";
+        if (failure instanceof RecoveryStorageException) return "HD_STORAGE";
+        if (failure instanceof RecoveryRefreshException) return "HD_REFRESH_REQUIRED";
+        if (failure instanceof HdRecoveryReader.RetryExhausted) return "HD_RETRY_EXHAUSTED";
+        if (failure instanceof MobileRpcClient.RpcFailure) {
+            String code = ((MobileRpcClient.RpcFailure)failure).code;
+            if ("-32011".equals(code)) return "HD_REFRESH_REQUIRED";
+            if ("RPC_INVALID".equals(code)) return "HD_INVALID_REQUEST";
+            if ("RPC_PROTOCOL".equals(code)) return "HD_VALIDATION";
+            if ("RPC_CANCELLED".equals(code)) return "HD_CANCELLED";
+            return "HD_RPC_REJECTED";
+        }
+        if (failure instanceof IllegalArgumentException || failure instanceof org.json.JSONException) return "HD_VALIDATION";
+        if (failure instanceof java.util.concurrent.CancellationException || failure instanceof InterruptedException) return "HD_CANCELLED";
+        return "HD_RECOVERY_FAILED";
     }
     public synchronized JSONObject account() { return copy(paths.get("0:" + receiveIndex)); }
     public synchronized JSONObject changeAccount() { return copy(paths.get("1:" + changeIndex)); }
@@ -100,10 +136,25 @@ public final class NativeHdWallet implements AutoCloseable {
     public synchronized JSONObject snapshot() {
         try {
             return new JSONObject().put("walletId", walletId).put("account", account()).put("accounts", accounts())
-                .put("hd", new JSONObject().put("complete", complete).put("recovering", recovering).put("scanned", scanned)
-                    .put("receiveIndex", receiveIndex).put("changeIndex", changeIndex).put("lastUsedReceive", lastUsedReceive)
-                    .put("lastUsedChange", lastUsedChange).put("error", error));
+                .put("hd", hdSnapshot());
         } catch (org.json.JSONException impossible) { throw new IllegalStateException("Cannot construct HD wallet state", impossible); }
+    }
+    synchronized JSONObject hdSnapshot() {
+        try {
+            long remaining = "retrying".equals(recoveryState) ? Math.max(0, retryDeadlineMs - TimeUnit.NANOSECONDS.toMillis(System.nanoTime())) : 0;
+            return new JSONObject().put("complete", complete).put("recovering", recovering).put("scanned", scanned)
+                    .put("receiveIndex", receiveIndex).put("changeIndex", changeIndex).put("lastUsedReceive", lastUsedReceive)
+                    .put("lastUsedChange", lastUsedChange).put("error", error).put("errorCode", errorCode)
+                    .put("recoveryState", recoveryState).put("retryAfterMs", Math.min(retryAfterMs, remaining)).put("retryAttempt", retryAttempt);
+        } catch (org.json.JSONException impossible) { throw new IllegalStateException("Cannot construct HD wallet state", impossible); }
+    }
+    void recoveryStatus(String state, long delayMs, int attempt, String code, Progress progress) {
+        synchronized (this) {
+            if (closed || !recovering) return;
+            recoveryState = state; retryAfterMs = Math.max(0, delayMs); retryAttempt = Math.max(0, attempt); errorCode = code;
+            retryDeadlineMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) + retryAfterMs;
+        }
+        publish(progress);
     }
     /** Public first pages only, with the original checkpoint from before their reads.
      * A caller must reconcile that checkpoint before presenting a current balance. */
@@ -124,17 +175,18 @@ public final class NativeHdWallet implements AutoCloseable {
         check(check);
         synchronized (this) {
             if (recovering || updating) throw new IllegalStateException("A wallet address update is already in progress.");
-            complete = false; error = ""; recoverySnapshots = new JSONArray();
+            complete = false; error = ""; errorCode = ""; recoveryState = "paused"; retryAfterMs = 0; retryAttempt = 0; recoverySnapshots = new JSONArray();
         }
         try { persist(vault.payload().put("needsRecovery", true).put("mobileHdRecovered", false), check); }
         catch (Exception failure) {
-            synchronized (this) { if (!closed) error = "HD address recovery is incomplete. Check storage and retry recovery."; }
+            synchronized (this) { if (!closed) { error = recoveryError(failure); errorCode = recoveryCode(failure); recoveryState = "failed"; } }
             throw failure;
         }
     }
     private void persist(JSONObject payload, Check check) throws Exception {
         check(check);
-        vault.save(payload, envelope -> { check(check); persistence.write(envelope, () -> check(check)); });
+        try { vault.save(payload, envelope -> { check(check); persistence.write(envelope, () -> check(check)); }); }
+        catch (Exception failure) { check(check); throw new RecoveryStorageException(failure); }
         check(check);
     }
     public JSONObject newAddress(Check check) throws Exception {
@@ -182,7 +234,7 @@ public final class NativeHdWallet implements AutoCloseable {
             return true;
         } catch (Exception failure) {
             if (!closed) {
-                synchronized (this) { complete = false; error = failure instanceof RecoveryLimitException ? recoveryError(failure) : "HD address recovery is incomplete. Check storage and connection, then retry recovery."; }
+                synchronized (this) { complete = false; error = recoveryError(failure); errorCode = recoveryCode(failure); recoveryState = "failed"; }
                 // Do not silently forget an incomplete extension after a normal relaunch.
                 // A disk failure may also prevent this marker, but never permits sending now.
                 try { JSONObject payload = vault.payload().put("needsRecovery", true).put("mobileHdRecovered", false); persist(payload, check); }
@@ -282,6 +334,15 @@ public final class NativeHdWallet implements AutoCloseable {
     private static boolean unsupportedCheckpoint(Exception failure) {
         return failure instanceof MobileRpcClient.RpcFailure && "-32601".equals(((MobileRpcClient.RpcFailure)failure).code);
     }
+    /** A reconnect probe must pass the same validation as the scanner before
+     * reopening its parallel window. The scanner still owns all progress. */
+    static void validateRecoveryRead(String method, JSONObject params, JSONObject response) throws Exception {
+        if ("getaddresschanges".equals(method)) {
+            usedChanges(params, response);
+            require(response.getJSONArray("changes").length() == 0 && !response.getBoolean("has_more"));
+        } else if ("getaddresshistory".equals(method)) historyUsed(response, params.getString("address"));
+        else throw new IllegalArgumentException("Unsupported HD recovery read.");
+    }
     /** Cover the known gap before its individual reads begin. Every prepared
      * address is already required by the monotonic scan boundary; none is a
      * speculative address beyond the gap. This scope does not occupy history
@@ -307,11 +368,12 @@ public final class NativeHdWallet implements AutoCloseable {
             if (closed) throw new IllegalStateException("Wallet is locked");
             if (complete) return;
             if (recovering || updating) throw new IllegalStateException("HD recovery is already running.");
-            recovering = true; error = ""; scanned = 0; recoverySnapshots = new JSONArray();
+            recovering = true; recoveryState = "scanning"; error = ""; errorCode = ""; retryAfterMs = 0; retryAttempt = 0; scanned = 0; recoverySnapshots = new JSONArray();
         }
         Scan[] branches = null;
         List<RecoveryGroup> groups = new ArrayList<>();
         JSONArray retained = new JSONArray(); int retainedBytes = 0;
+        Long checkpointEpoch = null;
         boolean legacy = false;
         try {
             check(check); JSONObject payload = vault.payload();
@@ -356,6 +418,9 @@ public final class NativeHdWallet implements AutoCloseable {
                         JSONObject sync = await(group.pending, check);
                         usedChanges(new JSONObject().put("addresses", group.addresses), sync);
                         require(sync.getJSONArray("changes").length() == 0 && !sync.getBoolean("has_more"));
+                        long epoch = sync.getLong("journal_epoch");
+                        if (checkpointEpoch != null && checkpointEpoch.longValue() != epoch) throw new RecoveryRefreshException();
+                        checkpointEpoch = epoch;
                         group.sync = copy(sync);
                     } catch (Exception failure) {
                         if (!unsupportedCheckpoint(failure)) throw failure;
@@ -436,10 +501,10 @@ public final class NativeHdWallet implements AutoCloseable {
             check(check);
             synchronized (this) {
                 if (closed) throw new IllegalStateException("Wallet is locked");
-                complete = true; recoverySnapshots = retained;
+                complete = true; recoveryState = "complete"; errorCode = ""; retryAfterMs = 0; retryAttempt = 0; recoverySnapshots = retained;
             }
         } catch (Exception failure) {
-            synchronized (this) { if (!closed) error = recoveryError(failure); }
+            synchronized (this) { if (!closed) { error = recoveryError(failure); errorCode = recoveryCode(failure); recoveryState = "failed"; retryAfterMs = 0; } }
             throw failure;
         } finally {
             for (RecoveryGroup group : groups) if (group.pending != null) group.pending.cancel(true);
@@ -497,7 +562,7 @@ public final class NativeHdWallet implements AutoCloseable {
         try { return new JSONObject(value.toString()); } catch (org.json.JSONException invalid) { throw new IllegalStateException("Invalid native HD account", invalid); }
     }
     @Override public void close() {
-        synchronized (this) { closed = true; recoverySnapshots = new JSONArray(); }
+        synchronized (this) { closed = true; recovering = false; recoveryState = "paused"; retryAfterMs = 0; recoverySnapshots = new JSONArray(); }
         vault.close();
     }
 }

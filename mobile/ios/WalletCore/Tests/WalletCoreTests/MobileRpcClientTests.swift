@@ -69,6 +69,33 @@ final class MobileWalletSubscriptionsTests: XCTestCase {
         await subscriptions.stop()
         XCTAssertFalse(events.events.contains { $0["reason"] as? String == "address" })
     }
+    func testRepeatedValidatedScopeSkipsDecodingAndRegistrationButChangesStillValidate() async throws {
+        let wire = RpcTestWire(), events = SubscriptionEvents(), validations = SubscriptionEvents(); wire.respond = ack
+        let subscriptions = MobileWalletSubscriptions(makeClient: { MobileRpcClient(factory: { wire }, subscriptions: true) },
+            validateAddress: { value in
+                validations.append(["address": value]); _ = try WalletCrypto.decodeAddress(value)
+            }, emit: events.append)
+        try await subscriptions.configure(address, [address])
+        try await eventually { events.events.count == 1 }
+        for _ in 0..<1_000 { try await subscriptions.configure(address, [address]) }
+        XCTAssertEqual(validations.events.count, 1)
+        XCTAssertEqual(wire.sent.count, 2)
+        do {
+            try await subscriptions.configure(address, [address, "invalid-address"])
+            XCTFail("A different scope must still be validated")
+        } catch { }
+        XCTAssertEqual(validations.events.count, 3)
+        let state = await subscriptions.state()
+        XCTAssertEqual(state["connected"] as? Bool, true)
+        XCTAssertEqual(state["total"] as? Int, 1)
+        XCTAssertEqual(wire.sent.count, 2)
+        await subscriptions.stop()
+        try await subscriptions.configure(address, [address])
+        try await eventually { events.events.count == 2 }
+        XCTAssertEqual(validations.events.count, 4)
+        XCTAssertEqual(wire.sent.count, 4)
+        await subscriptions.stop()
+    }
 }
 private final class RpcTestWire: RpcWire, @unchecked Sendable {
     private let mutex = NSLock()
