@@ -20,7 +20,12 @@
 		9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9582B6822FE993A50072D4E8 /* SceneDelegate.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		C011EC700000000000000107 /* App target proxy */ = {isa = PBXContainerItemProxy; containerPortal = 504EC2FC1FED79650016851F; proxyType = 1; remoteGlobalIDString = 504EC3031FED79650016851F; remoteInfo = App; };
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		C011EC700000000000000101 /* AppUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C011EC700000000000000004 /* ThirdPartyLicenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdPartyLicenses; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
 		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
@@ -36,6 +41,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		C011EC700000000000000102 /* AppUITests */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = AppUITests; sourceTree = "<group>"; };
 		C011EC700000000000000005 /* Plugins */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
@@ -46,6 +52,7 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		C011EC700000000000000103 /* UI test Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3011FED79650016851F /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -63,6 +70,7 @@
 			children = (
 				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
 				504EC3061FED79650016851F /* App */,
+				C011EC700000000000000102 /* AppUITests */,
 				504EC3051FED79650016851F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -71,6 +79,7 @@
 			isa = PBXGroup;
 			children = (
 				504EC3041FED79650016851F /* App.app */,
+				C011EC700000000000000101 /* AppUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -96,6 +105,18 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		C011EC700000000000000100 /* AppUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C011EC700000000000000109;
+			buildPhases = (C011EC700000000000000104, C011EC700000000000000103, C011EC700000000000000105,);
+			buildRules = ();
+			dependencies = (C011EC700000000000000106,);
+			fileSystemSynchronizedGroups = (C011EC700000000000000102,);
+			name = AppUITests;
+			productName = AppUITests;
+			productReference = C011EC700000000000000101;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		504EC3031FED79650016851F /* App */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
@@ -129,6 +150,7 @@
 				LastSwiftUpdateCheck = 0920;
 				LastUpgradeCheck = 0920;
 				TargetAttributes = {
+					C011EC700000000000000100 = {CreatedOnToolsVersion = 26.0; TestTargetID = 504EC3031FED79650016851F; };
 					504EC3031FED79650016851F = {
 						CreatedOnToolsVersion = 9.2;
 						LastSwiftMigration = 1100;
@@ -154,11 +176,13 @@
 			projectRoot = "";
 			targets = (
 				504EC3031FED79650016851F /* App */,
+				C011EC700000000000000100 /* AppUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		C011EC700000000000000105 /* UI test Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3021FED79650016851F /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -176,6 +200,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		C011EC700000000000000104 /* UI test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3001FED79650016851F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -186,6 +211,10 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C011EC700000000000000106 /* App dependency */ = {isa = PBXTargetDependency; target = 504EC3031FED79650016851F; targetProxy = C011EC700000000000000107; };
+/* End PBXTargetDependency section */
 
 /* Begin PBXVariantGroup section */
 		504EC30B1FED79650016851F /* Main.storyboard */ = {
@@ -207,6 +236,16 @@
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
+		C011EC700000000000000110 /* UI test Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.connectcoincrypto.connectwallet.mobile.alpha.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = App; };
+			name = Debug;
+		};
+		C011EC700000000000000111 /* UI test Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 15.0; PRODUCT_BUNDLE_IDENTIFIER = com.connectcoincrypto.connectwallet.mobile.alpha.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = App; };
+			name = Release;
+		};
 		504EC3141FED79650016851F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
@@ -367,6 +406,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		C011EC700000000000000109 /* UI test configurations */ = {isa = XCConfigurationList; buildConfigurations = (C011EC700000000000000110, C011EC700000000000000111,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
 		504EC2FF1FED79650016851F /* Build configuration list for PBXProject "App" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

@@ -74,6 +74,28 @@ build_app() {
   ditto -c -k --sequesterRsrc --keepParent "$product" "$artifact_dir/ConnectWallet-$label.app.zip"
 }
 
+smoke_simulator() (
+  # A new owned Simulator has no user wallets or credentials. The Debug-only
+  # launch argument is enforced by native code to deny all network transports.
+  local runtime device simulator
+  runtime="$(xcrun simctl list runtimes -j | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{const r=JSON.parse(s).runtimes.filter(x=>x.isAvailable&&x.identifier.includes(".iOS-")).sort((a,b)=>b.version.localeCompare(a.version,undefined,{numeric:true}))[0];if(!r)process.exit(1);console.log(r.identifier)})')"
+  device="$(xcrun simctl list devicetypes -j | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{const d=JSON.parse(s).devicetypes.filter(x=>x.name.startsWith("iPhone"));const v=d.find(x=>x.name==="iPhone 17 Pro")||d.find(x=>x.name==="iPhone 16 Pro")||d.at(-1);if(!v)process.exit(1);console.log(v.identifier)})')"
+  simulator="$(xcrun simctl create "ConnectWallet-CI-$RANDOM" "$device" "$runtime")"
+  [[ "$simulator" =~ ^[A-Fa-f0-9-]{36}$ ]] || exit 1
+  trap 'xcrun simctl shutdown "$simulator" >/dev/null 2>&1 || true; xcrun simctl delete "$simulator" >/dev/null 2>&1 || true' EXIT
+  xcrun simctl boot "$simulator"
+  xcrun simctl bootstatus "$simulator" -b
+  CONNECTWALLET_NATIVE_LIB_DIR="$native_root/iphonesimulator" xcodebuild \
+    -project "$mobile_dir/ios/App/App.xcodeproj" -scheme WalletUISmoke -configuration Debug \
+    -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator" \
+    -derivedDataPath "$native_root/iphonesimulator/DerivedData" \
+    -resultBundlePath "$artifact_dir/WalletUISmoke.xcresult" -parallel-testing-enabled NO \
+    ARCHS="$(uname -m)" ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+    CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= test
+  xcrun xcresulttool export attachments --path "$artifact_dir/WalletUISmoke.xcresult" \
+    --output-path "$artifact_dir/ui-screenshots"
+)
+
 node native/tools/check-provenance.mjs
 if [[ "$mode" == all || "$mode" == core ]]; then build_core; fi
 if [[ "$mode" != core ]]; then
@@ -82,6 +104,7 @@ if [[ "$mode" != core ]]; then
 fi
 if [[ "$mode" == all || "$mode" == simulator ]]; then
   build_app iphonesimulator "$(uname -m)" 'generic/platform=iOS Simulator' simulator
+  smoke_simulator
 fi
 if [[ "$mode" == all || "$mode" == device ]]; then
   build_app iphoneos arm64 'generic/platform=iOS' unsigned-device

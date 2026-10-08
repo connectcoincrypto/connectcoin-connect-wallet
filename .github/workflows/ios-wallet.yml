@@ -51,4 +51,5 @@ jobs:
             mobile/.tools/ios-artifacts/
             mobile/.tools/ios-native/*/build/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 7

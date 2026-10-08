@@ -55,14 +55,14 @@ public actor MobileClaimsEngine {
         if limiter == 0 { status = "error"; lastError = String(cString: error) }
         do {
             if FileManager.default.fileExists(atPath: self.receiptURL.path) {
-                let receipt = try JSON.decode(Data(contentsOf: self.receiptURL), maxBytes: 4096)
+                let receipt = try ClaimsPublicStore.read(self.receiptURL)
                 lastTxid = try PJ.hash(receipt["txid"]); receiptStatus = try PJ.string(receipt["status"])
                 try walletRequire(["pending", "submitted", "rejected", "not-sent", "unknown"].contains(receiptStatus), "CLAIMS_RECEIPT_UNAVAILABLE")
                 if ["pending", "unknown"].contains(receiptStatus) { unknownBlocked = true; unknown = 1; status = "unknown-outcome"; lastError = "CLAIMS_UNKNOWN_OUTCOME" }
             }
             let policyURL = self.receiptURL.deletingLastPathComponent().appendingPathComponent("claims-policy-v1.json")
             if FileManager.default.fileExists(atPath: policyURL.path) {
-                let saved = try JSON.decode(Data(contentsOf: policyURL), maxBytes: 4096)
+                let saved = try ClaimsPublicStore.read(policyURL)
                 allowMobile = try PJ.bool(saved["allowMobileData"])
                 rate = Int(try PJ.integer(saved["connectionsPerSecondLimit"], 1, 100))
                 concurrency = Int(try PJ.integer(saved["concurrency"], 1, 100))
@@ -130,14 +130,15 @@ public actor MobileClaimsEngine {
         if dispatchTask == nil {
             dispatchTask = Task { [weak self] in
                 while !Task.isCancelled {
-                    await self?.dispatchTick()
-                    try? await Task.sleep(nanoseconds: 2_000_000)
+                    guard let delay = await self?.dispatchTick() else { return }
+                    try? await Task.sleep(nanoseconds: delay)
                 }
             }
         }
     }
     public func stop() {
         enabled = false; allowed = false; pauseClock(); epoch &+= 1
+        dispatchTask?.cancel(); dispatchTask = nil
         maintenanceTask?.cancel(); maintenanceTask = nil
         cancelCaptures(); invalidateQueued(); resetAdmission(); acknowledgeStarts()
         status = unknownBlocked ? "unknown-outcome" : "stopped"
@@ -170,10 +171,7 @@ public actor MobileClaimsEngine {
         try writePublic(["allowMobileData": mobile, "allowBackground": false, "connectionsPerSecondLimit": rate, "concurrency": concurrency], url)
     }
     private func writePublic(_ data: JSONObject, _ url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let bytes = try JSON.encode(data)
-        try bytes.write(to: url, options: .atomic)
-        try walletRequire(try Data(contentsOf: url) == bytes, "CLAIMS_RECEIPT_UNAVAILABLE")
+        try ClaimsPublicStore.write(data, to: url)
     }
     private func record(_ txid: String, _ value: String) throws {
         do { try writePublic(["txid": txid, "status": value], receiptURL); lastTxid = txid; receiptStatus = value }
@@ -386,32 +384,33 @@ public actor MobileClaimsEngine {
         if capture.run == run { attempts = increment(attempts); if now() - started < 10 { recentStarts.append(started); recentStarts.sort() } }
     }
     private func acknowledgeStarts() { nextAck = now() + 0.02; for id in active.keys { acknowledge(id) }; recentStarts.removeAll { now() - $0 >= 10 } }
-    private func dispatchTick() {
+    private func dispatchTick() -> UInt64 {
         if now() >= nextAck { acknowledgeStarts() }
         if !fresh { cancelCaptures(); invalidateQueued(); admissionIdle = true }
-        guard !closed && enabled && allowed && !unknownBlocked && fresh && reservations.count < 100 else { admissionIdle = true; return }
-        guard active.count < concurrency && now() >= nextAdmission else { return }
+        guard !closed && enabled && allowed && !unknownBlocked && fresh && reservations.count < 100 else { admissionIdle = true; return 100_000_000 }
+        guard active.count < concurrency && now() >= nextAdmission else { return 2_000_000 }
         refreshSchedule()
-        guard let selected = scheduler.next(now: now(), prepared: true) else { admissionIdle = true; return }
+        guard let selected = scheduler.next(now: now(), prepared: true) else { admissionIdle = true; return 100_000_000 }
         let row = selected.row
-        guard available(row.key) && row.budget else { scheduler.remove(row.key); return }
-        if !selected.recovering && !ClaimScheduler.worth(row, rate: stats[row.policy]?.rate ?? 5) { dirty = true; return }
-        if stats[row.policy] == nil { guard stats.count < 3584 else { handleReadFailure(WalletError("CLAIMS_CAPACITY"), epoch); return }; stats[row.policy] = ClaimEMA() }
+        guard available(row.key) && row.budget else { scheduler.remove(row.key); return 2_000_000 }
+        if !selected.recovering && !ClaimScheduler.worth(row, rate: stats[row.policy]?.rate ?? 5) { dirty = true; return 2_000_000 }
+        if stats[row.policy] == nil { guard stats.count < 3584 else { handleReadFailure(WalletError("CLAIMS_CAPACITY"), epoch); return 100_000_000 }; stats[row.policy] = ClaimEMA() }
         var error = [CChar](repeating: 0, count: 32)
         let handle = cw_claim_cancellation_create(limiter, &error)
-        guard handle != 0 else { lastError = String(cString: error); return }
+        guard handle != 0 else { lastError = String(cString: error); return 100_000_000 }
         nextCapture &+= 1
         let capture = Capture(id: nextCapture, epoch: epoch, run: run, handle: handle, selection: selected)
         active[capture.id] = capture; scheduler.reserve(selected)
         let pacedAt = now(); if admissionIdle { nextAdmission = max(nextAdmission, pacedAt) }
         nextAdmission = max(nextAdmission + 1 / Double(rate), pacedAt - 1); admissionIdle = false
         guard let prepared = row.progress.prepared, let challenge = prepared["challenge"] as? String,
-              let time = try? PJ.integer(tip?["mediantime"], 1) else { release(capture.id); return }
+              let time = try? PJ.integer(tip?["mediantime"], 1) else { release(capture.id); return 100_000_000 }
+        let domain = row.domain, target = row.target, mask = row.mask, captureID = capture.id
         capturesQueue.async { [weak self] in
             var result = cw_claim_result()
-            let completed = row.domain.withCString { domain in challenge.withCString { challenge in row.target.withCString { target in
+            let completed = domain.withCString { domain in challenge.withCString { challenge in target.withCString { target in
                 var context = cw_claim_context(domain: domain, challenge_hex: challenge, target_hex: target,
-                    roots_version: 1, signature_mask: row.mask, validation_time: time)
+                    roots_version: 1, signature_mask: mask, validation_time: time)
                 return cw_claim_capture(&context, 10_000, handle, &result)
             } } }
             let code = withUnsafeBytes(of: result.error_code) { bytes in String(cString: bytes.bindMemory(to: CChar.self).baseAddress!) }
@@ -420,10 +419,11 @@ public actor MobileClaimsEngine {
                 valid: result.valid_proof != 0, hit: result.meets_target != 0, duration: result.duration_ms, error: code)
             cw_claim_result_free(&result)
             Task {
-                if let self { await self.complete(capture.id, value) }
+                if let self { await self.complete(captureID, value) }
                 else { cw_claim_cancellation_destroy(handle) }
             }
         }
+        return 2_000_000
     }
     private struct NativeProofResult {
         let completed: Bool, proof: String, captured: Bool, validationPassed: Bool, valid: Bool, hit: Bool, duration: Int64, error: String

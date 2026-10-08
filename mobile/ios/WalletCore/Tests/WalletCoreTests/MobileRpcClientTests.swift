@@ -102,7 +102,7 @@ private final class RpcTestWire: RpcWire, @unchecked Sendable {
 
 final class MobileRpcClientTests: XCTestCase {
     private let address = "cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e"
-    private let hash = String(repeating:"aa",count:32)
+    private let fixtureHash = String(repeating:"aa",count:32)
     private func eventually(_ condition: () -> Bool) async throws {
         for _ in 0..<200 { if condition() { return }; try await Task.sleep(nanoseconds:10_000_000) }
         XCTFail("Timed out waiting for local RPC fixture")
@@ -113,10 +113,10 @@ final class MobileRpcClientTests: XCTestCase {
         XCTAssertEqual((normalized["addresses"] as? [String])?.first,address)
         for request in [
             ("getaddresschanges",["addresses":[address,address.uppercased()]]),
-            ("gettransactions",["txids":Array(repeating:hash,count:33)]),
-            ("gettransactions",["txids":[hash,hash.uppercased()]]),
+            ("gettransactions",["txids":Array(repeating:fixtureHash,count:33)]),
+            ("gettransactions",["txids":[fixtureHash,fixtureHash.uppercased()]]),
             ("getaddresshistory",["address":address,"cursor":"invalid\n"]),
-            ("gettransaction",["txid":hash + "\n"]),
+            ("gettransaction",["txid":fixtureHash + "\n"]),
             ("sendrawtransaction",["transaction_hex":"00"]),
             ("subscribetip",[:])
         ] as [(String,JSONObject)] { XCTAssertThrowsError(try MobileRpcClient.validateParams(request.0,request.1)) }
@@ -137,6 +137,44 @@ final class MobileRpcClientTests: XCTestCase {
         }
         let one = try await first.value, two = try await second.value
         XCTAssertEqual(one["method"] as? String,"getchaintip"); XCTAssertEqual(two["method"] as? String,"getrecentblockhashes")
+    }
+    func testSixteenInFlightAndFortyEightTotalBound() async throws {
+        let wire = RpcTestWire(), client = MobileRpcClient(factory:{wire}); defer { client.close() }; client.setActive(true)
+        let tasks: [Task<JSONObject,Error>] = (0..<49).map { _ in Task { try await client.call("getchaintip") } }
+        try await eventually { wire.sent.count == 16 }
+        try await Task.sleep(nanoseconds:40_000_000); XCTAssertEqual(wire.sent.count,16)
+        var answered = 0
+        while answered < 48 {
+            try await eventually { wire.sent.count > answered }
+            let requests = wire.sent
+            XCTAssertLessThanOrEqual(requests.count - answered,16)
+            for request in requests.dropFirst(answered) { wire.reply(request,result:[:]) }
+            answered = requests.count
+        }
+        var completed = 0, busy = 0
+        for task in tasks {
+            do { _ = try await task.value; completed += 1 }
+            catch let failure as RpcFailure { XCTAssertEqual(failure.code,"RPC_BUSY"); busy += 1 }
+        }
+        XCTAssertEqual(completed,48); XCTAssertEqual(busy,1)
+    }
+    func testBountyStreamPublishesOnlyAfterCompleteEnd() async throws {
+        let wire = RpcTestWire(), client = MobileRpcClient(factory:{wire}); defer { client.close() }; client.setActive(true)
+        let stream = Task { try await client.streamBounties(fixtureHash) }
+        try await eventually { wire.sent.count == 1 }; wire.reply(wire.sent[0],result:["stream_id":"public-fixture"])
+        let chunks: [JSONObject] = [
+            ["type":"snapshot","tip":[:],"block_hash":fixtureHash,"unit":"connects","live":true,"cursor":"start.signature"],
+            ["type":"bounties","tip":[:],"items":[]],
+            ["type":"state","tip":[:],"cursor":"end.signature"]
+        ]
+        for (sequence,chunk) in chunks.enumerated() {
+            let message: JSONObject = ["jsonrpc":"2.0","method":"stream.chunk","params":["stream_id":"public-fixture","sequence":sequence,"items":chunk]]
+            wire.emit(try JSON.encode(message) + Data([10]))
+        }
+        let ending: JSONObject = ["jsonrpc":"2.0","method":"stream.end","params":["stream_id":"public-fixture","complete":true,"chunks":3]]
+        wire.emit(try JSON.encode(ending) + Data([10]))
+        let published = try await stream.value; XCTAssertEqual(published.count,3)
+        XCTAssertEqual(published[2]["type"] as? String,"state")
     }
     func testCancelledWrittenReadDrainsLateReplyWithoutPoisoningSibling() async throws {
         let wire = RpcTestWire(), client = MobileRpcClient(factory:{ wire }); defer { client.close() }; client.setActive(true)
@@ -167,13 +205,13 @@ final class MobileRpcClientTests: XCTestCase {
     func testSixPerMinuteParentsQuotaSurvivesEndpointReplacementAndFailedPersist() async throws {
         let clock = RpcTestClock(), firstWire = RpcTestWire(); firstWire.respond = { _ in [:] }
         let original = MobileRpcClient(factory:{firstWire},now:clock.now); defer { original.close() }; original.setActive(true)
-        for _ in 0..<6 { _ = try await original.call("gettransactions",["txids":[hash]]) }
+        for _ in 0..<6 { _ = try await original.call("gettransactions",["txids":[fixtureHash]]) }
         XCTAssertEqual(firstWire.sent.count,6)
         do { _ = try await original.replacing(factory:{RpcTestWire()}) { throw WalletError("disk failed") }; XCTFail("Failed persistence switched endpoint") } catch {}
         _ = try await original.call("getchaintip"); XCTAssertEqual(firstWire.sent.count,7)
         let secondWire = RpcTestWire(); secondWire.respond = { _ in [:] }
         let successor = try await original.replacing(factory:{secondWire}); defer { successor.close() }
-        let waiting = Task { try await successor.call("gettransactions",["txids":[hash]]) }
+        let waiting = Task { try await successor.call("gettransactions",["txids":[fixtureHash]]) }
         try await Task.sleep(nanoseconds:40_000_000); XCTAssertTrue(secondWire.sent.isEmpty)
         clock.advance(60); _ = try await waiting.value; XCTAssertEqual(secondWire.sent.count,1)
         original.setActive(true)

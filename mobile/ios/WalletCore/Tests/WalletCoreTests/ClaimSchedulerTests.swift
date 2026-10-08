@@ -84,4 +84,34 @@ final class ClaimSchedulerTests: XCTestCase {
         scheduler.rebuild([candidate], stats: [:], retired: [], now: 0)
         XCTAssertNil(scheduler.next(now: 0, prepared: false))
     }
+
+    func testOldProbeCompletionDoesNotReleaseNewReservation() throws {
+        let candidate = try row(); candidate.progress.prepared = [:]
+        var observed = ClaimEMA(); observed.connections = 0.000_000_001; observed.totalTime = 1
+        var scheduler = ClaimScheduler()
+        scheduler.rebuild([candidate], stats: [candidate.policy: observed], retired: [], now: 0)
+        let old = try XCTUnwrap(scheduler.next(now: 60, prepared: true))
+        scheduler.reserve(old); scheduler.acknowledge(old, now: 60)
+        let newer = try XCTUnwrap(scheduler.next(now: 120, prepared: true))
+        scheduler.reserve(newer); scheduler.release(old)
+        XCTAssertNil(scheduler.next(now: 120, prepared: true))
+        scheduler.release(newer)
+        XCTAssertNotNil(scheduler.next(now: 120, prepared: true))
+    }
+
+    func testRecoveryProbeCacheStaysBoundedAcrossCatalogPriorityChanges() throws {
+        var rows: [ClaimCandidate] = [], stats: [String: ClaimEMA] = [:]
+        for index in 0..<300 {
+            let candidate = try row(domain: "d\(index).example.com")
+            rows.append(candidate)
+            var observed = ClaimEMA(); observed.connections = 0.000_000_001; observed.totalTime = 1
+            stats[candidate.policy] = observed
+        }
+        var scheduler = ClaimScheduler()
+        scheduler.rebuild(rows, stats: stats, retired: [], now: 0)
+        XCTAssertEqual(scheduler.probeDue.count, 256)
+        for row in rows.prefix(100) { stats[row.policy] = ClaimEMA() }
+        scheduler.rebuild(rows, stats: stats, retired: [], now: 1)
+        XCTAssertLessThanOrEqual(scheduler.probeDue.count, 256)
+    }
 }

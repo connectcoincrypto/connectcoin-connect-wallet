@@ -2715,7 +2715,7 @@ test.describe('wallet security and backup', () => {
     await page.goto('/'); await waitReady(page); await page.locator('#open-settings').click();
     await expect(page.getByRole('heading', { name: 'Security & backup' })).toBeVisible();
     for (const [, id] of actions) await expect(page.locator(`#${id}`)).toBeDisabled();
-    await expect(page.locator('#wallet-security-help')).toContainText('Android app');
+    await expect(page.locator('#wallet-security-help')).toContainText('mobile app');
     await expect(page.locator('input[type=password], input[type=file], [autocomplete="current-password"], [autocomplete="new-password"]')).toHaveCount(0);
     await fakeNative(page, { exists: false, locked: true, accountAddress: null });
     await page.reload(); await waitReady(page); await page.locator('#open-settings').click();

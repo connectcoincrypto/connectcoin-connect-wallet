@@ -33,6 +33,10 @@ template<size_t N> struct Secret {
     std::array<uint8_t,N> bytes{};
     ~Secret() { cw_wallet_wipe(bytes.data(), N); }
 };
+struct SecretKeypair {
+    secp256k1_keypair value{};
+    ~SecretKeypair() { cw_wallet_wipe(&value,sizeof(value)); }
+};
 bool input(const uint8_t *data, size_t size) { return data || size == 0; }
 const uint8_t *nonempty(const uint8_t *data) { static const uint8_t empty{}; return data ? data : &empty; }
 const secp256k1_context *context() {
@@ -99,10 +103,13 @@ extern "C" int cw_wallet_hmac512(const uint8_t *key,size_t key_size,const uint8_
 extern "C" int cw_wallet_pbkdf512(const uint8_t *password,size_t password_size,const uint8_t *salt,size_t salt_size,uint8_t out[64]) {
     if (!input(password,password_size) || !input(salt,salt_size) || password_size>4096 || salt_size>8192 || !out) return 0;
     try {
-        std::vector<uint8_t> first(nonempty(salt),nonempty(salt)+salt_size); first.insert(first.end(),{0,0,0,1});
+        // A fixed wiped buffer avoids a vector reallocation leaving a copy of
+        // the BIP39 passphrase salt in a freed allocation.
+        Secret<8196> first;
+        if(salt_size) std::memcpy(first.bytes.data(),salt,salt_size);
+        first.bytes[salt_size+3]=1;
         Secret<64> u,next;
-        int ok=cw_wallet_hmac512(password,password_size,first.data(),first.size(),u.bytes.data());
-        cw_wallet_wipe(first.data(),first.size());
+        int ok=cw_wallet_hmac512(password,password_size,first.bytes.data(),salt_size+4,u.bytes.data());
         if (!ok) return 0;
         std::memcpy(out,u.bytes.data(),64);
         for (int i=1;i<2048;++i) {
@@ -185,10 +192,10 @@ extern "C" int cw_wallet_session_sign(cw_wallet_session *session,uint32_t index,
     if(!session || !digest || !signature || index>0x7fffffffU || change>1) return 0;
     try {
         std::lock_guard<std::mutex> guard(session->mutex); if(session->locked) return 0;
-        Node node; Secret<32> aux; secp256k1_keypair pair{}; secp256k1_xonly_pubkey pub;
-        if(!session->branches[change].derive(index,node) || !cw_wallet_random(aux.bytes.data(),32) || !secp256k1_keypair_create(context(),&pair,node.key.bytes.data())) return 0;
-        bool ok=secp256k1_schnorrsig_sign32(context(),signature,digest,&pair,aux.bytes.data()) && secp256k1_keypair_xonly_pub(context(),&pub,nullptr,&pair) && secp256k1_schnorrsig_verify(context(),signature,digest,32,&pub);
-        cw_wallet_wipe(&pair,sizeof(pair)); if(ok) return 1;
+        Node node; Secret<32> aux; SecretKeypair pair; secp256k1_xonly_pubkey pub;
+        if(!session->branches[change].derive(index,node) || !cw_wallet_random(aux.bytes.data(),32) || !secp256k1_keypair_create(context(),&pair.value,node.key.bytes.data())) return 0;
+        bool ok=secp256k1_schnorrsig_sign32(context(),signature,digest,&pair.value,aux.bytes.data()) && secp256k1_keypair_xonly_pub(context(),&pub,nullptr,&pair.value) && secp256k1_schnorrsig_verify(context(),signature,digest,32,&pub);
+        if(ok) return 1;
     } catch (...) { }
     cw_wallet_wipe(signature,64); return 0;
 }

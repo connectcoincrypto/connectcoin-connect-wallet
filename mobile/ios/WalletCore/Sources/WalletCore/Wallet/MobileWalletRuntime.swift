@@ -4,15 +4,25 @@ import CConnectWallet
 /// Sole owner of wallet identity and payment approval. The plugin exposes only
 /// named intents; passwords, native confirmation and signing never enter JS.
 public actor MobileWalletRuntime {
-    public static let shared = MobileWalletRuntime()
+    public static let shared: MobileWalletRuntime = {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--wallet-ui-smoke") {
+            return MobileWalletRuntime(directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("connectwallet-ui-smoke-\(UUID().uuidString)", isDirectory: true))
+        }
+        #endif
+        return MobileWalletRuntime()
+    }()
     private let fence = WalletLifecycleFence()
     private let storeResult: Result<DurableWalletStore, Error>
     private var settings: JSONObject = ["theme": "dark", "autoLockMinutes": 0, "rpcHost": "connectcoin4.com", "rpcPort": 48190]
+    private var settingsError: String?
     private var rpc: MobileRpcClient
     private var claims: MobileClaimsEngine
     private var subscriptions: MobileWalletSubscriptions?
     private var signing: VaultSession?, update: NativeVaultUpdateSession?, hd: NativeHdWallet?
     private var publicHd: JSONObject = [:], lastPayment: JSONObject?
+    private var paymentReceiptError: Error?
     private var active = false, paymentBusy = false
     private var paymentPermit: RpcBroadcastPermit?
     private var endpointChanging = false
@@ -35,10 +45,23 @@ public actor MobileWalletRuntime {
 
     public init(directory: URL? = nil) {
         storeResult = Result { try DurableWalletStore(directory: directory) }
-        if let store = try? storeResult.get(), let bytes = try? store.read(.settings, maxBytes: 4096), let value = try? JSON.decode(bytes, maxBytes: 4096),
-           let checked = try? Self.validateSettings(value) { settings = checked }
+        if case .success(let storage) = storeResult {
+            do {
+                if let bytes = try storage.read(.settings, maxBytes: 4096) { settings = try Self.validateSettings(JSON.decode(bytes, maxBytes: 4096)) }
+            } catch {
+                settings["autoLockMinutes"] = 15
+                settingsError = "Saved settings could not be verified. Review and save settings before unlocking or sending."
+            }
+        }
         let endpoint = (try? TcpEndpoint(settings["rpcHost"] as? String ?? "connectcoin4.com", settings["rpcPort"] as? Int ?? 48190)) ?? (try! TcpEndpoint())
         let client = MobileRpcClient(endpoint: endpoint); rpc = client; claims = MobileClaimsEngine(rpc: client)
+        if case .success(let storage) = storeResult {
+            do {
+                if let data = try storage.read(.payment, maxBytes: MobilePaymentReceipt.MAX_BYTES) {
+                    lastPayment = try MobilePaymentReceipt.summary(MobilePaymentReceipt.read(data))
+                }
+            } catch { paymentReceiptError = error }
+        }
     }
     private func store() throws -> DurableWalletStore { try storeResult.get() }
     public func setEventHandler(_ handler: @escaping (String, JSONObject) -> Void) { eventHandler = handler }
@@ -68,6 +91,8 @@ public actor MobileWalletRuntime {
                 "account": publicHd["account"] ?? NSNull(), "accounts": publicHd["accounts"] ?? [],
                 "accountScope": "hd-wallet", "walletId": publicHd["walletId"] ?? NSNull(), "hd": publicHd["hd"] ?? NSNull(),
                 "watch": watch, "lastPayment": lastPayment.map { $0 as Any } ?? NSNull(), "rpcTransport": "tcp",
+                "settingsError": settingsError.map { $0 as Any } ?? NSNull(),
+                "paymentReceiptError": paymentReceiptError == nil ? NSNull() : "The saved payment receipt could not be verified. Preserve wallet storage and check the previous payment before sending again." as Any,
                 "rpcEndpoint": "\(settings["rpcHost"] ?? "connectcoin4.com"):\(settings["rpcPort"] ?? 48190)"]
     }
     private func revoke() -> (UInt64, NativeHdWallet?) {
@@ -86,6 +111,7 @@ public actor MobileWalletRuntime {
     }
     private func live(_ token: UInt64) throws { try Task.checkCancellation(); try fence.check(token); try walletRequire(active, "Open the wallet to continue") }
     public func unlock(password: String) async throws {
+        try requireValidSettings()
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let token = try await revokeForOperation(), envelope = try store().readVault()
         let candidate = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
@@ -104,6 +130,7 @@ public actor MobileWalletRuntime {
         } catch { next.lock(); candidate.close(); throw error }
     }
     public func installMnemonic(_ mnemonic: String, password: String, replace: Bool, imported: Bool) async throws -> JSONObject {
+        try requireValidSettings()
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
         let token = try await revokeForOperation()
@@ -117,6 +144,7 @@ public actor MobileWalletRuntime {
         } catch { candidate.close(); throw error }
     }
     public func importEnvelope(_ data: Data, password: String, replace: Bool) async throws -> JSONObject {
+        try requireValidSettings()
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
         let envelope = try WalletVault.parse(data); let token = try await revokeForOperation()
@@ -141,6 +169,7 @@ public actor MobileWalletRuntime {
         defer { valid.close() }; try live(token); return try valid.payload().string("mnemonic")
     }
     public func changePassword(old: String, new: String) async throws -> JSONObject {
+        try requireValidSettings()
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let token = try await revokeForOperation(), envelope = try store().readVault()
         let changed = try await Task.detached { try WalletVault.changePassword(envelope, currentPassword: old, newPassword: new) }.value
@@ -184,7 +213,7 @@ public actor MobileWalletRuntime {
     public func perform(_ method: String, _ params: JSONObject = [:]) async throws -> JSONObject {
         switch method {
         case "getState": return try await publicState()
-        case "getSettings": return ["settings": settings]
+        case "getSettings": return ["settings": settings, "settingsError": settingsError.map { $0 as Any } ?? NSNull()]
         case "getRecoverySnapshots": return await hd?.recoverySnapshots() ?? ["groups": []]
         case "watchAccount": await refreshSubscriptions(); return try await publicState()
         case "lock": return await lock()
@@ -233,7 +262,8 @@ public actor MobileWalletRuntime {
                 }
                 claims = MobileClaimsEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions()
             } else { try store().write(.settings, JSON.encode(next)); settings = next }
-            return ["settings": settings, "endpointChanged": endpointChanged]
+            settingsError = nil
+            return ["settings": settings, "endpointChanged": endpointChanged, "settingsError": NSNull()]
         case "getPaymentBatch":
             if !paymentBusy, let receipt = try store().receipt() { try store().saveReservations(MobilePaymentBatch.reconcileNotSent(receipt, store().reservations())) }
             let summary = try MobilePaymentBatch.pendingSummary(store().receipt())
@@ -247,6 +277,10 @@ public actor MobileWalletRuntime {
         case "claimsPolicy": return ["state": try await claims.policy(params)]
         case "claimsLimits": return ["state": try await claims.limits(params)]
         case "claimsStart":
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--wallet-ui-smoke") { throw WalletError("Claims are disabled in offline UI tests") }
+            #endif
+            try requireValidSettings()
             try walletRequire(params.count == 1 && active, "Invalid claims start")
             let address = try params.string("address")
             try walletRequire((publicHd["accounts"] as? [JSONObject] ?? []).contains { $0["address"] as? String == address }, "Claims must use your native wallet address")
@@ -258,6 +292,8 @@ public actor MobileWalletRuntime {
     }
 
     public func preparePayment(_ params: JSONObject, p2c: Bool = false) async throws -> JSONObject {
+        try requireValidSettings()
+        try requirePaymentReceipt()
         try walletRequire(active && !paymentBusy && approval == nil, "Finish the current native wallet operation")
         guard let hd, let signing, !signing.isLocked else { throw WalletError("Unlock the wallet first") }
         let token = fence.token(), rpc = self.rpc, fence = self.fence
@@ -354,7 +390,12 @@ public actor MobileWalletRuntime {
         guard (try? live(token)) != nil else { return }
         emit("paymentPreparation", ["address": address, "operation": p2c ? "reviewP2C" : "reviewPayment", "stage": stage, "completed": completed, "total": total, "retryAfterMs": retry])
     }
+    private func requirePaymentReceipt() throws {
+        try walletRequire(paymentReceiptError == nil, "The saved payment receipt could not be verified. Preserve wallet storage and check the previous payment before sending again.")
+    }
+    private func requireValidSettings() throws { if let settingsError { throw WalletError(settingsError) } }
     public func confirmPayment(allowReplacement: Bool = false) async throws -> JSONObject {
+        try requirePaymentReceipt()
         guard let approved = approval, let signing, let hd else { throw WalletError("Review the payment again") }
         try live(approved.token); try walletRequire(!paymentBusy, "Payment already in progress")
         try walletRequire(!approved.replacesPending || allowReplacement, "Replacement was not authorized. Check the previous transaction before retrying.")
@@ -387,7 +428,7 @@ public actor MobileWalletRuntime {
         let signed = try await withTaskCancellationHandler(operation: { try await signingTask.value }, onCancel: { signingTask.cancel(); permit.cancel() })
         try live(token); try check()
         if try approved.plans.contains(where: { try NativeTransactions.amount($0.string("change")) > 0 }) { try await hd.allocateChange(Int(approved.change.integer("index"))) }
-        try check(); publicHd = await hd.snapshot(); try check()
+        try check(); let snapshot = await hd.snapshot(); try check(); publicHd = snapshot
         let storage = try store(), sender = RpcBatchSender(rpc: rpc, permit: permit)
         if let batch = approved.batch {
             let result = try await MobilePaymentBatch.asyncSubmit(walletID, approved.send!.address, batch, signed, store: storage, sender: sender, check: check)

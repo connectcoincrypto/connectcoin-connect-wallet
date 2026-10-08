@@ -115,10 +115,11 @@ struct ClaimEMA {
 /// turns; low-observed-rate recovery probes are bounded to one per minute.
 struct ClaimScheduler {
     struct Entry { let row: ClaimCandidate, score: Double, recovering: Bool, transportDue: Double }
-    struct Selection { let row: ClaimCandidate, recovering: Bool, economic: Bool }
+    struct Selection { let id = UUID(); let row: ClaimCandidate, recovering: Bool, economic: Bool }
     var groups: [String: [Int32: [Entry]]] = [:]
     var probeDue: [String: Double] = [:]
-    var pendingProbes = Set<String>()
+    var pendingProbes: [String: UUID] = [:]
+    private var probeOrder: [String] = []
     private var economic = false
     private var domainAfter = ""
     static func score(_ raw: ClaimInteger, rate: Double, scale: Double = 1) -> Double {
@@ -129,6 +130,7 @@ struct ClaimScheduler {
         groups.removeAll(keepingCapacity: true)
         let policies = Set(rows.map(\.policy))
         probeDue = probeDue.filter { policies.contains($0.key) }
+        probeOrder.removeAll { probeDue[$0] == nil }
         let eligible = rows.filter { $0.supported && $0.state == "available" && !retired.contains($0.key) && $0.budget && $0.raw > ClaimInteger() }
         let healthy = Set(eligible.filter { Self.worth($0, rate: stats[$0.policy]?.rate ?? 5) }.map(\.policy))
         var recovering: [String: ClaimCandidate] = [:]
@@ -137,7 +139,7 @@ struct ClaimScheduler {
         }
         let admitted = recovering.values.sorted(by: ClaimCandidate.before).prefix(256)
         let admittedKeys = Set(admitted.map(\.key))
-        for row in admitted where probeDue[row.policy] == nil { probeDue[row.policy] = now + 60 }
+        for row in admitted { _ = due(row.policy, now: now) }
         for row in eligible {
             let rate = stats[row.policy]?.rate ?? 5
             let recovery = !Self.worth(row, rate: rate)
@@ -151,13 +153,19 @@ struct ClaimScheduler {
             groups[domain]![mask]!.sort { ClaimCandidate.before($0.row, $1.row) }
         } }
     }
-    func next(now: Double, prepared: Bool) -> Selection? {
+    private mutating func due(_ policy: String, now: Double) -> Double {
+        if let value = probeDue[policy] { return value }
+        if probeOrder.count >= 256 { probeDue.removeValue(forKey: probeOrder.removeFirst()) }
+        probeOrder.append(policy); probeDue[policy] = now + 60
+        return now + 60
+    }
+    mutating func next(now: Double, prepared: Bool) -> Selection? {
         var leaders: [Entry] = []
         for domain in groups.keys.sorted() {
             var best: Entry?
             for mask in groups[domain]!.values {
                 guard let row = mask.first, row.transportDue <= now,
-                      !row.recovering || (!pendingProbes.contains(row.row.policy) && (probeDue[row.row.policy] ?? now + 60) <= now) else { continue }
+                      !row.recovering || (pendingProbes[row.row.policy] == nil && due(row.row.policy, now: now) <= now) else { continue }
                 if best == nil || row.score > best!.score || row.score == best!.score && ClaimCandidate.before(row.row, best!.row) { best = row }
             }
             if let best, (best.row.progress.prepared != nil) == prepared { leaders.append(best) }
@@ -170,13 +178,19 @@ struct ClaimScheduler {
     mutating func reserve(_ selected: Selection) {
         if !selected.economic { domainAfter = selected.row.domain }
         economic = !selected.economic
-        if selected.recovering { pendingProbes.insert(selected.row.policy) }
+        if selected.recovering { pendingProbes[selected.row.policy] = selected.id }
     }
     mutating func acknowledge(_ selected: Selection, now: Double) {
-        if selected.recovering { probeDue[selected.row.policy] = now + 60 }
+        if selected.recovering {
+            _ = due(selected.row.policy, now: now)
+            probeOrder.removeAll { $0 == selected.row.policy }; probeOrder.append(selected.row.policy)
+            probeDue[selected.row.policy] = now + 60
+        }
         release(selected)
     }
-    mutating func release(_ selected: Selection) { if selected.recovering { pendingProbes.remove(selected.row.policy) } }
+    mutating func release(_ selected: Selection) {
+        if selected.recovering && pendingProbes[selected.row.policy] == selected.id { pendingProbes.removeValue(forKey: selected.row.policy) }
+    }
     mutating func remove(_ key: String) {
         for domain in groups.keys { for mask in groups[domain]!.keys { groups[domain]![mask]!.removeAll { $0.row.key == key } } }
     }

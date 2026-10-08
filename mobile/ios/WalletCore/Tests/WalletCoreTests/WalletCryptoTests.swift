@@ -51,7 +51,10 @@ final class WalletCryptoTests: XCTestCase {
     func testInvalidAddressesAndIndicesFailClosed() throws {
         let session = try VaultSession(mnemonic: DesktopCryptoVectors.mnemonic); defer { session.close() }
         let address = try session.publicAccount(index: 0, change: 0).string("address")
-        for bad in ["", "t" + address, "CC" + address.dropFirst(2), String(address.dropLast()) + "q", " " + address, address + " "] {
+        let mixedCase = "CC" + String(address.dropFirst(2))
+        let badChecksum = String(address.dropLast()) + "q"
+        let invalidAddresses: [String] = ["", "t" + address, mixedCase, badChecksum, " " + address, address + " "]
+        for bad in invalidAddresses {
             XCTAssertThrowsError(try WalletCrypto.decodeAddress(bad))
         }
         XCTAssertThrowsError(try WalletCrypto.validatePublicKey(Data(repeating: 0, count: 32)))

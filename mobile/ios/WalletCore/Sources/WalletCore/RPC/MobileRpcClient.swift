@@ -93,6 +93,11 @@ final class NetworkRpcWire: RpcWire {
     init(_ endpoint: TcpEndpoint) { self.endpoint = endpoint }
     static func isPublicAddress(_ numeric: String) -> Bool { PublicRpcResolver.isPublic(numeric) }
     func start(queue: DispatchQueue, ready: @escaping () -> Void, receive: @escaping (Data) -> Void, failed: @escaping () -> Void) {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--wallet-ui-smoke") {
+            queue.async { failed() }; return
+        }
+        #endif
         PublicRpcResolver.resolve(endpoint.hostname) { [weak self] numeric in
             queue.async {
                 guard let self else { return }
