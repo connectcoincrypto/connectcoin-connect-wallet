@@ -9,7 +9,7 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo 'An Apple build requires macOS with Xcode 26 or newer.' >&2
   exit 2
 fi
-xcode_version="$(xcodebuild -version | head -n 1 | awk '{print $2}')"
+xcode_version="$(xcodebuild -version | awk 'NR == 1 {print $2}')"
 if [[ "${xcode_version%%.*}" -lt 26 ]]; then echo 'Capacitor 8 requires Xcode 26 or newer.' >&2; exit 2; fi
 command -v cmake >/dev/null
 command -v ninja >/dev/null
