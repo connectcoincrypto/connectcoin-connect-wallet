@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import viteConfig from '../vite.config.mjs';
 
 const mobile = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { DOMParser } = createRequire(path.join(mobile, '../package.json'))('@xmldom/xmldom');
@@ -161,7 +162,8 @@ assert.equal(config.server?.androidScheme, 'https');
 assert.equal(config.server?.errorPath, 'unsupported-webview.html');
 assert.equal(config.server?.url, undefined, 'Never ship a remote WebView development server');
 assert(!config.server?.allowNavigation?.length, 'External WebView origins must not gain native bridge access');
-assert.match(await read(path.join(mobile, 'vite.config.mjs')), /target:\s*'chrome105'/);
+const webTargets = Array.isArray(viteConfig.build.target) ? viteConfig.build.target : [viteConfig.build.target];
+assert.ok(webTargets.includes('chrome105'), 'The build must retain Android WebView 105 support');
 const fallback = await read(path.join(mobile, 'public/unsupported-webview.html'));
 assert.match(fallback, /<html\s+lang="en">/);
 assert.match(fallback, /default-src 'none'/);

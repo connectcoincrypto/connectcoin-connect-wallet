@@ -15,6 +15,7 @@ const pkg = JSON.parse(manifest), locked = JSON.parse(lock), capacitor = JSON.pa
 assert.equal(pkg.dependencies['@capacitor/ios'], '8.5.2');
 assert.equal(locked.packages['node_modules/@capacitor/ios'].version, '8.5.2');
 assert.equal(capacitor.ios.webContentsDebuggingEnabled, false);
+assert.equal(capacitor.ios.contentInset, 'never', 'Native safe-area bounds must not be applied a second time by UIScrollView.');
 assert.equal(capacitor.server.url, undefined, 'Only packaged web assets may run.');
 assert.match(spm, /exact: "8\.5\.2"/);
 assert.match(project, /PBXFileSystemSynchronizedRootGroup/);
@@ -31,6 +32,7 @@ for (const plugin of ['WalletDisabledHttp', 'WalletDisabledCookies', 'WalletBund
 assert.match(bridge, /setURLSchemeHandler\(WalletBundledAssetHandler\(\)/);
 assert.doesNotMatch(bridge, /setURLSchemeHandler\(nil/, 'WebKit cannot unregister an existing scheme handler.');
 assert.match(bridge, /configuration\.copy\(\) as! WKWebViewConfiguration/);
+assert.match(bridge, /webView\.topAnchor\.constraint\(equalTo: container\.safeAreaLayoutGuide\.topAnchor\)/);
 assert.match(bridge, /webView\?\.uiDelegate = restrictedUIDelegate/);
 assert.match(project, /PrivacyInfo\.xcprivacy in Resources/);
 assert.match(plist, /<string>connectcoin<\/string>/);

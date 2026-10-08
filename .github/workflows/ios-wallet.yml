@@ -57,3 +57,17 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 7
+      - name: Upload lightweight Simulator review images and logs
+        if: always() && matrix.mode == 'simulator'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ConnectWallet-iOS-UI-review-${{ github.sha }}
+          path: |
+            mobile/.tools/ios-artifacts/ui-screenshots/
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.json
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.png
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.log
+            mobile/.tools/ios-artifacts/ui-diagnostics/crashes/
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7

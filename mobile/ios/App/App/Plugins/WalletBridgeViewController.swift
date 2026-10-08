@@ -36,6 +36,28 @@ final class WalletBridgeViewController: CAPBridgeViewController {
     }
 
     override func capacitorDidLoad() {
+        if let webView {
+            // Native top/side safe areas keep scrolling content out of the
+            // status bar/notch. CSS sees zero top inset inside this rectangle;
+            // its existing bottom safe-area padding still protects the home bar.
+            let container = UIView()
+            container.backgroundColor = UIColor { traits in
+                traits.userInterfaceStyle == .light
+                    ? UIColor(red: 250 / 255, green: 248 / 255, blue: 253 / 255, alpha: 1)
+                    : UIColor(red: 21 / 255, green: 18 / 255, blue: 29 / 255, alpha: 1)
+            }
+            view = container
+            webView.translatesAutoresizingMaskIntoConstraints = false
+            webView.clipsToBounds = true
+            webView.scrollView.contentInsetAdjustmentBehavior = .never
+            container.addSubview(webView)
+            NSLayoutConstraint.activate([
+                webView.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor),
+                webView.leadingAnchor.constraint(equalTo: container.safeAreaLayoutGuide.leadingAnchor),
+                webView.trailingAnchor.constraint(equalTo: container.safeAreaLayoutGuide.trailingAnchor),
+                webView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ])
+        }
         webView?.uiDelegate = restrictedUIDelegate
         if let webView, let upstream = webView.navigationDelegate as? WKScriptMessageHandler {
             let handler = WalletScriptGuard(upstream: upstream)

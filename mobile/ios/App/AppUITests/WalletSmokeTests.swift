@@ -17,6 +17,7 @@ final class WalletSmokeTests: XCTestCase {
         XCTAssertTrue(create.waitForExistence(timeout: 15))
         expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: create)
         waitForExpectations(timeout: 15)
+        assertNativeTopSafeArea(app, checkHeader: true)
         snapshot(app, "Packaged wallet — clean start")
 
         tapWebButton(app, "Create wallet")
@@ -88,10 +89,29 @@ final class WalletSmokeTests: XCTestCase {
         let lock = app.webViews.buttons["Lock"]
         XCTAssertTrue(lock.waitForExistence(timeout: 90))
         XCTAssertTrue(app.webViews.staticTexts[address].exists)
+        assertNativeTopSafeArea(app, checkHeader: false)
         snapshot(app, "Public fixture — native unlock complete")
         tapWebButton(app, "Lock")
         XCTAssertTrue(app.webViews.buttons["Unlock native wallet"].waitForExistence(timeout: 10))
         XCTAssertEqual(app.state, .runningForeground)
+    }
+
+    @MainActor private func assertNativeTopSafeArea(_ app: XCUIApplication, checkHeader: Bool) {
+        let window = app.windows.firstMatch.frame
+        let web = app.webViews.firstMatch.frame
+        // The CI iPhone has a status bar. Its immutable native safe region must
+        // remain outside the WebView's scrolling rectangle, including on Send.
+        XCTAssertGreaterThan(web.minY, window.minY + 20)
+        XCTAssertLessThan(web.minY, window.minY + 100)
+        XCTAssertEqual(web.maxY, window.maxY, accuracy: 1)
+        if checkHeader {
+            let settings = app.webViews.buttons["Settings"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 10))
+            let topGap = settings.frame.minY - web.minY
+            // The packaged topbar has22px top padding, not another native inset.
+            XCTAssertGreaterThanOrEqual(topGap, 16)
+            XCTAssertLessThanOrEqual(topGap, 40)
+        }
     }
 
     @MainActor private func tapWebButton(_ app: XCUIApplication, _ title: String) {
