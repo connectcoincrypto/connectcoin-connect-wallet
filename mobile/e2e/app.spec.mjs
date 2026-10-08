@@ -498,8 +498,14 @@ test.describe('General settings', () => {
   });
 
   test('server switch clears public state and sweep drafts before ignoring old reads and events', async ({ page }) => {
+    await page.clock.install();
     await openNativeWallet(page, { history: [confirmedHistory], watchConnected: false, deferredMethods: { watchAccount: true } });
     await expect(page.locator('#balance')).toHaveText('1');
+    // Finish the scheduled startup catch-up before suspending manual refresh
+    // replies. Otherwise its balance read can consume the one-shot deferred
+    // response first and leave Refresh disabled while the fixture waits to click.
+    await page.clock.runFor(3000);
+    await expect(page.locator('#refresh')).toBeEnabled();
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await page.locator('#send-address').fill(otherAddress); await page.locator('#send-use-all').click();
     await page.evaluate(() => { window.testNative.deferredMethods = { balance: true, history: true }; });
