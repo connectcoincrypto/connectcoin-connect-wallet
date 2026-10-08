@@ -35,4 +35,6 @@ assert.equal(icon.readUInt32BE(16), 1024); assert.equal(icon.readUInt32BE(20), 1
 assert.equal(icon[25], 2, 'iOS icon must be RGB without an alpha channel.');
 assert.ok(!icon.includes(Buffer.from('tRNS')), 'iOS icon must not include PNG transparency.');
 assert.match(packageManifest, /linkedLibrary\("connectwallet_native"\)/);
+const privacy = await read('ios/App/App/PrivacyInfo.xcprivacy');
+for (const reason of ['CA92.1', '35F9.1', 'C617.1', '3B52.1']) assert.ok(privacy.includes(`<string>${reason}</string>`));
 console.log('iOS host, plugin registration, pinned dependencies and packaging policy checks passed.');

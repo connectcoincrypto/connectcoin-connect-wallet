@@ -48,6 +48,8 @@ bash scripts/build-ios.sh all        # all of the above
 
 The committed opaque 1024×1024 RGB icon is compiled deterministically from the existing repository SVG artwork. To regenerate it, install the root package's locked dependencies and run `node mobile/scripts/build-ios-icon.mjs` from the repository root. Desktop/Android icon masters are not modified.
 
+`App/App/PrivacyInfo.xcprivacy` declares app-private preferences, elapsed-time timers, app-container file metadata and user-selected document metadata according to [Apple's required-reason API definitions](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitypereasons). This is not an App Store privacy-label submission: the publisher still needs to review the actual RPC service's collection/retention practices and complete the distribution declarations.
+
 ## Verification and remaining acceptance
 
 `.github/workflows/ios-wallet.yml` runs macOS Swift tests, native linking, real Simulator/device app builds and UIKit/WKWebView smoke tests. Inspect the workflow for the exact commit; test source is not evidence of a completed passing run. Artifacts are temporary Actions outputs, never a release. The Simulator test creates/deletes only its own new simulator, launches with a Debug-Simulator-only offline flag, uses isolated temporary wallet storage, denies network before DNS and disables claims start. It opens/cancels native creation, recovery and document dialogs plus shared Settings. Screenshot attachments deliberately exclude generated recovery words. It never imports a user wallet, funds a wallet or broadcasts a transaction.

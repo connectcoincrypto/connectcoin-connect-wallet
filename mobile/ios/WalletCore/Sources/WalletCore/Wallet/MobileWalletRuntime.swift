@@ -166,7 +166,9 @@ public actor MobileWalletRuntime {
             // old receiving address and preserve every encrypted backup/password.
             publicHd = [:]
             emit("walletStateChanged", ["locked":true,"account":NSNull(),"accounts":[],"walletId":NSNull()])
-            throw WalletError("Wallet save could not be confirmed. Keep the old encrypted backup and both passwords. Reopen and authenticate the saved wallet before receiving or sending funds")
+            // The native bridge preserves this allowlisted code; shared UI gives
+            // explicit instructions to retain both passwords and all backups.
+            throw WalletError("STORAGE_UNCERTAIN")
         }
     }
     public func installMnemonic(_ mnemonic: String, password: String, replace: Bool, imported: Bool, replacementBackup: Data? = nil) async throws -> JSONObject {
@@ -256,10 +258,18 @@ public actor MobileWalletRuntime {
         guard active, let id = publicHd["walletId"] as? String, let rows = publicHd["accounts"] as? [JSONObject], !rows.isEmpty else { return }
         do {
             if subscriptions == nil {
-                subscriptions = MobileWalletSubscriptions(endpoint: try TcpEndpoint(settings.string("rpcHost"), Int(settings.integer("rpcPort"))), emit: { [weak self] value in Task { await self?.emit("walletChanged", value) } })
+                let endpoint = try TcpEndpoint(settings.string("rpcHost"), Int(settings.integer("rpcPort"))), generation = rpcGeneration
+                let label = "\(endpoint.hostname):\(endpoint.port)"
+                subscriptions = MobileWalletSubscriptions(endpoint: endpoint, emit: { [weak self] value in
+                    Task { await self?.acceptWatch(value, generation:generation, endpoint:label) }
+                })
             }
             try await subscriptions?.configure(id, rows.map { try $0.string("address") })
         } catch { /* Native watch state remains explicitly disconnected. */ }
+    }
+    private func acceptWatch(_ value: JSONObject, generation: UInt64, endpoint: String) {
+        guard active && generation == rpcGeneration && value["address"] as? String == publicHd["walletId"] as? String else { return }
+        var event = value; event["rpcEndpoint"] = endpoint; emit("walletChanged", event)
     }
     private static func validateSettings(_ value: JSONObject) throws -> JSONObject {
         try walletRequire(Set(value.keys) == Set(["theme", "autoLockMinutes", "rpcHost", "rpcPort"]), "Invalid wallet settings")

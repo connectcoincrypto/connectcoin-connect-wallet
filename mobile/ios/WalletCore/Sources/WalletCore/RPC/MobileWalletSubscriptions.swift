@@ -141,7 +141,7 @@ public actor MobileWalletSubscriptions {
     }
     private func event(_ reason: String, tip: JSONObject?, reorg: Bool, changed: [String]) {
         var value: JSONObject = ["address": walletID, "reason": reason, "reorg": reorg,
-            "changedAddresses": changed, "resyncRequired": false, "watched": identifiers.count,
+            "changedAddresses": changed, "resync_required": false, "watched": identifiers.count,
             "total": addresses.count, "coverageLimited": identifiers.count < addresses.count]
         if let tip { value["tip"] = tip }; emit(value)
     }

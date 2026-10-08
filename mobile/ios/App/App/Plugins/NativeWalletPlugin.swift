@@ -202,7 +202,23 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
     @objc func claimsState(_ call: CAPPluginCall) { simple(call, "claimsState") }
     @objc func claimsPolicy(_ call: CAPPluginCall) { simple(call, "claimsPolicy", empty: false) }
     @objc func claimsLimits(_ call: CAPPluginCall) { simple(call, "claimsLimits", empty: false) }
-    @objc func claimsStart(_ call: CAPPluginCall) { simple(call, "claimsStart", empty: false) }
+    @objc func claimsStart(_ call: CAPPluginCall) {
+        let params = parameters(call)
+        Task { @MainActor in
+            self.begin(call) {
+                try walletRequire(params.count == 1, "Invalid claims start")
+                let address = try params.string("address")
+                _ = try WalletCrypto.decodeAddress(address)
+                let wallet = try await self.runtime.publicState()
+                try walletRequire((wallet["accounts"] as? [JSONObject] ?? []).contains { $0["address"] as? String == address }, "Claims must use your native wallet address")
+                let state = try await self.runtime.perform("claimsState").object("state")
+                try await self.ui.confirm(title: "Start Automatic Claims?",
+                    message: "Public reward address:\n\(address)\n\nThis performs public TLS proof work and can use substantial battery and network data. It runs only while the wallet is visible, pauses in the background, and does not unlock or spend your wallet.\n\nLimits: \(state["connectionsPerSecondLimit"] ?? 100) connection starts/second and \(state["concurrency"] ?? 100) simultaneous attempts. Mobile data: \(state["allowMobileData"] as? Bool == true ? "allowed" : "disabled").",
+                    button: "Start foreground claims")
+                return try await self.runtime.perform("claimsStart", params)
+            }
+        }
+    }
     @objc func claimsStop(_ call: CAPPluginCall) { simple(call, "claimsStop") }
     @objc func claimsCheckSubmission(_ call: CAPPluginCall) { simple(call, "claimsCheckSubmission") }
 
@@ -360,7 +376,7 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
         Task { @MainActor in
             self.begin(call) {
                 var values = try await self.ui.form(title: "Change wallet password",
-                    message: "This changes the password for the wallet on this device. Previously exported backups keep their original password.",
+                    message: "This changes the password for the wallet on this device. Previously exported backups keep their original password. If saving fails or cannot be verified, keep both passwords and your existing encrypted backup until reopening confirms which password works.",
                     fields: [.init(key: "old", label: "Current password", secure: true),
                              .init(key: "new", label: "New password", secure: true),
                              .init(key: "confirm", label: "Confirm new password", secure: true)], button: "Change password") { values in

@@ -61,13 +61,15 @@ final class PaymentReceiptTests: XCTestCase {
         let runtime = MobileWalletRuntime(directory: directory), state = try await runtime.publicState()
         XCTAssertFalse(try PJ.string(state["settingsError"]).isEmpty)
         let configuration = try await runtime.perform("getSettings")
-        XCTAssertEqual(try PJ.integer(PJ.object(configuration["settings"])["autoLockMinutes"]), 15)
+        XCTAssertEqual(try PJ.integer(configuration["autoLockMinutes"]), 15)
+        XCTAssertEqual(configuration["rpcHost"] as? String, "connectcoin4.com")
         await runtime.setActive(true)
         do { try await runtime.unlock(password: "public fixture"); XCTFail("Malformed settings must block unlocking") } catch { XCTAssertTrue(error.localizedDescription.contains("settings")) }
         let corrected: JSONObject = ["theme": "dark", "autoLockMinutes": 5, "rpcHost": "connectcoin4.com", "rpcPort": 48190]
         _ = try await runtime.perform("saveSettings", corrected)
         let repaired = try await runtime.perform("getSettings")
-        XCTAssertTrue(PJ.null(repaired["settingsError"])); XCTAssertEqual(try PJ.integer(PJ.object(repaired["settings"])["autoLockMinutes"]), 5)
+        let repairedState = try await runtime.publicState()
+        XCTAssertTrue(PJ.null(repairedState["settingsError"])); XCTAssertEqual(try PJ.integer(repaired["autoLockMinutes"]), 5)
         await runtime.setActive(false)
     }
 }
