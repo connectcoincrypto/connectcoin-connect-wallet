@@ -1,10 +1,14 @@
 name: Mobile alpha checks
 
-# Temporary alpha branch only. No tags, GitHub Release, store upload, real wallet
+# Development checks on main and mobile branches. No tags, GitHub Release, store upload, real wallet
 # profile, production claims, signing key, or live RPC query is used by these jobs.
 on:
   push:
-    branches: [mobile-alpha]
+    branches: [main, mobile-alpha]
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-alpha.yml']
+  pull_request:
+    branches: [main]
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-alpha.yml']
   workflow_dispatch:
 
 permissions:

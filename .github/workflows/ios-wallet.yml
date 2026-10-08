@@ -3,9 +3,10 @@ name: iOS wallet checks
 on:
   workflow_dispatch:
   push:
-    branches: ['ios-*', 'mobile-ios-*']
+    branches: [main, 'ios-*', 'mobile-ios-*']
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', '.github/workflows/ios-wallet.yml']
   pull_request:
-    paths: ['mobile/**', '.github/workflows/ios-wallet.yml']
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', '.github/workflows/ios-wallet.yml']
 
 permissions:
   contents: read
