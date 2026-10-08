@@ -45,21 +45,21 @@ final class HdWalletTests: XCTestCase {
     func testEmptyDiscoveryChecksBothBranchesOnceAndReusesFirstPages() async throws {
         let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
         let wire = HdWire(), rpc = MobileRpcClient(factory: { wire }); rpc.setActive(true); defer { rpc.close() }
-        try await hd.recover(rpc: rpc, progress: { _ in })
+        try await hd.recover(reader: { try await rpc.call($0, $1) }, environment: HdRetryEnvironment(isOnline: { true }, jitter: { 0 }), progress: { _ in })
         let state = await hd.snapshot(), groups = await hd.recoverySnapshots()
         XCTAssertEqual(try state.object("hd").boolean("complete"), true)
         XCTAssertEqual(try state.array("accounts").count, 40)
         XCTAssertEqual(wire.count("getaddresshistory"), 40)
         XCTAssertEqual(wire.count("getaddresschanges"), 1)
         XCTAssertEqual(try JSON.object(groups.array("groups")[0]).array("histories").count, 40)
-        try await hd.recover(rpc: rpc, progress: { _ in })
+        try await hd.recover(reader: { try await rpc.call($0, $1) }, environment: HdRetryEnvironment(isOnline: { true }, jitter: { 0 }), progress: { _ in })
         XCTAssertEqual(wire.count("getaddresshistory"), 40)
     }
     func testUsedFirstAddressExtendsGapWithoutRescanningPrefix() async throws {
         let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
         let first = try signing.publicAccount(index: 0, change: 0).string("address")
         let wire = HdWire(positive: first), rpc = MobileRpcClient(factory: { wire }); rpc.setActive(true); defer { rpc.close() }
-        try await hd.recover(rpc: rpc, progress: { _ in })
+        try await hd.recover(reader: { try await rpc.call($0, $1) }, environment: HdRetryEnvironment(isOnline: { true }, jitter: { 0 }), progress: { _ in })
         let state = await hd.snapshot()
         XCTAssertEqual(try state.object("hd").integer("lastUsedReceive"), 0)
         XCTAssertEqual(try state.object("hd").integer("receiveIndex"), 1)
@@ -69,7 +69,7 @@ final class HdWalletTests: XCTestCase {
     func testLegacyServerDiscoveryRemainsCompleteButHasNoReusableCheckpoint() async throws {
         let (hd, signing, vault) = try fixture(); defer { signing.lock(); vault.close() }
         let wire = HdWire(legacy: true), rpc = MobileRpcClient(factory: { wire }); rpc.setActive(true); defer { rpc.close() }
-        try await hd.recover(rpc: rpc, progress: { _ in })
+        try await hd.recover(reader: { try await rpc.call($0, $1) }, environment: HdRetryEnvironment(isOnline: { true }, jitter: { 0 }), progress: { _ in })
         let state = await hd.snapshot(), cache = await hd.recoverySnapshots()
         XCTAssertEqual(try state.object("hd").boolean("complete"), true)
         XCTAssertTrue(try cache.array("groups").isEmpty)

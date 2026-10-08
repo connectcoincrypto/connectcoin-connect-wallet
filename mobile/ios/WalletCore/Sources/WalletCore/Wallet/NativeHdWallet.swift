@@ -10,6 +10,9 @@ public actor NativeHdWallet {
     private var receiveIndex: Int, changeIndex: Int, lastReceive: Int, lastChange: Int
     private var complete: Bool, recovering = false, closed = false, scanned = 0
     private var error = "", groups: [JSONObject] = []
+    private var recoveryState = "paused", errorCode = "", retryAfterMs = 0, retryAttempt = 0
+    private var retryRevision: UInt64 = 0
+    private var recoveryLease: HdRecoveryLease?
     private let walletID: String
 
     public init(session: VaultSession, vault: NativeVaultUpdateSession, persist: @escaping (JSONObject) throws -> Void) throws {
@@ -41,7 +44,9 @@ public actor NativeHdWallet {
         return ["walletId": walletID, "account": paths["0:\(receiveIndex)"] ?? [:], "accounts": ordered,
                 "hd": ["complete": complete, "recovering": recovering, "scanned": scanned,
                        "receiveIndex": receiveIndex, "changeIndex": changeIndex, "lastUsedReceive": lastReceive,
-                       "lastUsedChange": lastChange, "error": error] as JSONObject]
+                       "lastUsedChange": lastChange, "error": error, "errorCode": errorCode,
+                       "recoveryState": complete ? "complete" : recoveryState,
+                       "retryAfterMs": retryAfterMs, "retryAttempt": retryAttempt] as JSONObject]
     }
     public func accounts() -> [JSONObject] { snapshot()["accounts"] as? [JSONObject] ?? [] }
     public func account() throws -> JSONObject { try derive(receiveIndex, 0) }
@@ -52,7 +57,8 @@ public actor NativeHdWallet {
     private func save(_ payload: JSONObject) throws { try check(); try vault.save(payload, writer: { try self.persist($0) }); try check() }
     public func requestRecovery() throws {
         try check(); try walletRequire(!recovering, "HD recovery is already running")
-        complete = false; groups = []; error = ""
+        complete = false; groups = []; error = ""; errorCode = ""; recoveryState = "paused"
+        retryAfterMs = 0; retryAttempt = 0
         var payload = try vault.payload(); payload["needsRecovery"] = true; payload["mobileHdRecovered"] = false; try save(payload)
     }
     public func newAddress() throws -> JSONObject {
@@ -89,19 +95,50 @@ public actor NativeHdWallet {
             throw error
         }
     }
-    public func close() { closed = true; groups = []; vault.close() }
+    public func close() {
+        recoveryLease?.cancel(); closed = true; groups = []; recovering = false
+        recoveryState = "paused"; retryAfterMs = 0; vault.close()
+    }
+
+    private func retryProgress(_ status: HdRetryStatus, _ progress: (JSONObject) async -> Void) async {
+        guard !closed && !session.isLocked && status.revision > retryRevision else { return }
+        retryRevision = status.revision; recoveryState = status.state
+        retryAfterMs = status.retryAfterMs; retryAttempt = status.retryAttempt; errorCode = status.errorCode
+        await progress(snapshot())
+    }
 
     /// Capture a journal watermark before history reads and reuse those first pages
     /// for initial balances. Sixteen requests share one socket and its method quota.
-    public func recover(rpc: MobileRpcClient, progress: @escaping (JSONObject) -> Void) async throws {
+    public func recover(rpc: MobileRpcClient, progress: @escaping (JSONObject) async -> Void) async throws {
+        try await recover(reader: { try await rpc.call($0, $1) }, progress: progress)
+    }
+
+    /// Injectable public-read seam: tests never need a node, keys on the wire,
+    /// wall-clock backoff, or an alternative production endpoint.
+    func recover(reader: @escaping HdRetryCoordinator.Reader, environment: HdRetryEnvironment = .live,
+                 ownership: @escaping () throws -> Void = {},
+                 progress: @escaping (JSONObject) async -> Void) async throws {
         try check(); guard !complete else { return }; try walletRequire(!recovering, "HD recovery is already running")
-        recovering = true; scanned = 0; error = ""; groups = []
-        defer { recovering = false; progress(snapshot()) }
+        recovering = true; scanned = 0; error = ""; errorCode = ""; groups = []
+        recoveryState = "scanning"; retryAfterMs = 0; retryAttempt = 0; retryRevision = 0
+        let lease = HdRecoveryLease(), session = self.session
+        recoveryLease = lease
+        let retries = HdRetryCoordinator(environment: environment, check: {
+            try lease.check()
+            do { try ownership() } catch { throw CancellationError() }
+            if session.isLocked { throw CancellationError() }
+        }, progress: { status in await self.retryProgress(status, progress) })
+        defer {
+            lease.cancel()
+            if recoveryLease === lease { recoveryLease = nil; recovering = false }
+        }
         var next = [0, 0], gaps = [0, 0], used = [lastReceive, lastChange], done = [false, false]
         let minimum = [max(receiveIndex, lastReceive + Self.gap), max(changeIndex, lastChange + Self.gap)]
         var retainedBytes = 0, legacy = false
         do {
-            var payload = try vault.payload(); payload["needsRecovery"] = true; try save(payload)
+            var payload: JSONObject
+            do { payload = try vault.payload(); payload["needsRecovery"] = true; try save(payload) }
+            catch { try check(); throw HdRecoveryFailure.storage }
             while !done.allSatisfy({ $0 }) {
                 try check()
                 var members: [(Int, Int, JSONObject)] = []
@@ -109,7 +146,12 @@ public actor NativeHdWallet {
                 for branch in 0...1 where !done[branch] {
                     let boundary = max(minimum[branch], next[branch] + Self.gap - gaps[branch] - 1)
                     for index in next[branch]...min(boundary, next[branch] + 49) {
-                        members.append((branch, index, try derive(index, branch)))
+                        do { members.append((branch, index, try derive(index, branch))) }
+                        catch {
+                            try check()
+                            if paths.count >= Self.maxAccounts || index > Int(Int32.max) { throw HdRecoveryFailure.resource }
+                            throw HdRecoveryFailure.derivation
+                        }
                     }
                 }
                 let byBranch = [members.filter { $0.0 == 0 }, members.filter { $0.0 == 1 }]
@@ -117,11 +159,16 @@ public actor NativeHdWallet {
                 for offset in 0..<max(byBranch[0].count, byBranch[1].count) {
                     for branch in 0...1 where offset < byBranch[branch].count { members.append(byBranch[branch][offset]) }
                 }
-                progress(snapshot())
+                await progress(snapshot()); try check()
                 let addresses = try members.map { try $0.2.string("address") }
                 var checkpoint: JSONObject?
                 if !legacy {
-                    do { checkpoint = try await rpc.call("getaddresschanges", ["addresses": addresses]); try Self.validateWatermark(checkpoint!) }
+                    do {
+                        checkpoint = try await retries.call("getaddresschanges", ["addresses": addresses], reader: { method, params in
+                            let value = try await reader(method, params)
+                            try Self.validateWatermark(value); return value
+                        })
+                    }
                     catch let failure as RpcFailure where failure.code == "-32601" { legacy = true; groups = []; retainedBytes = 0 }
                 }
                 try check()
@@ -136,15 +183,18 @@ public actor NativeHdWallet {
                             for _ in 0..<1000 {
                                 try Task.checkCancellation()
                                 var params: JSONObject = ["address": address]; if let cursor { params["cursor"] = cursor }
-                                let page = try await rpc.call("getaddresshistory", params)
-                                let positive = try Self.historyUsed(page, address)
+                                let page = try await retries.call("getaddresshistory", params, reader: { method, params in
+                                    let value = try await reader(method, params)
+                                    _ = try Self.historyUsed(value, address); return value
+                                })
+                                let positive = try !page.array("items").isEmpty
                                 if first == nil { first = page }
                                 if positive || page.isNull("next_cursor") { return (offset, positive, first!) }
                                 let next = try page.string("next_cursor")
                                 try walletRequire(cursors.insert(next).inserted, "Repeated HD history cursor")
                                 cursor = next
                             }
-                            throw WalletError("HD history pagination limit reached")
+                            throw HdRecoveryFailure.resource
                         }
                     }
                     while submitted < min(16, members.count) { enqueue(submitted); submitted += 1 }
@@ -158,18 +208,25 @@ public actor NativeHdWallet {
                             }
                         }
                         results[result.0] = (result.1, retainGroup ? result.2 : nil)
+                        // Publish only each branch's validated contiguous prefix.
+                        // Out-of-order replies remain buffered until their gap is
+                        // justified; retries never reset pages or gap counters.
+                        for branch in 0...1 {
+                            while let offset = members.firstIndex(where: { $0.0 == branch && $0.1 == next[branch] }),
+                                  let ready = results[offset] {
+                                let index = members[offset].1
+                                try walletRequire(!done[branch], "Invalid HD scan ordering")
+                                if ready.0 { used[branch] = max(used[branch], index); gaps[branch] = 0 } else { gaps[branch] += 1 }
+                                scanned += 1; next[branch] += 1
+                                if index >= minimum[branch] && gaps[branch] >= Self.gap { done[branch] = true }
+                            }
+                        }
+                        await progress(snapshot()); try check()
                         if submitted < members.count { enqueue(submitted); submitted += 1 }
                     }
                 }
                 try check()
-                for (offset, member) in members.enumerated() {
-                    guard let result = results[offset] else { throw WalletError("Incomplete HD discovery") }
-                    let branch = member.0, index = member.1
-                    try walletRequire(index == next[branch] && !done[branch], "Invalid HD scan ordering")
-                    if result.0 { used[branch] = max(used[branch], index); gaps[branch] = 0 } else { gaps[branch] += 1 }
-                    scanned += 1; next[branch] += 1
-                    if index >= minimum[branch] && gaps[branch] >= Self.gap { done[branch] = true }
-                }
+                try walletRequire(results.count == members.count, "Incomplete HD discovery")
                 if retainGroup, let checkpoint {
                     let histories: [JSONObject] = try members.indices.map {
                         guard let result = results[$0], let page = result.1 else { throw WalletError("Incomplete HD cache group") }; return page
@@ -178,17 +235,33 @@ public actor NativeHdWallet {
                     let size = try JSON.encode(group).count
                     if retainedBytes + size <= 8 * 1024 * 1024 { groups.append(group); retainedBytes += size }
                 }
-                progress(snapshot())
+                await progress(snapshot()); try check()
             }
             lastReceive = used[0]; lastChange = used[1]
             receiveIndex = max(receiveIndex, lastReceive + 1); changeIndex = max(changeIndex, lastChange + 1)
-            _ = try derive(receiveIndex, 0); _ = try derive(changeIndex, 1)
-            payload = try vault.payload()
+            do { _ = try derive(receiveIndex, 0); _ = try derive(changeIndex, 1) }
+            catch { try check(); throw paths.count >= Self.maxAccounts ? HdRecoveryFailure.resource : HdRecoveryFailure.derivation }
+            do { payload = try vault.payload() }
+            catch { try check(); throw HdRecoveryFailure.storage }
             payload["receiveIndex"] = receiveIndex; payload["changeIndex"] = changeIndex
             payload["lastUsedReceive"] = lastReceive; payload["lastUsedChange"] = lastChange
             payload["needsRecovery"] = false; payload["scanLookahead"] = true; payload["mobileHdRecovered"] = true
-            try save(payload); complete = true
-        } catch { self.error = "HD recovery is incomplete. Check your connection and rescan addresses."; throw error }
+            do { try save(payload) }
+            catch { try check(); throw HdRecoveryFailure.storage }
+            complete = true; recovering = false; recoveryState = "complete"; retryAfterMs = 0; retryAttempt = 0; errorCode = ""
+            await progress(snapshot())
+        } catch {
+            recovering = false; retryAfterMs = 0
+            if closed || session.isLocked || Task.isCancelled || error is CancellationError {
+                recoveryState = "paused"; self.error = ""; errorCode = ""
+            } else {
+                let failure = (error as? HdRecoveryFailure) ?? .invalid
+                recoveryState = "failed"; self.error = failure.message; errorCode = failure.code
+                // A journal reset invalidates every watermark held by this run.
+                if failure.code == HdRecoveryFailure.rescan.code { groups = [] }
+            }
+            await progress(snapshot()); throw error
+        }
     }
     private static func validateWatermark(_ value: JSONObject) throws {
         try walletRequire(Set(value.keys) == Set(["tip", "unit", "changes", "next_cursor", "has_more", "through_sequence", "journal_epoch"]) && value["unit"] as? String == "connects", "Invalid HD checkpoint")
