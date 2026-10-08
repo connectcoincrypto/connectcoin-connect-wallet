@@ -12,6 +12,9 @@ const [manifest, lock, project, plist, scene, bridge, spm, config, packageManife
   read('capacitor.config.json'), read('ios/WalletCore/Package.swift'),
 ]);
 const pkg = JSON.parse(manifest), locked = JSON.parse(lock), capacitor = JSON.parse(config);
+assert.equal(capacitor.appName, 'ConnectWallet');
+assert.match(plist, /<key>CFBundleDisplayName<\/key>\s*<string>ConnectWallet<\/string>/);
+assert.match(await read('index.html'), /<title>ConnectWallet<\/title>/);
 assert.equal(pkg.dependencies['@capacitor/ios'], '8.5.2');
 assert.equal(locked.packages['node_modules/@capacitor/ios'].version, '8.5.2');
 assert.equal(capacitor.ios.webContentsDebuggingEnabled, false);

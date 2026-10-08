@@ -70,6 +70,12 @@ build_app() {
   test -d "$product"
   test -s "$product/PrivacyInfo.xcprivacy"
   /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$product/Info.plist"
+  local display_name
+  display_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$product/Info.plist")"
+  if [[ "$display_name" != ConnectWallet ]]; then
+    echo "Unexpected installed app name: $display_name" >&2; exit 1
+  fi
+  echo "Verified installed app name: $display_name"
   xcrun lipo -info "$product/App"
   # These are explicitly labelled app bundles, not installable/signed IPAs.
   ditto -c -k --sequesterRsrc --keepParent "$product" "$artifact_dir/ConnectWallet-$label.app.zip"

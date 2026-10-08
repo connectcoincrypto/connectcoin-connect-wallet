@@ -3,7 +3,7 @@ name: iOS wallet checks
 on:
   workflow_dispatch:
   push:
-    branches: ['codex/ios-*', 'codex/mobile-ios-*']
+    branches: ['ios-*', 'mobile-ios-*']
   pull_request:
     paths: ['mobile/**', '.github/workflows/ios-wallet.yml']
 
