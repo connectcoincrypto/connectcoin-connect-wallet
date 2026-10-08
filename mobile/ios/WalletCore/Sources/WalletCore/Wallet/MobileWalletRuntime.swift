@@ -120,7 +120,8 @@ public actor MobileWalletRuntime {
         let candidate = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
         do { try live(token); try await adopt(candidate, token: token) } catch { candidate.close(); throw error }
     }
-    private func adopt(_ candidate: NativeVaultUpdateSession, token: UInt64, lockAfterCommit: Bool = false, beforePublish: (() async throws -> Void)? = nil) async throws {
+    private func adopt(_ candidate: NativeVaultUpdateSession, token: UInt64, lockAfterCommit: Bool = false,
+                       beforeCommit: (() async throws -> Void)? = nil, commit: (() throws -> Void)? = nil) async throws {
         try live(token)
         let payload = try candidate.payload(), next = try VaultSession(mnemonic: payload.string("mnemonic"), passphrase: payload.string("passphrase"))
         let store = try self.store(), fence = self.fence
@@ -129,14 +130,22 @@ public actor MobileWalletRuntime {
             let snapshot = await nextHd.snapshot()
             // Validate and derive the entire supported HD state before replacing
             // any saved vault. A valid desktop vault may exceed iOS capacity.
-            try live(token); try await beforePublish?()
+            try live(token); try await beforeCommit?(); try live(token)
+            try commit?()
+            // No suspension or cancellation check between successful durable
+            // commit and publication: a changed password cannot be reported as
+            // cancelled merely because backgrounding raced the final save.
             if lockAfterCommit {
-                try live(token); next.lock(); candidate.close(); await nextHd.close(); try live(token)
-                publicHd = snapshot; emit("walletStateChanged", try await publicState()); await refreshSubscriptions(); return
+                next.lock(); candidate.close(); publicHd = snapshot
+                Task { await nextHd.close() }
+                // Password rotation does not start discovery or a new watch.
+                // Existing public subscriptions may remain; the UI can request
+                // its own watch after receiving this locked state.
+                emit("walletStateChanged", try await publicState()); return
             }
-            try live(token); signing = next; update = candidate; hd = nextHd; publicHd = snapshot
-            try live(token); noteUserInteraction(); emit("walletStateChanged", try await publicState())
-            await refreshSubscriptions(); startRecovery(nextHd, token)
+            signing = next; update = candidate; hd = nextHd; publicHd = snapshot
+            noteUserInteraction(); emit("walletStateChanged", try await publicState())
+            await refreshSubscriptions(); if (try? live(token)) != nil { startRecovery(nextHd, token) }
         } catch { next.lock(); candidate.close(); throw error }
     }
     private func beginCustody() throws {
@@ -181,8 +190,9 @@ public actor MobileWalletRuntime {
             return try WalletVault.createForUpdate(payload, password: password)
         }.value
         do {
-            try await adopt(candidate, token: token, beforePublish: {
+            try await adopt(candidate, token: token, beforeCommit: {
                 try await self.stopClaimsForReplacement(token)
+            }, commit: {
                 try self.fence.commit(token) {
                     try self.verifiedReplacement(storage, replace:replace, backup:replacementBackup)
                     try self.commitCustody(storage, candidate.envelope(), token)
@@ -201,8 +211,9 @@ public actor MobileWalletRuntime {
             try session.save(payload, writer: { _ in }); return session
         }.value
         do {
-            try await adopt(candidate, token: token, beforePublish: {
+            try await adopt(candidate, token: token, beforeCommit: {
                 try await self.stopClaimsForReplacement(token)
+            }, commit: {
                 try self.fence.commit(token) {
                     try self.verifiedReplacement(storage, replace:replace, backup:replacementBackup)
                     try self.commitCustody(storage, candidate.envelope(), token)
@@ -235,7 +246,7 @@ public actor MobileWalletRuntime {
         let changed = try await Task.detached { try WalletVault.changePassword(envelope, currentPassword: old, newPassword: new) }.value
         let candidate = try await Task.detached { try WalletVault.openForUpdate(changed, password: new) }.value
         do {
-            try await adopt(candidate, token: token, lockAfterCommit:true, beforePublish: { try self.commitCustody(self.store(), changed, token) })
+            try await adopt(candidate, token: token, lockAfterCommit:true, commit: { try self.commitCustody(self.store(), changed, token) })
             return try await publicState()
         } catch { candidate.close(); throw error }
     }

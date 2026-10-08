@@ -5,7 +5,7 @@ import Capacitor
 public final class NativeExplorerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "NativeExplorerPlugin"
     public let jsName = "NativeExplorer"
-    public let pluginMethods = [CAPPluginMethod(name: "openTransaction", returnType: CAPPluginReturnPromise)]
+    public let pluginMethods: [CAPPluginMethod] = [CAPPluginMethod(name: "openTransaction", returnType: CAPPluginReturnPromise)!]
     private var opening = false
 
     @objc func openTransaction(_ call: CAPPluginCall) {

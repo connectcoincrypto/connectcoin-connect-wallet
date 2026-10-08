@@ -13,6 +13,11 @@ final class WalletCryptoTests: XCTestCase {
             "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04")
         XCTAssertEqual(try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "caf\u{00e9}"),
             try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "cafe\u{0301}"))
+        // Independent Node/OpenSSL PBKDF2 vector: NFKD expands this valid
+        // 1,024-unit passphrase to a 33,800-byte BIP39 salt.
+        let expanded = String(repeating:"\u{fdfa}",count:1024)
+        let expandedSeed = try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic,expanded)
+        XCTAssertEqual(WalletCrypto.hex(expandedSeed),"ccecde153fb813776d910a53e68efb8d64ded6558c852eade3a7e365d2be9fe2845d8f9a4192677a7ca47d9c08a36c885f1cdc2b4037a3955eb63fa6687de304")
         XCTAssertFalse(WalletCrypto.validateMnemonic(Array(repeating: "abandon", count: 12).joined(separator: " ")))
         XCTAssertThrowsError(try WalletCrypto.generateMnemonic(15))
         XCTAssertThrowsError(try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, String(repeating: "x", count: 1025)))

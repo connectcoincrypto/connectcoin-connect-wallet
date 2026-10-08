@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C011EC700000000000000200 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = C011EC700000000000000201; };
 		C011EC700000000000000001 /* WalletCore in Frameworks */ = {isa = PBXBuildFile; productRef = C011EC700000000000000002 /* WalletCore */; };
 		C011EC700000000000000003 /* ThirdPartyLicenses in Resources */ = {isa = PBXBuildFile; fileRef = C011EC700000000000000004 /* ThirdPartyLicenses */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
@@ -25,6 +26,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		C011EC700000000000000201 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		C011EC700000000000000101 /* AppUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C011EC700000000000000004 /* ThirdPartyLicenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdPartyLicenses; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
@@ -89,6 +91,7 @@
 			children = (
 				9582B6822FE993A50072D4E8 /* SceneDelegate.swift */,
 				C011EC700000000000000005 /* Plugins */,
+				C011EC700000000000000201 /* PrivacyInfo.xcprivacy */,
 				C011EC700000000000000004 /* ThirdPartyLicenses */,
 				50379B222058CBB4000EE86E /* capacitor.config.json */,
 				504EC3071FED79650016851F /* AppDelegate.swift */,
@@ -188,6 +191,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */,
+				C011EC700000000000000200 /* PrivacyInfo.xcprivacy in Resources */,
 				C011EC700000000000000003 /* ThirdPartyLicenses in Resources */,
 				50B271D11FEDC1A000F3C39B /* public in Resources */,
 				504EC30F1FED79650016851F /* Assets.xcassets in Resources */,

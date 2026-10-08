@@ -68,6 +68,7 @@ build_app() {
     CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= build
   local product="$native_root/$sdk/DerivedData/Build/Products/Release-$sdk/App.app"
   test -d "$product"
+  test -s "$product/PrivacyInfo.xcprivacy"
   /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$product/Info.plist"
   xcrun lipo -info "$product/App"
   # These are explicitly labelled app bundles, not installable/signed IPAs.

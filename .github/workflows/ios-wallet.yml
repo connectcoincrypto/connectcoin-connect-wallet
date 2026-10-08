@@ -16,9 +16,13 @@ concurrency:
 
 jobs:
   ios:
-    name: Swift core tests and unsigned iOS apps
+    name: iOS ${{ matrix.mode }}
     runs-on: macos-15
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [core, simulator, device]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -40,13 +44,13 @@ jobs:
         run: npm ci --prefix mobile --ignore-scripts
       - name: Test JavaScript policies
         run: npm test --prefix mobile
-      - name: Compile native wallet, run Swift vectors, build simulator and device apps
-        run: bash mobile/scripts/build-ios.sh all
+      - name: Verify native wallet or packaged app
+        run: bash mobile/scripts/build-ios.sh "${{ matrix.mode }}"
       - name: Upload unsigned app bundles and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ConnectWallet-iOS-unsigned-${{ github.sha }}
+          name: ConnectWallet-iOS-${{ matrix.mode }}-${{ github.sha }}
           path: |
             mobile/.tools/ios-artifacts/
             mobile/.tools/ios-native/*/build/CMakeFiles/CMakeConfigureLog.yaml

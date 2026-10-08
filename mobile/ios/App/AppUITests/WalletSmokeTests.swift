@@ -9,6 +9,9 @@ final class WalletSmokeTests: XCTestCase {
         app.launchArguments = ["--wallet-ui-smoke"]
         app.launch()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 30))
+        let isolation = app.staticTexts["wallet-native-security-check"]
+        XCTAssertTrue(isolation.waitForExistence(timeout: 15))
+        XCTAssertEqual(isolation.label, "Native isolation verified")
         let create = app.webViews.buttons["Create wallet"]
         XCTAssertTrue(create.waitForExistence(timeout: 15))
         expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: create)

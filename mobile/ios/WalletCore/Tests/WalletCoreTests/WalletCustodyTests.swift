@@ -59,6 +59,26 @@ final class WalletCustodyTests: XCTestCase {
         XCTAssertEqual(secrets.mnemonic,DesktopCryptoVectors.mnemonic); XCTAssertEqual(secrets.passphrase,"café 🔑")
         let exported = try await runtime.exportEnvelope(password:DesktopCryptoVectors.password)
         XCTAssertEqual(exported,before)
+        let settings = try await runtime.perform("getSettings")
+        XCTAssertEqual(Set(settings.keys),Set(["theme","autoLockMinutes","rpcHost","rpcPort"]))
+        let watch = try await runtime.perform("watchAccount")
+        XCTAssertTrue(watch["address"] is NSNull); XCTAssertEqual(watch["connected"] as? Bool,false)
+        let snapshots = try await runtime.perform("getRecoverySnapshots")
+        XCTAssertEqual(Set(snapshots.keys),Set(["walletId","groups"])); XCTAssertTrue(snapshots["walletId"] is NSNull)
+        let saved = try await runtime.perform("saveSettings",settings)
+        XCTAssertEqual(try saved.object("state")["locked"] as? Bool,true)
+        await runtime.setActive(false)
+    }
+    func testSuccessfulPasswordChangeRemainsLockedAndPreservesImportedPassphrase() async throws {
+        let folder = directory(); defer { try? FileManager.default.removeItem(at:folder) }
+        let store = try DurableWalletStore(directory:folder); _ = try original(store)
+        let runtime = MobileWalletRuntime(directory:folder); await runtime.setActive(true)
+        let nextPassword = "new public fixture password"
+        let state = try await runtime.changePassword(old:DesktopCryptoVectors.password,new:nextPassword)
+        XCTAssertEqual(state["locked"] as? Bool,true); XCTAssertEqual(state["exists"] as? Bool,true)
+        let reopened = try WalletVault.decrypt(store.readVault(),password:nextPassword)
+        XCTAssertEqual(try reopened.string("passphrase"),"café 🔑")
+        XCTAssertThrowsError(try WalletVault.decrypt(store.readVault(),password:DesktopCryptoVectors.password))
         await runtime.setActive(false)
     }
     func testUnsupportedCurrentHdRangeCannotChangePasswordOnDisk() async throws {

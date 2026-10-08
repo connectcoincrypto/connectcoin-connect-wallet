@@ -24,6 +24,12 @@ assert.match(scene, /rootViewController = WalletBridgeViewController\(\)/);
 for (const plugin of ['NativeWalletPlugin', 'NativePaymentInputPlugin', 'NativeExplorerPlugin']) {
   assert.ok(bridge.includes(`registerPluginInstance(${plugin}())`), `${plugin} must be registered`);
 }
+for (const plugin of ['WalletDisabledHttp', 'WalletDisabledCookies', 'WalletBundledWebView']) {
+  assert.ok(bridge.includes(`registerPluginInstance(${plugin}())`), `${plugin} must restrict built-in capabilities`);
+}
+assert.match(bridge, /setURLSchemeHandler\(WalletBundledAssetHandler\(\)/);
+assert.match(bridge, /webView\?\.uiDelegate = restrictedUIDelegate/);
+assert.match(project, /PrivacyInfo\.xcprivacy in Resources/);
 assert.match(plist, /<string>connectcoin<\/string>/);
 assert.match(plist, /NSCameraUsageDescription/);
 assert.doesNotMatch(plist, /UIBackgroundModes/, 'Claims must stop when iOS suspends the app.');

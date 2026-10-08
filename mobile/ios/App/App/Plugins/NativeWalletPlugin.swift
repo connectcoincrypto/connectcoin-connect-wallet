@@ -8,13 +8,13 @@ import WalletCore
 public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRecognizerDelegate {
     public let identifier = "NativeWalletPlugin"
     public let jsName = "NativeWallet"
-    public let pluginMethods = [
+    public let pluginMethods: [CAPPluginMethod] = [
         "getState", "getRecoverySnapshots", "watchAccount", "lock", "getSettings", "saveSettings",
         "create", "importRecovery", "importWallet", "exportWallet", "changePassword", "viewRecoveryPhrase",
         "unlock", "recoverAddresses", "newAddress", "readPaymentClipboard", "reviewPayment", "reviewP2C",
         "getPaymentBatch", "dismissPaymentBatch", "queryPublic", "claimsState", "claimsPolicy", "claimsLimits",
         "claimsStart", "claimsStop", "claimsCheckSubmission"
-    ].map { CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise) }
+    ].map { CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise)! }
 
     private let runtime = MobileWalletRuntime.shared
     private var nativeUI: WalletNativeUI?
@@ -233,8 +233,9 @@ public final class NativeWalletPlugin: CAPPlugin, CAPBridgedPlugin, UIGestureRec
             self.begin(call) {
                 let endpoint = try TcpEndpoint(params.string("rpcHost"), Int(params.integer("rpcPort", min: 1, max: 65535)))
                 let before = try await self.runtime.perform("getSettings", [:])
+                let previousPort = try before.integer("rpcPort")
                 if before["rpcHost"] as? String != endpoint.hostname ||
-                    (try before.integer("rpcPort")) != Int64(endpoint.port) {
+                    previousPort != Int64(endpoint.port) {
                     try await self.ui.confirm(title: "Change RPC server",
                         message: "Use \(endpoint.hostname):\(endpoint.port)?\n\nThe wallet must finish existing work, then locks and verifies the new server before showing its data.",
                         button: "Change server")

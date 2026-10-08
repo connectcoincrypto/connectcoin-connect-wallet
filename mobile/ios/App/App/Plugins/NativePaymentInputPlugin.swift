@@ -31,9 +31,9 @@ final class PaymentLinkMailbox {
 public final class NativePaymentInputPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "NativePaymentInputPlugin"
     public let jsName = "NativePaymentInput"
-    public let pluginMethods = [
-        CAPPluginMethod(name: "takePaymentLink", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "scanPaymentQr", returnType: CAPPluginReturnPromise)
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "takePaymentLink", returnType: CAPPluginReturnPromise)!,
+        CAPPluginMethod(name: "scanPaymentQr", returnType: CAPPluginReturnPromise)!
     ]
     private var observers: [NSObjectProtocol] = []
     private var pendingScan: CAPPluginCall?

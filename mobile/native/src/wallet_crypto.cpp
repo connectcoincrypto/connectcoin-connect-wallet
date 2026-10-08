@@ -101,11 +101,13 @@ extern "C" int cw_wallet_hmac512(const uint8_t *key,size_t key_size,const uint8_
     catch (...) { cw_wallet_wipe(out,64); return 0; }
 }
 extern "C" int cw_wallet_pbkdf512(const uint8_t *password,size_t password_size,const uint8_t *salt,size_t salt_size,uint8_t out[64]) {
-    if (!input(password,password_size) || !input(salt,salt_size) || password_size>4096 || salt_size>8192 || !out) return 0;
+    // A 1,024-UTF16-unit BIP39 passphrase can expand substantially under NFKD
+    // (for example U+FDFA expands to 33 UTF-8 bytes per original unit).
+    if (!input(password,password_size) || !input(salt,salt_size) || password_size>4096 || salt_size>65536 || !out) return 0;
     try {
         // A fixed wiped buffer avoids a vector reallocation leaving a copy of
         // the BIP39 passphrase salt in a freed allocation.
-        Secret<8196> first;
+        Secret<65540> first;
         if(salt_size) std::memcpy(first.bytes.data(),salt,salt_size);
         first.bytes[salt_size+3]=1;
         Secret<64> u,next;
