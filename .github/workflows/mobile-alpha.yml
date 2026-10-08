@@ -1,0 +1,144 @@
+name: Mobile alpha checks
+
+# Temporary alpha branch only. No tags, GitHub Release, store upload, real wallet
+# profile, production claims, signing key, or live RPC query is used by these jobs.
+on:
+  push:
+    branches: [mobile-alpha]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-alpha-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android alpha / JVM, APK and isolated emulator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: helpers/requirements.txt
+      - name: Install locked test dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --prefix mobile
+          python -m pip install --only-binary=:all: -r helpers/requirements.txt
+          python -c "import cryptography; assert cryptography.__version__ == '50.0.1'"
+          cd mobile
+          npx playwright install --with-deps chromium
+      - name: Verify public proof source and native host oracles
+        run: |
+          node mobile/native/tools/check-provenance.mjs
+          cmake -S mobile/native -B mobile/.tools/native-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCONNECTWALLET_NATIVE_TESTS=ON
+          cmake --build mobile/.tools/native-host --parallel 2
+          ctest --test-dir mobile/.tools/native-host --output-on-failure
+          python mobile/native/tests/test_oracle.py --cli mobile/.tools/native-host/p2c_test_cli -v
+      - name: JavaScript, UI and packaged-source checks
+        working-directory: mobile
+        run: |
+          npm test
+          npm run test:ui
+          npm run sync:android
+          npm run check:android
+      - name: Install pinned Android build toolchain on disposable runner
+        run: |
+          # Hosted images include the SDK but do not guarantee sdkmanager is on PATH.
+          sdkmanager_path="${ANDROID_HOME:?}/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_path" ]]; then
+            mapfile -t managers < <(find "$ANDROID_HOME/cmdline-tools" -mindepth 3 -maxdepth 3 -type f -name sdkmanager | sort -V)
+            sdkmanager_path="${managers[-1]:-}"
+          fi
+          test -x "$sdkmanager_path"
+          printf '%s\n' "$(dirname "$sdkmanager_path")" >> "$GITHUB_PATH"
+          "$sdkmanager_path" --sdk_root="$ANDROID_HOME" 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+      - name: Unit tests, both native architectures, APK and lint
+        working-directory: mobile/android
+        run: bash ./gradlew --no-daemon --max-workers=2 --console=plain -Dorg.gradle.jvmargs=-Xmx3g :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug :app:lintRelease
+      - name: Enable emulator acceleration only inside disposable runner
+        run: |
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Isolated Android 36 smoke tests
+        uses: reactivecircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808 # v2
+        timeout-minutes: 15
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -wipe-data -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: cd mobile/android && bash ./gradlew --no-daemon --max-workers=2 --console=plain -Dorg.gradle.jvmargs=-Xmx3g :app:connectedDebugAndroidTest
+      - name: Upload test-only debug APK and reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ConnectWallet-mobile-alpha-android-${{ github.sha }}
+          path: |
+            mobile/android/app/build/outputs/apk/debug/*.apk
+            mobile/android/app/build/reports/
+            mobile/android/app/build/outputs/androidTest-results/
+            mobile/test-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  apple-native:
+    name: Apple native engine / macOS oracle and iOS static builds
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: helpers/requirements.txt
+      - name: Build and verify macOS public-proof host engine
+        run: |
+          python -m pip install --only-binary=:all: -r helpers/requirements.txt
+          python -c "import cryptography; assert cryptography.__version__ == '50.0.1'"
+          node mobile/native/tools/check-provenance.mjs
+          cmake -S mobile/native -B mobile/.tools/native-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCONNECTWALLET_NATIVE_TESTS=ON
+          cmake --build mobile/.tools/native-host --parallel 3
+          ctest --test-dir mobile/.tools/native-host --output-on-failure
+          python mobile/native/tests/test_oracle.py --cli mobile/.tools/native-host/p2c_test_cli -v
+      - name: Compile iOS device and simulator static libraries (not an iOS app)
+        run: |
+          for sdk in iphoneos iphonesimulator; do
+            cmake -S mobile/native -B "mobile/.tools/native-$sdk" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$sdk" -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCONNECTWALLET_NATIVE_TESTS=OFF
+            cmake --build "mobile/.tools/native-$sdk" --parallel 3
+          done
+      - name: Upload native test logs only (no IPA or store publication)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ConnectWallet-mobile-alpha-apple-native-checks-${{ github.sha }}
+          path: |
+            mobile/.tools/native-host/Testing/Temporary/LastTest.log
+            mobile/.tools/native-*/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 7

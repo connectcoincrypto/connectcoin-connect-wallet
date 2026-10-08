@@ -1,0 +1,77 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace = "com.connectcoincrypto.connectwallet.mobile.alpha"
+    compileSdk = rootProject.ext.compileSdkVersion
+    ndkVersion '28.2.13676358'
+    externalNativeBuild {
+        cmake { path file('../../native/CMakeLists.txt'); version '3.22.1' }
+    }
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+    defaultConfig {
+        applicationId "com.connectcoincrypto.connectwallet.mobile.alpha"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0.0-alpha.1"
+        resourceConfigurations += ['en']
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    buildTypes {
+        release {
+            debuggable false
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+    implementation 'fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.24.0'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.86'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    implementation 'com.google.zxing:core:3.4.1'
+    testImplementation 'fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.24.0'
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    testImplementation 'org.json:json:20250517'
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+// Ship the exact native dependency licenses with every APK. Generated assets
+// stay outside source assets so Capacitor sync cannot overwrite the notices.
+def nativeNoticesDirectory = layout.buildDirectory.dir('generated/native-notices')
+def syncNativeNotices = tasks.register('syncNativeNotices', Sync) {
+    from('../../native/vendor/core/COPYING') { into 'licenses'; rename { 'CONNECTCOIN-CORE-MIT.txt' } }
+    from('../../native/vendor/MBEDTLS-LICENSE') { into 'licenses' }
+    from('../../native/vendor/NOTICE') { into 'licenses' }
+    from('../../native/vendor/licenses') { include '*.txt'; into 'licenses' }
+    into nativeNoticesDirectory
+}
+android.sourceSets.main.assets.srcDir(nativeNoticesDirectory)
+tasks.named('preBuild').configure { dependsOn(syncNativeNotices) }

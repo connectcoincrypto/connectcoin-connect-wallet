@@ -1,0 +1,65 @@
+ConnectWallet public P2C engine
+
+Core-derived parser, certificate validation, Mbed TLS patches and TLS capture
+adapter: Copyright (c) 2026 The ConnectCoin developers. MIT; see core/COPYING.
+The Core COPYING file also preserves the Bitcoin Core contributor attribution.
+The compatibility adapters and JNI/native transport are maintained by ConnectWallet.
+
+Mbed TLS 3.6.7: Copyright The Mbed TLS Contributors.
+Source: https://github.com/Mbed-TLS/mbedtls/releases/tag/mbedtls-3.6.7
+Licensed under Apache-2.0 OR GPL-2.0-or-later; this distribution chooses Apache-2.0.
+The full dual-license text is preserved in MBEDTLS-LICENSE.
+Changes applied at build time are the Core RSA-PSS, root-first X.509 and CMake
+policy patches identified in core/provenance.json.
+
+Project Everest code bundled by Mbed TLS:
+Copyright 2016-2018 INRIA and Microsoft Corporation. Apache-2.0.
+Source: https://project-everest.github.io/
+
+p256-m code bundled by Mbed TLS:
+Copyright The Mbed TLS Contributors. Author: Manuel Pégourié-Gonnard.
+Apache-2.0 OR GPL-2.0-or-later (Apache-2.0 selected).
+Source: https://github.com/mpg/p256-m
+
+Android wallet cryptography and wordlist notices
+
+ACINQ secp256k1-kmp 0.24.0 (unmodified Maven dependency): Apache-2.0.
+License: ACINQ-SECP256K1-KMP-APACHE-2.0.txt, copied verbatim from:
+https://raw.githubusercontent.com/ACINQ/secp256k1-kmp/v0.24.0/LICENSE
+SHA-256: 7af92a819013990fdb316690d81e34c6e36d5f5fdfe7e3667d83c65f3f190a68
+The upstream license's original copyright appendix is retained unchanged.
+
+Bitcoin Core libsecp256k1, bundled by ACINQ's Android JNI dependency:
+Copyright (c) 2013 Pieter Wuille. MIT; see SECP256K1-MIT.txt.
+ACINQ v0.24.0 pins its native/secp256k1 submodule to:
+6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d
+License copied verbatim from:
+https://raw.githubusercontent.com/bitcoin-core/secp256k1/6e2c8bc4ecdc6e71dbe7a368f360d8d453ce435d/COPYING
+SHA-256: a735999c7e5649df6fcda6fb06ab97435851c392b1b93494ae8725f37441632f
+
+English BIP39 wordlist from @scure/bip39 2.4.0:
+Copyright (c) 2022 Patricio Palladino, Paul Miller (paulmillr.com).
+MIT; see SCURE-BIP39-MIT.txt. Wordlist data is unchanged; its representation
+was converted into the Java EnglishWords class for the native wallet.
+License copied verbatim from:
+https://raw.githubusercontent.com/paulmillr/scure-bip39/2.4.0/LICENSE
+SHA-256: 1565efd0ec4580bfaa96c7eeaaa9af3791baa1cc562c3bde62d0a055910b9ec7
+
+Bouncy Castle bcprov-jdk18on 1.86:
+Copyright (c) 2000-2026 The Legion of the Bouncy Castle Inc.
+MIT; the dependency's complete license is preserved in the APK at
+META-INF/LICENSE.md, unchanged from the published bcprov-jdk18on-1.86.jar.
+Source: https://github.com/bcgit/bc-java/blob/r1rv86/LICENSE.md
+
+Android QR scanner (unmodified Maven dependencies)
+
+JourneyApps ZXing Android Embedded 4.3.0:
+Copyright Journey Mobile, Inc. and ZXing contributors. Apache-2.0.
+Source: https://github.com/journeyapps/zxing-android-embedded/tree/v4.3.0
+License: ZXING-APACHE-2.0.txt, upstream COPYING.
+
+ZXing Core 3.4.1:
+Copyright ZXing authors. Apache-2.0.
+Source: https://github.com/zxing/zxing/tree/zxing-3.4.1
+License: ZXING-APACHE-2.0.txt (Apache License, Version 2.0).
+Only QR decoding is enabled by the native scanner activity; no barcode image is saved.

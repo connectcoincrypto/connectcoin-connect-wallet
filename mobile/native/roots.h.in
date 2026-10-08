@@ -1,0 +1,6 @@
+#pragma once
+#include <span>
+namespace consensus::p2c::data {
+inline constexpr char pem[] = R"CONNECTROOT(@ROOT_PEM@)CONNECTROOT";
+inline const auto p2c_roots_v1 = std::as_bytes(std::span{pem, sizeof(pem) - 1});
+}

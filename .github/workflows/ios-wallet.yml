@@ -1,0 +1,73 @@
+name: iOS wallet checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ios-*', 'mobile-ios-*']
+  pull_request:
+    paths: ['mobile/**', '.github/workflows/ios-wallet.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-wallet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: iOS ${{ matrix.mode }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [core, simulator, device]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - name: Select installed Xcode 26 or newer
+        shell: bash
+        run: |
+          set -euo pipefail
+          chosen="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' -print | sort -Vr | head -n 1)"
+          if [[ -n "$chosen" ]]; then sudo xcode-select -s "$chosen/Contents/Developer"; fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Install locked JavaScript dependencies
+        run: npm ci --prefix mobile --ignore-scripts
+      - name: Test JavaScript policies
+        run: npm test --prefix mobile
+      - name: Verify native wallet or packaged app
+        run: bash mobile/scripts/build-ios.sh "${{ matrix.mode }}"
+      - name: Upload unsigned app bundles and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ConnectWallet-iOS-${{ matrix.mode }}-${{ github.sha }}
+          path: |
+            mobile/.tools/ios-artifacts/
+            mobile/.tools/ios-native/*/build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
+      - name: Upload lightweight Simulator review images and logs
+        if: always() && matrix.mode == 'simulator'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ConnectWallet-iOS-UI-review-${{ github.sha }}
+          path: |
+            mobile/.tools/ios-artifacts/ui-screenshots/
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.json
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.png
+            mobile/.tools/ios-artifacts/ui-diagnostics/*.log
+            mobile/.tools/ios-artifacts/ui-diagnostics/crashes/
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7

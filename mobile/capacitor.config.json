@@ -1,0 +1,18 @@
+{
+  "appId": "com.connectcoincrypto.connectwallet.mobile.alpha",
+  "appName": "ConnectWallet",
+  "webDir": "dist",
+  "ios": {
+    "webContentsDebuggingEnabled": false,
+    "contentInset": "never",
+    "preferredContentMode": "mobile",
+    "allowsLinkPreview": false
+  },
+  "android": {
+    "minWebViewVersion": 105,
+    "allowMixedContent": false,
+    "resolveServiceWorkerRequests": false,
+    "webContentsDebuggingEnabled": false
+  },
+  "server": { "androidScheme": "https", "errorPath": "unsupported-webview.html" }
+}
