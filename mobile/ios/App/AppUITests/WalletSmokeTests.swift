@@ -36,7 +36,10 @@ final class WalletSmokeTests: XCTestCase {
 
         tapWebButton(app, "Import wallet file")
         let pickerCancel = app.buttons["Cancel"].firstMatch
-        XCTAssertTrue(pickerCancel.waitForExistence(timeout: 10))
+        // A fresh CI Simulator launches Apple's document-picker extension on
+        // first use; that separate process can take more than 20 seconds.
+        // Still require the real native Cancel control and working dismissal.
+        XCTAssertTrue(pickerCancel.waitForExistence(timeout: 60))
         pickerCancel.tap()
         XCTAssertTrue(create.waitForExistence(timeout: 10))
 
