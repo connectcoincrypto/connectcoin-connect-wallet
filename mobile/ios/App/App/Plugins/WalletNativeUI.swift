@@ -47,7 +47,7 @@ final class WalletNativeUI: NSObject, UIDocumentPickerDelegate {
     func importEncrypted() async throws -> Data {
         let url = try await pick(UIDocumentPickerViewController(forOpeningContentTypes: [.json, .data], asCopy: true), exporting: false)
         try Task.checkCancellation()
-        return try await Task.detached(priority: .userInitiated) { try Self.readEncrypted(url) }.value
+        return try await WalletEncryptedFileReader.read(url)
     }
 
     func exportEncrypted(_ bytes: Data) async throws {
@@ -63,7 +63,7 @@ final class WalletNativeUI: NSObject, UIDocumentPickerDelegate {
         try Task.checkCancellation()
         // Replacement never proceeds merely because the picker returned. Verify
         // the saved encrypted bytes while the provider's security scope is live.
-        let readback = try await Task.detached(priority: .userInitiated) { try Self.readEncrypted(destination) }.value
+        let readback = try await WalletEncryptedFileReader.read(destination)
         guard readback == bytes else { throw WalletError("The saved backup could not be verified. Your current wallet is unchanged.") }
     }
 
@@ -80,22 +80,6 @@ final class WalletNativeUI: NSObject, UIDocumentPickerDelegate {
             controller.allowsMultipleSelection = false
             presenter.present(controller, animated: true)
         }
-    }
-
-    nonisolated private static func readEncrypted(_ url: URL) throws -> Data {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var data = Data()
-        while data.count <= WalletVault.maxFileBytes {
-            try Task.checkCancellation()
-            guard let chunk = try handle.read(upToCount: min(8192, WalletVault.maxFileBytes + 1 - data.count)), !chunk.isEmpty else { break }
-            data.append(chunk)
-        }
-        guard !data.isEmpty, data.count <= WalletVault.maxFileBytes else { throw WalletError("Choose a valid encrypted wallet file.") }
-        _ = try WalletVault.parse(data)
-        return data
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
@@ -184,6 +168,10 @@ private final class WalletFormController: UIViewController, UITextFieldDelegate 
                 text.backgroundColor = .secondarySystemBackground
                 text.heightAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
                 text.textContentType = .none
+                let toolbar = UIToolbar(); toolbar.sizeToFit()
+                toolbar.items = [UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+                                 UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(dismissKeyboard))]
+                text.inputAccessoryView = toolbar
                 input = text
             } else {
                 let text = UITextField(); text.font = .preferredFont(forTextStyle: .body)
@@ -213,6 +201,7 @@ private final class WalletFormController: UIViewController, UITextFieldDelegate 
     }
 
     func textFieldShouldReturn(_ textField: UITextField) -> Bool { textField.resignFirstResponder(); return true }
+    @objc private func dismissKeyboard() { view.endEditing(true) }
 
     @objc private func submit() {
         var values: [String: String] = [:]

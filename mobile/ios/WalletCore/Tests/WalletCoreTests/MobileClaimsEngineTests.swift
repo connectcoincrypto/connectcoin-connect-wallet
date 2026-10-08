@@ -7,6 +7,26 @@ private final class ClaimsOfflineWire: RpcWire {
     func cancel() {}
 }
 
+private final class ClaimsReceiptWire: RpcWire, @unchecked Sendable {
+    private let mutex = NSLock()
+    private let response: JSONObject
+    private var receive: ((Data) -> Void)?, methods: [String] = []
+    init(_ response: JSONObject) { self.response = response }
+    var requests: [String] { mutex.lock(); defer { mutex.unlock() }; return methods }
+    func start(queue: DispatchQueue, ready: @escaping () -> Void, receive: @escaping (Data) -> Void, failed: @escaping () -> Void) {
+        mutex.lock(); self.receive = receive; mutex.unlock(); ready()
+    }
+    func send(_ bytes: Data, completed: @escaping (Bool) -> Void) {
+        do {
+            let request = try JSON.decode(Data(bytes.dropLast()))
+            mutex.lock(); methods.append(request["method"] as? String ?? ""); let callback = receive; mutex.unlock()
+            completed(true)
+            callback?(try JSON.encode(["jsonrpc": "2.0", "id": request["id"]!, "result": response]) + Data([10]))
+        } catch { completed(false) }
+    }
+    func cancel() {}
+}
+
 final class MobileClaimsEngineTests: XCTestCase {
     private let address = "cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e"
     private let txid = String(repeating: "ab", count: 32)
@@ -80,5 +100,34 @@ final class MobileClaimsEngineTests: XCTestCase {
         XCTAssertThrowsError(try ClaimsPublicStore.read(link))
         XCTAssertThrowsError(try ClaimsPublicStore.write(["oversized": String(repeating: "x", count: 4096)], to: url))
         XCTAssertEqual(try ClaimsPublicStore.read(url)["status"] as? String, "submitted")
+    }
+
+    func testUnknownResolutionRequiresMatchingMainnetTransactionAndNeverBroadcasts() async throws {
+        let vector = try PaymentVectors.fixture(), claim = try PJ.object(vector["attached"])
+        let expected = try PJ.string(claim["txid"]), validHex = try PJ.string(claim["hex"])
+        let differentHex = try PJ.string(PJ.object(vector["payment"])["hex"])
+        let tip: JSONObject = ["chain": "main", "genesis_hash": NativePaymentChecks.GENESIS,
+            "height": 120, "hash": String(repeating: "aa", count: 32), "mediantime": 1_700_000_000]
+        var wrongTip = tip; wrongTip["genesis_hash"] = String(repeating: "00", count: 32)
+        let cases: [(JSONObject, Bool)] = [
+            (["tip": wrongTip, "status": "confirmed", "transaction": ["hex": validHex]], false),
+            (["tip": tip, "status": "confirmed", "transaction": ["hex": differentHex]], false),
+            (["tip": tip, "status": "missing", "transaction": ["hex": validHex]], false),
+            (["tip": tip, "status": "pending", "transaction": ["hex": validHex]], true)
+        ]
+        for (response, resolves) in cases {
+            let url = try location(); try ClaimsPublicStore.write(["txid": expected, "status": "pending"], to: url)
+            let wire = ClaimsReceiptWire(response)
+            let client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+            let engine = MobileClaimsEngine(rpc: client, receiptURL: url); await engine.setActive(true)
+            do { _ = try await engine.checkSubmission(); XCTAssertTrue(resolves) }
+            catch { XCTAssertFalse(resolves) }
+            let state = await engine.state()
+            XCTAssertEqual(state["receiptStatus"] as? String, resolves ? "submitted" : "pending")
+            XCTAssertEqual(state["running"] as? Bool, false)
+            XCTAssertEqual(try ClaimsPublicStore.read(url)["status"] as? String, resolves ? "submitted" : "pending")
+            XCTAssertEqual(wire.requests, ["gettransaction"])
+            await engine.close()
+        }
     }
 }
