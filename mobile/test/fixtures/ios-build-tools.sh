@@ -6,6 +6,12 @@ uname() { if [[ "$1" == -s ]]; then echo Darwin; else echo arm64; fi; }
 ninja() { :; }
 npm() { :; }
 swift() { :; }
+exit() {
+  # Reproduce the unavailable function-local state seen by the macOS Bash 3.2
+  # EXIT trap, including when this fixture runs under a newer Bash locally.
+  if [[ "${IOS_BUILD_TEST_DROP_SIMULATOR:-0}" == 1 ]]; then unset simulator; fi
+  builtin exit "$@"
+}
 node() {
   if [[ "$1" == -p ]]; then echo 1.0.0
   elif [[ "$1" == -e ]]; then
@@ -68,10 +74,13 @@ xcrun() {
       printf 'mock native library\n' > "$2" ;;
     lipo) echo 'mock arm64 image' ;;
     simctl)
+      printf '%s\n' "$*" >> "${IOS_BUILD_TEST_LOG:?}"
       case "$1" in
         list) echo '{}' ;;
-        create) echo 11111111-2222-3333-4444-555555555555 ;;
-        boot|bootstatus|shutdown|delete) : ;;
+        create) echo "${IOS_BUILD_TEST_SIMULATOR:-11111111-2222-3333-4444-555555555555}" ;;
+        boot) return "${IOS_BUILD_TEST_BOOT_EXIT:-0}" ;;
+        bootstatus) : ;;
+        shutdown|delete) return "${IOS_BUILD_TEST_CLEANUP_EXIT:-0}" ;;
         io) printf 'mock screenshot\n' > "$4" ;;
         spawn) echo 'mock simulator log' ;;
         *) return 1 ;;

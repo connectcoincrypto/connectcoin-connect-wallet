@@ -103,7 +103,10 @@ smoke_simulator() (
   device="$(xcrun simctl list devicetypes -j | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>{const d=JSON.parse(s).devicetypes.filter(x=>x.name.startsWith("iPhone"));const v=d.find(x=>x.name==="iPhone 17 Pro")||d.find(x=>x.name==="iPhone 16 Pro")||d.at(-1);if(!v)process.exit(1);console.log(v.identifier)})')"
   simulator="$(xcrun simctl create "ConnectWallet-CI-$RANDOM" "$device" "$runtime")"
   [[ "$simulator" =~ ^[A-Fa-f0-9-]{36}$ ]] || exit 1
-  trap 'xcrun simctl shutdown "$simulator" >/dev/null 2>&1 || true; xcrun simctl delete "$simulator" >/dev/null 2>&1 || true' EXIT
+  # Capture the validated UUID now. Bash 3.2 can unwind function locals before
+  # running EXIT when a sourced script exits; late lookup would fail with -u.
+  # The UUID character allowlist above makes this literal trap argument safe.
+  trap "xcrun simctl shutdown '$simulator' >/dev/null 2>&1 || true; xcrun simctl delete '$simulator' >/dev/null 2>&1 || true" EXIT
   xcrun simctl boot "$simulator"
   xcrun simctl bootstatus "$simulator" -b
   CONNECTWALLET_NATIVE_LIB_DIR="$native_root/iphonesimulator" xcodebuild \

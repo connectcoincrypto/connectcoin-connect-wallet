@@ -158,4 +158,5 @@ jobs:
             mobile/.tools/native-host/Testing/Temporary/LastTest.log
             mobile/.tools/native-*/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 7
