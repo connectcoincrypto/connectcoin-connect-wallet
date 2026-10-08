@@ -277,6 +277,12 @@ public final class MobileRpcClient: @unchecked Sendable {
     private func pump() {
         guard active else { return }
         guard !jobs.isEmpty else { return }
+        // Revocation must settle even during a quota wait, a full in-flight
+        // window or DNS resolution. It never cancels a written operation.
+        for job in Array(jobs.values) where !job.written && job.permit?.isValid == false {
+            finish(job,.failure(RpcFailure("RPC_CANCELLED")))
+        }
+        guard !jobs.isEmpty else { return }
         let time = now()
         // Reclaim expired block-specific histories even when those blocks never
         // appear again. Remote block hashes cannot grow the limiter indefinitely.

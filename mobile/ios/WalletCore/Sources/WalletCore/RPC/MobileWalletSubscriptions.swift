@@ -17,7 +17,7 @@ private final class SubscriptionMailbox: @unchecked Sendable {
 /// Address events invalidate balances; ordinary tip events only update confirmations.
 /// The native owner supplies addresses, never the WebView or a remote notification.
 public actor MobileWalletSubscriptions {
-    private let endpoint: TcpEndpoint
+    private let makeClient: () -> MobileRpcClient
     private let emit: (JSONObject) -> Void
     private var client: MobileRpcClient?
     private var current: Task<Void, Never>?
@@ -29,7 +29,12 @@ public actor MobileWalletSubscriptions {
     private var pending: [JSONObject] = []
     private var attempt = 0
     private var lastMessage = ProcessInfo.processInfo.systemUptime
-    public init(endpoint: TcpEndpoint, emit: @escaping (JSONObject) -> Void) { self.endpoint = endpoint; self.emit = emit }
+    public init(endpoint: TcpEndpoint, emit: @escaping (JSONObject) -> Void) {
+        makeClient = { MobileRpcClient(endpoint:endpoint,subscriptions:true) }; self.emit = emit
+    }
+    init(makeClient: @escaping () -> MobileRpcClient, emit: @escaping (JSONObject) -> Void) {
+        self.makeClient = makeClient; self.emit = emit
+    }
     public func state() -> JSONObject { ["connected": connected, "coverageLimited": identifiers.count < addresses.count, "watched": identifiers.count, "total": addresses.count] }
     public func stop() {
         generation &+= 1; connectionGeneration &+= 1; current?.cancel(); current = nil; sleeper?.cancel(); sleeper = nil
@@ -45,7 +50,7 @@ public actor MobileWalletSubscriptions {
     private func run(_ token: UInt64) async {
         while token == generation && !Task.isCancelled {
             connectionGeneration &+= 1; let connection = connectionGeneration
-            let rpc = MobileRpcClient(endpoint: endpoint, subscriptions: true)
+            let rpc = makeClient()
             client = rpc; identifiers = [:]; tipID = ""; connected = false; registering = true; pending = []
             lastMessage = ProcessInfo.processInfo.systemUptime
             let mailbox = SubscriptionMailbox()
@@ -74,7 +79,8 @@ public actor MobileWalletSubscriptions {
                     let sleep = Task<Void, Error> { try await Task.sleep(nanoseconds:30_000_000_000) }
                     sleeper = sleep; try await sleep.value; sleeper = nil; try check(token,connection)
                     if ProcessInfo.processInfo.systemUptime - lastMessage >= 60 {
-                        _ = try NativePaymentChecks.tip(await rpc.call("getchaintip")); lastMessage = ProcessInfo.processInfo.systemUptime
+                        let heartbeat = try await rpc.call("getchaintip"); try check(token,connection)
+                        _ = try NativePaymentChecks.tip(heartbeat); lastMessage = ProcessInfo.processInfo.systemUptime
                     }
                 }
             } catch { /* Public status is a reconnect hint, not raw server-controlled text. */ }
@@ -94,6 +100,9 @@ public actor MobileWalletSubscriptions {
     }
     private func lost(_ token: UInt64, _ connection: UInt64) {
         guard token == generation && connection == connectionGeneration else { return }
+        // A disconnect between two registration ACKs must revoke the whole
+        // wire. Otherwise an auto-opened socket could mix subscription IDs.
+        connectionGeneration &+= 1
         if connected { event("disconnected",tip:nil,reorg:false,changed:[]) }
         connected = false; sleeper?.cancel()
     }

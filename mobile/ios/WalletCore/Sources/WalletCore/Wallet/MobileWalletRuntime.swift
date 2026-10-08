@@ -70,17 +70,24 @@ public actor MobileWalletRuntime {
                 "watch": watch, "lastPayment": lastPayment.map { $0 as Any } ?? NSNull(), "rpcTransport": "tcp",
                 "rpcEndpoint": "\(settings["rpcHost"] ?? "connectcoin4.com"):\(settings["rpcPort"] ?? 48190)"]
     }
-    public func lock() async -> JSONObject {
-        paymentPermit?.cancel(); _ = fence.invalidate(); recovery?.cancel(); recovery = nil
+    private func revoke() -> (UInt64, NativeHdWallet?) {
+        paymentPermit?.cancel(); let token = fence.invalidate(); recovery?.cancel(); recovery = nil
         signing?.lock(); signing = nil; update?.close(); update = nil
         let old = hd; hd = nil; approval?.inventory.discard(); approval = nil
+        return (token, old)
+    }
+    private func revokeForOperation() async throws -> UInt64 {
+        let (token, old) = revoke(); await old?.close(); try live(token); return token
+    }
+    public func lock() async -> JSONObject {
+        let (_, old) = revoke()
         await old?.close()
         let state = (try? await publicState()) ?? ["locked": true]; emit("walletStateChanged", state); return state
     }
     private func live(_ token: UInt64) throws { try Task.checkCancellation(); try fence.check(token); try walletRequire(active, "Open the wallet to continue") }
     public func unlock(password: String) async throws {
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
-        _ = await lock(); let token = fence.token(), envelope = try store().readVault()
+        let token = try await revokeForOperation(), envelope = try store().readVault()
         let candidate = try await Task.detached { try WalletVault.openForUpdate(envelope, password: password) }.value
         do { try live(token); try await adopt(candidate, token: token) } catch { candidate.close(); throw error }
     }
@@ -90,7 +97,8 @@ public actor MobileWalletRuntime {
         let store = try self.store(), fence = self.fence
         do {
             let nextHd = try NativeHdWallet(session: next, vault: candidate, persist: { value in try fence.commit(token) { try store.saveVault(value) } })
-            try live(token); signing = next; update = candidate; hd = nextHd; publicHd = await nextHd.snapshot()
+            let snapshot = await nextHd.snapshot()
+            try live(token); signing = next; update = candidate; hd = nextHd; publicHd = snapshot
             try live(token); noteUserInteraction(); emit("walletStateChanged", try await publicState())
             await refreshSubscriptions(); startRecovery(nextHd, token)
         } catch { next.lock(); candidate.close(); throw error }
@@ -98,7 +106,7 @@ public actor MobileWalletRuntime {
     public func installMnemonic(_ mnemonic: String, password: String, replace: Bool, imported: Bool) async throws -> JSONObject {
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
-        _ = await lock(); let token = fence.token()
+        let token = try await revokeForOperation()
         let candidate = try await Task.detached { () throws -> NativeVaultUpdateSession in
             var payload = try WalletVault.newPayload(mnemonic: mnemonic); payload["needsRecovery"] = true
             return try WalletVault.createForUpdate(payload, password: password)
@@ -111,7 +119,7 @@ public actor MobileWalletRuntime {
     public func importEnvelope(_ data: Data, password: String, replace: Bool) async throws -> JSONObject {
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
         let storage = try store(); try walletRequire(!storage.exists(.vault) || replace, "Back up the existing wallet before replacement")
-        let envelope = try WalletVault.parse(data); _ = await lock(); let token = fence.token()
+        let envelope = try WalletVault.parse(data); let token = try await revokeForOperation()
         let candidate = try await Task.detached { () throws -> NativeVaultUpdateSession in
             let session = try WalletVault.openForUpdate(envelope, password: password)
             var payload = try session.payload(); payload["needsRecovery"] = true; payload["mobileHdRecovered"] = false
@@ -134,10 +142,13 @@ public actor MobileWalletRuntime {
     }
     public func changePassword(old: String, new: String) async throws -> JSONObject {
         try walletRequire(active && !paymentBusy, "Finish the current payment first")
-        _ = await lock(); let token = fence.token(), envelope = try store().readVault()
+        let token = try await revokeForOperation(), envelope = try store().readVault()
         let changed = try await Task.detached { try WalletVault.changePassword(envelope, currentPassword: old, newPassword: new) }.value
-        try live(token); try fence.commit(token) { try store().saveVault(changed) }
-        try await unlock(password: new); return try await publicState()
+        let candidate = try await Task.detached { try WalletVault.openForUpdate(changed, password: new) }.value
+        do {
+            try live(token); try fence.commit(token) { try store().saveVault(changed) }
+            try await adopt(candidate, token: token); return try await publicState()
+        } catch { candidate.close(); throw error }
     }
     private func startRecovery(_ owner: NativeHdWallet, _ token: UInt64) {
         recovery?.cancel()
@@ -152,7 +163,7 @@ public actor MobileWalletRuntime {
     private func acceptHd(_ value: JSONObject, _ token: UInt64) async {
         guard (try? live(token)) != nil else { return }
         publicHd = value; await refreshSubscriptions()
-        if let state = try? await publicState() { emit("walletStateChanged", state) }
+        if let state = try? await publicState(), (try? live(token)) != nil { emit("walletStateChanged", state) }
     }
     private func refreshSubscriptions() async {
         guard active, let id = publicHd["walletId"] as? String, let rows = publicHd["accounts"] as? [JSONObject], !rows.isEmpty else { return }
@@ -179,7 +190,8 @@ public actor MobileWalletRuntime {
         case "lock": return await lock()
         case "newAddress":
             guard let hd else { throw WalletError("Unlock the wallet first") }
-            _ = try await hd.newAddress(); publicHd = await hd.snapshot(); await refreshSubscriptions(); return try await publicState()
+            let token = fence.token(); _ = try await hd.newAddress(); let snapshot = await hd.snapshot()
+            try live(token); publicHd = snapshot; await refreshSubscriptions(); try live(token); return try await publicState()
         case "recoverAddresses":
             guard let hd else { throw WalletError("Unlock the wallet first") }
             try await hd.requestRecovery(); startRecovery(hd, fence.token()); return try await publicState()
@@ -195,24 +207,30 @@ public actor MobileWalletRuntime {
             }
             let response = try await rpc.call(method, arguments); try live(token)
             try walletRequire(rpcToken == rpcGeneration, "RPC endpoint changed")
-            if let hd { for address in try NativeHdWallet.usedAddresses(method, arguments, response) { _ = try await hd.observeUsed(address) }; publicHd = await hd.snapshot() }
+            if let hd {
+                for address in try NativeHdWallet.usedAddresses(method, arguments, response) { _ = try await hd.observeUsed(address); try live(token) }
+                let snapshot = await hd.snapshot(); try live(token); try walletRequire(rpcToken == rpcGeneration, "RPC endpoint changed")
+                publicHd = snapshot
+            }
             return ["result": response]
         case "saveSettings":
             let next = try Self.validateSettings(params)
             let endpointChanged = settings["rpcHost"] as? String != next["rpcHost"] as? String || settings["rpcPort"] as? Int != next["rpcPort"] as? Int
             try walletRequire(active && !paymentBusy && approval == nil, "Finish the current payment before changing settings")
-            if endpointChanged { try walletRequire(await claims.canChangeEndpoint(), "Wait for claim submission before changing RPC") }
             paymentBusy = true; endpointChanging = endpointChanged
             defer { paymentBusy = false; endpointChanging = false }
+            if endpointChanged { try walletRequire(await claims.canChangeEndpoint(), "Wait for claim submission before changing RPC") }
             if endpointChanged {
+                let token = fence.token(), storage = try store()
                 await claims.close(); await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
-                let replacement = try await rpc.replaceEndpoint(TcpEndpoint(next.string("rpcHost"), Int(next.integer("rpcPort"))))
-                // The old transport is retired at this point. If persistence fails,
-                // keep the old preference and an inactive replacement; no hidden
-                // traffic is allowed to the uncommitted endpoint.
-                do { try store().write(.settings, JSON.encode(next)) }
-                catch { replacement.setActive(false); rpc = replacement; throw error }
-                settings = next; rpc = replacement
+                do {
+                    let replacement = try await rpc.replaceEndpoint(TcpEndpoint(next.string("rpcHost"), Int(next.integer("rpcPort"))), persist: { [fence] in
+                        try fence.commit(token) { try storage.write(.settings, JSON.encode(next)) }
+                    })
+                    settings = next; rpc = replacement
+                } catch {
+                    claims = MobileClaimsEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions(); throw error
+                }
                 claims = MobileClaimsEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions()
             } else { try store().write(.settings, JSON.encode(next)); settings = next }
             return ["settings": settings, "endpointChanged": endpointChanged]
@@ -409,6 +427,6 @@ private struct RpcBatchSender: MobilePaymentBatchAsyncSender {
     func broadcast(_ hex: String) async throws -> JSONObject { try await rpc.broadcast(hex, permit: permit) }
     func provenNotSent(_ error: Error) -> Bool {
         guard let failure = error as? RpcFailure else { return false }
-        return !failure.unknownOutcome && !failure.explicitRejection && ["RPC_CANCELLED", "RPC_INACTIVE", "RPC_BUSY", "RPC_INVALID"].contains(failure.code)
+        return !failure.unknownOutcome && !failure.explicitRejection && failure.code == "RPC_CANCELLED"
     }
 }

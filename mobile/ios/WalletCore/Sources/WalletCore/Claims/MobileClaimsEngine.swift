@@ -118,7 +118,7 @@ public actor MobileClaimsEngine {
         try walletRequire(lastError != "CLAIMS_RECEIPT_UNAVAILABLE", "CLAIMS_RECEIPT_UNAVAILABLE")
         try walletRequire(!unknownBlocked, "CLAIMS_UNKNOWN_OUTCOME")
         try walletRequire(foreground, "Open the app to start claims.")
-        try walletRequire(!enabled && active.isEmpty && reservations.isEmpty() && transmitting == nil, "Stop the existing claims session and wait for it to finish.")
+        try walletRequire(!enabled && active.isEmpty && reservations.isEmpty && transmitting == nil, "Stop the existing claims session and wait for it to finish.")
         if self.address != address { for item in progress.values { item.prepared = nil } }
         self.address = address; enabled = true; epoch &+= 1; run &+= 1
         attempts = 0; valid = 0; invalid = 0; hits = 0; submitted = 0; unknown = 0; cancelled = 0
@@ -146,7 +146,7 @@ public actor MobileClaimsEngine {
         stop(); closed = true; dispatchTask?.cancel(); dispatchTask = nil; network.cancel()
         cw_claim_limiter_destroy(limiter); limiter = 0
     }
-    public func canChangeEndpoint() -> Bool { !enabled && active.isEmpty && reservations.isEmpty() && transmitting == nil && winners.isEmpty }
+    public func canChangeEndpoint() -> Bool { !enabled && active.isEmpty && reservations.isEmpty && transmitting == nil && winners.isEmpty }
     public func policy(_ options: JSONObject) throws -> JSONObject {
         try PJ.keys(options, ["allowMobileData", "allowBackground"])
         let mobile = try PJ.bool(options["allowMobileData"]), background = try PJ.bool(options["allowBackground"])

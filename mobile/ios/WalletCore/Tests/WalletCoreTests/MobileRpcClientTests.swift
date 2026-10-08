@@ -6,6 +6,70 @@ private final class RpcTestClock: @unchecked Sendable {
     func now() -> TimeInterval { mutex.lock(); defer { mutex.unlock() }; return time }
     func advance(_ by: TimeInterval) { mutex.lock(); time += by; mutex.unlock() }
 }
+
+private final class SubscriptionEvents: @unchecked Sendable {
+    private let mutex = NSLock(); private var values: [JSONObject] = []
+    func append(_ value: JSONObject) { mutex.lock(); values.append(value); mutex.unlock() }
+    var events: [JSONObject] { mutex.lock(); defer { mutex.unlock() }; return values }
+}
+
+final class MobileWalletSubscriptionsTests: XCTestCase {
+    private let address = "cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e"
+    private let addressID = "11111111-1111-4111-8111-111111111111", tipID = "22222222-2222-4222-8222-222222222222"
+    private var tip: JSONObject { ["chain":"main","genesis_hash":NativePaymentChecks.GENESIS,"height":120,"hash":String(repeating:"aa",count:32),"mediantime":1_700_000_000] }
+    private func eventually(_ condition: () -> Bool) async throws {
+        for _ in 0..<200 { if condition() { return }; try await Task.sleep(nanoseconds:10_000_000) }
+        XCTFail("Timed out waiting for subscription fixture"); throw WalletError("Subscription fixture timed out")
+    }
+    private func ack(_ request: JSONObject) -> JSONObject? {
+        if request["method"] as? String == "subscribeaddress" { return ["subscription_id":addressID,"tip":tip,"cursor":"cursor.signature","changes_only":true] }
+        if request["method"] as? String == "subscribetip" { return ["subscription_id":tipID,"tip":tip,"cursor":"cursor.signature"] }
+        return nil
+    }
+    private func event(_ id: String, addressEvent: Bool = true) throws -> Data {
+        var params: JSONObject = ["subscription_id":id,"kind":addressEvent ? "address" : "tip","tip":tip,"reorg":false]
+        if addressEvent { params["address"] = address; params["refresh"] = true }
+        return try JSON.encode(["jsonrpc":"2.0","method":"subscription","params":params]) + Data([10])
+    }
+    func testNativeAddressScopeAndImmediateDisconnect() async throws {
+        let wire = RpcTestWire(), events = SubscriptionEvents(); wire.respond = ack
+        let subscriptions = MobileWalletSubscriptions(makeClient:{ MobileRpcClient(factory:{wire},subscriptions:true) },emit:events.append)
+        try await subscriptions.configure(address,[address])
+        try await eventually { events.events.count == 1 }
+        XCTAssertEqual(events.events[0]["reason"] as? String,"connected")
+        wire.emit(try event(addressID)); wire.emit(try event(tipID,addressEvent:false))
+        try await eventually { events.events.count == 3 }
+        XCTAssertEqual(events.events[1]["reason"] as? String,"address")
+        XCTAssertEqual(events.events[1]["changedAddresses"] as? [String],[address])
+        XCTAssertEqual(events.events[2]["reason"] as? String,"tip")
+        wire.disconnect()
+        try await eventually { events.events.count == 4 }
+        XCTAssertEqual(events.events[3]["reason"] as? String,"disconnected")
+        let state = await subscriptions.state(); XCTAssertEqual(state["connected"] as? Bool,false)
+        await subscriptions.stop()
+        wire.emit(try event(addressID)); try await Task.sleep(nanoseconds:20_000_000)
+        XCTAssertEqual(events.events.count,4)
+    }
+    func testFailedInitialRegistrationNeverInvalidatesIndependentStartup() async throws {
+        let wire = RpcTestWire(), events = SubscriptionEvents()
+        let subscriptions = MobileWalletSubscriptions(makeClient:{ MobileRpcClient(factory:{wire},subscriptions:true) },emit:events.append)
+        try await subscriptions.configure(address,[address])
+        try await eventually { wire.sent.count == 1 }; wire.disconnect()
+        try await Task.sleep(nanoseconds:20_000_000)
+        XCTAssertTrue(events.events.isEmpty)
+        await subscriptions.stop()
+    }
+    func testForgedSubscriptionIdentityRevokesEstablishedWire() async throws {
+        let wire = RpcTestWire(), events = SubscriptionEvents(); wire.respond = ack
+        let subscriptions = MobileWalletSubscriptions(makeClient:{ MobileRpcClient(factory:{wire},subscriptions:true) },emit:events.append)
+        try await subscriptions.configure(address,[address]); try await eventually { events.events.count == 1 }
+        wire.emit(try event("33333333-3333-4333-8333-333333333333"))
+        try await eventually { events.events.count == 2 }
+        XCTAssertEqual(events.events[1]["reason"] as? String,"disconnected")
+        await subscriptions.stop()
+        XCTAssertFalse(events.events.contains { $0["reason"] as? String == "address" })
+    }
+}
 private final class RpcTestWire: RpcWire, @unchecked Sendable {
     private let mutex = NSLock()
     private var callback: ((Data) -> Void)?, failure: (() -> Void)?, ready: (() -> Void)?
@@ -42,11 +106,12 @@ final class MobileRpcClientTests: XCTestCase {
     private func eventually(_ condition: () -> Bool) async throws {
         for _ in 0..<200 { if condition() { return }; try await Task.sleep(nanoseconds:10_000_000) }
         XCTFail("Timed out waiting for local RPC fixture")
+        throw WalletError("RPC fixture timed out")
     }
     func testStrictNativeMethodParametersAndPublicEndpoints() throws {
         let normalized = try MobileRpcClient.validateParams("getaddresschanges",["addresses":[address.uppercased()],"cursor":NSNull()])
         XCTAssertEqual((normalized["addresses"] as? [String])?.first,address)
-        for request: (String,JSONObject) in [
+        for request in [
             ("getaddresschanges",["addresses":[address,address.uppercased()]]),
             ("gettransactions",["txids":Array(repeating:hash,count:33)]),
             ("gettransactions",["txids":[hash,hash.uppercased()]]),
@@ -54,7 +119,7 @@ final class MobileRpcClientTests: XCTestCase {
             ("gettransaction",["txid":hash + "\n"]),
             ("sendrawtransaction",["transaction_hex":"00"]),
             ("subscribetip",[:])
-        ] { XCTAssertThrowsError(try MobileRpcClient.validateParams(request.0,request.1)) }
+        ] as [(String,JSONObject)] { XCTAssertThrowsError(try MobileRpcClient.validateParams(request.0,request.1)) }
         XCTAssertThrowsError(try MobileRpcClient.validateParams("subscribeaddress",["address":address,"changes_only":false],subscriptions:true))
         XCTAssertThrowsError(try MobileRpcClient.validateParams("sendrawtransaction",["transaction_hex":String(repeating:"00",count:10)],subscriptions:true))
         for host in ["127.0.0.1","localhost","server.local","example.com\n","bad..example.com","https://example.com"] { XCTAssertThrowsError(try TcpEndpoint(host)) }
@@ -81,7 +146,8 @@ final class MobileRpcClientTests: XCTestCase {
         let second = Task { try await client.call("getrecentblockhashes") }
         try await eventually { wire.sent.count == 2 }
         wire.reply(wire.sent[0],result:[:]); wire.reply(wire.sent[1],result:["valid":true])
-        XCTAssertEqual(try await second.value["valid"] as? Bool,true)
+        let result = try await second.value
+        XCTAssertEqual(result["valid"] as? Bool,true)
     }
     func testBroadcastPermitPrewriteCancellationAndPostwriteUncertainty() async throws {
         let wire = RpcTestWire(); wire.autoReady = false
@@ -112,6 +178,18 @@ final class MobileRpcClientTests: XCTestCase {
         clock.advance(60); _ = try await waiting.value; XCTAssertEqual(secondWire.sent.count,1)
         original.setActive(true)
         do { _ = try await original.call("getchaintip"); XCTFail("Retired client reopened") } catch {}
+    }
+    func testRevokedBroadcastSettlesWhileConnectionIsStillPending() async throws {
+        let wire = RpcTestWire(); wire.autoReady = false
+        let client = MobileRpcClient(factory:{wire}); defer { client.close() }; client.setActive(true)
+        let permit = RpcBroadcastPermit()
+        let pending = Task { try await client.broadcast(String(repeating:"00",count:10),permit:permit) }
+        try await Task.sleep(nanoseconds:20_000_000); permit.cancel()
+        do { _ = try await pending.value; XCTFail("Revoked broadcast succeeded") }
+        catch let error as RpcFailure { XCTAssertEqual(error.code,"RPC_CANCELLED"); XCTAssertFalse(error.unknownOutcome) }
+        XCTAssertTrue(wire.sent.isEmpty)
+        wire.becomeReady(); try await Task.sleep(nanoseconds:20_000_000)
+        XCTAssertTrue(wire.sent.isEmpty)
     }
     func testFortyEightPerMinuteAndServerCooldownDoNotRetryBroadcasts() async throws {
         let clock = RpcTestClock(), wire = RpcTestWire(); wire.respond = { _ in [:] }

@@ -142,6 +142,12 @@ extern "C" int cw_wallet_valid_public(const uint8_t public_key[32]) {
     if (!public_key) return 0;
     try { secp256k1_xonly_pubkey pub; return secp256k1_xonly_pubkey_parse(context(),&pub,public_key); } catch (...) { return 0; }
 }
+extern "C" int cw_wallet_is_public_address(const char *address) {
+    if(!address) return 0;
+    size_t size=0; while(size<=64 && address[size]) ++size;
+    if(!size || size>64) return 0;
+    try { return connectwallet::IsPublicAddress(std::string_view(address,size)) ? 1 : 0; } catch(...) { return 0; }
+}
 extern "C" int cw_wallet_verify(const uint8_t signature[64],const uint8_t digest[32],const uint8_t public_key[32]) {
     if (!signature || !digest || !public_key) return 0;
     try { secp256k1_xonly_pubkey pub; return secp256k1_xonly_pubkey_parse(context(),&pub,public_key) && secp256k1_schnorrsig_verify(context(),signature,digest,32,&pub); } catch (...) { return 0; }

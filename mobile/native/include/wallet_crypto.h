@@ -20,6 +20,8 @@ int cw_wallet_gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12], const 
 int cw_wallet_gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t aad_size,
     const uint8_t *cipher, size_t size, const uint8_t tag[16], uint8_t *plain);
 int cw_wallet_valid_public(const uint8_t public_key[32]);
+/* Public numeric IP validation shared with the pinned P2C transport. */
+int cw_wallet_is_public_address(const char *numeric_address);
 int cw_wallet_verify(const uint8_t signature[64], const uint8_t digest[32], const uint8_t public_key[32]);
 typedef struct cw_wallet_session cw_wallet_session;
 /* Seed is consumed only during construction, and never retained. Private

@@ -86,7 +86,7 @@ public actor NativeHdWallet {
         defer { recovering = false; progress(snapshot()) }
         var next = [0, 0], gaps = [0, 0], used = [lastReceive, lastChange], done = [false, false]
         let minimum = [max(receiveIndex, lastReceive + Self.gap), max(changeIndex, lastChange + Self.gap)]
-        var retainedBytes = 0
+        var retainedBytes = 0, legacy = false
         do {
             var payload = try vault.payload(); payload["needsRecovery"] = true; try save(payload)
             while !done.allSatisfy({ $0 }) {
@@ -99,11 +99,21 @@ public actor NativeHdWallet {
                         members.append((branch, index, try derive(index, branch)))
                     }
                 }
+                let byBranch = [members.filter { $0.0 == 0 }, members.filter { $0.0 == 1 }]
+                members = []
+                for offset in 0..<max(byBranch[0].count, byBranch[1].count) {
+                    for branch in 0...1 where offset < byBranch[branch].count { members.append(byBranch[branch][offset]) }
+                }
                 progress(snapshot())
                 let addresses = try members.map { try $0.2.string("address") }
-                let checkpoint = try await rpc.call("getaddresschanges", ["addresses": addresses])
-                try check(); try Self.validateWatermark(checkpoint)
-                var results: [Int: (Bool, JSONObject)] = [:]
+                var checkpoint: JSONObject?
+                if !legacy {
+                    do { checkpoint = try await rpc.call("getaddresschanges", ["addresses": addresses]); try Self.validateWatermark(checkpoint!) }
+                    catch let failure as RpcFailure where failure.code == "-32601" { legacy = true; groups = []; retainedBytes = 0 }
+                }
+                try check()
+                var results: [Int: (Bool, JSONObject?)] = [:]
+                var groupBytes = 0, retainGroup = !legacy
                 try await withThrowingTaskGroup(of: (Int, Bool, JSONObject).self) { tasks in
                     var submitted = 0
                     func enqueue(_ offset: Int) {
@@ -126,7 +136,15 @@ public actor NativeHdWallet {
                     }
                     while submitted < min(16, members.count) { enqueue(submitted); submitted += 1 }
                     while let result = try await tasks.next() {
-                        try check(); results[result.0] = (result.1, result.2)
+                        try check()
+                        if retainGroup {
+                            groupBytes += try JSON.encode(result.2).count
+                            if retainedBytes + groupBytes > 8 * 1024 * 1024 {
+                                retainGroup = false
+                                for key in Array(results.keys) { results[key] = (results[key]!.0, nil) }
+                            }
+                        }
+                        results[result.0] = (result.1, retainGroup ? result.2 : nil)
                         if submitted < members.count { enqueue(submitted); submitted += 1 }
                     }
                 }
@@ -139,9 +157,14 @@ public actor NativeHdWallet {
                     scanned += 1; next[branch] += 1
                     if index >= minimum[branch] && gaps[branch] >= Self.gap { done[branch] = true }
                 }
-                let group: JSONObject = ["addresses": addresses, "sync": checkpoint, "histories": members.indices.compactMap { results[$0]?.1 }]
-                let size = try JSON.encode(group).count
-                if retainedBytes + size <= 8 * 1024 * 1024 { groups.append(group); retainedBytes += size }
+                if retainGroup, let checkpoint {
+                    let histories: [JSONObject] = try members.indices.map {
+                        guard let result = results[$0], let page = result.1 else { throw WalletError("Incomplete HD cache group") }; return page
+                    }
+                    let group: JSONObject = ["addresses": addresses, "sync": checkpoint, "histories": histories]
+                    let size = try JSON.encode(group).count
+                    if retainedBytes + size <= 8 * 1024 * 1024 { groups.append(group); retainedBytes += size }
+                }
                 progress(snapshot())
             }
             lastReceive = used[0]; lastChange = used[1]
@@ -160,7 +183,7 @@ public actor NativeHdWallet {
         _ = try value.integer("through_sequence", min: 0, max: 9_007_199_254_740_991)
         _ = try value.integer("journal_epoch", min: 0, max: 9_007_199_254_740_991)
         try walletRequire(try value.array("changes").isEmpty && !value.boolean("has_more"), "Invalid HD watermark")
-        _ = try NativePaymentChecks.cursor(value)
+        try walletRequire(try NativePaymentChecks.cursor(value) != nil, "Missing HD watermark cursor")
     }
     public static func historyUsed(_ page: JSONObject, _ address: String) throws -> Bool {
         try walletRequire(page.count == 6 && page["address"] as? String == address && page["unit"] as? String == "connects" && (try page.boolean("live")), "Invalid HD history")

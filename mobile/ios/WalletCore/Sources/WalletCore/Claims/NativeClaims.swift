@@ -4,7 +4,7 @@ import CConnectWallet
 public enum NativeClaims {
     // A handle can be cancelled from the Swift task cancellation callback while
     // its owning native worker is blocked. Destruction shares the same lock.
-    private final class Lease {
+    private final class Lease: @unchecked Sendable {
         private let mutex = NSLock()
         private var handle: Int64
         init() throws {
