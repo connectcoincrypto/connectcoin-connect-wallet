@@ -14,6 +14,7 @@ import { diagnosticError } from '../src/core/diagnostics.mjs';
 import { createRequire } from 'node:module';
 import { waitForUiCondition } from './ui-wait.mjs';
 import { closeElectronTest } from './ui-close.mjs';
+import { createUiStartupDiagnostics } from './ui-startup.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // macOS Home/End scroll the document instead of moving the input caret.
@@ -86,20 +87,24 @@ function nextStage(value) {
 }
 
 async function openApplication(executablePath) {
-  // Disable Playwright's default forced-light emulation so this test observes
-  // Electron nativeTheme and the real application color-scheme behavior.
-  application = await electron.launch({ executablePath, args: [root], env, colorScheme: null, timeout: 30000 });
-  page = await application.firstWindow();
-  page.setDefaultTimeout(15000);
-  page.on('pageerror', error => errors.push(error.name));
-  page.on('requestfailed', request => {
-    if (request.url().endsWith('/assets/icon.png')) failedBrandRequests.push(request.failure()?.errorText ?? 'Image request failed');
-  });
-  await page.getByRole('heading', { name: 'Hello, connection.' }).waitFor();
-  assert.equal(await page.title(), 'ConnectWallet · ConnectCoin');
-  assert.equal(await application.evaluate(({ app }) => app.getName()), 'ConnectWallet');
-  assert.equal(await page.locator('.auth-art .brand strong').textContent(), 'ConnectWallet');
-  await assertLoadedImage('.auth-art .brand-mark img');
+  const startup = createUiStartupDiagnostics();
+  try {
+    // Disable Playwright's default forced-light emulation so this test observes
+    // Electron nativeTheme and the real application color-scheme behavior.
+    application = await startup.run('electron-launch', () => electron.launch({ executablePath, args: [root], env, colorScheme: null, timeout: 30000 }));
+    page = await startup.run('first-window', () => application.firstWindow());
+    page.setDefaultTimeout(15000);
+    startup.observePage(page);
+    page.on('pageerror', error => errors.push(error.name));
+    page.on('requestfailed', request => {
+      if (request.url().endsWith('/assets/icon.png')) failedBrandRequests.push(request.failure()?.errorText ?? 'Image request failed');
+    });
+    await startup.run('welcome-heading', () => page.getByRole('heading', { name: 'Hello, connection.' }).waitFor());
+    await startup.run('window-title', async () => assert.equal(await page.title(), 'ConnectWallet · ConnectCoin'));
+    await startup.run('application-name', async () => assert.equal(await application.evaluate(({ app }) => app.getName()), 'ConnectWallet'));
+    await startup.run('brand-label', async () => assert.equal(await page.locator('.auth-art .brand strong').textContent(), 'ConnectWallet'));
+    await startup.run('brand-image', () => assertLoadedImage('.auth-art .brand-mark img'));
+  } finally { startup.dispose(); }
 }
 async function assertLoadedImage(selector) {
   // A visible <img> with a cancelled file:// request still occupies its box.

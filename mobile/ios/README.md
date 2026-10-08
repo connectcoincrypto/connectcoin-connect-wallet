@@ -38,7 +38,7 @@ bash scripts/build-ios.sh device     # unsigned arm64 device app
 bash scripts/build-ios.sh all        # all of the above
 ```
 
-`build-ios.sh` builds the optional native wallet target with pinned scrypt/secp256k1 dependencies, combines the required static libraries per SDK, copies third-party notices into the app and links `WalletCore`. It does not install tools, sign, publish, request store credentials or create a release. Generated libraries/build products remain under ignored `mobile/.tools/ios-native/`; output archives and hashes are in `.tools/ios-artifacts/`:
+`build-ios.sh` builds the optional native wallet target with pinned scrypt/secp256k1 dependencies, combines the required static libraries per SDK, copies third-party notices into the app and links `WalletCore`. It does not install tools, sign, publish, request store credentials or create a release. Generated libraries/build products remain under ignored `mobile/.tools/ios-native/`. Each invocation prints and creates its own `.tools/ios-artifacts/<mode>-<unique-id>/` directory, preserving previous results and keeping their archives, checksums and diagnostics separate:
 
 - `ConnectWallet-simulator.app.zip`
 - `ConnectWallet-unsigned-device.app.zip`

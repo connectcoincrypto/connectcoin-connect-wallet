@@ -300,7 +300,17 @@ assert.match(nativeWallet, /WalletVault\.newPayload\("ConnectWallet mobile", mne
 assert.match(nativeWallet, /new VaultSession\(payload\.getString\("mnemonic"\), payload\.optString\("passphrase", ""\)\)/,
   'Removing the setup field must not change keys in an existing encrypted wallet');
 const exposed = [...nativeWallet.matchAll(/@PluginMethod\s+public\s+void\s+(\w+)\s*\(/g)].map(x => x[1]).sort();
-assert.deepEqual(exposed, ['changePassword', 'claimsCheckSubmission', 'claimsLimits', 'claimsPolicy', 'claimsStart', 'claimsState', 'claimsStop', 'create', 'dismissPaymentBatch', 'exportWallet', 'getPaymentBatch', 'getRecoverySnapshots', 'getSettings', 'getState', 'importRecovery', 'importWallet', 'lock', 'newAddress', 'queryPublic', 'readPaymentClipboard', 'recoverAddresses', 'reviewP2C', 'reviewPayment', 'saveSettings', 'unlock', 'viewRecoveryPhrase', 'watchAccount'].sort());
+const approvedWalletMethods = ['changePassword', 'claimsCheckSubmission', 'claimsLimits', 'claimsPolicy', 'claimsStart', 'claimsState', 'claimsStop', 'create', 'dismissPaymentBatch', 'exportWallet', 'getPaymentBatch', 'getRecoverySnapshots', 'getSettings', 'getState', 'importRecovery', 'importWallet', 'lock', 'newAddress', 'queryPublic', 'readPaymentClipboard', 'recoverAddresses', 'reviewP2C', 'reviewPayment', 'saveSettings', 'unlock', 'viewRecoveryPhrase', 'watchAccount'].sort();
+assert.deepEqual(exposed, approvedWalletMethods);
+// Keep the independent, explicit runtime assertion in sync. Do not derive its
+// expected API from the actual plugin: that would allow an unintended method.
+const walletSmoke = await read(path.join(app, 'src/androidTest/java/com/connectcoincrypto/connectwallet/mobile/alpha/WalletSmokeTest.java'));
+const smokeAllowlist = walletSmoke.match(/NATIVE_WALLET_METHODS\s*=\s*new HashSet<>\(Arrays\.asList\(([\s\S]*?)\)\);/);
+assert(smokeAllowlist, 'The device smoke test must retain its exact approved wallet method list');
+assert.deepEqual([...smokeAllowlist[1].matchAll(/"([A-Za-z]\w*)"/g)].map(match => match[1]).sort(),
+  [...approvedWalletMethods, 'addListener', 'removeListener', 'removeAllListeners', 'checkPermissions', 'requestPermissions'].sort(),
+  'The device smoke allowlist must cover the approved API plus only the inherited framework methods');
+assert.match(walletSmoke, /assertEquals\(NATIVE_WALLET_METHODS, wallet\)/);
 const recoverySnapshots = nativeWallet.slice(nativeWallet.indexOf('@PluginMethod public void getRecoverySnapshots('), nativeWallet.indexOf('@PluginMethod public void readPaymentClipboard('));
 assert.match(recoverySnapshots, /if \(!empty\(call\)\) return/);
 assert.match(recoverySnapshots, /hdWallet\.recoverySnapshots\(\)/);

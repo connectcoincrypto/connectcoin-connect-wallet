@@ -64,11 +64,11 @@ jobs:
         with:
           name: ConnectWallet-iOS-UI-review-${{ github.sha }}
           path: |
-            mobile/.tools/ios-artifacts/ui-screenshots/
-            mobile/.tools/ios-artifacts/ui-diagnostics/*.json
-            mobile/.tools/ios-artifacts/ui-diagnostics/*.png
-            mobile/.tools/ios-artifacts/ui-diagnostics/*.log
-            mobile/.tools/ios-artifacts/ui-diagnostics/crashes/
+            mobile/.tools/ios-artifacts/*/ui-screenshots/
+            mobile/.tools/ios-artifacts/*/ui-diagnostics/*.json
+            mobile/.tools/ios-artifacts/*/ui-diagnostics/*.png
+            mobile/.tools/ios-artifacts/*/ui-diagnostics/*.log
+            mobile/.tools/ios-artifacts/*/ui-diagnostics/crashes/
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 7

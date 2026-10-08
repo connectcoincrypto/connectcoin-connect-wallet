@@ -15,8 +15,12 @@ command -v cmake >/dev/null
 command -v ninja >/dev/null
 cd "$mobile_dir"
 native_root="$mobile_dir/.tools/ios-native"
-artifact_dir="$mobile_dir/.tools/ios-artifacts"
-mkdir -p "$native_root" "$artifact_dir"
+artifact_root="$mobile_dir/.tools/ios-artifacts"
+mkdir -p "$native_root" "$artifact_root"
+# xcodebuild requires a new resultBundlePath. Keep each invocation's archives,
+# checksums and diagnostics together, without deleting or reusing an old result.
+artifact_dir="$(mktemp -d "$artifact_root/$mode-XXXXXXXX")"
+printf 'iOS artifacts for this invocation: %s\n' "$artifact_dir"
 
 build_native() {
   local sdk="$1" arch="$2" build_dir="$native_root/$1/build"
