@@ -33,4 +33,4 @@ $classPath = $jars -join [IO.Path]::PathSeparator
 if ($LASTEXITCODE -ne 0) { throw 'Native RPC test compilation failed.' }
 & $runtime -cp ($outputDirectory + [IO.Path]::PathSeparator + $classPath) org.junit.runner.JUnitCore com.connectcoincrypto.connectwallet.mobile.alpha.RpcTransportTest
 if ($LASTEXITCODE -ne 0) { throw 'Native RPC tests failed.' }
-# Loopback only. Passing these tests does not certify APK/plugin/Android lifecycle behavior.
+# These transport tests use loopback endpoints only.

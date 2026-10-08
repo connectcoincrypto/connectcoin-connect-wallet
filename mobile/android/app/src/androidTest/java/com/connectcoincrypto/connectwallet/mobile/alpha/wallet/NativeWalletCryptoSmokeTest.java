@@ -52,7 +52,7 @@ public class NativeWalletCryptoSmokeTest {
         try { session.publicAccount(0, 0); fail("Locked session derived an account"); } catch (IllegalStateException expected) { }
     }
     @Test public void androidAesGcmAndDesktopCostScryptRoundTripWithoutPersistence() throws Exception {
-        // Do not silently skip: an alpha capable of creating wallets must satisfy this budget.
+        // Do not silently skip: wallet creation must satisfy this budget.
         assertTrue("Desktop-compatible scrypt requires a >=256MiB application heap", Runtime.getRuntime().maxMemory() >= 256L * 1024 * 1024);
         char[] password = "Public instrumentation password!".toCharArray();
         try {

@@ -62,8 +62,8 @@ endif()
 if(ANDROID)
   add_library(connectwallet_claims SHARED src/jni.cpp)
   target_link_libraries(connectwallet_claims PRIVATE connectwallet_p2c)
-  # The installable alpha uses debug signing, but its native crypto must not
-  # benchmark an unoptimized build. Target options follow Mbed TLS's own Debug
+  # Keep native crypto optimized in debug-signed builds too.
+  # Target options follow Mbed TLS's own Debug
   # -O0 flags, so -O2 wins for every native component without disabling checks,
   # assertions or debug symbols. Keep host sanitizer/debug builds unchanged.
   foreach(component everest p256m mbedcrypto mbedx509 mbedtls connectwallet_p2c connectwallet_claims)

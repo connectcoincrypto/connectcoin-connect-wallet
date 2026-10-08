@@ -330,7 +330,7 @@ export function releaseNotes(version, runId, sha) {
       '- **RPC compatibility:** automatic address updates require a server supporting acknowledged changes-only subscriptions. Older servers show a warning and retain startup/manual reads; use **Refresh** to update balances and transactions. There is no silent fallback to per-block address polling. Subscription-capacity warnings also identify when manual refresh is needed for untracked addresses.',
       '- Automatic Claims bounty discovery remains independent of balance/history updates. On compatible servers, changes to spendable funds such as coinbase maturity are delivered as address events.',
       '',
-      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
     ].join('\n');
     return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
   }
@@ -343,7 +343,7 @@ export function releaseNotes(version, runId, sha) {
       '- The native helper retains the global concurrency limit and a separate configured-rate rolling limit on TCP-start permits. The production path uses native pacing without an additional JavaScript rate timer; the compatibility fallback uses the same bounded-debt schedule.',
       '- Regression tests cover multiple configured rates, coarse timers, delayed acknowledgments, debt boundaries, cancellation, idle periods and concurrency. Actual throughput still depends on system and network conditions.',
       '',
-      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
     ].join('\n');
     return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
   }
@@ -356,7 +356,7 @@ export function releaseNotes(version, runId, sha) {
       '- Recovery probes remain limited per domain/policy across bounty refreshes, cancellation and restarts. Attempt statistics and probe cooldowns still begin only when a connection actually starts.',
       '- Regression tests cover delayed acknowledgments, rate/concurrency bounds, cancellation, restart, fair ordering and duplicate-probe prevention.',
       '',
-      'This is a desktop release; the mobile alpha is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
     ].join('\n');
     return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
   }

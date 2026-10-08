@@ -183,7 +183,7 @@ are compile-time guarded; CMake rejects enabling them for an Android build.
 
 Android builds produce `libconnectwallet_claims.so` for arm64-v8a/x86_64 with
 16-KiB load-segment alignment. All Android native components, including Mbed TLS,
-use `-O2` even in the debug-signed installable alpha; debug symbols and checks
+use `-O2` even in the debug-signed installable APK; debug symbols and checks
 remain enabled. Host debug/sanitizer configurations are not overridden.
 Apple CI compiles native static libraries for iOS
 device/simulator and runs the host oracle on macOS. **That is not an iOS app,

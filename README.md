@@ -6,7 +6,7 @@ A calmer home for ConnectCoin. **ConnectWallet is a desktop light wallet**: it k
 
 **ConnectCoin mainnet wallet.** It relies on an unencrypted RPC connection and a trusted server for chain state; it does not independently validate consensus.
 
-Mobile development lives separately in [`mobile/`](mobile/README.md), with an Android native wallet/claims alpha and explicit unfinished integration gates. It is not a production replacement for the desktop wallet. The desktop application/version remains unchanged.
+The Android and iOS applications live in [`mobile/`](mobile/README.md), sharing the mobile interface with native wallet and Automatic Claims implementations. The desktop application and version remain separate.
 
 ## What you can do
 

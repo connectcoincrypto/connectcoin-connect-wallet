@@ -214,7 +214,7 @@ E: manifest
     A: android:dataExtractionRules(0x0101064e)=@0x7f0b0000
     A: android:debuggable(0x0101000f)=(type 0x12)0xffffffff
     E: activity
-      A: android:name(0x01010003)="com.example.alpha.MainActivity"
+      A: android:name(0x01010003)="com.example.wallet.MainActivity"
       A: android:exported(0x01010010)=(type 0x12)0xffffffff
       E: intent-filter
         E: action
@@ -231,16 +231,16 @@ E: manifest
         E: data
           A: android:scheme(0x01010027)="connectcoin"
     E: activity
-      A: android:name(0x01010003)="com.example.alpha.PaymentQrCaptureActivity"
+      A: android:name(0x01010003)="com.example.wallet.PaymentQrCaptureActivity"
       A: android:exported(0x01010010)=(type 0x12)0x0
     E: service
-      A: android:name(0x01010003)="com.example.alpha.ClaimsService"
+      A: android:name(0x01010003)="com.example.wallet.ClaimsService"
       A: android:exported(0x01010010)=(type 0x12)0x0
       A: android:foregroundServiceType(0x01010599)=0x40000000
 '@
-    $null = Assert-Manifest $fixture 'com.example.alpha' 'debug'
+    $null = Assert-Manifest $fixture 'com.example.wallet' 'debug'
     $modernFixture = $fixture.Replace('A: android:', 'A: http://schemas.android.com/apk/res/android:').Replace('(type 0x12)0x0', 'false').Replace('(type 0x12)0xffffffff', 'true')
-    $null = Assert-Manifest $modernFixture 'com.example.alpha' 'debug'
+    $null = Assert-Manifest $modernFixture 'com.example.wallet' 'debug'
     $badFixtures = @(
         $fixture.Replace('android.permission.INTERNET', 'android.permission.POST_NOTIFICATIONS'),
         $fixture.Replace('android.permission.CAMERA', 'android.permission.VIBRATE'),
@@ -250,7 +250,7 @@ E: manifest
         $fixture.Replace('android:scheme(0x01010027)="connectcoin"', "android:scheme(0x01010027)=`"connectcoin`"`n          A: android:host(0x01010028)=`"*`""),
         $fixture.Replace('android.intent.category.BROWSABLE', 'android.intent.category.LAUNCHER'),
         $fixture.Replace('android.intent.action.VIEW', 'android.intent.action.SEND'),
-        $fixture.Replace('com.example.alpha.PaymentQrCaptureActivity', 'com.journeyapps.barcodescanner.CaptureActivity'),
+        $fixture.Replace('com.example.wallet.PaymentQrCaptureActivity', 'com.journeyapps.barcodescanner.CaptureActivity'),
         $fixture.Replace('android:exported(0x01010010)=(type 0x12)0x0', 'android:exported(0x01010010)=(type 0x12)0xffffffff'),
         $fixture.Replace('android:required(0x0101028e)=(type 0x12)0x0', 'android:required(0x0101028e)=(type 0x12)0xffffffff')
     )
@@ -258,11 +258,11 @@ E: manifest
     $badFixtures += [regex]::Replace($fixture, '(PaymentQrCaptureActivity"\s+A: android:exported\(0x01010010\)=)\(type 0x12\)0x0', '${1}(type 0x12)0xffffffff')
     foreach ($bad in $badFixtures) {
         $rejected = $false
-        try { $null = Assert-Manifest $bad 'com.example.alpha' 'debug' } catch { $rejected = $true }
+        try { $null = Assert-Manifest $bad 'com.example.wallet' 'debug' } catch { $rejected = $true }
         Require $rejected 'Manifest negative self-test failed.'
     }
     $rejected = $false
-    try { $null = Assert-Manifest $fixture 'com.example.alpha' 'release' } catch { $rejected = $true }
+    try { $null = Assert-Manifest $fixture 'com.example.wallet' 'release' } catch { $rejected = $true }
     Require $rejected 'Debuggable release negative self-test failed.'
     Write-Host 'APK verifier self-tests passed (manifest parsing and negative security cases).'
     exit 0
@@ -272,7 +272,7 @@ Require ($SdkRoot -and $JavaHome -and $ApkPath) 'Supply -SdkRoot, -JavaHome and 
 $sdk = (Resolve-Path -LiteralPath $SdkRoot).Path
 $jdk = (Resolve-Path -LiteralPath $JavaHome).Path
 $apk = (Resolve-Path -LiteralPath $ApkPath).Path
-Require ((Get-Item -LiteralPath $apk).Length -le 268435456) 'APK exceeds the bounded alpha verification size.'
+Require ((Get-Item -LiteralPath $apk).Length -le 268435456) 'APK exceeds the bounded verification size.'
 $buildTools = Join-Path $sdk 'build-tools/36.0.0'
 $aapt2 = Join-Path $buildTools 'aapt2.exe'
 $signer = Join-Path $buildTools 'lib/apksigner.jar'
@@ -317,7 +317,7 @@ $signature = Run-Tool $javaExe @('-jar', $signer, 'verify', '--verbose', '--prin
 if ($Variant -eq 'debug') {
     Require ($signature.ExitCode -eq 0) 'Debug APK signature verification failed.'
     Require ($signature.Text -match 'Signer #1 certificate DN:.*CN=Android Debug') 'Expected the local Android debug signing certificate.'
-} else { Require ($signature.ExitCode -ne 0) 'Release signing was not requested; refuse to label a signed release as the unsigned alpha artifact.' }
+} else { Require ($signature.ExitCode -ne 0) 'Release signing was not requested; refuse to label a signed release as an unsigned artifact.' }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.Drawing
@@ -395,8 +395,8 @@ $report = [ordered]@{ verifiedAtUtc = [DateTime]::UtcNow.ToString('o'); status =
     appId = $config.appId; appName = $config.appName; versionName = $versionName; versionCode = [int]$versionCode; minSdk = [int]$minSdk; targetSdk = [int]$targetSdk
     platformPermissions = $manifestResult.PlatformPermissions; internalSignaturePermission = $manifestResult.InternalSignaturePermission; locales = $locales
     verifiedWebAssets = $assetCount; verifiedLauncherBitmaps = $iconCount; signatureVerified = ($Variant -eq 'debug'); installableTestArtifact = ($Variant -eq 'debug')
-    distribution = $(if ($Variant -eq 'debug') { 'Debug-signed alpha test only; not a production release.' } else { 'UNSIGNED RELEASE: NOT INSTALLABLE. Signing/distribution was not requested.' })
-    limitations = @('Static APK verification does not replace emulator/device lifecycle, network or clipboard tests.') }
+    distribution = $(if ($Variant -eq 'debug') { 'Debug-signed APK.' } else { 'Unsigned release APK; signing is required for installation.' })
+    checks = @('Compiled manifest, permissions, backup policy, package identity, version, signing state, launcher icons and bundled web assets.') }
 New-Item -ItemType Directory -Path (Split-Path -Parent $reportFile) -Force | Out-Null
 [IO.File]::WriteAllText($reportFile, ($report | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
 Write-Host ('Verified {0} APK: {1}' -f $Variant, $apk)

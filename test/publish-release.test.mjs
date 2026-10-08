@@ -75,7 +75,7 @@ test('1.1.4 release notes describe address-driven synchronization with compatibi
     'old-chain reads cannot publish obsolete snapshots', 'revalidate wallet data',
     'Older servers show a warning and retain startup/manual reads', 'use **Refresh**',
     'no silent fallback to per-block address polling', 'manual refresh is needed for untracked addresses',
-    'bounty discovery remains independent', 'coinbase maturity', 'mobile alpha is not included',
+    'bounty discovery remains independent', 'coinbase maturity', 'mobile app is not included',
     'No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format',
     'Close ConnectWallet before upgrading', 'same Windows installer family',
     'Claims are disabled by default', 'Installers use English', 'Windows downloads are unsigned',
@@ -92,12 +92,12 @@ test('1.1.4 release notes describe address-driven synchronization with compatibi
   }
 });
 
-test('adding 1.1.4 release notes preserves all previously published 1.1.x notes exactly', () => {
+test('desktop release notes preserve their content with neutral mobile naming', () => {
   const hashes = {
     '1.1.0': '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd',
     '1.1.1': 'dbba98f4dcf0919efd294e87972288f8a03022c3fe5b4214d138153b0964d175',
-    '1.1.2': '5b82dec2d732d18c3132d7f6719c6029e41437ff96a60ab00dc580a94385ee02',
-    '1.1.3': '24f12824b3fcda9b49dcee8f654fe58bdb85a2368541add2b3cd5e003a9da216',
+    '1.1.2': '99f9d7be65b164b8117c1b4ab5031788bc6162fd182625623ea68e38e27b4e24',
+    '1.1.3': '705fbc0af47687277678034b33df8c78dc29594395a66af6ade03990e11cd58f',
   };
   for (const [version, expectedHash] of Object.entries(hashes)) {
     assert.equal(createHash('sha256').update(releaseNotes(version, '5678', sha)).digest('hex'), expectedHash, version);
@@ -110,7 +110,7 @@ test('1.1.3 release notes describe bounded-debt pacing and retain distribution d
     'one second of scheduling debt', 'Genuine idle periods do not bank extra credit',
     'preserves a still-future deadline and recent start-permit history within the running helper', 'global concurrency limit',
     'configured-rate rolling limit on TCP-start permits', 'without an additional JavaScript rate timer',
-    'Actual throughput still depends on system and network conditions', 'mobile alpha is not included',
+    'Actual throughput still depends on system and network conditions', 'mobile app is not included',
     'English', 'unsigned', 'not Developer-ID signed or notarized', 'SHA256SUMS',
     '/blob/v1.1.3/docs/installers.md', '/actions/runs/5678', sha]) assert.ok(notes.includes(text), text);
   assert.ok(notes.indexOf('## New in 1.1.3') < notes.indexOf('## Downloads'));
@@ -126,7 +126,7 @@ test('1.1.2 release notes describe bounded start admission without overstating p
   const notes = releaseNotes('1.1.2', '5678', sha);
   for (const text of ['# ConnectWallet 1.1.2', '## New in 1.1.2', 'start acknowledgment',
     'rate and concurrency limits', 'bounded pending-start queue', 'Recovery probes',
-    'connection actually starts', 'mobile alpha is not included', 'English', 'unsigned',
+    'connection actually starts', 'mobile app is not included', 'English', 'unsigned',
     'not Developer-ID signed or notarized', '/blob/v1.1.2/docs/installers.md', sha]) {
     assert.ok(notes.includes(text), text);
   }

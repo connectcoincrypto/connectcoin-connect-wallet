@@ -1243,7 +1243,7 @@ test('QR URI intake displays exact amount and metadata without automatic review'
   await expect(page.locator('#send-request-details')).toContainText('Order 42');
   await expect(page.locator('#review-payment')).toBeEnabled();
   await expectNoIntakePayment(page);
-  await page.screenshot({ path: 'test-results/alpha-scan-payment.png', fullPage: true });
+  await page.screenshot({ path: 'test-results/mobile-scan-payment.png', fullPage: true });
 });
 
 test('QR cancellation is a no-op and camera denial offers sanitized feedback without changing a draft', async ({ page }) => {
@@ -1309,7 +1309,7 @@ test('cold and warm external connectcoin links automatically fill Send without s
   await expect(page.locator('#send-amount')).toHaveValue('0.75');
   await expect(page.locator('#send-request-details')).toContainText('Warm');
   await expect(page.locator('#send-request-details')).not.toContainText('Cold');
-  await page.screenshot({ path: 'test-results/alpha-auto-payment-link.png', fullPage: true });
+  await page.screenshot({ path: 'test-results/mobile-auto-payment-link.png', fullPage: true });
   await expectNoIntakePayment(page);
 });
 
@@ -2514,11 +2514,13 @@ test('old-WebView fallback is static and does not load the wallet runtime', asyn
   await expect(page.locator('input, textarea, button')).toHaveCount(0);
 });
 
-test('first launch is honest, English, and has no private-key entry', async ({ page }) => {
+test('first launch uses ConnectWallet branding, English, and no private-key entry', async ({ page }) => {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await waitReady(page);
   await expect(page.getByText('Your wallet,')).toBeVisible();
+  await expect(page.locator('.brand-copy')).toHaveText('ConnectWalletMobile MAINNET');
+  await expect(page.locator('#setup-panel .notice')).toHaveText('Recover receiving and change addresses from your recovery phrase. Keep a verified backup before replacing a wallet.');
   await expect(page.locator('#preview-notice')).toBeVisible();
   await expect(page.locator('#watch-form, #watch-address, #watch-submit, #forget')).toHaveCount(0);
   await expect(page.locator('#wallet-panel')).toBeHidden();
@@ -2529,7 +2531,7 @@ test('first launch is honest, English, and has no private-key entry', async ({ p
   await expect(page.locator('body')).not.toContainText(/connection is not encrypted|Traffic is not encrypted|server-authenticated|Use a server you trust|independent full-node|not blockchain consensus/i);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   expect(errors).toEqual([]);
-  await page.screenshot({ path: 'test-results/alpha-start.png', fullPage: true });
+  await page.screenshot({ path: 'test-results/mobile-start.png', fullPage: true });
 });
 
 test('legacy watched address never restores browser wallet UI or receive requests', async ({ page }) => {
@@ -3158,7 +3160,7 @@ test('native-owned receive works with bounded RPC errors and conservative saved 
   await expect(page.locator('#claims-status')).toContainText('stopped');
   expect(await page.evaluate(() => window.testNative.calls.some(call => call.method === 'claimsStart'))).toBe(false);
   await expect(page.locator('#global-error')).toBeEmpty();
-  await page.screenshot({ path: 'test-results/alpha-claims.png', fullPage: true });
+  await page.screenshot({ path: 'test-results/mobile-claims.png', fullPage: true });
   await expect.poll(() => page.evaluate(() => localStorage.getItem('TEST_ONLY_NATIVE_CLAIMS_POLICY'))).toContain('"allowBackground":true');
   await page.reload();
   await waitReady(page);
@@ -3746,5 +3748,5 @@ test('payment request fields, long links and QR fit the smallest supported viewp
     expect(await page.evaluate(() => window.testCopiedLink)).toBe(await page.locator('#receive-uri').inputValue());
   }
   await page.setViewportSize({ width: 320, height: 568 });
-  await page.screenshot({ path: 'test-results/alpha-receive-small.png', fullPage: true });
+  await page.screenshot({ path: 'test-results/mobile-receive-small.png', fullPage: true });
 });

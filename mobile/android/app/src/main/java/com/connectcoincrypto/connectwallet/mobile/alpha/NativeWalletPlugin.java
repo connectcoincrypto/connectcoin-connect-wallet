@@ -1340,7 +1340,7 @@ public final class NativeWalletPlugin extends Plugin {
                         }
                         encrypted = WalletVault.openForUpdate(WalletVault.parse(new String(source, StandardCharsets.UTF_8)), secret);
                         JSONObject payload = encrypted.payload();
-                        // Preserve any passphrase already stored by earlier alpha builds.
+                        // Preserve any passphrase already stored by earlier builds.
                         unlocked = new VaultSession(payload.getString("mnemonic"), payload.optString("passphrase", ""));
                         nextHd = createHd(unlocked, encrypted); encrypted = null;
                         JSONObject nextPublic = nextHd.snapshot();

@@ -73,7 +73,7 @@ test('iOS background is unsupported even when every preference and capability is
   denied({ platform: 'ios', appActive: false, allowBackground: true, nativeBackgroundAvailable: true, allowMobileData: true }, 'ios-background-unsupported');
 });
 
-test('enabling every preference cannot bypass the unavailable alpha claims engine', () => {
+test('enabling every preference cannot bypass an unavailable native claims engine', () => {
   for (const platform of ['android', 'ios']) {
     for (const appActive of [true, false]) {
       denied({ platform, appActive, allowMobileData: true, allowBackground: true, nativeBackgroundAvailable: true,

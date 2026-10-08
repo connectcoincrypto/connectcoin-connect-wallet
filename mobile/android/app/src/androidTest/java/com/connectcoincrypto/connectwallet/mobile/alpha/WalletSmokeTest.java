@@ -49,7 +49,7 @@ import org.xmlpull.v1.XmlPullParser;
  * on loopback; here we verify the actual Android lifecycle reaches that transport.
  */
 @RunWith(AndroidJUnit4.class)
-public final class AlphaSmokeTest {
+public final class WalletSmokeTest {
     private static final String APP_ID = "com.connectcoincrypto.connectwallet.mobile.alpha";
     private static final String PROFILE_KEY = "connectwallet.mobile.alpha.public-profile.v1";
     private Context context;
@@ -243,7 +243,8 @@ public final class AlphaSmokeTest {
     @Test public void mergedPackageHasEnglishIdentityAndNoNotificationPromptPermission() throws Exception {
         PackageInfo info = context.getPackageManager().getPackageInfo(APP_ID,
             PackageManager.GET_PERMISSIONS | PackageManager.GET_PROVIDERS | PackageManager.GET_ACTIVITIES | PackageManager.GET_CONFIGURATIONS);
-        assertEquals("1.0.0-alpha.1", info.versionName);
+        assertEquals("1.0.0", info.versionName);
+        assertEquals(2, info.versionCode);
         Set<String> requested = new HashSet<>(Arrays.asList(info.requestedPermissions));
         // AndroidX may merge its own signature permission for non-exported dynamic receivers.
         requested.remove(APP_ID + ".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION");

@@ -1,6 +1,6 @@
-# ConnectWallet iOS development alpha
+# ConnectWallet iOS
 
-The iOS host packages the shared mobile UI with Capacitor 8.5.2 and a native Swift/C++ wallet runtime. This is development source, not an App Store release. An unsigned device `.app` archive is not an installable IPA. A green compile/test run is not physical-device acceptance or permission to use real funds.
+The iOS host packages the shared mobile UI with Capacitor 8.5.2 and a native Swift/C++ wallet runtime. Device installation requires Apple signing; an unsigned device `.app` archive is not an installable IPA.
 
 ## Native boundaries
 
@@ -51,8 +51,8 @@ The committed opaque 1024×1024 RGB icon is compiled deterministically from the 
 
 `App/App/PrivacyInfo.xcprivacy` declares app-private preferences, elapsed-time timers, app-container file metadata and user-selected document metadata according to [Apple's required-reason API definitions](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitypereasons). This is not an App Store privacy-label submission: the publisher still needs to review the actual RPC service's collection/retention practices and complete the distribution declarations.
 
-## Verification and remaining acceptance
+## Verification
 
 `.github/workflows/ios-wallet.yml` runs macOS Swift tests, native linking, real Simulator/device app builds and UIKit/WKWebView smoke tests. Inspect the workflow for the exact commit; test source is not evidence of a completed passing run. Artifacts are temporary Actions outputs, never a release. The Simulator test creates/deletes only its own new simulator, launches with a Debug-Simulator-only offline flag, uses isolated temporary wallet storage, denies network before DNS and disables claims start. It verifies file-proxy/cookie-prompt/class-alias isolation and opens/cancels native creation, recovery and document dialogs plus shared Settings. A second test imports the public BIP39 `abandon … about` fixture through native forms, checks its known first receiving address, and locks/unlocks its encrypted test vault. Screenshot attachments deliberately exclude recovery/password inputs. It never imports a user wallet, funds a wallet or broadcasts a transaction.
 
-Before use beyond a development alpha, run physical iPhone/iPad acceptance for keyboard/large text/rotation, Files providers and cancelled/stalled import/export, wrong passwords and replacement failure, protected-data locking, app-switch/process-death recovery, QR permissions/scanning/deep links, background/foreground and Wi-Fi/mobile/VPN transitions, memory pressure/KDF cost, long HD recovery and public payment/claims receipts. Live payment/claim tests require separately authorized dedicated test funds and explicit native review. Simulator smoke does not establish those results or App Store policy compliance.
+The physical iPhone/iPad verification checklist covers keyboard/large text/rotation, Files providers and cancelled/stalled import/export, wrong passwords and replacement failure, protected-data locking, app-switch/process-death recovery, QR permissions/scanning/deep links, background/foreground and Wi-Fi/mobile/VPN transitions, memory pressure/KDF cost, long HD recovery and public payment/claims receipts. Live payment/claim tests require separately authorized dedicated test funds and explicit native review. App Store distribution requires the publisher's signing and policy submissions separately from these tests.

@@ -22,6 +22,13 @@ assert.equal(capacitor.ios.contentInset, 'never', 'Native safe-area bounds must 
 assert.equal(capacitor.server.url, undefined, 'Only packaged web assets may run.');
 assert.match(spm, /exact: "8\.5\.2"/);
 assert.match(project, /PBXFileSystemSynchronizedRootGroup/);
+assert.equal(pkg.version, '1.0.0');
+assert.equal(locked.version, pkg.version);
+assert.equal(locked.packages[''].version, pkg.version);
+assert.deepEqual([...project.matchAll(/MARKETING_VERSION = ([^;]+);/g)].map(match => match[1]),
+  [pkg.version, pkg.version], 'Both iOS configurations must use the current mobile version.');
+assert.deepEqual([...project.matchAll(/CURRENT_PROJECT_VERSION = ([^;]+);/g)].map(match => match[1]),
+  ['2', '2'], 'Both iOS configurations must increment the installed build.');
 assert.match(project, /relativePath = \.\.\/WalletCore;/);
 assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.4;/);
 assert.doesNotMatch(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.0;/);

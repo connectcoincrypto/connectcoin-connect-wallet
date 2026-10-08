@@ -12,7 +12,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 
 /** User-started, visible P2C proof collection. No boot receiver or sticky restart.
- * specialUse is a truthful alpha declaration, not a claim of store approval.
+ * specialUse declares the foreground service category for proof collection.
  */
 public final class ClaimsService extends Service {
     private static final String CHANNEL = "automatic-claims-active";

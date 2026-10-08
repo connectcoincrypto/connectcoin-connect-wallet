@@ -69,13 +69,23 @@ build_app() {
   local product="$native_root/$sdk/DerivedData/Build/Products/Release-$sdk/App.app"
   test -d "$product"
   test -s "$product/PrivacyInfo.xcprivacy"
-  /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$product/Info.plist"
-  local display_name
+  local bundle_id display_name marketing_version build_version expected_version
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$product/Info.plist")"
+  if [[ "$bundle_id" != com.connectcoincrypto.connectwallet.mobile.alpha ]]; then
+    echo "Unexpected application identity: $bundle_id" >&2; exit 1
+  fi
   display_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$product/Info.plist")"
   if [[ "$display_name" != ConnectWallet ]]; then
     echo "Unexpected installed app name: $display_name" >&2; exit 1
   fi
   echo "Verified installed app name: $display_name"
+  expected_version="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')"
+  marketing_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$product/Info.plist")"
+  build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$product/Info.plist")"
+  if [[ "$marketing_version" != "$expected_version" || "$build_version" != 2 ]]; then
+    echo "Unexpected installed app version: $marketing_version ($build_version)" >&2; exit 1
+  fi
+  echo "Verified installed app version: $marketing_version ($build_version)"
   xcrun lipo -info "$product/App"
   # These are explicitly labelled app bundles, not installable/signed IPAs.
   ditto -c -k --sequesterRsrc --keepParent "$product" "$artifact_dir/ConnectWallet-$label.app.zip"

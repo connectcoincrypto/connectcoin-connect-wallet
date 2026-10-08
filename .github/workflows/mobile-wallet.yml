@@ -1,26 +1,26 @@
-name: Mobile alpha checks
+name: Mobile wallet checks
 
 # Development checks on main and mobile branches. No tags, GitHub Release, store upload, real wallet
 # profile, production claims, signing key, or live RPC query is used by these jobs.
 on:
   push:
-    branches: [main, mobile-alpha]
-    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-alpha.yml']
+    branches: [main]
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-wallet.yml']
   pull_request:
     branches: [main]
-    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-alpha.yml']
+    paths: ['mobile/**', 'src/**', 'assets/**', 'LICENSE', 'helpers/**', 'package.json', 'package-lock.json', '.github/workflows/mobile-wallet.yml']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: mobile-alpha-${{ github.ref }}
+  group: mobile-wallet-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   android:
-    name: Android alpha / JVM, APK and isolated emulator
+    name: Android / JVM, APK and isolated emulator
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -96,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ConnectWallet-mobile-alpha-android-${{ github.sha }}
+          name: ConnectWallet-mobile-android-${{ github.sha }}
           path: |
             mobile/android/app/build/outputs/apk/debug/*.apk
             mobile/android/app/build/reports/
@@ -140,7 +140,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ConnectWallet-mobile-alpha-apple-native-checks-${{ github.sha }}
+          name: ConnectWallet-mobile-apple-native-checks-${{ github.sha }}
           path: |
             mobile/.tools/native-host/Testing/Temporary/LastTest.log
             mobile/.tools/native-*/CMakeFiles/CMakeConfigureLog.yaml

@@ -56,7 +56,7 @@ assert.equal(attr(application[0], 'roundIcon'), '@mipmap/ic_launcher_round');
 assert.equal(attr(application[0], 'label'), '@string/app_name');
 assert.notEqual(attr(application[0], 'debuggable'), 'true');
 for (const component of ['provider', 'receiver', 'activity-alias']) {
-  assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the native wallet alpha`);
+  assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the native wallet`);
 }
 const services = elements(manifest, 'service');
 assert.equal(services.length, 1);
@@ -139,8 +139,8 @@ for (const name of ['ic_launcher', 'ic_launcher_round']) {
 const gradle = await read(path.join(app, 'build.gradle'));
 assert.match(gradle, /namespace\s*=\s*"com\.connectcoincrypto\.connectwallet\.mobile\.alpha"/);
 assert.match(gradle, /applicationId\s+"com\.connectcoincrypto\.connectwallet\.mobile\.alpha"/);
-assert.match(gradle, /versionCode\s+1\b/);
-assert.match(gradle, /versionName\s+"1\.0\.0-alpha\.1"/);
+assert.match(gradle, /versionCode\s+2\b/);
+assert.match(gradle, /versionName\s+"1\.0\.0"/);
 assert.match(gradle, /resourceConfigurations\s*\+=\s*\['en'\]/);
 assert.match(gradle, /release\s*\{\s*debuggable\s+false/);
 assert.match(gradle, /testImplementation\s+'org\.json:json:20250517'/);
@@ -513,4 +513,4 @@ assert.match(await read(path.join(java, 'ClaimsService.java')), /START_NOT_STICK
 const icons = spawnSync(process.execPath, [path.join(mobile, 'scripts/generate-android-icons.mjs'), '--check'], { encoding: 'utf8' });
 assert.equal(icons.status, 0, icons.stderr || icons.stdout || String(icons.error));
 console.log(icons.stdout.trim());
-console.log(`Android alpha static checks passed (${xmlCount} XML documents, manifest, backup, pinned build tools, WebView fallback and restricted native wallet bridge).`);
+console.log(`Android static checks passed (${xmlCount} XML documents, manifest, backup, pinned build tools, WebView fallback and restricted native wallet bridge).`);
