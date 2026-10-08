@@ -8,7 +8,7 @@ final class PaymentTransactionsTests: XCTestCase {
         XCTAssertEqual(try NativeTransactions.coinAmount("0.0000000001"), 1)
         XCTAssertEqual(try NativeTransactions.format(10_000_000_001), "1.0000000001")
         XCTAssertEqual(try NativeTransactions.coinAmount("100000000"), NativeTransactions.MAX_MONEY)
-        for invalid in ["-1", "1e3", "0.00000000001", "100000001", "01", "Infinity", "NaN", ".1", "1."] { XCTAssertThrowsError(try NativeTransactions.coinAmount(invalid), invalid) }
+        for invalid in ["-1", "1e3", "0.00000000001", "100000001", "999999999", "01", "Infinity", "NaN", ".1", "1."] { XCTAssertThrowsError(try NativeTransactions.coinAmount(invalid), invalid) }
         XCTAssertThrowsError(try NativeTransactions.amount("1000000000000000001"))
         XCTAssertEqual(try PaymentTarget.target("1"), String(repeating: "f", count: 64))
         XCTAssertEqual(try PaymentTarget.target("2"), "7" + String(repeating: "f", count: 63))

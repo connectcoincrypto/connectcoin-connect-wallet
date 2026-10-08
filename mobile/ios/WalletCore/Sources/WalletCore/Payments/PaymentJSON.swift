@@ -41,9 +41,20 @@ enum PJ {
         if let a = lhs as? [Any], let b = rhs as? [Any] { return a.count == b.count && zip(a, b).allSatisfy { equal($0.0, $0.1) } }
         if let a = lhs as? String, let b = rhs as? String { return a == b }
         if let a = lhs as? NSNumber, let b = rhs as? NSNumber {
-            return (CFGetTypeID(a) == CFBooleanGetTypeID()) == (CFGetTypeID(b) == CFBooleanGetTypeID()) && a == b
+            return (CFGetTypeID(a) == CFBooleanGetTypeID()) == (CFGetTypeID(b) == CFBooleanGetTypeID())
+                && ["f", "d"].contains(String(cString: a.objCType)) == ["f", "d"].contains(String(cString: b.objCType)) && a == b
         }
         return lhs is NSNull && rhs is NSNull
+    }
+    static func snapshot(_ object: JSONObject) -> JSONObject {
+        // Detach nested mutable Foundation containers while retaining immutable
+        // strings, including large raw parents shared by thousands of outputs.
+        func copy(_ value: Any) -> Any {
+            if let dictionary = value as? JSONObject { return dictionary.mapValues(copy) }
+            if let array = value as? [Any] { return array.map(copy) }
+            return value
+        }
+        return object.mapValues(copy)
     }
     static func outpoint(_ value: JSONObject) throws -> String { try hash(value["txid"]) + ":" + String(integer(value["vout"], 0, 0xffff_ffff)) }
 }

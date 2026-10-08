@@ -30,7 +30,7 @@ public actor NativeHdWallet {
     private func derive(_ index: Int, _ branch: Int) throws -> JSONObject {
         try check(); let key = "\(branch):\(index)"
         if let value = paths[key] { return value }
-        try walletRequire(paths.count < Self.maxAccounts && index <= Int32.max, "HD recovery exceeds this device's address limit; use ConnectWallet desktop")
+        try walletRequire(paths.count < Self.maxAccounts && index <= Int(Int32.max), "HD recovery exceeds this device's address limit; use ConnectWallet desktop")
         let value = try session.publicAccount(index: index, change: branch); paths[key] = value; return value
     }
     public func snapshot() -> JSONObject {
@@ -147,7 +147,7 @@ public actor NativeHdWallet {
             lastReceive = used[0]; lastChange = used[1]
             receiveIndex = max(receiveIndex, lastReceive + 1); changeIndex = max(changeIndex, lastChange + 1)
             _ = try derive(receiveIndex, 0); _ = try derive(changeIndex, 1)
-            var payload = try vault.payload()
+            payload = try vault.payload()
             payload["receiveIndex"] = receiveIndex; payload["changeIndex"] = changeIndex
             payload["lastUsedReceive"] = lastReceive; payload["lastUsedChange"] = lastChange
             payload["needsRecovery"] = false; payload["scanLookahead"] = true; payload["mobileHdRecovered"] = true
@@ -181,5 +181,41 @@ public actor NativeHdWallet {
             }
         }
         return !rows.isEmpty
+    }
+    public static func usedAddresses(_ method: String, _ params: JSONObject, _ response: JSONObject) throws -> [String] {
+        if method == "getaddresshistory" {
+            let address = try params.string("address"); return try historyUsed(response, address) ? [address] : []
+        }
+        if method == "getaddressutxos" {
+            let address = try params.string("address")
+            return try NativePaymentChecks.utxos(response, address, response.object("tip")).isEmpty ? [] : [address]
+        }
+        guard method == "getaddresschanges" else { return [] }
+        try walletRequire(Set(response.keys) == Set(["tip", "unit", "changes", "next_cursor", "has_more", "through_sequence", "journal_epoch"]) && response["unit"] as? String == "connects", "Invalid address journal")
+        let tip = try NativePaymentChecks.tip(response.object("tip")), more = try response.boolean("has_more")
+        let through = try response.integer("through_sequence", min: 0, max: 9_007_199_254_740_991)
+        _ = try response.integer("journal_epoch", min: 0, max: 9_007_199_254_740_991)
+        try walletRequire(try NativePaymentChecks.cursor(response) != nil, "Missing journal cursor")
+        let requested = try params.array("addresses").map { try JSON.string($0) }
+        try walletRequire(!requested.isEmpty && requested.count <= 100 && Set(requested).count == requested.count, "Invalid journal scope")
+        let changes = try response.array("changes"); try walletRequire(changes.count <= 500 && (!more || !changes.isEmpty), "Invalid journal page")
+        var used = Set<String>(), previous: Int64 = -1
+        for value in changes {
+            let event = try JSON.object(value), sequence = try event.integer("sequence", min: 0, max: through)
+            try walletRequire(sequence > previous, "Unordered journal"); previous = sequence
+            let address = try event.string("address"), txid = try event.string("txid"), kind = try event.string("kind"), action = try event.string("action")
+            try walletRequire(requested.contains(address) && MobileRpcClient.hash(txid) && ["history", "utxo"].contains(kind) && ["upsert", "remove"].contains(action), "Invalid journal event")
+            let utxo = kind == "utxo", upsert = action == "upsert"
+            try walletRequire(event.count == 5 + (utxo ? 1 : 0) + (upsert ? 1 : 0), "Invalid journal event schema")
+            let vout = utxo ? try event.integer("vout", min: 0, max: 0xffffffff) : -1
+            if !upsert { continue }
+            let item = try event.object("item"); try walletRequire(item["txid"] as? String == txid, "Journal identity mismatch")
+            let page: JSONObject = ["address": address, "tip": tip, "unit": "connects", "live": true, "items": [item], "next_cursor": NSNull()]
+            if utxo { try walletRequire(try item.integer("vout") == vout, "Journal output mismatch"); _ = try NativePaymentChecks.utxos(page, address, tip) }
+            else { _ = try historyUsed(page, address) }
+            used.insert(address)
+        }
+        try walletRequire(!more || previous < through, "Invalid journal continuation")
+        return used.sorted()
     }
 }

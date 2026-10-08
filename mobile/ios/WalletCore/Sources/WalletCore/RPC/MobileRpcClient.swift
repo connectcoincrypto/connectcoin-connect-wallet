@@ -1,5 +1,7 @@
 import Foundation
 import Network
+import Darwin
+import CConnectWallet
 
 public struct RpcFailure: Error, LocalizedError {
     public let code: String
@@ -12,6 +14,19 @@ public struct RpcFailure: Error, LocalizedError {
         if unknownOutcome { return "Broadcast outcome is unknown. Check its transaction ID before retrying." }
         if code == "-32029" { return "RPC rate limit reached. Retrying after the server cooldown." }
         return code
+    }
+}
+
+/// Native lifecycle fence checked atomically at the first socket write. Once a
+/// write begins, revocation never pretends the outcome is safely unsent.
+public final class RpcBroadcastPermit: @unchecked Sendable {
+    private let mutex = NSLock()
+    private var valid = true
+    public init() {}
+    public func cancel() { mutex.lock(); valid = false; mutex.unlock() }
+    public var isValid: Bool { mutex.lock(); defer { mutex.unlock() }; return valid }
+    fileprivate func perform(_ action: () -> Void) -> Bool {
+        mutex.lock(); defer { mutex.unlock() }; guard valid else { return false }; action(); return true
     }
 }
 
@@ -40,40 +55,88 @@ public protocol RpcWire: AnyObject {
     func cancel()
 }
 
-final class NetworkRpcWire: RpcWire {
-    let connection: NWConnection
-    init(_ endpoint: TcpEndpoint) {
-        let options = NWProtocolTCP.Options(); options.noDelay = true
-        options.enableKeepalive = true
-        connection = NWConnection(host: NWEndpoint.Host(endpoint.hostname), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: NWParameters(tls: nil, tcp: options))
+/// getaddrinfo is not cancellable. At most two process-wide native workers may
+/// remain in OS resolution, with no unbounded queued work. A late result never
+/// opens a socket after its wire has been cancelled. Numeric NWEndpoint avoids
+/// a second DNS lookup between address validation and the actual connection.
+private enum PublicRpcResolver {
+    static let mutex = NSLock()
+    static var running = 0
+    static let workers = DispatchQueue(label: "connectwallet.ios.rpc.dns", attributes: .concurrent)
+    static func resolve(_ hostname: String, _ completed: @escaping (String?) -> Void) {
+        mutex.lock()
+        guard running < 2 else { mutex.unlock(); completed(nil); return }
+        running += 1; mutex.unlock()
+        workers.async {
+            var numeric: String?
+            var hints = addrinfo(); hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP
+            var head: UnsafeMutablePointer<addrinfo>?
+            if getaddrinfo(hostname, nil, &hints, &head) == 0, let first = head {
+                defer { freeaddrinfo(first) }
+                // Match the Android rule: the resolver's chosen first endpoint
+                // must itself be public. Mixed private/public answers fail shut.
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if let address = first.pointee.ai_addr,
+                   getnameinfo(address,first.pointee.ai_addrlen,&host,socklen_t(host.count),nil,0,NI_NUMERICHOST) == 0 {
+                    let result = String(cString: host)
+                    if isPublic(result) { numeric = result }
+                }
+            }
+            mutex.lock(); running -= 1; mutex.unlock(); completed(numeric)
+        }
     }
+    static func isPublic(_ numeric: String) -> Bool { numeric.withCString { cw_wallet_is_public_address($0) == 1 } }
+}
+final class NetworkRpcWire: RpcWire {
+    private let endpoint: TcpEndpoint, mutex = NSLock()
+    private var connection: NWConnection?, cancelled = false
+    init(_ endpoint: TcpEndpoint) { self.endpoint = endpoint }
+    static func isPublicAddress(_ numeric: String) -> Bool { PublicRpcResolver.isPublic(numeric) }
     func start(queue: DispatchQueue, ready: @escaping () -> Void, receive: @escaping (Data) -> Void, failed: @escaping () -> Void) {
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready: ready(); self?.read(receive, failed)
-            case .failed: failed()
-            default: break
+        PublicRpcResolver.resolve(endpoint.hostname) { [weak self] numeric in
+            queue.async {
+                guard let self else { return }
+                self.mutex.lock()
+                guard !self.cancelled else { self.mutex.unlock(); return }
+                guard let numeric else { self.mutex.unlock(); failed(); return }
+                let options = NWProtocolTCP.Options(); options.noDelay = true; options.enableKeepalive = true
+                let connection = NWConnection(host: NWEndpoint.Host(numeric), port: NWEndpoint.Port(rawValue: self.endpoint.port)!, using: NWParameters(tls:nil,tcp:options))
+                self.connection = connection; self.mutex.unlock()
+                connection.stateUpdateHandler = { [weak self] state in
+                    switch state {
+                    case .ready: ready(); self?.read(connection, receive, failed)
+                    case .failed: failed()
+                    default: break
+                    }
+                }
+                connection.start(queue: queue)
             }
         }
-        connection.start(queue: queue)
     }
-    private func read(_ receive: @escaping (Data) -> Void, _ failed: @escaping () -> Void) {
+    private func read(_ connection: NWConnection, _ receive: @escaping (Data) -> Void, _ failed: @escaping () -> Void) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, error in
             if let data, !data.isEmpty { receive(data) }
-            if complete || error != nil { failed() } else { self?.read(receive, failed) }
+            if complete || error != nil { failed() } else { self?.read(connection, receive, failed) }
         }
     }
     func send(_ bytes: Data, completed: @escaping (Bool) -> Void) {
+        mutex.lock(); let connection = cancelled ? nil : self.connection; mutex.unlock()
+        guard let connection else { completed(false); return }
         connection.send(content: bytes, completion: .contentProcessed { completed($0 == nil) })
     }
-    func cancel() { connection.stateUpdateHandler = nil; connection.cancel() }
+    func cancel() {
+        mutex.lock(); cancelled = true; let old = connection; connection = nil; mutex.unlock()
+        old?.stateUpdateHandler = nil; old?.cancel()
+    }
 }
 
 /// One multiplexed TCP connection, 16 in-flight requests, 48 total operations.
 /// Quota waits never consume request timeout, nor occupy an in-flight slot.
-public final class MobileRpcClient {
+// All mutable client state and callbacks are owned by queue; public operations
+// enqueue there. The only cross-queue flags have their own mutexes.
+public final class MobileRpcClient: @unchecked Sendable {
     public typealias Completion = (Result<JSONObject, Error>) -> Void
-    private final class Cancellation {
+    private final class Cancellation: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
         func cancel() { lock.lock(); cancelled = true; lock.unlock() }
@@ -82,32 +145,42 @@ public final class MobileRpcClient {
     private final class Job {
         let id: String, method: String
         let params: JSONObject
+        let permit: RpcBroadcastPermit?
         var completion: Completion?
         var started: TimeInterval?
         var written = false
         var streamID: String?
-        var sequence = 0, rows = 0, bytes = 0
+        var sequence = 0, rows = 0, bytes = 0, retainedBytes = 0
         var snapshot = false, state = false
         var chunks: [JSONObject] = []
-        init(_ id: String, _ method: String, _ params: JSONObject, _ completion: @escaping Completion) {
-            self.id = id; self.method = method; self.params = params; self.completion = completion
+        init(_ id: String, _ method: String, _ params: JSONObject, _ permit: RpcBroadcastPermit?, _ completion: @escaping Completion) {
+            self.id = id; self.method = method; self.params = params; self.permit = permit; self.completion = completion
         }
     }
     private let queue = DispatchQueue(label: "connectwallet.ios.rpc")
     private let factory: () -> RpcWire
     private let now: () -> TimeInterval
     private let window: TimeInterval
-    private var wire: RpcWire?, ready = false, active = false
+    private var wire: RpcWire?, ready = false, active = false, retired = false
     private var epoch: UInt64 = 0
     private var buffer = Data()
     private var jobs: [String: Job] = [:], order: [String] = []
     private var history: [String: [TimeInterval]] = [:], cooldowns: [String: TimeInterval] = [:]
     private var timer: DispatchSourceTimer?
     private var connectStarted: TimeInterval?
+    private var retainedStreamBytes = 0
     // Listener-only clients are constructed natively. UI query never exposes these methods.
     private let subscriptions: Bool
-    public var notification: ((JSONObject) -> Void)?
-    public var disconnected: (() -> Void)?
+    private var notificationHandler: ((JSONObject) -> Void)?
+    private var disconnectedHandler: (() -> Void)?
+    public var notification: ((JSONObject) -> Void)? {
+        get { queue.sync { notificationHandler } }
+        set { queue.async { self.notificationHandler = newValue } }
+    }
+    public var disconnected: (() -> Void)? {
+        get { queue.sync { disconnectedHandler } }
+        set { queue.async { self.disconnectedHandler = newValue } }
+    }
 
     public convenience init(endpoint: TcpEndpoint, subscriptions: Bool = false) {
         self.init(factory: { NetworkRpcWire(endpoint) }, subscriptions: subscriptions)
@@ -121,20 +194,42 @@ public final class MobileRpcClient {
     }
     deinit { timer?.cancel(); wire?.cancel() }
     public func setActive(_ value: Bool) {
-        queue.async { self.active = value; if !value { self.failWire("RPC_CANCELLED") } else { self.pump() } }
+        queue.async { guard !self.retired else { return }; self.active = value; if !value { self.failWire("RPC_CANCELLED") } else { self.pump() } }
     }
     public func cancelAll() { queue.async { self.failWire("RPC_CANCELLED") } }
+    public func close() { queue.async { self.retired = true; self.active = false; self.failWire("RPC_CANCELLED") } }
+    /// Native settings transition: no broadcast may overlap replacement. Public
+    /// reads are revoked and quota/cooldown timestamps survive the endpoint swap.
+    public func replaceEndpoint(_ endpoint: TcpEndpoint) async throws -> MobileRpcClient {
+        try await replacing(factory: { NetworkRpcWire(endpoint) })
+    }
+    func replacing(factory: @escaping () -> RpcWire) async throws -> MobileRpcClient {
+        try await withCheckedThrowingContinuation { continuation in queue.async {
+            guard !self.retired, !self.jobs.values.contains(where: { $0.method == "sendrawtransaction" }) else {
+                continuation.resume(throwing: RpcFailure("RPC_BUSY")); return
+            }
+            let successor = MobileRpcClient(factory:factory,subscriptions:self.subscriptions,window:self.window,now:self.now)
+            let history = self.history, cooldowns = self.cooldowns, active = self.active
+            self.retired = true; self.active = false; self.failWire("RPC_CANCELLED")
+            successor.queue.async {
+                successor.history = history; successor.cooldowns = cooldowns; successor.active = active
+                continuation.resume(returning:successor)
+            }
+        } }
+    }
     public func call(_ method: String, _ params: JSONObject = [:]) async throws -> JSONObject {
         try walletRequire(!["sendrawtransaction", "getblockbounties"].contains(method), "Unsupported native RPC method")
         return try await operation(method, params)
     }
-    public func broadcast(_ hex: String) async throws -> JSONObject { try await operation("sendrawtransaction", ["transaction_hex": hex]) }
+    public func broadcast(_ hex: String, permit: RpcBroadcastPermit? = nil) async throws -> JSONObject {
+        try await operation("sendrawtransaction", ["transaction_hex": hex], permit:permit)
+    }
     /// Chunks are published only after a verified stream.end, never on an incomplete snapshot.
     public func streamBounties(_ hash: String) async throws -> [JSONObject] {
         let result = try await operation("getblockbounties", ["block_hash": hash])
         return try result.array("chunks").map { try JSON.object($0) }
     }
-    private func operation(_ method: String, _ params: JSONObject) async throws -> JSONObject {
+    private func operation(_ method: String, _ params: JSONObject, permit: RpcBroadcastPermit? = nil) async throws -> JSONObject {
         let id = UUID().uuidString
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler(operation: {
@@ -146,7 +241,8 @@ public final class MobileRpcClient {
                         let clean = try Self.validateParams(method, params, subscriptions: self.subscriptions)
                         guard self.active else { throw RpcFailure("RPC_INACTIVE") }
                         guard self.jobs.count < 48 else { throw RpcFailure("RPC_BUSY") }
-                        self.jobs[id] = Job(id, method, clean) { continuation.resume(with: $0) }
+                        guard permit?.isValid != false else { throw RpcFailure("RPC_CANCELLED") }
+                        self.jobs[id] = Job(id, method, clean, permit) { continuation.resume(with: $0) }
                         self.order.append(id); self.pump()
                     } catch { continuation.resume(throwing: error) }
                 }
@@ -158,11 +254,13 @@ public final class MobileRpcClient {
         var failure = RpcFailure("RPC_CANCELLED")
         failure.unknownOutcome = job.method == "sendrawtransaction" && job.written
         job.completion?(.failure(failure)); job.completion = nil
+        retainedStreamBytes -= job.retainedBytes; job.retainedBytes = 0; job.chunks = []
         if !job.written { remove(job); pump() }
         // A written request retains its ID until reply/timeout, so late replies do
         // not corrupt unrelated payments. No cancellation ever auto-retries a send.
     }
     private func quotaKeys(_ job: Job) -> [(String, Int)] {
+        if subscriptions && ["subscribeaddress", "subscribetip"].contains(job.method) { return [] }
         if job.method == "getblockbounties" { return [(job.method, 48), (job.method + ":" + (job.params["block_hash"] as? String ?? ""), 8)] }
         return [(job.method, job.method == "gettransactions" ? 6 : 48)]
     }
@@ -178,6 +276,13 @@ public final class MobileRpcClient {
         guard active else { return }
         guard !jobs.isEmpty else { return }
         let time = now()
+        // Reclaim expired block-specific histories even when those blocks never
+        // appear again. Remote block hashes cannot grow the limiter indefinitely.
+        for key in Array(history.keys) {
+            let retained = history[key]!.filter { time - $0 < window }
+            if retained.isEmpty { history.removeValue(forKey:key) } else { history[key] = retained }
+        }
+        for key in Array(cooldowns.keys) where cooldowns[key]! <= time { cooldowns.removeValue(forKey:key) }
         let waiting = order.compactMap { jobs[$0] }.filter { !$0.written && eligible($0, time) }
         guard !waiting.isEmpty else { return }
         if wire == nil { connect() }; guard ready, let wire else { return }
@@ -187,12 +292,17 @@ public final class MobileRpcClient {
             do {
                 var bytes = try JSON.encode(["jsonrpc": "2.0", "id": job.id, "method": job.method, "params": job.params])
                 try walletRequire(bytes.count <= 1024 * 1024, "RPC_INVALID"); bytes.append(10)
-                for (key, _) in quotaKeys(job) { history[key, default: []].append(time) }
-                job.started = time; job.written = true; count += 1
-                let epoch = self.epoch
-                wire.send(bytes) { [weak self] success in
-                    guard let self else { return }; self.queue.async { if !success && self.epoch == epoch { self.failWire("RPC_UNAVAILABLE") } }
+                try walletRequire(Set(history.keys).union(quotaKeys(job).map { $0.0 }).count <= 1024, "RPC_BUSY")
+                let transmit = {
+                    for (key, _) in self.quotaKeys(job) { self.history[key, default: []].append(time) }
+                    job.started = time; job.written = true
+                    let epoch = self.epoch
+                    wire.send(bytes) { [weak self] success in
+                        guard let self else { return }; self.queue.async { if !success && self.epoch == epoch { self.failWire("RPC_UNAVAILABLE") } }
+                    }
                 }
+                if let permit = job.permit { guard permit.perform(transmit) else { throw RpcFailure("RPC_CANCELLED") } } else { transmit() }
+                count += 1
             } catch { finish(job, .failure(error)) }
         }
     }
@@ -232,8 +342,6 @@ public final class MobileRpcClient {
                     if let delay = try? details.integer("retry_after_ms", min: 0) { error.retryAfterMs = Int(min(60_000, delay)) }
                 }
                 error.explicitRejection = error.code == "-32020" && error.nodeCode != nil
-                // Validation/rate-limit errors received from the service are proven rejection.
-                if ["-32029", "-32602", "-32601"].contains(error.code) { error.explicitRejection = true }
                 error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection
                 if error.code == "-32029" { cooldowns[job.method] = now() + max(window, Double(error.retryAfterMs) / 1000) }
                 finish(job, .failure(error)); return
@@ -249,7 +357,7 @@ public final class MobileRpcClient {
             }
         } else {
             let method = try message.string("method"), params = try message.object("params")
-            if subscriptions && method == "subscription" { notification?(message); return }
+            if subscriptions && method == "subscription" { notificationHandler?(message); return }
             let streamID = try params.string("stream_id")
             guard let job = jobs.values.first(where: { $0.streamID == streamID }) else { throw RpcFailure("RPC_PROTOCOL") }
             job.bytes += bytes; try walletRequire(job.bytes <= 64 * 1024 * 1024, "RPC_STREAM_LIMIT")
@@ -268,10 +376,16 @@ public final class MobileRpcClient {
                 let items = try chunk.array("items"); job.rows += items.count
                 try walletRequire(items.count <= 500 && job.rows <= 100_000, "RPC_STREAM_LIMIT")
             } else { try walletRequire(type == "state", "RPC_PROTOCOL"); _ = try chunk.string("cursor"); job.state = true }
-            if job.completion != nil { job.chunks.append(chunk) }
+            if job.completion != nil {
+                try walletRequire(retainedStreamBytes + bytes <= 64 * 1024 * 1024, "RPC_STREAM_LIMIT")
+                job.chunks.append(chunk); job.retainedBytes += bytes; retainedStreamBytes += bytes
+            }
         }
     }
-    private func remove(_ job: Job) { jobs.removeValue(forKey: job.id); order.removeAll { $0 == job.id } }
+    private func remove(_ job: Job) {
+        retainedStreamBytes -= job.retainedBytes; job.retainedBytes = 0
+        jobs.removeValue(forKey: job.id); order.removeAll { $0 == job.id }
+    }
     private func finish(_ job: Job, _ result: Result<JSONObject, Error>) {
         remove(job); let completion = job.completion; job.completion = nil; completion?(result)
     }
@@ -281,7 +395,7 @@ public final class MobileRpcClient {
             var error = RpcFailure(code); error.unknownOutcome = job.method == "sendrawtransaction" && job.written
             finish(job, .failure(error))
         }
-        disconnected?()
+        disconnectedHandler?()
     }
     private func tick() {
         let time = now()
@@ -301,25 +415,37 @@ public final class MobileRpcClient {
             "subscribeaddress": ["address", "changes_only"], "subscribetip": []]
         guard let allowed = methods[method], Set(params.keys).isSubset(of: allowed),
               subscriptions || !["subscribeaddress", "subscribetip"].contains(method) else { throw RpcFailure("RPC_INVALID") }
+        if subscriptions { try walletRequire(["subscribeaddress","subscribetip","getchaintip"].contains(method), "RPC_INVALID") }
+        var clean: JSONObject = [:]
         for key in allowed {
             guard let value = params[key] else { if ["cursor", "include_pending_spent"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
             switch key {
-            case "address": _ = try WalletCrypto.decodeAddress(JSON.string(value))
+            case "address":
+                let text = try JSON.string(value); _ = try WalletCrypto.decodeAddress(text); clean[key] = text.lowercased()
             case "addresses":
-                let addresses = try JSON.array(value); try walletRequire(!addresses.isEmpty && addresses.count <= 10_000, "RPC_INVALID")
-                for address in addresses { _ = try WalletCrypto.decodeAddress(JSON.string(address)) }
-            case "txid", "block_hash": try walletRequire(hash(try JSON.string(value)), "RPC_INVALID")
+                let addresses = try JSON.array(value); try walletRequire(!addresses.isEmpty && addresses.count <= 100, "RPC_INVALID")
+                var normalized = [String]()
+                for address in addresses { let text = try JSON.string(address); _ = try WalletCrypto.decodeAddress(text); normalized.append(text.lowercased()) }
+                try walletRequire(Set(normalized).count == normalized.count,"RPC_INVALID"); clean[key] = normalized
+            case "txid", "block_hash":
+                let text = try JSON.string(value); try walletRequire(hash(text), "RPC_INVALID"); clean[key] = text.lowercased()
             case "txids":
-                let ids = try JSON.array(value); try walletRequire(!ids.isEmpty && ids.count <= 100, "RPC_INVALID")
-                for id in ids { try walletRequire(hash(try JSON.string(id)), "RPC_INVALID") }
-            case "cursor": try walletRequire(try JSON.string(value).utf8.count <= 2048, "RPC_INVALID")
-            case "include_pending_spent", "changes_only": _ = try JSON.boolean(value)
+                let ids = try JSON.array(value); try walletRequire(!ids.isEmpty && ids.count <= 32, "RPC_INVALID")
+                var normalized = [String]()
+                for id in ids { let text = try JSON.string(id); try walletRequire(hash(text),"RPC_INVALID"); normalized.append(text.lowercased()) }
+                try walletRequire(Set(normalized).count == normalized.count,"RPC_INVALID"); clean[key] = normalized
+            case "cursor":
+                if value is NSNull { clean[key] = NSNull() }
+                else { let text = try JSON.string(value); try walletRequire(text.range(of:"\\A[A-Za-z0-9_.-]{1,1024}\\z",options:.regularExpression) != nil,"RPC_INVALID"); clean[key] = text }
+            case "include_pending_spent", "changes_only":
+                let boolean = try JSON.boolean(value); try walletRequire(key != "changes_only" || boolean,"RPC_INVALID"); clean[key] = boolean
             case "transaction_hex":
                 let hex = try JSON.string(value)
-                try walletRequire(!hex.isEmpty && hex.count <= 800_000 && hex.count % 2 == 0 && hex.range(of: "^[0-9a-fA-F]+$", options: .regularExpression) != nil, "RPC_INVALID")
+                try walletRequire(hex.count >= 20 && hex.count <= 800_000 && hex.count % 2 == 0 && hex.range(of: "\\A[0-9a-fA-F]+\\z", options: .regularExpression) != nil, "RPC_INVALID")
+                clean[key] = hex.lowercased()
             default: throw RpcFailure("RPC_INVALID")
             }
         }
-        return try JSON.clone(params)
+        return clean
     }
 }

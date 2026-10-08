@@ -14,6 +14,10 @@ public protocol MobilePaymentBatchSender {
     /// A timeout, cancellation, or server rejection is insufficient evidence.
     func provenNotSent(_ error: Error) -> Bool
 }
+public protocol MobilePaymentBatchAsyncSender {
+    func broadcast(_ hex: String) async throws -> JSONObject
+    func provenNotSent(_ error: Error) -> Bool
+}
 
 /// Durable public journal for explicitly approved independent payments. There
 /// is no automatic resume/retry: an uncertain outcome stops the whole batch.
@@ -22,6 +26,36 @@ public enum MobilePaymentBatch {
     public static let NOT_SENT = "not-sent", UNKNOWN = "check-required", SUBMITTED = "submitted"
     private static let receiptKeys = ["version", "batch", "batchId", "walletId", "address", "requestedTotal", "total", "fee", "inputTotal", "change", "acknowledged", "transactions"]
     private static let partKeys = ["txid", "hex", "status", "amount", "fee", "selected"]
+
+    public static func asyncSubmit(_ walletId: String, _ address: String, _ batchPlan: JSONObject, _ signed: [JSONObject], store: MobilePaymentBatchStore, sender: MobilePaymentBatchAsyncSender, check: () throws -> Void = {}) async throws -> JSONObject {
+        try check(); try Task.checkCancellation()
+        if let old = try store.receipt() { try validate(old); try PJ.require(PJ.bool(old["acknowledged"]), "Review and dismiss the earlier batch receipt before another payment.") }
+        var receipt = try create(walletId, address, batchPlan, signed)
+        let previous = try store.reservations(); try NativePaymentReservations.validate(previous); var held = previous, parts = try PJ.objects(receipt["transactions"])
+        for part in parts {
+            let selected = try PJ.objects(part["selected"])
+            for input in selected { try PJ.require(previous[PJ.outpoint(input)] == nil, "Batch funding was reserved by another payment. Review again.") }
+            held = try NativePaymentReservations.reserve(held, selected, PJ.string(part["txid"]))
+        }
+        try check(); try Task.checkCancellation(); try store.saveReceipt(receipt); try store.saveReservations(held)
+        for i in parts.indices {
+            do { try check(); try Task.checkCancellation() } catch { return try stop(receipt, previous, store, -1) }
+            parts[i]["status"] = UNKNOWN; receipt["transactions"] = parts
+            do { try store.saveReceipt(receipt) }
+            catch { parts[i]["status"] = NOT_SENT; receipt["transactions"] = parts; return try stop(receipt, previous, store, i) }
+            do {
+                let sent = try await sender.broadcast(PJ.string(parts[i]["hex"]))
+                if (sent["txid"] as? String) != (parts[i]["txid"] as? String) { return try stop(receipt, previous, store, -1) }
+            } catch {
+                let unsent = sender.provenNotSent(error)
+                if unsent { parts[i]["status"] = NOT_SENT; receipt["transactions"] = parts }
+                return try stop(receipt, previous, store, unsent ? i : -1)
+            }
+            parts[i]["status"] = SUBMITTED; receipt["transactions"] = parts
+            do { try store.saveReceipt(receipt) }
+            catch { parts[i]["status"] = UNKNOWN; receipt["transactions"] = parts; return try stop(receipt, previous, store, -1) }
+        }; return try summary(receipt)
+    }
 
     public static func submit(_ walletId: String, _ address: String, _ batchPlan: JSONObject, _ signed: [JSONObject], store: MobilePaymentBatchStore, sender: MobilePaymentBatchSender, check: () throws -> Void = {}) throws -> JSONObject {
         try check()

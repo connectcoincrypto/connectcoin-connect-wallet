@@ -12,18 +12,18 @@ final class WalletCryptoTests: XCTestCase {
         XCTAssertEqual(try WalletCrypto.hex(WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "TREZOR")),
             "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04")
         XCTAssertEqual(try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "caf\u{00e9}"),
-            WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "cafe\u{0301}"))
+            try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, "cafe\u{0301}"))
         XCTAssertFalse(WalletCrypto.validateMnemonic(Array(repeating: "abandon", count: 12).joined(separator: " ")))
         XCTAssertThrowsError(try WalletCrypto.generateMnemonic(15))
         XCTAssertThrowsError(try WalletCrypto.mnemonicToSeed(DesktopCryptoVectors.mnemonic, String(repeating: "x", count: 1025)))
     }
     func testWhitespaceMatchesDesktop() throws {
-        for code: UInt32 in [9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279] {
+        for code in [UInt32(9),10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279] {
             let separator = String(UnicodeScalar(code)!)
             let phrase = separator + DesktopCryptoVectors.mnemonic.uppercased().replacingOccurrences(of: " ", with: separator) + separator
             XCTAssertEqual(try WalletCrypto.normalizeMnemonic(phrase), DesktopCryptoVectors.mnemonic)
         }
-        for code: UInt32 in [0,8,14,28,31,133,6158,8203,8288] {
+        for code in [UInt32(0),8,14,28,31,133,6158,8203,8288] {
             XCTAssertFalse(WalletCrypto.validateMnemonic(DesktopCryptoVectors.mnemonic.replacingOccurrences(of: " ", with: String(UnicodeScalar(code)!))))
         }
     }
@@ -35,7 +35,7 @@ final class WalletCryptoTests: XCTestCase {
             let index = Int(try row.integer("index")), change = Int(try row.integer("change"))
             let account = try session.publicAccount(index: index, change: change)
             XCTAssertEqual(Set(account.keys), Set(["publicKey","address","path","network","index","change"]))
-            for field in ["address", "publicKey", "path"] { XCTAssertEqual(try account.string(field), row.string(field)) }
+            for field in ["address", "publicKey", "path"] { XCTAssertEqual(try account.string(field), try row.string(field)) }
             let pub = try WalletCrypto.fromHex(row.string("publicKey")), digest = try WalletCrypto.fromHex(row.string("digest"))
             XCTAssertEqual(try WalletCrypto.decodeAddress(row.string("address").uppercased()), pub)
             XCTAssertTrue(WalletCrypto.verifySchnorr(try WalletCrypto.fromHex(row.string("signature")), digest, pub))

@@ -22,7 +22,9 @@ public enum NativeTransactions {
         let fields = value.split(separator: ".", omittingEmptySubsequences: false)
         let decimals = fields.count == 2 ? String(fields[1]) : ""
         guard let whole = Int64(fields[0]), let fraction = Int64((decimals + String(repeating: "0", count: 10)).prefix(10)) else { throw WalletError("Invalid CONN amount.") }
-        return try amount(String(whole * COIN + fraction))
+        let product = whole.multipliedReportingOverflow(by: COIN), sum = product.partialValue.addingReportingOverflow(fraction)
+        try PJ.require(!product.overflow && !sum.overflow, "Amount exceeds the money range.")
+        return try amount(String(sum.partialValue))
     }
     public static func format(_ value: Int64) throws -> String {
         _ = try amount(String(value)); var decimal = String(format: "%010lld", value % COIN)
@@ -161,9 +163,13 @@ public enum NativeTransactions {
     public static func prepareClaim(_ bounty: JSONObject, _ parentHex: String, _ rewardAddress: String, _ rate: Int) throws -> JSONObject {
         var funded = bounty; funded["rawTransaction"] = parentHex; let output = try verifyFunding(funded, nil)
         try PJ.require(PJ.integer(output["type"]) == 2 && PJ.integer(output["rootVersion"]) == 1, "Unsupported bounty output.")
-        for pair in [("domain", "domain"), ("connection_work_target", "target"), ("root_certificates_version", "rootVersion"), ("signature_algorithms_mask", "mask")] {
-            guard let actual = bounty[pair.0], let expected = output[pair.1] else { throw WalletError("Bounty differs from the funding transaction.") }
-            try PJ.require(String(describing: actual) == String(describing: expected), "Bounty differs from the funding transaction.")
+        for pair in [("domain", "domain"), ("connection_work_target", "target")] {
+            try PJ.require(PJ.string(bounty[pair.0]) == PJ.string(output[pair.1]), "Bounty differs from the funding transaction.")
+        }
+        for pair in [("root_certificates_version", "rootVersion"), ("signature_algorithms_mask", "mask")] {
+            let expected = try PJ.integer(output[pair.1])
+            if let text = bounty[pair.0] as? String { try PJ.require(text == String(expected), "Bounty differs from the funding transaction.") }
+            else { try PJ.require(PJ.integer(bounty[pair.0]) == expected, "Bounty differs from the funding transaction.") }
         }
         let fee = try claimFee(rate), value = try PJ.money(output, "amount"); try PJ.require(fee <= COIN && value > fee, "Bounty is smaller than its safe fee.")
         let reward: JSONObject = try ["type": 1, "amount": String(value - fee), "publicKey": WalletCrypto.hex(WalletCrypto.decodeAddress(rewardAddress))]
@@ -223,7 +229,7 @@ public enum NativeTransactions {
         var selected = [JSONObject](), inputs = [JSONObject](), outputs = recipients; var sum: Int64 = 0, fee: Int64 = -1, change: Int64 = 0, total = requested
         for funding in sorted {
             let count = inputs.count + 1; try paymentSize(count <= MAX_PAYMENT_INPUTS && size.weight(count, false) <= MAX_WEIGHT)
-            let candidate = funding.metadata; selected.append(candidate); sum = try PJ.add(sum, funding.value)
+            let candidate = PJ.snapshot(funding.metadata); selected.append(candidate); sum = try PJ.add(sum, funding.value)
             inputs.append(try ["txid": PJ.string(candidate["txid"]), "vout": PJ.integer(candidate["vout"]), "scriptSig": "", "sequence": Int64(0xffff_fffd), "witness": [String(repeating: "0", count: 128)]])
             if deductFee {
                 if sum < requested { continue }; let remaining = sum - requested; change = remaining == 0 ? 0 : max(remaining, changeDust)

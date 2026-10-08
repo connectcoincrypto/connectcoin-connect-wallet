@@ -20,7 +20,7 @@ final class WalletVaultTests: XCTestCase {
             copy[field] = (old.first == "0" ? "1" : "0") + old.dropFirst()
             XCTAssertThrowsError(try WalletVault.decrypt(copy, password: DesktopCryptoVectors.password))
         }
-        for version: Any in [true, "1", 1.0, 2] {
+        for version in [true, "1", 1.0, 2] as [Any] {
             var copy = original; copy["version"] = version
             XCTAssertThrowsError(try WalletVault.serialize(copy))
         }
@@ -43,8 +43,8 @@ final class WalletVaultTests: XCTestCase {
         var saved: JSONObject?
         try session.save(next) { saved = $0 }
         let updated = try XCTUnwrap(saved)
-        XCTAssertEqual(try original.string("salt"), updated.string("salt"))
-        XCTAssertNotEqual(try original.string("nonce"), updated.string("nonce"))
+        XCTAssertEqual(try original.string("salt"), try updated.string("salt"))
+        XCTAssertNotEqual(try original.string("nonce"), try updated.string("nonce"))
         let reopened = try WalletVault.decrypt(updated, password: DesktopCryptoVectors.password)
         XCTAssertEqual(try reopened.integer("receiveIndex"), 9)
         XCTAssertEqual(try reopened.object("desktopMetadata").boolean("retained"), true)
@@ -62,15 +62,15 @@ final class WalletVaultTests: XCTestCase {
         let before = try WalletVault.decrypt(original, password: DesktopCryptoVectors.password)
         let changed = try WalletVault.changePassword(original, currentPassword: DesktopCryptoVectors.password, newPassword: "new public test password")
         let after = try WalletVault.decrypt(changed, password: "new public test password")
-        XCTAssertEqual(try JSON.encode(before), JSON.encode(after))
-        XCTAssertNotEqual(try original.string("salt"), changed.string("salt"))
-        XCTAssertNotEqual(try original.string("nonce"), changed.string("nonce"))
+        XCTAssertEqual(try JSON.encode(before), try JSON.encode(after))
+        XCTAssertNotEqual(try original.string("salt"), try changed.string("salt"))
+        XCTAssertNotEqual(try original.string("nonce"), try changed.string("nonce"))
         XCTAssertThrowsError(try WalletVault.decrypt(changed, password: DesktopCryptoVectors.password))
         XCTAssertEqual(try WalletVault.decrypt(original, password: DesktopCryptoVectors.password).string("mnemonic"), DesktopCryptoVectors.mnemonic)
     }
     func testPayloadTypesAndNetworkAreStrict() throws {
         var payload = try WalletVault.newPayload(name: "Fixture", mnemonic: DesktopCryptoVectors.mnemonic)
-        for invalid: Any in [true, 1.0, "1", -1, Int(Int32.max) + 1] {
+        for invalid in [true, 1.0, "1", -1, Int(Int32.max) + 1] as [Any] {
             payload["receiveIndex"] = invalid; XCTAssertThrowsError(try WalletVault.validatePayload(payload))
         }
         payload["receiveIndex"] = 0; payload["needsRecovery"] = 1
