@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname, basename } from 'node:path';
 import { ClaimsEngine } from '../src/core/claims.mjs';
 import { DiagnosticLog, diagnosticError } from '../src/core/diagnostics.mjs';
+import { MAX_CONNECTION_LIMIT } from '../src/core/connection-limits.mjs';
 
 const row = vout => ({ txid: '12'.repeat(32), vout, amount: '1000000000', domain: 'private-canary.example',
   status: 'available', connection_work_target: 'f'.repeat(64), root_certificates_version: 1, signature_algorithms_mask: 7 });
@@ -223,7 +224,7 @@ test('progress allowlists exclude arbitrary reasons, duration labels, nested dat
     paused: false, durationScope: 'run', reason: 'stop', domain: 'private-canary.example', proof: 'private-proof-canary',
     get cancelledOther() { invoked++; return 1; } });
   log.record('claims.progress', { reason: 'private-reason-canary', durationScope: 'private-scope-canary', prepareActive: 5, dnsActive: 3,
-    captureActive: 257, submitActive: 5, operationsStarted: Infinity, operationsFailed: -1, cancelledStop: 1.5,
+    captureActive: MAX_CONNECTION_LIMIT + 1, submitActive: 5, operationsStarted: Infinity, operationsFailed: -1, cancelledStop: 1.5,
     durationTotalMs: Number.MAX_SAFE_INTEGER + 1, raw: { private: 'canary' } });
   log.record('claims.failed', { reason: 'fatal', error: Object.assign(new Error('private-error-canary'), { unknownOutcome: true }) });
   await log.flush();

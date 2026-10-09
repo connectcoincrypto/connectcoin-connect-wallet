@@ -15,6 +15,9 @@ const DIAGNOSTIC_INTERVAL_MS = 5000, DIAGNOSTIC_SAMPLES_PER_STAGE = 4;
 // Pipeline preparation/IPC without preassigning a long queue at low rates.
 // The helper still spaces actual socket starts; this is not a rate allowance.
 const START_LOOKAHEAD_MS = 100;
+// Bound IPC admissions awaiting a real TCP-start acknowledgement independently
+// of the user's active connection limit. Each acknowledgement frees a slot.
+const MAX_PENDING_STARTS = 128;
 const CANCELLATIONS = Object.freeze({ stop: 'cancelledStop', locked: 'cancelledLocked', suspend: 'cancelledSuspend',
   clear: 'cancelledClear', unavailable: 'cancelledUnavailable', 'window-exit': 'cancelledWindowExit',
   'sibling-proof': 'cancelledSiblingProof', fatal: 'cancelledFatal', other: 'cancelledOther' });
@@ -89,7 +92,7 @@ export class ClaimsEngine {
   }
   beginOperation(stage, controller) {
     // Only active work is retained: at most 4 preparations, 2 DNS requests,
-    // 256 captures and 4 submissions. No historical IDs or payloads are stored.
+    // the configured active captures and 4 submissions. No history is retained.
     const operation = { stage, controller, started: performance.now() };
     this.diagnosticOperations.add(operation); this.countDiagnostic('operationsStarted');
     return operation;
@@ -409,7 +412,7 @@ export class ClaimsEngine {
       // Only the production/helper contract guarantees socket pacing. Legacy
       // adapters without that gate retain their single-start handshake: pacing
       // dispatch alone could let delayed starts bunch together above the limit.
-      const pendingLimit = this.pool.pacesStarts ? Math.min(this.options.concurrency, Math.max(2,
+      const pendingLimit = this.pool.pacesStarts ? Math.min(this.options.concurrency, MAX_PENDING_STARTS, Math.max(2,
         Math.ceil(this.options.connectionsPerSecond * START_LOOKAHEAD_MS / 1000))) : 1;
       if (this.pendingStarts.size >= pendingLimit || this.connections.size >= this.options.concurrency) {
         // Cancelled requests can still occupy capacity while their callbacks

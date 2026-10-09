@@ -1,4 +1,5 @@
 import { numericInputValue } from './numeric-value.mjs';
+import { MAX_CONNECTION_LIMIT } from '../core/connection-limits.mjs';
 
 const numeric = value => Number(numericInputValue(value));
 const integer = (value, min, max) => /^\d+$/.test(String(numericInputValue(value))) && Number.isSafeInteger(numeric(value)) && numeric(value) >= min && numeric(value) <= max;
@@ -24,7 +25,7 @@ export function preferenceBatch(config, draft, { rpcReady = false } = {}) {
     if (group) (patch[group] ??= {})[key] = value;
     else patch[key] = value;
   };
-  for (const [key, max] of [['maxConnectionsPerSecond', 256], ['maxConcurrent', 256], ['lookbackBlocks', 600]]) {
+  for (const [key, max] of [['maxConnectionsPerSecond', MAX_CONNECTION_LIMIT], ['maxConcurrent', MAX_CONNECTION_LIMIT], ['lookbackBlocks', 600]]) {
     if (integer(draft.claims[key], 1, max)) take('claims', key, numeric(draft.claims[key]), config.claims?.[key], 'claims');
   }
   for (const [key, min, max] of [['autoLockMinutes', 0, 60], ['feeRate', 1201, 100000]]) {

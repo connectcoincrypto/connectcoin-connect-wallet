@@ -82,6 +82,15 @@ test('claims default off with 100 starts and concurrent connections without over
   }
 });
 
+test('claim connection limits accept positive signed integers and reject invalid representations', () => {
+  for (const name of ['maxConnectionsPerSecond', 'maxConcurrent']) {
+    for (const value of [1, 257, 512, 1000, 2147483647]) assert.equal(validateConfig({ claims: { [name]: value } }).claims[name], value);
+    for (const value of [0, -1, 1.5, NaN, Infinity, 2147483648, Number.MAX_SAFE_INTEGER + 1, '1000', null, undefined]) {
+      assert.throws(() => validateConfig({ claims: { [name]: value } }), /integer/);
+    }
+  }
+});
+
 test('Automatic Claims preference accepts only booleans and migrates legacy limits without enabling execution', async () => {
   for (const enabled of [true, false]) assert.equal(validateConfig({ claims: { enabled } }).claims.enabled, enabled);
   for (const enabled of [undefined, null, '', 'true', 'false', 0, 1, {}, [], new Boolean(false)]) {
@@ -121,7 +130,7 @@ test('mainnet is the default, test networks require explicit selection and profi
   for (const network of ['mainnet', '', '__proto__', null, 1]) assert.throws(() => validateConfig({ network }), /network/);
   assert.throws(() => validateConfig({ network: 'regtest' }), /development/);
   assert.equal(validateConfig({ network: 'regtest' }, { allowRegtest: true }).network, 'regtest');
-  for (const input of [{ version: 2 }, { autoLockMinutes: -1 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 257 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
+  for (const input of [{ version: 2 }, { autoLockMinutes: -1 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 2147483648 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
 });
 
 test('appearance defaults to the system, accepts only explicit supported preferences and persists', async () => {

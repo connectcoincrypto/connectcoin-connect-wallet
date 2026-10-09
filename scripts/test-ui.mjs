@@ -1492,6 +1492,7 @@ try {
     focused: document.activeElement === window.editingClaimField,
     ...window.claimEditingEvents,
   })), { value: '1132', sameNode: true, focused: true, focus: 0, blur: 0 }, 'A successful autosave must preserve number-input identity and insert the next digit at the original caret.');
+  await waitForUiCondition(page, async () => (await window.connectwallet.invoke('getState')).config.claims.maxConnectionsPerSecond === 1132);
 
   nextStage('autosave errors survive updates and clear only after a successful retry');
   await application.evaluate((_electron, moduleUrl) => {
@@ -1505,7 +1506,7 @@ try {
   }, new URL('../src/core/wallet-service.mjs', import.meta.url).href);
   await page.locator('#claims-rate').fill('110');
   await page.waitForFunction(() => document.querySelector('#view-error')?.textContent.includes('Isolated autosave write failure'));
-  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims.maxConnectionsPerSecond, 112);
+  assert.equal((await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims.maxConnectionsPerSecond, 1132);
   const errorSnapshot = await page.evaluate(() => window.connectwallet.invoke('getState'));
   errorSnapshot.claims.status = 'autosave-error-background-check';
   await application.evaluate(({ BrowserWindow }, value) => BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', value), errorSnapshot);
@@ -1530,27 +1531,32 @@ try {
   await page.waitForFunction(() => document.querySelector('#view-error').classList.contains('hidden') && document.querySelector('#app').getAttribute('aria-busy') === 'false');
 
   nextStage('automatic claim limits and invalid drafts');
-  await page.locator('#claims-rate').fill('101');
+  assert.equal(await page.locator('#claims-rate').getAttribute('max'), '2147483647');
+  assert.equal(await page.locator('#claims-concurrent').getAttribute('max'), '2147483647');
+  assert.equal(await page.locator('#claims-rate').getAttribute('data-integer-digits'), '10');
+  assert.equal(await page.locator('#claims-concurrent').getAttribute('data-integer-digits'), '10');
+  await assertTrailingPeriodPreference('#claims-rate', 2147483647, ['claims', 'maxConnectionsPerSecond']);
+  await page.locator('#claims-rate').fill('1000');
   assert.equal(await page.locator('#claims-warning').isVisible(), true);
   assert.equal(await page.locator('[role="switch"]').getAttribute('aria-checked'), 'false');
-  await page.locator('#claims-concurrent').fill('77');
+  await page.locator('#claims-concurrent').fill('513');
   await page.locator('#claims-lookback').fill('345');
   await page.locator('[data-view="activity"]').first().click();
   await waitForUiCondition(page, async () => {
     const { config } = await window.connectwallet.invoke('getState');
-    return config.claims.maxConnectionsPerSecond === 101 && config.claims.maxConcurrent === 77 && config.claims.lookbackBlocks === 345;
+    return config.claims.maxConnectionsPerSecond === 1000 && config.claims.maxConcurrent === 513 && config.claims.lookbackBlocks === 345;
   });
   await page.reload();
   await page.locator('[data-view="claims"]').first().click();
-  assert.equal(await page.locator('#claims-rate').inputValue(), '101');
-  assert.equal(await page.locator('#claims-concurrent').inputValue(), '77');
+  assert.equal(await page.locator('#claims-rate').inputValue(), '1000');
+  assert.equal(await page.locator('#claims-concurrent').inputValue(), '513');
   assert.equal(await page.locator('#claims-lookback').inputValue(), '345');
   await page.locator('#claims-rate').fill('');
-  await page.locator('#claims-concurrent').fill('999');
+  await page.locator('#claims-concurrent').fill('2147483648');
   await page.locator('#claims-lookback').fill('0');
   await page.locator('[data-view="overview"]').first().click();
   const invalidClaims = (await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims;
-  assert.deepEqual(invalidClaims, { enabled: false, maxConnectionsPerSecond: 101, maxConcurrent: 77, lookbackBlocks: 345 });
+  assert.deepEqual(invalidClaims, { enabled: false, maxConnectionsPerSecond: 1000, maxConcurrent: 513, lookbackBlocks: 345 });
   await page.reload();
   await page.locator('[data-view="claims"]').first().click();
   await page.getByRole('switch', { name: 'Enable automatic claims' }).click();

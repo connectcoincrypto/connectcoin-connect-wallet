@@ -129,9 +129,9 @@ test('locked offline preferences persist partial limits and remain separate from
   const s = f.service;
   assert.equal(s.getState().phase, 'locked');
   await s.setClaims({ enabled: true });
-  await s.setClaims({ maxConcurrent: 7 });
-  await s.setClaims({ maxConnectionsPerSecond: 3, lookbackBlocks: 42 });
-  const expected = { enabled: true, maxConcurrent: 7, maxConnectionsPerSecond: 3, lookbackBlocks: 42 };
+  await s.setClaims({ maxConcurrent: 1000 });
+  await s.setClaims({ maxConnectionsPerSecond: 2147483647, lookbackBlocks: 42 });
+  const expected = { enabled: true, maxConcurrent: 1000, maxConnectionsPerSecond: 2147483647, lookbackBlocks: 42 };
   assert.deepEqual(s.config.claims, expected);
   assert.deepEqual((await readConfig(f.directory)).claims, expected);
   assert.equal(s.getState().claims.enabled, false);

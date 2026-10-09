@@ -81,9 +81,9 @@ test('a delayed start acknowledgement does not block other domains or exceed glo
   assert.equal(f.requests.length, 6, 'refresh must not bypass occupied admission slots');
 });
 
-for (const [rate, limit] of [[1, 2], [100, 10], [256, 26]]) {
+for (const [rate, limit, concurrency = 100] of [[1, 2], [100, 10], [256, 26], [1, 2, 1000], [1000, 100, 1000], [2147483647, 128, 2147483647]]) {
   test(`unacknowledged admissions at ${rate}/second stay within the short lookahead of ${limit}`, async t => {
-    const f = fixture(t, { concurrency: 100, rate });
+    const f = fixture(t, { concurrency, rate });
     f.ready(ordinary()); f.engine.start(); await settle();
     assert.equal(f.requests.length, limit, 'available concurrency must not become a long queue of unstarted requests');
     assert.equal(f.engine.snapshot().attempts, 0);
@@ -95,6 +95,23 @@ for (const [rate, limit] of [[1, 2], [100, 10], [256, 26]]) {
     assert.equal(f.requests.length, limit + 1, 'elapsed time must not grow the unacknowledged backlog');
   });
 }
+
+test('bounded start lookahead permits active concurrency above 512 as TCP starts are acknowledged', async t => {
+  const f = fixture(t, { concurrency: 1000, rate: 10000 });
+  f.ready(ordinary()); f.engine.start(); await settle();
+  assert.equal(f.requests.length, 128);
+  let acknowledged = 0;
+  while (f.requests.length < 1000) {
+    const batch = f.requests.slice(acknowledged);
+    for (const request of batch) { request.start(); acknowledged++; }
+    await settle();
+    assert.ok(f.requests.length - acknowledged <= 128, 'only IPC admissions have a fixed bound');
+  }
+  assert.equal(f.active, 1000);
+  assert.equal(f.engine.connections.size, 1000);
+  assert.equal(f.peak, 1000);
+  assert.equal(f.engine.enabled, true);
+});
 
 test('out-of-order start acknowledgements do not reorder subsequent fair and economic admissions', async t => {
   const f = fixture(t);

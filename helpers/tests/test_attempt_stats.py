@@ -5,14 +5,15 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import math
 import sys
 import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HELPERS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HELPERS))
@@ -38,6 +39,57 @@ def progress(stats, *, finished=False, elapsed=1.0):
 
 
 class AttemptStatsTests(unittest.TestCase):
+    def run_paced_generation(self, *, rate, concurrency, attempts, quantum=0.0, submit_delays=None):
+        clock, starts, sleeps = [100.0], [], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            step = max(seconds, math.ulp(clock[0]))
+            clock[0] += math.ceil(step / quantum) * quantum if quantum else step
+        def submit(*args, **kwargs):
+            starts.append(clock[0])
+            clock[0] += (submit_delays or {}).get(len(starts), 0.0)
+            future = Future()
+            future.set_exception(OSError("offline capture failure"))
+            return future
+        executor = SimpleNamespace(submit=submit, shutdown=Mock())
+        with patch.object(generator, "ThreadPoolExecutor", return_value=executor) as create, \
+             patch.object(generator, "validate_root_bundle"), \
+             patch.object(generator, "resolve_endpoints", return_value=(object(),)), \
+             patch.object(generator.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(generator.time, "sleep", side_effect=sleep):
+            with self.assertRaisesRegex(generator.GenerationError, "no proof met the target"):
+                generator.generate_connection_proof(context(), "unused", generator.GenerationOptions(
+                    connections_per_second=rate, concurrency=concurrency, max_attempts=attempts))
+            self.assertEqual(create.call_args.kwargs["max_workers"], concurrency)
+        executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+        return starts, sleeps
+
+    def test_legacy_generator_accepts_int32_limits_without_eager_worker_allocation(self):
+        for value in (257, 400, 1000, 2147483647):
+            with self.subTest(value=value):
+                generator._validate_options(generator.GenerationOptions(connections_per_second=value, concurrency=value))
+                starts, _ = self.run_paced_generation(rate=value, concurrency=value, attempts=3)
+                self.assertEqual(len(starts), 3)
+        for name in ("connections_per_second", "concurrency"):
+            for value in (True, 1.5, 2147483648):
+                with self.subTest(name=name, value=value), self.assertRaises(generator.GenerationError):
+                    generator._validate_options(generator.GenerationOptions(**{name: value}))
+
+    def test_legacy_generator_recovers_coarse_wakes_without_new_interval_per_start(self):
+        starts, sleeps = self.run_paced_generation(rate=100, concurrency=1000, attempts=1001, quantum=0.015625)
+        self.assertGreaterEqual(starts[-1] - starts[0], 10.0 - 1e-8)
+        self.assertLessEqual(starts[-1] - starts[0], 10.0 + 0.015625)
+        self.assertTrue(any(left == right for left, right in zip(starts, starts[1:])))
+        self.assertTrue(sleeps)
+
+    def test_legacy_generator_caps_debt_from_fresh_time_after_delayed_submit(self):
+        starts, _ = self.run_paced_generation(rate=10, concurrency=1000, attempts=30, submit_delays={1: 5.0})
+        self.assertEqual(starts[0], 100.0)
+        caught_up = sum(abs(start - 105.0) < 1e-8 for start in starts[1:])
+        self.assertGreaterEqual(caught_up, 10)
+        self.assertLessEqual(caught_up, 12)
+        self.assertGreater(starts[-1], 105.0)
+
     def fake_network(self, stack, captured, *, met_target=False):
         stack.enter_context(patch.object(generator, "validate_root_bundle"))
         stack.enter_context(patch.object(generator, "resolve_endpoints", return_value=(object(),)))

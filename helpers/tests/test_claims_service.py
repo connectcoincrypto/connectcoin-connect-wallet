@@ -124,133 +124,130 @@ class PacingClock:
 
 
 class PacingTests(unittest.TestCase):
-    RATES = (1, 7, 10, 50, 100, 256)
-    PHASES = (("_before_start", "next_start"), ("_connecting", "next_connection"))
+    RATES = (1, 7, 10, 50, 100, 256, 400, 1000)
 
     def job(self, helper, identifier=1, domain="example.com"):
         helper.budgets.setdefault("fixture", service.Budget(0, 0))
         return service.Job(identifier, "attempt", domain=domain, bounty_id="fixture")
 
-    def test_each_gate_uses_the_configured_interval_and_only_sleeps_the_remainder(self):
+    def test_single_gate_uses_the_configured_interval_and_only_sleeps_the_remainder(self):
         for rate in self.RATES:
-            for method, phase in self.PHASES:
-                with self.subTest(rate=rate, gate=method), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
-                    gate = getattr(h.service, method)
-                    gate(self.job(h.service))
-                    deadline = 100.0 + 1.0 / rate
-                    self.assertAlmostEqual(getattr(h.service, phase), deadline, places=12)
-                    clock.now += 0.4 / rate
-                    began_wait = clock.now
-                    gate(self.job(h.service, 2))
-                    self.assertAlmostEqual(clock.now, deadline, places=10)
-                    self.assertAlmostEqual(sum(clock.sleeps), deadline - began_wait, places=10)
-                    self.assertTrue(all(0 < delay <= 0.010 for delay in clock.sleeps))
+            with self.subTest(rate=rate), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
+                h.service._connecting(self.job(h.service))
+                deadline = 100.0 + 1.0 / rate
+                self.assertAlmostEqual(h.service.next_connection, deadline, places=12)
+                clock.now += 0.4 / rate
+                began_wait = clock.now
+                job = self.job(h.service, 2)
+                h.service._before_start(job)
+                self.assertEqual(clock.sleeps, [])
+                self.assertFalse(job.started)
+                h.service._connecting(job)
+                self.assertAlmostEqual(clock.now, deadline, places=10)
+                self.assertAlmostEqual(sum(clock.sleeps), deadline - began_wait, places=10)
+                self.assertTrue(all(0 < delay <= 0.010 for delay in clock.sleeps))
+                self.assertEqual([frame["id"] for frame in h.frames if frame["type"] == "started"], [1, 2])
 
-    def test_both_gates_recover_coarse_timer_wakes_without_compounding_delay(self):
+    def test_coarse_timer_wakes_recover_without_compounding_delay(self):
         with Fixture(connectionsPerSecond=100) as h, PacingClock(quantum=0.015625) as clock:
             starts = []
             for index in range(1001):
                 job = self.job(h.service, index, "other.example" if index % 2 else "example.com")
                 h.service._before_start(job)
-                h.service._started(job)
                 h.service._connecting(job)
                 starts.append(job.started_at)
-            # Floating-point phase boundaries can require one extra timer
-            # quantum; they must not add a quantum to each configured interval.
-            self.assertGreaterEqual(starts[-1] - starts[0], 10.0)
-            self.assertLessEqual(starts[-1] - starts[0], 10.0 + clock.quantum)
-            self.assertAlmostEqual(h.service.next_start, 110.01, places=9)
             self.assertAlmostEqual(h.service.next_connection, 110.01, places=9)
+            self.assertGreaterEqual(starts[-1] - starts[0], 10.0 - 1e-8)
+            self.assertLessEqual(starts[-1] - starts[0], 10.0 + clock.quantum)
             self.assertTrue(any(right == left for left, right in zip(starts, starts[1:])))
-            self.assertLessEqual(len(h.service.connection_starts), 100)
 
-    def test_one_second_cap_is_applied_after_advancing_both_global_phases(self):
+    def test_one_second_debt_cap_is_applied_after_advancing_phase(self):
         for rate in self.RATES:
             interval = 1.0 / rate
-            for method, phase in self.PHASES:
-                for extra in (0.0, interval - 1e-9, interval, interval + 1e-9, 5.0):
-                    with self.subTest(rate=rate, gate=method, extra=extra), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
-                        gate = getattr(h.service, method)
-                        gate(self.job(h.service))
-                        previous = getattr(h.service, phase)
-                        clock.now = previous + 1.0 + extra
-                        gate(self.job(h.service, 2))
-                        expected = previous + interval if extra <= interval else clock.now - 1.0
-                        self.assertAlmostEqual(getattr(h.service, phase), expected, places=11)
+            for extra in (0.0, interval - 1e-9, interval, interval + 1e-9, 5.0):
+                with self.subTest(rate=rate, extra=extra), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
+                    h.service._connecting(self.job(h.service))
+                    previous = h.service.next_connection
+                    clock.now = previous + 1.0 + extra
+                    h.service._connecting(self.job(h.service, 2))
+                    self.assertAlmostEqual(h.service.next_connection,
+                                           max(previous + interval, clock.now - 1.0), places=11)
 
-    def test_phase_update_reads_fresh_time_after_gate_work_and_idle_setup(self):
+    def test_phase_uses_fresh_time_after_start_report_and_excludes_ipc_duration(self):
         for rate in self.RATES:
-            for method, phase in self.PHASES:
-                for idle in (False, True):
-                    with self.subTest(rate=rate, gate=method, idle=idle), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
-                        gate = getattr(h.service, method)
-                        if not idle:
-                            gate(self.job(h.service))
-                            clock.now = getattr(h.service, phase)
-                        before = clock.now
-                        clock.jumps[clock.reads + 2] = 3.0
-                        gate(self.job(h.service, 2))
-                        self.assertAlmostEqual(clock.now, before + 3.0, places=12)
-                        self.assertAlmostEqual(getattr(h.service, phase), clock.now + 1.0 / rate if idle else clock.now - 1.0, places=12)
+            for idle in (False, True):
+                with self.subTest(rate=rate, idle=idle), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
+                    if not idle:
+                        h.service._connecting(self.job(h.service))
+                        clock.now = h.service.next_connection
+                    before = clock.now
+                    emit = h.service.emit_callback
+                    def delayed_emit(frame):
+                        if frame["type"] == "started": clock.now += 3.0
+                        emit(frame)
+                    h.service.emit_callback = delayed_emit
+                    job = self.job(h.service, 2)
+                    h.service._connecting(job)
+                    self.assertEqual(job.started_at, before + 3.0)
+                    self.assertAlmostEqual(h.service.next_connection,
+                                           clock.now + 1.0 / rate if idle else clock.now - 1.0, places=11)
 
-    def test_delayed_acknowledgements_do_not_add_an_extra_interval(self):
+    def test_delayed_acknowledgements_do_not_add_a_second_rate_interval(self):
         for rate in self.RATES:
             with self.subTest(rate=rate), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
+                h.service._connecting(self.job(h.service))
+                clock.now = h.service.next_connection
                 emit = h.service.emit_callback
                 def delayed_emit(frame):
-                    if frame["type"] == "started":
-                        clock.now += 1.5 / rate
+                    if frame["type"] == "started": clock.now += 1.5 / rate
                     emit(frame)
                 h.service.emit_callback = delayed_emit
                 starts = []
-                for identifier in range(4):
+                for identifier in range(2, 6):
                     job = self.job(h.service, identifier)
                     h.service._before_start(job)
-                    h.service._started(job)
                     h.service._connecting(job)
                     starts.append(job.started_at)
                 self.assertEqual(clock.sleeps, [])
                 for left, right in zip(starts, starts[1:]):
                     self.assertAlmostEqual(right - left, 1.5 / rate, places=11)
 
-    def test_actual_tcp_permits_keep_a_configured_rolling_ceiling_during_catch_up(self):
+    def test_catch_up_has_no_separate_rolling_one_second_quota(self):
         for rate in self.RATES:
             with self.subTest(rate=rate), Fixture(connectionsPerSecond=rate) as h, PacingClock() as clock:
                 h.service._connecting(self.job(h.service))
                 clock.now += 5.0
                 starts = []
                 for identifier in range(2 * rate + 3):
-                    job = self.job(h.service, identifier + 2, "other.example" if identifier % 2 else "example.com")
+                    job = self.job(h.service, identifier + 2)
                     h.service._connecting(job)
                     starts.append(job.started_at)
-                    self.assertLessEqual(len(h.service.connection_starts), rate)
                     self.assertGreaterEqual(h.service.next_connection, clock.now - 1.0)
-                for index, now in enumerate(starts):
-                    self.assertLessEqual(sum(then + 1.0 > now for then in starts[:index + 1]), rate)
+                # Core's bounded lateness can admit more than rate permits in a
+                # rolling second after preemption, but debt never exceeds one second.
+                self.assertGreater(sum(then < starts[0] + 1.0 for then in starts), rate)
                 self.assertTrue(clock.sleeps)
 
-    def test_cancellation_and_stop_during_either_wait_do_not_spend_a_slot(self):
-        for method, phase in self.PHASES:
-            for stop in (False, True):
-                with self.subTest(gate=method, stop=stop), Fixture(connectionsPerSecond=10) as h, PacingClock() as clock:
-                    gate = getattr(h.service, method)
-                    gate(self.job(h.service))
-                    deadline, history = getattr(h.service, phase), tuple(h.service.connection_starts)
-                    job = self.job(h.service, 2)
-                    clock.on_sleep = h.service.close if stop else job.control.cancel
-                    with self.assertRaises(CaptureCancelled): gate(job)
-                    self.assertEqual(getattr(h.service, phase), deadline)
-                    self.assertEqual(tuple(h.service.connection_starts), history)
-                    self.assertFalse(job.started)
+    def test_cancellation_and_stop_while_waiting_do_not_spend_a_start(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop), Fixture(connectionsPerSecond=10) as h, PacingClock() as clock:
+                h.service._connecting(self.job(h.service))
+                deadline = h.service.next_connection
+                job = self.job(h.service, 2)
+                clock.on_sleep = h.service.close if stop else job.control.cancel
+                with self.assertRaises(CaptureCancelled): h.service._connecting(job)
+                self.assertEqual(h.service.next_connection, deadline)
+                self.assertFalse(job.started)
+                self.assertEqual(len(h.frames), 1)
 
-    def test_budget_exhausted_while_waiting_does_not_advance_admission_phase(self):
+    def test_budget_exhausted_during_rate_wait_does_not_advance_phase_or_ack(self):
         with Fixture(connectionsPerSecond=100) as h, PacingClock() as clock:
-            h.service._before_start(self.job(h.service))
-            deadline = h.service.next_start
+            h.service._connecting(self.job(h.service))
+            deadline = h.service.next_connection
             clock.on_sleep = lambda: setattr(h.service.budgets["fixture"], "successes", service.MAX_UINT64)
-            with self.assertRaises(service.BudgetExhausted): h.service._before_start(self.job(h.service, 2))
-            self.assertEqual(h.service.next_start, deadline)
-            self.assertFalse(h.service.connection_starts)
+            with self.assertRaises(service.BudgetExhausted): h.service._connecting(self.job(h.service, 2))
+            self.assertEqual(h.service.next_connection, deadline)
+            self.assertEqual(len(h.frames), 1)
 
     def test_live_capacity_demand_keeps_phase_but_cancelled_only_jobs_do_not_bridge_idle(self):
         with patch.object(service.ClaimsService, "_schedule"), Fixture(connectionsPerSecond=10, concurrency=1) as h, PacingClock() as clock:
@@ -259,38 +256,146 @@ class PacingTests(unittest.TestCase):
                 job = h.service.jobs[identifier]
                 h.service.pending.remove(job)
                 job.running = True
-                h.service._before_start(job); h.service._started(job); h.service._connecting(job)
+                h.service._before_start(job); h.service._connecting(job)
                 return job
             first = admit(1)
             h.service.active_tls = 1
             clock.now += 5.0
             second = admit(2)
-            self.assertAlmostEqual(h.service.next_start, clock.now - 1.0)
             self.assertAlmostEqual(h.service.next_connection, clock.now - 1.0)
             h.service._cancel(first); h.service._cancel(second)
-            prior_history = tuple(h.service.connection_starts)
             third = admit(3)
-            self.assertAlmostEqual(h.service.next_start, clock.now + 0.1)
-            self.assertAlmostEqual(h.service.next_connection, clock.now + 0.1)
-            self.assertEqual(tuple(h.service.connection_starts), prior_history + (third.started_at,))
+            self.assertAlmostEqual(h.service.next_connection, third.started_at + 0.1)
 
-    def test_idle_preserves_future_deadlines_and_does_not_clear_tcp_history(self):
+    def test_idle_preserves_a_future_deadline(self):
         with patch.object(service.ClaimsService, "_schedule"), Fixture(connectionsPerSecond=1) as h, PacingClock() as clock:
             h.attempt(1, connection_work_target="00" * 32)
             first = h.service.jobs[1]; h.service.pending.remove(first); first.running = True
-            h.service._before_start(first); h.service._started(first); h.service._connecting(first)
+            h.service._before_start(first); h.service._connecting(first)
             h.service._cancel(first)
             clock.now += 0.2
             h.attempt(2, connection_work_target="00" * 32)
-            self.assertEqual(tuple(h.service.connection_starts), (100.0,))
             second = h.service.jobs[2]; h.service.pending.remove(second); second.running = True
-            h.service._before_start(second); h.service._started(second); h.service._connecting(second)
+            h.service._before_start(second); h.service._connecting(second)
             self.assertAlmostEqual(second.started_at, 101.0, places=10)
-            self.assertAlmostEqual(h.service.next_start, 102.0, places=10)
             self.assertAlmostEqual(h.service.next_connection, 102.0, places=10)
+
+    def test_low_rate_high_concurrency_keeps_ack_behind_the_socket_gate(self):
+        with Fixture(connectionsPerSecond=1, concurrency=1000) as h, PacingClock() as clock:
+            h.service._connecting(self.job(h.service))
+            job = self.job(h.service, 2)
+            h.service._before_start(job)
+            self.assertFalse(job.started)
+            def while_waiting():
+                self.assertFalse(job.started)
+                self.assertEqual(len(h.frames), 1)
+            clock.on_sleep = while_waiting
+            h.service._connecting(job)
+            self.assertAlmostEqual(job.started_at, 101.0, places=10)
+            self.assertEqual([frame["id"] for frame in h.frames], [1, 2])
+
+    def test_cancellation_while_another_start_report_holds_gate_is_responsive(self):
+        with Fixture(connectionsPerSecond=100) as h:
+            job = self.job(h.service)
+            h.service.connection_lock.acquire()
+            done = threading.Event()
+            outcome = []
+            def connect():
+                try:
+                    h.service._connecting(job)
+                except CaptureCancelled:
+                    outcome.append("cancelled")
+                finally:
+                    done.set()
+            worker = threading.Thread(target=connect)
+            worker.start()
+            try:
+                job.control.cancel()
+                self.assertTrue(done.wait(1))
+                self.assertEqual(outcome, ["cancelled"])
+                self.assertFalse(job.started)
+                self.assertEqual(h.frames, [])
+            finally:
+                h.service.connection_lock.release()
+                worker.join(1)
 
 
 class ServiceTests(unittest.TestCase):
+    def test_positive_int32_options_above_256_are_lazy(self):
+        for value in (257, 400, 1000, 2147483647):
+            with self.subTest(value=value), Fixture(connectionsPerSecond=value, concurrency=value) as h:
+                self.assertEqual(h.service.rate, value)
+                self.assertEqual(h.service.concurrency, value)
+                self.assertEqual(h.service.max_pending, max(512, value + 2))
+                self.assertEqual(len(h.service.executor._threads), 0)
+                self.assertEqual(h.service.jobs, {})
+                self.assertEqual(h.capture.call_count, 0)
+
+    def test_option_limits_reject_nonpositive_fractional_boolean_and_above_int32(self):
+        for key in ("connectionsPerSecond", "concurrency"):
+            for value in (0, -1, True, False, 1.5, "1000", float("inf"), 2147483648):
+                options = {"connectionsPerSecond": 1, "concurrency": 1, key: value}
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    service.ClaimsService(options, lambda _: None, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem")
+
+    def test_configured_1000_requests_and_two_dns_slots_do_not_hit_legacy_512_limit(self):
+        with patch.object(service.ClaimsService, "_schedule"), Fixture(concurrency=1000) as h:
+            for identifier in range(1, 1001):
+                h.attempt(identifier, connection_work_target="00" * 32)
+            for identifier in (1001, 1002):
+                h.service.command({"type": "resolve", "id": identifier, "domain": "example.com"})
+            self.assertEqual(len(h.service.jobs), 1002)
+            self.assertEqual(len(h.service.executor._threads), 0)
+            with self.assertRaisesRegex(ValueError, "pending request"):
+                h.attempt(1003, connection_work_target="00" * 32)
+            h.service.command({"type": "cancel", "id": 500})
+            self.assertTrue(h.wait("attempt", 500)["cancelled"])
+            h.attempt(1003, connection_work_target="00" * 32)
+            self.assertEqual(len(h.service.jobs), 1002)
+            self.assertEqual(h.capture.call_count, 0)
+
+    def test_worker_creation_exhaustion_emits_error_and_cancels_without_dead_scheduler(self):
+        for error in (RuntimeError("cannot start new thread"), MemoryError()):
+            with self.subTest(error=type(error).__name__), Fixture(concurrency=1000) as h:
+                h.resolve_domain()
+                with patch.object(h.service.executor, "submit", side_effect=error):
+                    h.attempt(2)
+                    failure = h.wait("error", None)
+                    h.service.scheduler.join(1)
+                self.assertFalse(h.service.scheduler.is_alive())
+                self.assertTrue(h.service.closed)
+                self.assertEqual(failure["message"], "Claims helper could not create a connection worker")
+                self.assertTrue(all(job.control.cancelled() for job in h.service.jobs.values()))
+                self.assertEqual(h.capture.call_count, 0)
+
+    def test_failed_thread_growth_cancels_even_the_job_enqueued_before_submit_raised(self):
+        entered = threading.Event()
+        with Fixture(concurrency=1000) as h:
+            h.resolve_domain()
+            def blocked_capture(*args, **kwargs):
+                fake_capture(*args, **kwargs)
+                entered.set()
+                kwargs["control"]._event.wait(3)
+                raise CaptureCancelled("cancelled")
+            h.capture.side_effect = blocked_capture
+            h.attempt(2, connection_work_target="00" * 32)
+            self.assertTrue(entered.wait(1))
+            # Real ThreadPoolExecutor.submit enqueues before growing its pool;
+            # failure must never cause a duplicate retry or an orphaned job.
+            with patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start new thread")):
+                h.attempt(3, connection_work_target="00" * 32)
+                h.wait("error", None)
+                h.service.scheduler.join(1)
+            self.assertTrue(h.wait("attempt", 2)["cancelled"])
+            queued = h.wait("attempt", 3)
+            self.assertTrue(queued["cancelled"])
+            self.assertFalse(queued["started"])
+            h.service.executor.shutdown(wait=True)
+            self.assertEqual(h.capture.call_count, 1)
+            self.assertEqual(h.service.jobs, {})
+            self.assertEqual(h.service.active_tls, 0)
+            self.assertTrue(all(budget.users == 0 for budget in h.service.budgets.values()))
+
     def test_protocol_start_frame_and_clean_shutdown(self):
         frames = []
         payload = [{"type": "start", "protocol": 4, "options": {"connectionsPerSecond": 100, "concurrency": 100}}, {"type": "shutdown"}]
@@ -312,7 +417,7 @@ class ServiceTests(unittest.TestCase):
         for raw in (b"{}", b"x" * 16385 + b"\n", b'{"x":NaN}\n', b'{"x":Infinity}\n', b'{"type":"cancel","type":"attempt"}\n'):
             with self.subTest(raw=raw[:30]), self.assertRaises(ValueError): service.read_frame(io.BytesIO(raw))
         self.assertIsNone(service.read_frame(io.BytesIO()))
-        for options in ({"connectionsPerSecond": 0, "concurrency": 1}, {"connectionsPerSecond": 1, "concurrency": 257},
+        for options in ({"connectionsPerSecond": 0, "concurrency": 1}, {"connectionsPerSecond": 1, "concurrency": 2147483648},
                         {"connectionsPerSecond": True, "concurrency": 1}, {"connectionsPerSecond": 1, "concurrency": 1, "maxAttempts": 1000}):
             with self.assertRaises(ValueError): service.ClaimsService(options, lambda _: None, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem")
         with Fixture() as h:
@@ -357,6 +462,8 @@ class ServiceTests(unittest.TestCase):
                 self.assertIsNone(result["proof"])
                 self.assertEqual(result["successfulConnections"], "1")
                 self.assertIs(result["validationPassed"], reason == "work")
+                self.assertIs(h.capture.call_args.kwargs["complete_handshake"], False)
+                h.verify.assert_called_once()
                 h.verify.assert_called_once()
                 self.assertEqual(h.verify.call_args.args[0].connection_work_target, "f" * 64)
                 self.assertNotIn("secret", json.dumps(h.frames))
@@ -624,7 +731,8 @@ class ServiceTests(unittest.TestCase):
 
     def test_actual_tcp_start_gate_recovers_delayed_start_reports(self):
         with Fixture(connectionsPerSecond=10) as h, PacingClock() as clock:
-            jobs = [service.Job(index, "attempt") for index in range(3)]
+            h.service.budgets["fixture"] = service.Budget(0, 0)
+            jobs = [service.Job(index, "attempt", bounty_id="fixture") for index in range(3)]
             h.service._connecting(jobs[0])
             # Reports delayed behind IPC retain the shared phase; they do not
             # each add another complete interval once the pipe is available.
@@ -633,14 +741,13 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([job.started_at for job in jobs], [100.0, 100.25, 100.25])
             self.assertAlmostEqual(h.service.next_connection, 100.3, places=11)
             self.assertEqual(clock.sleeps, [])
-            phase, history = h.service.next_connection, tuple(h.service.connection_starts)
-            cancelled = service.Job(4, "attempt")
+            phase = h.service.next_connection
+            cancelled = service.Job(4, "attempt", bounty_id="fixture")
             cancelled.control.cancel()
             with self.assertRaises(CaptureCancelled): h.service._connecting(cancelled)
             self.assertEqual(h.service.next_connection, phase)
-            self.assertEqual(tuple(h.service.connection_starts), history)
 
-    def test_service_completes_handshake_and_measures_after_start_acknowledgement(self):
+    def test_service_captures_through_certificate_verify_and_measures_after_start_acknowledgement(self):
         with Fixture() as h:
             h.resolve_domain()
             clock = [100.0]
@@ -654,7 +761,9 @@ class ServiceTests(unittest.TestCase):
                 result = h.wait("attempt", 2)
             self.assertTrue(result["captured"])
             self.assertEqual(result["seconds"], 0)
-            self.assertIs(h.capture.call_args.kwargs["complete_handshake"], True)
+            self.assertIs(h.capture.call_args.kwargs["complete_handshake"], False)
+            h.verify.assert_called_once()
+            self.assertTrue(result["validationPassed"])
 
     def test_exact_two_expected_gate_is_strict_and_counts_only_success(self):
         with Fixture() as h:
@@ -778,12 +887,8 @@ class ServiceTests(unittest.TestCase):
             for identifier in identifiers:
                 h.attempt(identifier, bounty=identifier,
                           domain="other.example" if identifier % 2 == 0 else "example.com")
-            admissions, permits = [], []
-            before_start, connecting = h.service._before_start, h.service._connecting
-            def before(job):
-                previous, idle = h.service.next_start, h.service.start_idle
-                before_start(job)
-                admissions.append((job.domain, clock.now, previous, idle, h.service.next_start))
+            permits = []
+            connecting = h.service._connecting
             def connect(job):
                 previous, idle = h.service.next_connection, h.service.connection_idle
                 connecting(job)
@@ -796,8 +901,7 @@ class ServiceTests(unittest.TestCase):
                     clock.now += 2.25  # Delayed IPC exceeds the one-second debt cap.
                 original_emit(frame)
             h.service.emit_callback = emit
-            with patch.object(h.service, "_before_start", side_effect=before), \
-                 patch.object(h.service, "_connecting", side_effect=connect):
+            with patch.object(h.service, "_connecting", side_effect=connect):
                 while h.service.pending:
                     job = h.service.pending.popleft()
                     job.running = True
@@ -807,7 +911,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([frame["id"] for frame in results], identifiers)
             self.assertTrue(all(frame["verified"] for frame in results))
             self.assertEqual(h.capture.call_count, len(identifiers))
-            for observations in (admissions, permits):
+            for observations in (permits,):
                 self.assertEqual(len(observations), len(identifiers))
                 self.assertEqual({row[0] for row in observations}, {"example.com", "other.example"})
                 self.assertEqual([row[3] for row in observations], [True] + [False] * (len(identifiers) - 1))
@@ -816,10 +920,8 @@ class ServiceTests(unittest.TestCase):
                     self.assertAlmostEqual(phase, expected, places=11)
             times = [row[1] for row in permits]
             self.assertTrue(any(right == left for left, right in zip(times, times[1:])))
-            # Check the combined domains' permit stream, independently of the
-            # internal deque. Observer/ACK timestamps are not socket permits.
-            for index, now in enumerate(times):
-                self.assertLessEqual(sum(then + 1.0 > now for then in times[:index + 1]), rate)
+            self.assertTrue(any(sum(then + 1.0 > now for then in times[:index + 1]) > rate
+                                for index, now in enumerate(times)))
             self.assertTrue(clock.sleeps)
 
     def test_global_concurrency_and_cancellation_are_per_attempt(self):
@@ -920,9 +1022,8 @@ class ServiceTests(unittest.TestCase):
                 # clock rate accuracy. Expire the previous synthetic slot so
                 # OS sleep granularity cannot add 4-16 seconds to 1,100 mocks.
                 # Keep the real start hook (including budget/cancel checks);
-                # the cross-domain test checks deterministic phase and quota.
+                # the cross-domain test checks deterministic shared pacing.
                 with h.service.condition:
-                    h.service.next_start = 0
                     h.service.next_connection = 0
                 h.attempt(identifier, bounty=identifier)
                 self.assertTrue(h.wait("attempt", identifier)["captured"])

@@ -166,10 +166,18 @@ class ClaimsTests(unittest.TestCase):
             value_request = request()
             value_request["context"][name] = value
             with self.assertRaises(ValueError): claims_bridge.parse_request(value_request)
-        for name, value in [("concurrency", 257), ("connectionsPerSecond", -1), ("overallTimeout", 0), ("maxAttempts", True), ("allow_private_addresses", True)]:
+        for name, value in [("concurrency", 2147483648), ("connectionsPerSecond", -1), ("connectionsPerSecond", 2147483648), ("overallTimeout", 0), ("maxAttempts", True), ("allow_private_addresses", True)]:
             value_request = request()
             value_request["options"][name] = value
             with self.assertRaises(ValueError): claims_bridge.parse_request(value_request)
+
+    def test_legacy_bridge_accepts_positive_int32_connection_limits(self):
+        for value in (257, 400, 1000, 2147483647):
+            value_request = request()
+            value_request["options"].update(connectionsPerSecond=value, concurrency=value)
+            context, options = claims_bridge.parse_request(value_request)
+            self.assertEqual(options.connections_per_second, value)
+            self.assertEqual(options.concurrency, value)
 
     def test_dns_private_and_mixed_destinations(self):
         private = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443))

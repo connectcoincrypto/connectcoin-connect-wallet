@@ -7,9 +7,9 @@ are not required at runtime. The upstream license is retained alongside it.
 ConnectWallet's local hardening in `generator.py` also rejects multicast,
 reserved and IPv6 translation/tunnel destinations: `is_global` by itself is
 not a sufficient SSRF boundary. Local patches also add independently cancellable
-capture sockets and completion telemetry. Desktop raw capture success now means
-TLS completion through authenticated server Finished and sent client Finished,
-before certificate-path/CertificateVerify verification and the hash-target
+capture sockets and completion telemetry. Desktop raw capture success means
+TLS capture through CertificateVerify, without waiting for server Finished or
+sending client Finished, before certificate-path/CertificateVerify verification and the hash-target
 test; it still governs the existing successful-connection budget. The protocol-4
 desktop service emits a raw capture event before verification, then one terminal
 result per request with a required tri-state `validationPassed`. For each domain and exact
@@ -30,7 +30,10 @@ also has no validated observation. Once validation completes, its `true` or
 including cancellation while synchronous validation is running. Raw captures
 still consume the successful-connection budget even when validation fails.
 The legacy one-shot generator retains bounded snapshots for development tooling;
-it is not the desktop scheduling path. Every worker verifies its capture before
+it is not the desktop scheduling path. Its local scheduling patch now retains
+the Core's bounded-debt deadline (`max(next + interval, now - 1 second)`), and
+both the legacy bridge and persistent service accept positive signed 32-bit
+rate/concurrency settings instead of imposing a 256 ceiling. Every worker verifies its capture before
 recording an outcome, including in-flight work completed after another proof
 wins. Snapshots identify these semantics with `validation: "certificate-proof-v1"`.
 Importing a snapshot into the EMA rejects an absent/different marker or a gap
@@ -59,7 +62,7 @@ The local `--probe-rsa` mode follows Core's `ProbeP2CRsaForTest` in
 version-1 roots, and certificate validation at the supplied wall-clock time.
 It completes TLS 1.3, verifies Server Finished and sends Client Finished before
 reporting authenticated RSA capability. This is an opt-in extension to `tls13.py`;
-the desktop claims service now opts into full handshake completion too. Proofs
+the desktop claims service does not opt into full handshake completion. Proofs
 still encode only the original five messages through CertificateVerify. The probe uses a random dummy
 transaction ID solely to reuse the challenge/proof verifier, and a maximum work
 target; no wallet transaction or keys enter the process and no HTTP is sent.
@@ -97,8 +100,9 @@ X.509 implementation can reject some encodings accepted by Core; the node's
 consensus validation remains authoritative.
 
 The desktop uses one persistent helper/executor shared across all bounties,
-defaulting to 100 starts/sec and 100 simultaneous TLS connections (maximum 256
-of either). Those global limits remain available to a single domain, without
+defaulting to 100 starts/sec and 100 simultaneous TLS connections. Both settings
+accept integers from 1 to 2,147,483,647, subject to actual OS/network capacity;
+worker threads are created only as needed. Those global limits remain available to a single domain, without
 additional per-domain/IP caps or progressive transport cooldowns. Below-floor domain/mask
 policies that qualify at the initial 5/s rate have bounded once-per-minute
 recovery probes without resetting EMA or weakening verification. Each connection
@@ -106,7 +110,11 @@ has a 10-second network deadline, excluding local queue/rate/start-report waits;
 there is no 1,000-attempt
 or 180-second batch limit. DNS resolution uses two bounded slots, a 60-second
 positive cache and 2-second negative cache. The cache holds at most 4,096 domains
-with 32 pinned endpoints each, and the total pending-request limit is 512.
+with 32 pinned endpoints each. The retained-request limit is
+`max(512, concurrency + 2)` for TLS and DNS work; the desktop separately bounds
+admissions awaiting a start acknowledgment to at most 128 (fewer at low rates).
+That admission bound does not cap already-started connections at 128. Failure
+to create a worker ends the helper session instead of silently losing requests.
 Resolved endpoints use a weighted rotation per domain/signature-policy mask:
 99% of selection weight follows each IP's valid-proof/TCP-TLS-time EMA and 1%
 is uniform exploration. Each IP starts with `connections = 0.1` and
@@ -117,12 +125,15 @@ neutral. This does not change the separate domain EMA or capture budget.
 IP histories for unchanged endpoints survive DNS refreshes and are bounded by
 the existing cache and seven supported signature-policy masks. No per-IP
 connection cap or cooldown is added, and the ten-second timeout is unchanged.
-Socket-start
-reports run outside the cancellation lock. A second actual-connect pacing gate
-prevents delayed reports from creating a TCP-start burst. Full handshakes send
-an application-key close_notify and drain up to 64 KiB for at most 200 ms;
-best-effort teardown failures do not invalidate a completed proof, while
-cancellation still aborts delivery. These are ConnectWallet-local patches;
+Socket-start reports run outside the cancellation lock. A single serialized
+TCP-start gate includes acknowledgment and advances its shared deadline from a
+fresh monotonic reading, retaining at most one second of scheduling debt.
+There is no additional rolling-window quota; catch-up may briefly exceed the
+configured average rate, while true idle periods cannot bank credit. Captures
+close after CertificateVerify and cancellation still aborts delivery. Only
+opt-in full handshakes (the RSA probe) send an application-key close_notify and
+drain up to 64 KiB for at most 200 ms; best-effort teardown failures do not
+invalidate an otherwise completed capture. These are ConnectWallet-local patches;
 Core and the upstream P2C Tools repository are not changed by them.
 The helper independently enforces Core's exact successful-capture budget:
 stop starting attempts once `successes * (target + 1) > 2^257`, including successful

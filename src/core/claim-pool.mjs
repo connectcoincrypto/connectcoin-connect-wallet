@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process';
 import { getClaimsHelper, validateClaimContext } from './claims.mjs';
 import { diagnosticProcessExit } from './diagnostics.mjs';
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 
 export const CONNECTION_DEFAULTS = Object.freeze({ connectionsPerSecond: 100, concurrency: 100 });
 export function validateConnectionOptions(input = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !Object.hasOwn(CONNECTION_DEFAULTS, key))) throw new Error('Invalid connection options');
   const options = { ...CONNECTION_DEFAULTS, ...input };
-  for (const value of Object.values(options)) if (!Number.isInteger(value) || value < 1 || value > 256) throw new Error('Connection limits must be between 1 and 256');
+  for (const value of Object.values(options)) if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONNECTION_LIMIT) throw new Error(`Connection limits must be integers between 1 and ${MAX_CONNECTION_LIMIT}`);
   return Object.freeze(options);
 }
 export function claimAborted() { return Object.assign(new Error('Automatic Claims stopped'), { name: 'AbortError' }); }
@@ -25,7 +26,7 @@ export class ConnectionPool {
   constructor({ helper, resourcesPath, basePath, spawnProcess = spawn, onDiagnostic = () => {}, onFailure = () => {} } = {}) {
     Object.assign(this, { helper, resourcesPath, basePath, spawnProcess, onDiagnostic, onFailure });
     this.pacesStarts = true; // Protocol 4 enforces one global clock at socket start.
-    this.requests = new Map(); this.sequence = 0; this.closing = false;
+    this.requests = new Map(); this.sequence = 0; this.pendingStarts = 0; this.closing = false;
   }
   async start(options) {
     if (this.closing) throw claimAborted();
@@ -80,16 +81,35 @@ export class ConnectionPool {
     if ((this.child?.stdin.writableLength ?? 0) > 1024 * 1024) throw new Error('Claims helper input backpressure exceeded');
     this.child.stdin.write(line);
   }
+  armDeadline(request, delay, message = 'Claims helper request exceeded its deadline') {
+    clearTimeout(request.timer);
+    // Node timers use signed 32-bit milliseconds. Large real admission queues
+    // must never wrap a legitimate pacing allowance into an immediate timeout.
+    const maximumDelay = 2_147_483_647;
+    request.timer = setTimeout(() => {
+      if (delay > maximumDelay) this.armDeadline(request, delay - maximumDelay, message);
+      else this.fail(new Error(message));
+    }, Math.min(delay, maximumDelay));
+  }
   request(kind, body, { signal, onStarted, onCapture, onResult } = {}) {
     if (this.failure) return Promise.reject(this.failure);
     if (!this.started || this.closing || signal?.aborted) return Promise.reject(claimAborted());
-    if (this.requests.size >= 512 || this.sequence >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('Claims helper request capacity exceeded'));
+    // Bound retained requests by actual configured work plus DNS. Raising the
+    // user's concurrency must not turn the former 512-request guard into a stop.
+    if (this.requests.size >= Math.max(512, this.options.concurrency + 2) || this.sequence >= Number.MAX_SAFE_INTEGER) return Promise.reject(new Error('Claims helper request capacity exceeded'));
     return new Promise((resolve, reject) => {
       const id = ++this.sequence;
       const request = { id, kind, body, signal, onStarted, onCapture, onResult, resolve, reject, started: false, capture: null };
       request.abort = () => { try { this.send({ type: 'cancel', id }); } catch { /* A closing helper is already cancelled. */ } };
-      // Bounds one DNS/capture/verification, never a whole bounty's search.
-      request.timer = setTimeout(() => this.fail(new Error('Claims helper request exceeded its deadline')), 45000);
+      // Socket pacing has its own generous watchdog, including every admission
+      // ahead of this one. A stalled helper still fails without charging this
+      // local queue wait to the capture/verification deadline.
+      if (kind === 'resolve') this.armDeadline(request, 45000);
+      else {
+        this.pendingStarts++;
+        this.armDeadline(request, 60000 + this.pendingStarts * 1000 / this.options.connectionsPerSecond,
+          'Claims helper start acknowledgement exceeded its deadline');
+      }
       signal?.addEventListener('abort', request.abort, { once: true });
       this.requests.set(id, request);
       try { this.send({ type: kind, id, ...body }); } catch (error) { this.fail(error); }
@@ -125,6 +145,8 @@ export class ConnectionPool {
     if (request.kind !== 'attempt') throw new Error('Mismatched helper response type');
     if (message.type === 'started') {
       if (request.started || request.capture) throw new Error('Duplicate helper start');
+      this.pendingStarts--;
+      this.armDeadline(request, 45000);
       request.started = true; request.onStarted?.(); return;
     }
     if (!['capture', 'attempt'].includes(message.type)) throw new Error('Unknown claims helper response');
@@ -165,6 +187,7 @@ export class ConnectionPool {
   }
   finish(request, error, result) {
     if (!this.requests.delete(request.id)) return;
+    if (request.kind === 'attempt' && !request.started) this.pendingStarts--;
     clearTimeout(request.timer); request.signal?.removeEventListener('abort', request.abort);
     // Closing cancels every request, including callers without an AbortSignal.
     // Result callbacks above may retain validated observations, never a proof.

@@ -64,6 +64,27 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.5 release notes describe claims changes without weakening validation or promising throughput', () => {
+  const notes = releaseNotes('1.1.5', '5678', sha);
+  for (const text of [
+    '# ConnectWallet 1.1.5', '## New in 1.1.5', 'removed the 256 ceiling', 'signed 32-bit integers',
+    'defaults remain 100/100', 'saved settings are preserved', 'four-submission RPC limit',
+    'one shared TCP-start timeline', 'one second of scheduling debt', 'brief catch-up bursts',
+    'Genuine idle periods do not bank catch-up credit', 'stops after `CertificateVerify`',
+    'without waiting for server Finished or sending client Finished',
+    'CertificateVerify-signature validation still run before target evaluation',
+    'RSA compatibility probe continues to complete the handshake', 'No fixed performance increase is promised',
+    'mobile app is not included', 'wallet keys or the encrypted wallet format',
+    'Installers use English', 'Windows downloads are unsigned', 'not Developer-ID signed or notarized',
+    'SHA256SUMS', '/blob/v1.1.5/README.md', '/actions/runs/5678', sha,
+  ]) assert.ok(notes.includes(text), text);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.equal((notes.match(/## New in 1\.1\.5/g) ?? []).length, 1);
+  for (const previous of ['1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', '1.2.0']) {
+    assert.ok(!releaseNotes(previous, '5678', sha).includes('## New in 1.1.5'));
+  }
+});
+
 test('1.1.4 release notes describe address-driven synchronization with compatibility and safety limits', () => {
   const notes = releaseNotes('1.1.4', '5678', sha);
   for (const text of [

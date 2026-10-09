@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "vendor"))
 
 from connectcoin_p2c_tools.envelope import ConnectionProof  # noqa: E402
 from connectcoin_p2c_tools.generator import (  # noqa: E402
+    MAX_CONNECTION_LIMIT,
     GenerationOptions,
     GenerationProgress,
     generate_connection_proof,
@@ -80,8 +81,8 @@ def parse_request(request: object) -> tuple[ConnectionProof, GenerationOptions]:
         raise ValueError("invalid generation options")
     proof = parse_context(context)
     generation = GenerationOptions(
-        connections_per_second=bounded_int(options["connectionsPerSecond"], "rate", 1, 256),
-        concurrency=bounded_int(options["concurrency"], "concurrency", 1, 256),
+        connections_per_second=bounded_int(options["connectionsPerSecond"], "rate", 1, MAX_CONNECTION_LIMIT),
+        concurrency=bounded_int(options["concurrency"], "concurrency", 1, MAX_CONNECTION_LIMIT),
         overall_timeout=bounded_int(options["overallTimeout"], "timeout", 1, 600),
         max_attempts=bounded_int(options["maxAttempts"], "attempts", 1, 100000),
         connection_timeout=10.0,

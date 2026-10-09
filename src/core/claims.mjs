@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { validateAttemptStats } from './claim-priority.mjs';
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 
 const BASE = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTEXT_KEYS = ['domain', 'txid', 'input_index', 'connection_work_target', 'root_certificates_version', 'signature_algorithms_mask', 'validation_time'];
@@ -27,8 +28,8 @@ export function validateClaimOptions(options = {}) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new Error('Invalid claim options');
   if (Object.keys(options).some((key) => !Object.hasOwn(DEFAULT_CLAIM_OPTIONS, key))) throw new Error('Unknown claim option');
   const result = { ...DEFAULT_CLAIM_OPTIONS, ...options };
-  integer(result.connectionsPerSecond, 1, 256, 'connections per second');
-  integer(result.concurrency, 1, 256, 'simultaneous connections');
+  integer(result.connectionsPerSecond, 1, MAX_CONNECTION_LIMIT, 'connections per second');
+  integer(result.concurrency, 1, MAX_CONNECTION_LIMIT, 'simultaneous connections');
   integer(result.overallTimeout, 1, 600, 'claim timeout');
   integer(result.maxAttempts, 1, 100000, 'claim attempts');
   return Object.freeze(result);

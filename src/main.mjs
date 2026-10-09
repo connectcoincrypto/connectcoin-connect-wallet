@@ -12,6 +12,7 @@ const UI_URL = pathToFileURL(INDEX).href;
 const ICON = join(ROOT, '..', 'assets', 'icon.png');
 const ICON_URL = pathToFileURL(ICON).href;
 const PAYMENT_URI_URL = pathToFileURL(join(ROOT, 'core', 'payment-uri.mjs')).href;
+const CONNECTION_LIMITS_URL = pathToFileURL(join(ROOT, 'core', 'connection-limits.mjs')).href;
 const SERVICE_METHODS = new Set(['getState','prepareWallet','confirmWallet','cancelSetup','beginWalletReplacement','cancelWalletReplacement','restoreWallet','unlock','lock','previewSend','cancelSendPreview','confirmSend','newAddress','paymentRequest','getRecoveryPhrase','saveConfig','setTheme','setDeveloperMode','setClaims','refresh']);
 const EXTERNAL = new Set(['https://connectcoincrypto.com/','https://connectcoincrypto.com/whitepaper.pdf','https://explorer.connectcoincrypto.com/','https://github.com/connectcoincrypto/connectcoin-connect-wallet','https://github.com/connectcoincrypto/connectcoin','https://discord.gg/JYWbz5PsPp']);
 let window, service, startupTiming, quitting = false, closing = false, actionInProgress = false, closeSequence = 0;
@@ -108,7 +109,7 @@ else {
     session.setPermissionRequestHandler((_contents,_permission,callback) => callback(false));
     session.setPermissionCheckHandler(() => false);
     session.webRequest.onBeforeRequest((details, callback) => {
-      const allowed = details.url === ICON_URL || details.url === PAYMENT_URI_URL || details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
+      const allowed = details.url === ICON_URL || details.url === PAYMENT_URI_URL || details.url === CONNECTION_LIMITS_URL || details.url.startsWith(pathToFileURL(join(ROOT,'ui')).href + '/') || details.url.startsWith('data:image/');
       callback({ cancel: !allowed });
     });
     service.on('state', state => {

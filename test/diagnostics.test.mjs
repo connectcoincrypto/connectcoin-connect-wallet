@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile, mkdir } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join, isAbsolute, resolve, dirname, basename } from 'node:path';
 import { DiagnosticLog, diagnosticError, diagnosticProcessExit } from '../src/core/diagnostics.mjs';
+import { MAX_CONNECTION_LIMIT } from '../src/core/connection-limits.mjs';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'connectwallet-diagnostics-'));
@@ -27,6 +28,21 @@ test('startup timing logs retain only safe numeric timing metadata', async t => 
   assert.deepEqual(stored.map(row => row.event), events);
   for (const row of stored) assert.deepEqual(row.details, { stage: 'lifecycle', runId: 1, durationMs: 123.5 });
   assert.equal(JSON.stringify(stored).includes('PRIVATE-CANARY'), false);
+});
+
+test('claims diagnostics retain high concurrency without widening unrelated metadata bounds', async t => {
+  const log = new DiagnosticLog({ directory: await fixture(t) });
+  const valid = [0, 257, 400, 1000, MAX_CONNECTION_LIMIT];
+  for (const captureActive of valid) log.record('claims.progress', { captureActive, prepareActive: 4, dnsActive: 2, submitActive: 4 });
+  for (const captureActive of [-1, 0.5, MAX_CONNECTION_LIMIT + 1, NaN, Infinity, '1000']) {
+    log.record('claims.progress', { captureActive, prepareActive: 5, dnsActive: 3, submitActive: 5 });
+  }
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored.slice(0, valid.length).map(row => row.details), valid.map(captureActive => ({
+    captureActive, prepareActive: 4, dnsActive: 2, submitActive: 4,
+  })));
+  for (const row of stored.slice(valid.length)) assert.deepEqual(row.details, {});
 });
 
 test('helper DNS, blocked destination and target exhaustion retain safe distinct reasons', () => {

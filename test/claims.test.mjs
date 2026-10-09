@@ -65,7 +65,11 @@ test('enqueue without new bounties still wakes the scheduler without redundant q
 test('claims options are finite and public context cannot smuggle private fields', () => {
   assert.equal(validateClaimOptions().concurrency, 100);
   assert.equal(validateClaimOptions().connectionsPerSecond, 100);
-  for (const options of [{ concurrency: 0 }, { concurrency: 257 }, { connectionsPerSecond: -1 }, { overallTimeout: Infinity }, { maxAttempts: 0 }, { allowPrivate: true }]) assert.throws(() => validateClaimOptions(options));
+  for (const options of [{ concurrency: 0 }, { concurrency: 2147483648 }, { connectionsPerSecond: -1 }, { overallTimeout: Infinity }, { maxAttempts: 0 }, { allowPrivate: true }]) assert.throws(() => validateClaimOptions(options));
+  for (const name of ['connectionsPerSecond', 'concurrency']) {
+    for (const value of [257, 1000, 2147483647]) assert.equal(validateClaimOptions({ [name]: value })[name], value);
+    for (const value of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 2147483648]) assert.throws(() => validateClaimOptions({ [name]: value }));
+  }
   for (const delta of [{ domain: '127.0.0.1/evil' }, { domain: 'wallet.local' }, { domain: 'EXAMPLE.com' }, { domain: 'localhost' }, { root_certificates_version: 2 }, { signature_algorithms_mask: 0 }, { validation_time: 0 }, { password: 'not permitted' }]) assert.throws(() => validateClaimContext({ ...context(), ...delta }));
   assert.deepEqual(validateClaimContext(context()), context());
 });

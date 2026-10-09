@@ -155,7 +155,8 @@ export async function testPackaged(options) {
   const security = validateHelperSecurity(selfTest.stdout, expectedVersion);
   // Only start/shutdown frames: no claim requests, DNS, TLS, RPC or wallet data.
   const pool = new ConnectionPool({ helper: { command: layout.helper, args: [] } });
-  try { await pool.start({}); }
+  // Reject stale helpers that still impose the old 256 ceiling without doing network work.
+  try { await pool.start({ connectionsPerSecond: 1000, concurrency: 1000 }); }
   finally { await pool.close(); }
   console.log(`Packaged ConnectWallet ${packagedPackage.version} verified for ${options.platform}/${options.arch}: app.asar, native executables, roots, ${manifest.length} license files and protocol-4 startup/shutdown.`);
   console.log(`Packaged cryptography ${security.cryptographyVersion}; ${security.opensslVersion}. No GUI was launched.`);

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from connectcoin_p2c_tools.domain import is_canonical_domain
-from connectcoin_p2c_tools.generator import resolve_endpoints
+from connectcoin_p2c_tools.generator import MAX_CONNECTION_LIMIT, resolve_endpoints
 from connectcoin_p2c_tools.hashes import meets_work_target
 from connectcoin_p2c_tools.protocol import parse_proof
 from connectcoin_p2c_tools.tls13 import CaptureCancelled, CaptureControl, TLSGenerationError, capture_tls13_proof
@@ -117,8 +117,9 @@ class Job:
 class ClaimsService:
     def __init__(self, options, emit, parse_context, roots_path):
         _keys(options, ("connectionsPerSecond", "concurrency"))
-        self.rate = _integer(options["connectionsPerSecond"], 1, 256)
-        self.concurrency = _integer(options["concurrency"], 1, 256)
+        self.rate = _integer(options["connectionsPerSecond"], 1, MAX_CONNECTION_LIMIT)
+        self.concurrency = _integer(options["concurrency"], 1, MAX_CONNECTION_LIMIT)
+        self.max_pending = max(MAX_PENDING, self.concurrency + 2)
         validate_root_bundle(roots_path, 1)
         self.roots_path = roots_path
         self.emit_callback = emit
@@ -126,6 +127,7 @@ class ClaimsService:
         self.condition = threading.Condition(threading.RLock())
         self.output_lock = threading.Lock()
         self.capture_lock = threading.Lock()
+        self.connection_lock = threading.Lock()
         self.jobs = {}
         self.pending = deque()
         self.dns = OrderedDict()
@@ -133,10 +135,8 @@ class ClaimsService:
         self.last_id = 0
         self.active_tls = 0
         self.active_dns = 0
-        self.next_start = 0.0
         self.next_connection = 0.0
-        self.start_idle = self.connection_idle = True
-        self.connection_starts = deque()
+        self.connection_idle = True
         self.closed = False
         # Two resolver slots cannot occupy the TLS capacity. The same executor
         # serves all domains/bounties for the entire unlocked claims session.
@@ -185,7 +185,7 @@ class ClaimsService:
                 raise ValueError("helper is shutting down")
             if identifier <= self.last_id:
                 raise ValueError("request IDs must be strictly increasing")
-            if len(self.jobs) >= MAX_PENDING:
+            if len(self.jobs) >= self.max_pending:
                 raise ValueError("helper pending request limit exceeded")
             if kind == "attempt":
                 target = int(context.connection_work_target, 16)
@@ -206,13 +206,25 @@ class ClaimsService:
                 # An empty or cancelled-only session earns no pacing credit.
                 # Active captures and queued attempts both keep demand alive.
                 if not any(item.kind == "attempt" and not item.control.cancelled() for item in self.jobs.values()):
-                    self.start_idle = self.connection_idle = True
+                    self.connection_idle = True
             self.last_id = identifier
             self.jobs[identifier] = job
             self.pending.append(job)
             self.condition.notify_all()
 
     def _schedule(self):
+        try:
+            self._schedule_jobs()
+        except (RuntimeError, MemoryError):
+            # ThreadPoolExecutor grows lazily. A failed submit can already have
+            # enqueued its job, so never retry it or leave the scheduler dead
+            # with outstanding requests. The desktop closes the failed helper.
+            try:
+                self.emit({"type": "error", "message": "Claims helper could not create a connection worker"})
+            finally:
+                self.close()
+
+    def _schedule_jobs(self):
         while True:
             with self.condition:
                 if self.closed:
@@ -277,66 +289,54 @@ class ClaimsService:
                    **({"message": "Resolution cancelled" if cancelled else "Public DNS resolution failed"} if not ok or cancelled else {})})
 
     def _before_start(self, job):
-        while True:
-            with self.condition:
-                if self.closed or job.control.cancelled():
-                    raise CaptureCancelled("TLS capture cancelled")
-                delay = self.next_start - time.monotonic()
-                if delay <= 0:
-                    budget = self.budgets[job.bounty_id]
-                    if budget.successes == MAX_UINT64 or budget.successes * (budget.target + 1) > (1 << 257):
-                        raise BudgetExhausted()
-                    now = time.monotonic()
-                    if self.start_idle:
-                        self.next_start = max(self.next_start, now)
-                        self.start_idle = False
-                    # Advance the shared phase first, then bound debt to one
-                    # second. Late timer wakes do not add a fresh interval.
-                    self.next_start = max(self.next_start + 1.0 / self.rate, now - 1.0)
-                    return
-            # Python 3.11+ sleep uses a high-resolution Windows waitable timer;
-            # Lock/Condition timed waits can round to ~15 ms and cap 100/s at 65/s.
-            # Short sleeps avoid changing the OS timer policy and make rate-wait
-            # cancellation responsive within 10 ms without spinning or holding locks.
-            time.sleep(min(delay, 0.010))
-
-    def _started(self, job):
         with self.condition:
-            # Recheck at the actual socket-start hook, after any rate wait.
+            if self.closed or job.control.cancelled():
+                raise CaptureCancelled("TLS capture cancelled")
             budget = self.budgets[job.bounty_id]
             if budget.successes == MAX_UINT64 or budget.successes * (budget.target + 1) > (1 << 257):
                 raise BudgetExhausted()
+
+    def _started(self, job):
+        with self.condition:
+            self._before_start(job)
             job.started = True
             job.started_at = time.monotonic()
         self.emit({"type": "started", "id": job.identifier})
 
     def _connecting(self, job):
-        # IPC can delay already reserved start reports. Apply the same bounded
-        # phase to TCP start permits, with a separate rolling configured-rate
-        # ceiling. The socket connect follows this hook.
-        # The pre-report gate bounds acknowledgements waiting on IPC.
-        # Neither local wait belongs to the network deadline or EMA duration.
+        # One socket-start gate, shared by every domain. Keep its short start
+        # report in the same serialized turn so delayed IPC cannot bunch
+        # separately reserved permits. Waiting requests have not acknowledged
+        # a start, preserving the desktop's bounded admission lookahead.
+        while not self.connection_lock.acquire(timeout=0.010):
+            self._before_start(job)
+        try:
+            self._connect_turn(job)
+        finally:
+            self.connection_lock.release()
+
+    def _connect_turn(self, job):
         while True:
             with self.condition:
-                if self.closed or job.control.cancelled():
-                    raise CaptureCancelled("TLS capture cancelled")
-                now = time.monotonic()
-                while self.connection_starts and self.connection_starts[0] + 1.0 <= now:
-                    self.connection_starts.popleft()
-                ready = self.next_connection
-                if len(self.connection_starts) >= self.rate:
-                    ready = max(ready, self.connection_starts[0] + 1.0)
-                delay = ready - now
+                self._before_start(job)
+                delay = self.next_connection - time.monotonic()
                 if delay <= 0:
-                    now = time.monotonic()
-                    if self.connection_idle:
-                        self.next_connection = max(self.next_connection, now)
-                        self.connection_idle = False
-                    self.next_connection = max(self.next_connection + 1.0 / self.rate, now - 1.0)
-                    self.connection_starts.append(now)
-                    job.started_at = now
-                    return
+                    break
+            # Python 3.11+ uses high-resolution Windows sleeps. Condition
+            # timed waits can round to ~15 ms; cap sleeps for cancellation.
             time.sleep(min(delay, 0.010))
+        self._started(job)
+        with self.condition:
+            if self.closed or job.control.cancelled():
+                raise CaptureCancelled("TLS capture cancelled")
+            now = time.monotonic()
+            if self.connection_idle:
+                self.next_connection = max(self.next_connection, now)
+                self.connection_idle = False
+            # Core's shared phase retains at most one second of lateness;
+            # there is no additional rolling-window quota or second timer.
+            self.next_connection = max(self.next_connection + 1.0 / self.rate, now - 1.0)
+            job.started_at = now
 
     def _select_endpoint(self, domain, signature_algorithms_mask):
         _integer(signature_algorithms_mask, 1, 7)
@@ -405,8 +405,8 @@ class ClaimsService:
                 captured = capture_tls13_proof(endpoint, job.context.domain, job.context.challenge,
                     signature_algorithms_mask=job.context.signature_algorithms_mask,
                     timeout=CONNECTION_TIMEOUT, control=job.control,
-                    before_start=lambda: self._before_start(job), on_started=lambda: self._started(job),
-                    on_connecting=lambda: self._connecting(job), complete_handshake=True)
+                    before_start=lambda: self._before_start(job), on_started=None,
+                    on_connecting=lambda: self._connecting(job), complete_handshake=False)
                 job.captured = True
             except CaptureCancelled:
                 raise
@@ -503,7 +503,8 @@ class ClaimsService:
             jobs = list(self.jobs.values())
             self.condition.notify_all()
         for job in jobs: self._cancel(job)
-        self.scheduler.join(2)
+        if self.scheduler is not threading.current_thread():
+            self.scheduler.join(2)
         # OS DNS resolution is not interruptible by Python. Electron's process
         # shutdown deadline remains the hard bound for a stuck resolver.
         self.executor.shutdown(wait=False, cancel_futures=False)

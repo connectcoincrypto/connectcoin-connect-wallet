@@ -26,7 +26,8 @@ console.log(`Bundled cryptography ${security.cryptographyVersion}; ${security.op
 // incompatible with the wallet. Exercise the real protocol-4 handshake too;
 // this sends no DNS requests, TLS connections, RPC calls or wallet data.
 const pool = new ConnectionPool({ helper: { command: helper, args: [] } });
-try { await pool.start({}); }
+// Above the old 256 ceiling, but no connections are requested or threads preallocated.
+try { await pool.start({ connectionsPerSecond: 1000, concurrency: 1000 }); }
 finally { await pool.close(); }
 // An older helper may lack RSA probing. Exercise the new mode with an
 // invalid request so packaging cannot silently ship it; no DNS/TLS is attempted.

@@ -85,7 +85,8 @@ class GenerationResult:
 
 
 ProgressCallback = Callable[[GenerationProgress], None]
-MAX_CONCURRENCY = 256
+MAX_CONNECTION_LIMIT = 2147483647
+MAX_CONCURRENCY = MAX_CONNECTION_LIMIT
 
 
 def _is_public_endpoint(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -107,11 +108,11 @@ def _is_public_endpoint(address: ipaddress.IPv4Address | ipaddress.IPv6Address) 
 def _validate_options(options: GenerationOptions) -> None:
     if not 1 <= options.port <= 65535:
         raise GenerationError("port must be between 1 and 65535")
-    if options.connections_per_second < -1:
-        raise GenerationError("connections_per_second must be -1, 0, or a positive integer")
+    if type(options.connections_per_second) is not int or not -1 <= options.connections_per_second <= MAX_CONNECTION_LIMIT:
+        raise GenerationError(f"connections_per_second must be -1, 0, or a positive integer up to {MAX_CONNECTION_LIMIT}")
     if options.connections_per_second == 0:
         raise GenerationError("TLS proof generation is disabled by connections_per_second=0")
-    if not 1 <= options.concurrency <= MAX_CONCURRENCY:
+    if type(options.concurrency) is not int or not 1 <= options.concurrency <= MAX_CONCURRENCY:
         raise GenerationError(f"concurrency must be between 1 and {MAX_CONCURRENCY}")
     if not math.isfinite(options.connection_timeout) or options.connection_timeout <= 0:
         raise GenerationError("connection_timeout must be finite and positive")
@@ -312,7 +313,9 @@ def _generate_connection_proof(
                 pending[future] = attempts_started
                 if options.connections_per_second != -1:
                     interval = 1.0 / options.connections_per_second
-                    next_start = max(next_start + interval, now + interval)
+                    # Retain Core's bounded catch-up phase through timer and
+                    # worker delays instead of adding a new interval to now.
+                    next_start = max(next_start + interval, time.monotonic() - 1.0)
 
             if not pending:
                 delay = max(0.0, next_start - time.monotonic())

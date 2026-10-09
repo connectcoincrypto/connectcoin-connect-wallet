@@ -320,6 +320,19 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.5') {
+    const highlights = [
+      '## New in 1.1.5',
+      '',
+      '- **Higher Automatic Claims limits:** removed the 256 ceiling for connections per second and simultaneous connections. Both accept positive signed 32-bit integers, while defaults remain 100/100 and saved settings are preserved. System resources and network conditions still limit achievable throughput; bounded queues, backpressure and the four-submission RPC limit remain in place.',
+      '- **Core-aligned pacing:** one shared TCP-start timeline compensates for timer and IPC delays, with at most one second of scheduling debt. The separate rolling-one-second quota has been removed, allowing brief catch-up bursts. Genuine idle periods do not bank catch-up credit.',
+      '- **Shorter TLS capture:** Automatic Claims stops after `CertificateVerify`, without waiting for server Finished or sending client Finished. Certificate-chain, domain, time, policy and CertificateVerify-signature validation still run before target evaluation. The separate RSA compatibility probe continues to complete the handshake.',
+      '- Regression checks cover values above 256, pacing and cancellation, resource failures, proof validation and startup of the bundled helper with higher configured limits. No fixed performance increase is promised.',
+      '',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.4') {
     const highlights = [
       '## New in 1.1.4',
