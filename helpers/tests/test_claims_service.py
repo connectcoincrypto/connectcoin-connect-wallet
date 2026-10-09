@@ -13,6 +13,7 @@ import unittest
 from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
+from time import monotonic as fixture_clock
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,12 +67,14 @@ class Fixture:
             self.condition.notify_all()
 
     def wait(self, kind, identifier, timeout=4):
-        deadline = time.monotonic() + timeout
+        # Service clock patches simulate network/IPC time, not the harness's
+        # real deadline for waiting on another thread's protocol frames.
+        deadline = fixture_clock() + timeout
         with self.condition:
             while True:
                 found = next((frame for frame in self.frames if frame["type"] == kind and frame.get("id") == identifier), None)
                 if found is not None: return found
-                remaining = deadline - time.monotonic()
+                remaining = deadline - fixture_clock()
                 if remaining <= 0: raise AssertionError(f"Missing {kind} frame for request {identifier}")
                 self.condition.wait(remaining)
 
@@ -87,6 +90,27 @@ class Fixture:
         self.service.close()
         self.service.executor.shutdown(wait=True)
         self.stack.close()
+
+
+class FixtureTests(unittest.TestCase):
+    def test_intermediate_frames_and_simulated_time_jumps_do_not_expire_real_wait(self):
+        h = Fixture()
+        clock = [100.0]
+        notifications = iter(((11.0, {"type": "capture", "id": 2}),
+                              (20.0, {"type": "attempt", "id": 2})))
+        def notified_wait(remaining):
+            self.assertGreater(remaining, 0)
+            self.assertLessEqual(remaining, 4)
+            advance, frame = next(notifications)
+            clock[0] += advance
+            h.emit(frame)
+        # Force the capture notification to wake the waiter before the terminal
+        # frame. The former shared clock expired here after the first jump.
+        with patch.object(service.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(h.condition, "wait", side_effect=notified_wait) as wait:
+            self.assertEqual(h.wait("attempt", 2), {"type": "attempt", "id": 2})
+        self.assertEqual(wait.call_count, 2)
+        self.assertEqual(clock[0], 131.0)
 
 
 class PacingClock:
