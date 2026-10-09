@@ -121,18 +121,20 @@ try {
   stage = 'numeric caret and DOM identity survive background progress';
   // Number inputs do not expose selectionStart/selectionEnd. Type in the
   // middle, let background state render, then type again at that exact caret.
-  // Out-of-range digits keep this presentation-only fixture from autosaving
-  // into the real service, which intentionally has no wallet.
-  await page.locator('#claims-rate').fill('1000');
+  // Lookback remains limited to 600, while connection limits accept these
+  // values. Keep this presentation-only draft invalid so autosave cannot publish
+  // the real service's wallet-free state over our synthetic progress fixture.
+  assert.equal(await page.locator('#claims-lookback').getAttribute('max'), '600');
+  await page.locator('#claims-lookback').fill('1000');
   await page.keyboard.press('Home');
   await page.keyboard.press('ArrowRight');
   await page.keyboard.press('2');
-  assert.equal(await page.locator('#claims-rate').inputValue(), '12000');
+  assert.equal(await page.locator('#claims-lookback').inputValue(), '12000');
   await page.evaluate(() => {
-    window.numericEditingField = document.querySelector('#claims-rate');
+    window.numericEditingField = document.querySelector('#claims-lookback');
     window.numericEditingEvents = { focus: 0, blur: 0 };
     for (const type of ['focus', 'blur']) document.addEventListener(type, event => {
-      if (event.target.id === 'claims-rate') window.numericEditingEvents[type]++;
+      if (event.target.id === 'claims-lookback') window.numericEditingEvents[type]++;
     }, true);
   });
   await burst(20, true); await waitForLatest();
@@ -148,8 +150,8 @@ try {
   }
   await page.keyboard.press('3');
   assert.deepEqual(await page.evaluate(() => ({
-    value: document.querySelector('#claims-rate').value,
-    sameNode: window.numericEditingField === document.querySelector('#claims-rate'),
+    value: document.querySelector('#claims-lookback').value,
+    sameNode: window.numericEditingField === document.querySelector('#claims-lookback'),
     focused: document.activeElement === window.numericEditingField,
     ...window.numericEditingEvents,
   })), { value: '123000', sameNode: true, focused: true, focus: 0, blur: 0 }, 'Background progress must preserve the actual number input and its native caret without blur/refocus.');
@@ -171,6 +173,8 @@ try {
   assert.doesNotMatch(await page.locator('#app').textContent(), /Queried addresses and transactions can be observed or altered in transit/);
   assert.equal(await page.getByRole('button', { name: /^Save/ }).count(), 0);
   await waitForLatest();
+  assert.deepEqual(await page.evaluate(async () => (await window.connectwallet.invoke('getState')).config.claims), config.claims,
+    'The invalid presentation-only numeric draft must not change saved claim preferences.');
 
   stage = 'draft, focus, selection and scroll during updates';
   // A valid endpoint draft must not commit just because background rendering
