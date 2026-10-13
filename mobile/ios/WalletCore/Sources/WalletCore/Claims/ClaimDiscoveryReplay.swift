@@ -47,6 +47,11 @@ struct ClaimDiscoveryReplay {
                 try walletRequire(pages <= 100 && events.count <= 500 && (!more || !events.isEmpty) &&
                     (events.isEmpty || following != from), "CLAIMS_RPC_DATA")
                 if from == nil { try walletRequire(events.isEmpty && !more, "CLAIMS_RPC_DATA") }
+                // A required reset must not be masked by a transient failure
+                // while refreshing the new tip's hashes.
+                if events.contains(where: { $0["type"] as? String == "resync_required" }) {
+                    throw RpcFailure("-32011")
+                }
                 let changed: Bool
                 if let window { changed = try !window.tip.same(as: tip) } else { changed = true }
                 readHashes = readHashes || forceWindow || changed
@@ -59,7 +64,6 @@ struct ClaimDiscoveryReplay {
                 nextLoaded.formIntersection(Set(heights.keys))
                 for event in events {
                     let kind = try PJ.string(event["type"])
-                    if kind == "resync_required" { throw RpcFailure("-32011") }
                     let sequence = try PJ.integer(event["sequence"], 0, 9_007_199_254_740_991)
                     try walletRequire(sequence > lastSequence, "CLAIMS_RPC_DATA"); lastSequence = sequence
                     let key = try PJ.outpoint(event)

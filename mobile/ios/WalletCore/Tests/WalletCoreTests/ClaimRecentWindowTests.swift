@@ -239,6 +239,36 @@ final class ClaimRecentWindowTests: XCTestCase {
         catch let error as RpcFailure { XCTAssertEqual(error.code, "-32011") }
     }
 
+    func testRequiredResyncAtNewTipWinsOverHashRefreshFailureOnEveryPage() async throws {
+        let known = try ClaimRecentWindow(recentWindow()), row = try candidate(known)
+        for resetPage in [1, 2] {
+            let f = WindowFixture()
+            f.hook = { method, _, count in
+                if method == "getrecentblockhashes" { throw RpcFailure("RPC_TIMEOUT") }
+                guard method == "getbountychanges" else { return nil }
+                if count < resetPage {
+                    return ["tip": f.tip, "next_cursor": "before-reset", "has_more": true,
+                        "changes": [self.event(row, "pending_spend", 1)]]
+                }
+                f.current = recentWindow(701)
+                return ["tip": f.tip, "next_cursor": "reset", "has_more": false,
+                    "changes": [["type": "resync_required"]]]
+            }
+            do {
+                _ = try await f.run(known: known, cursor: "old", rows: [row.key: row], loaded: Set(known.order))
+                XCTFail("Required resync was ignored")
+            } catch let error as RpcFailure {
+                XCTAssertEqual(error.code, "-32011", "A timeout must not mask the server's required reset")
+            } catch {
+                XCTFail("Unexpected error instead of required resync: \(error)")
+            }
+            XCTAssertEqual(f.calls.map(\.0), Array(repeating: "getbountychanges", count: resetPage))
+            XCTAssertEqual(f.hashCounts, [])
+            XCTAssertEqual(row.state, "available", "Earlier pages must remain privately staged")
+            XCTAssertEqual(known, try ClaimRecentWindow(recentWindow()))
+        }
+    }
+
     func testSameHashMetadataAndGenesisMustAlwaysAgreeIncludingFinalFence() async throws {
         let known = try ClaimRecentWindow(recentWindow())
         for method in ["getbountychanges", "getchaintip"] {

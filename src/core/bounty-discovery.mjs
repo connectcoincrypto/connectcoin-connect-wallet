@@ -159,6 +159,10 @@ export async function discoverBounties({ rpc, network, lookback = 600, previous 
       const from = cursor;
       const page = await query('getbountychanges', from ? { cursor: from } : {});
       if (++journalPages > 100 || !cursorValid(page.next_cursor) || typeof page.has_more !== 'boolean' || !Array.isArray(page.changes) || page.changes.length > 10000 || (page.has_more && !page.changes.length) || (page.changes.length && page.next_cursor === from)) throw new Error('Invalid or excessive bounty journal response.');
+      // A reset revokes the old catalog immediately. Do not let a following
+      // hash query (quota wait, timeout or malformed reply) postpone suspension
+      // or hide the reset behind an unrelated read failure.
+      if (page.changes.some(event => event?.type === 'resync_required')) throw new RescanRequired('Bounty journal requested a new snapshot.');
       cursor = page.next_cursor;
       return page;
     };

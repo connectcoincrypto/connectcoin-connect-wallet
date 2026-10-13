@@ -231,6 +231,31 @@ for (const code of [-32004, -32011, 'resync_required']) test(`journal reset ${co
   assert.deepEqual(result.window, f.current);
 });
 
+for (const code of ['RPC_TIMEOUT', -32029, 'RPC_PROTOCOL']) {
+  test(`a reset precedes hash lookup and cannot be hidden by a subsequent ${code} failure`, async () => {
+    const f = fixture(), previous = f.warm(), trace = [];
+    f.current = makeWindow(701);
+    f.hook = (method, count, params) => {
+      if (method === 'getbountychanges') {
+        trace.push(params.cursor ?? 'new-watermark');
+        if (count === 1) return { tip: f.current.tip, next_cursor: 'reset', has_more: false,
+          changes: [{ type: 'resync_required' }] };
+      }
+      if (method === 'getrecentblockhashes') {
+        trace.push('hash-query');
+        throw Object.assign(new Error('Isolated hash read failed'), { code });
+      }
+    };
+    await assert.rejects(discoverBounties({ ...f.options, ...previous,
+      onReset: details => { trace.push(`reset:${details.reason}`); },
+    }), error => error.code === code);
+    assert.deepEqual(trace, ['previous', 'reset:journal-reset', 'new-watermark', 'hash-query'],
+      'Suspend/reset first, obtain a fresh watermark without the invalid cursor, then request hashes.');
+    assert.equal(previous.cursor, 'previous');
+    assert.equal(f.reads.length, 0); assert.equal(f.published.length, 0);
+  });
+}
+
 for (const method of ['getbountychanges', 'getrecentblockhashes', 'getchaintip']) test(`a malformed ${method} tip still fails closed`, async () => {
   const f = fixture();
   f.hook = name => {
@@ -410,6 +435,50 @@ test('WalletService commits the full cache with its cursor and reuses it across 
   assert.equal(source.count('getrecentblockhashes'), 1);
   assert.equal(source.count('getchaintip'), 3);
   assert.equal(source.count('getbountychanges'), 6);
+});
+
+test('WalletService drains and clears reset work before starting a blocked adaptive hash request', async t => {
+  const { service, source } = walletFixture(t);
+  await service.syncBountiesInternal(service.epoch);
+  const { claimWindow, claimBlocks, claimCursor } = service;
+  source.current = makeWindow(701);
+  const trace = [];
+  let resetEntered, drain, hashEntered, failHash;
+  const resetting = new Promise(resolve => { resetEntered = resolve; });
+  const draining = new Promise(resolve => { drain = resolve; });
+  const hashing = new Promise(resolve => { hashEntered = resolve; });
+  const blockedHash = new Promise(resolve => { failHash = resolve; });
+  t.after(() => { drain(); failHash(); });
+  service.engine.suspend = async () => {
+    service.engine.paused = true; trace.push('suspend'); resetEntered(); await draining;
+  };
+  service.engine.clear = () => { trace.push('clear'); };
+  let reset = false;
+  source.hook = async (method, count, params) => {
+    if (method === 'getbountychanges' && !reset) {
+      reset = true;
+      return { tip: source.current.tip, next_cursor: 'invalidated-cursor', has_more: false,
+        changes: [{ type: 'resync_required' }] };
+    }
+    if (method === 'getbountychanges') assert.equal(params.cursor, undefined);
+    if (method === 'getrecentblockhashes') {
+      trace.push('hash-query'); hashEntered(); await blockedHash;
+      throw Object.assign(new Error('Isolated hash timeout after reset'), { code: 'RPC_TIMEOUT' });
+    }
+  };
+  const pending = service.syncBountiesInternal(service.epoch);
+  const rejected = assert.rejects(pending, error => error.code === 'RPC_TIMEOUT');
+  await resetting;
+  assert.deepEqual(trace, ['suspend']);
+  assert.equal(source.count('getrecentblockhashes'), 1, 'Do not request another hash list while old workers drain.');
+  drain(); await hashing;
+  assert.deepEqual(trace, ['suspend', 'clear', 'hash-query']);
+  assert.equal(service.engine.paused, true, 'The old catalog cannot authorize work throughout the hash wait.');
+  assert.strictEqual(service.claimWindow, claimWindow); assert.strictEqual(service.claimBlocks, claimBlocks);
+  assert.equal(service.claimCursor, claimCursor, 'The reset watermark cannot become a committed cursor.');
+  failHash(); await rejected;
+  assert.equal(service.engine.resumes, 1, 'A failed reset must not resume workers.');
+  assert.equal(service.engine.paused, true);
 });
 
 for (const stage of ['stream', 'final tip']) test(`WalletService leaves its committed cache and cursor untouched after ${stage} failure`, async t => {

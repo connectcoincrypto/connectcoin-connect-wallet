@@ -311,9 +311,10 @@ public final class MobileClaimsEngine implements AutoCloseable {
             String startCursor = originalCursor;
             JSONObject first = request("getbountychanges", startCursor == null ? new JSONObject() : new JSONObject().put("cursor", startCursor), epoch);
             JSONObject expected = validateTip(first.optJSONObject("tip"));
+            JSONArray firstEvents = journalEvents(first);
             boolean force = startCursor == null;
             if (startCursor == null) {
-                require(first.opt("changes") instanceof JSONArray && first.getJSONArray("changes").length() == 0 && Boolean.FALSE.equals(first.opt("has_more")), "CLAIMS_RPC_DATA");
+                require(firstEvents.length() == 0 && Boolean.FALSE.equals(first.opt("has_more")), "CLAIMS_RPC_DATA");
                 startCursor = validCursor(first.opt("next_cursor")); first = null;
             }
             MobileClaimBlockWindow refreshed = refreshWindow(known, expected, force, epoch);
@@ -362,11 +363,21 @@ public final class MobileClaimsEngine implements AutoCloseable {
             } catch (ChainMoved moved) {
                 if (pass == 2) throw moved;
                 first = request("getbountychanges", new JSONObject().put("cursor", originalCursor), epoch);
-                known = refreshWindow(known, validateTip(first.optJSONObject("tip")), false, epoch);
+                JSONObject expected = validateTip(first.optJSONObject("tip"));
+                journalEvents(first);
+                known = refreshWindow(known, expected, false, epoch);
                 recent = known.blocks();
             }
         }
         synchronized (this) { check(epoch); nextBlock = now() + 1500; readRecovered("catalog"); }
+    }
+    /** Reset markers invalidate the cursor before any secondary RPC can fail
+     * and mask them. All callers validate the page's tip before this envelope. */
+    private static JSONArray journalEvents(JSONObject changes) throws JSONException {
+        require(changes.opt("changes") instanceof JSONArray && changes.opt("has_more") instanceof Boolean, "CLAIMS_RPC_DATA");
+        JSONArray events = changes.getJSONArray("changes"); require(events.length() <= 500, "CLAIMS_RPC_DATA");
+        for (int index = 0; index < events.length(); index++) if ("resync_required".equals(events.getJSONObject(index).opt("type"))) throw new IllegalArgumentException("CLAIMS_RESYNC");
+        return events;
     }
     /** Private clone plus delta replay; no partially received block is published. */
     private void replay(long epoch, String newBlock, Map<String, Candidate> staged) throws Exception {
@@ -404,9 +415,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             JSONObject changes = page == 0 && first != null ? first : request("getbountychanges", new JSONObject().put("cursor", nextCursor), epoch);
             if (page > 0 || first == null) replayAfterFirst = false;
             nextTip = validateTip(changes.optJSONObject("tip"));
-            require(changes.opt("changes") instanceof JSONArray && changes.opt("has_more") instanceof Boolean, "CLAIMS_RPC_DATA");
-            JSONArray events = changes.getJSONArray("changes"); require(events.length() <= 500, "CLAIMS_RPC_DATA");
-            for (int index = 0; index < events.length(); index++) if ("resync_required".equals(events.getJSONObject(index).opt("type"))) throw new IllegalArgumentException("CLAIMS_RESYNC");
+            JSONArray events = journalEvents(changes);
             if (window != null && !MobileClaimBlockWindow.sameTip(window.tip(), nextTip)) throw new ChainMoved();
             String following = validCursor(changes.opt("next_cursor")); more = changes.getBoolean("has_more");
             require((!more || events.length() > 0) && (events.length() == 0 || !following.equals(nextCursor)), "CLAIMS_RPC_DATA");

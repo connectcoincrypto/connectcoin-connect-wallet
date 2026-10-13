@@ -413,6 +413,41 @@ public class MobileClaimsEngineTest {
             assertEquals(0, f.engine.snapshot().getInt("eligible")); assertTrue(f.engine.snapshot().getBoolean("enabled"));
         }
     }
+    @Test public void journalResetWithNewTipWinsBeforeAnyFailingHashQuery() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.start(); f.engine.tick(); Object anchor = engineField(f.engine, "blockWindow");
+            long attempts = f.engine.snapshot().getLong("attempts"), valid = f.engine.snapshot().getLong("valid");
+            f.recentOverride = MobileClaimBlockWindowTest.window(1, 0, 0); f.currentTip = f.recentOverride.getJSONObject("tip");
+            f.changesByCursor.put((String)engineField(f.engine, "cursor"), new JSONArray().put(new JSONObject().put("type", "resync_required")));
+            f.readFailures.put("getrecentblockhashes", rpcFailure("RPC_TIMEOUT", "getrecentblockhashes", 0));
+            int reads = f.calls.size(); setEngineField(f.engine, "nextDiscovery", 0L); maintain(f.engine);
+            assertEquals(List.of("getbountychanges"), f.calls.subList(reads, f.calls.size()));
+            assertEquals("CLAIMS_RESYNC", f.engine.snapshot().getString("lastError")); assertNull(engineField(f.engine, "cursor"));
+            assertSame(anchor, engineField(f.engine, "blockWindow")); assertTrue(((Map<?, ?>)engineField(f.engine, "catalog")).isEmpty());
+            assertEquals(attempts, f.engine.snapshot().getLong("attempts")); assertEquals(valid, f.engine.snapshot().getLong("valid"));
+            assertTrue(f.engine.snapshot().getBoolean("enabled")); assertEquals(0, f.broadcasts);
+        }
+    }
+    @Test public void streamRetryResetWithNewTipWinsBeforeAnyFailingHashQuery() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.start(); f.engine.tick(); Object anchor = engineField(f.engine, "blockWindow");
+            long attempts = f.engine.snapshot().getLong("attempts"), valid = f.engine.snapshot().getLong("valid");
+            ((Set<?>)engineField(f.engine, "loaded")).clear(); f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1500));
+            f.onStream = () -> {
+                f.recentOverride = MobileClaimBlockWindowTest.window(1, 0, 0); f.currentTip = f.recentOverride.getJSONObject("tip");
+                while (f.changes.size() <= f.changesCount + 1) f.changes.add(new JSONArray());
+                f.changes.set(f.changesCount + 1, new JSONArray().put(new JSONObject().put("type", "resync_required")));
+                f.readFailures.put("getrecentblockhashes", rpcFailure("RPC_UNAVAILABLE", "getrecentblockhashes", 0));
+                f.onStream = null;
+            };
+            int reads = f.calls.size(); maintain(f.engine);
+            assertEquals(List.of("stream", "getbountychanges", "getbountychanges"), f.calls.subList(reads, f.calls.size()));
+            assertEquals("CLAIMS_RESYNC", f.engine.snapshot().getString("lastError")); assertNull(engineField(f.engine, "cursor"));
+            assertSame(anchor, engineField(f.engine, "blockWindow")); assertTrue(((Map<?, ?>)engineField(f.engine, "catalog")).isEmpty());
+            assertEquals(attempts, f.engine.snapshot().getLong("attempts")); assertEquals(valid, f.engine.snapshot().getLong("valid"));
+            assertEquals(0, f.broadcasts); assertTrue(f.engine.snapshot().getBoolean("enabled"));
+        }
+    }
     @Test public void contradictoryFinalTipAndGenesisIdentityFailClosedWithoutPublishing() throws Exception {
         for (String field : List.of("height", "mediantime", "hash")) try (Fixture f = new Fixture(true)) {
             f.start(); maintain(f.engine); String previous = (String)engineField(f.engine, "cursor");
