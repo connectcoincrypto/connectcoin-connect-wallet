@@ -75,7 +75,7 @@ function discoveryFixture(rows) {
   const live = new Set(rows.slice(0, 2).map(bountyKey));
   const removals = [];
   const engine = {
-    enabled: true, queue: new Map(rows.map(value => [bountyKey(value), { bounty: value }])),
+    enabled: true, pendingProofs: new Map(), queue: new Map(rows.map(value => [bountyKey(value), { bounty: value }])),
     activeKeys: () => new Set(live), hasActive: key => live.has(key),
     retire(txid, vout) { const key = `${txid}:${vout}`; if (live.has(key)) this.queue.get(key).retired = true; else this.queue.delete(key); },
     remove(txid, vout) { const key = `${txid}:${vout}`; removals.push(key); this.queue.delete(key); live.delete(key); },

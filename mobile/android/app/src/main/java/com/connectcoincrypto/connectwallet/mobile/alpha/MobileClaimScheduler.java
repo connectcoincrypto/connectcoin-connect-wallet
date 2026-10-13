@@ -70,15 +70,16 @@ final class MobileClaimScheduler {
     private static boolean eligible(MobileClaimsEngine.Candidate row, Set<String> retired) {
         return row.supported && row.state.equals("available") && !retired.contains(row.key) && row.budget() && row.raw.signum() > 0;
     }
-    void rebuild(Iterable<MobileClaimsEngine.Candidate> rows, Map<String, MobileClaimsEngine.Ema> stats, Set<String> retired, long now) {
+    void rebuild(Iterable<MobileClaimsEngine.Candidate> rows, Map<String, MobileClaimsEngine.PerformanceWindow> stats, Set<String> retired, long now) {
         entries.clear(); groups.clear();
         List<MobileClaimsEngine.Candidate> candidates = new ArrayList<>();
         Set<String> policies = new HashSet<>(), healthy = new HashSet<>();
         Map<String, MobileClaimsEngine.Candidate> recovery = new HashMap<>();
+        Map<String, Double> rates = new HashMap<>();
         for (MobileClaimsEngine.Candidate row : rows) {
             policies.add(row.policy);
             if (!eligible(row, retired)) continue;
-            candidates.add(row); double rate = rate(row, stats);
+            candidates.add(row); double rate = rates.computeIfAbsent(row.policy, unused -> rate(row, stats));
             if (worth(row.raw, rate)) healthy.add(row.policy);
             else if (worth(row.raw, 5)) {
                 MobileClaimsEngine.Candidate previous = recovery.get(row.policy);
@@ -94,18 +95,18 @@ final class MobileClaimScheduler {
             MobileClaimsEngine.Candidate row = representatives.get(index); admitted.add(row.key); probeDue(row.policy, now);
         }
         for (MobileClaimsEngine.Candidate row : candidates) {
-            double rate = rate(row, stats); boolean recovering = !worth(row.raw, rate);
+            double rate = rates.get(row.policy); boolean recovering = !worth(row.raw, rate);
             if (recovering && !admitted.contains(row.key)) continue;
             Group group = groups.computeIfAbsent(row.domain, Group::new);
-            MobileClaimsEngine.Ema observed = stats.get(row.policy);
+            MobileClaimsEngine.PerformanceWindow observed = stats.get(row.policy);
             Entry entry = new Entry(row, rate, recovering, group, observed == null ? 0 : observed.retryAfter);
             if (!Double.isFinite(entry.score)) continue;
             group.masks.computeIfAbsent(row.mask, unused -> new TreeSet<>(MobileClaimScheduler::compareEntries)).add(entry);
             entries.put(row.key, entry);
         }
     }
-    static double rate(MobileClaimsEngine.Candidate row, Map<String, MobileClaimsEngine.Ema> stats) {
-        MobileClaimsEngine.Ema value = stats.get(row.policy); return value == null ? 5 : value.rate();
+    static double rate(MobileClaimsEngine.Candidate row, Map<String, MobileClaimsEngine.PerformanceWindow> stats) {
+        MobileClaimsEngine.PerformanceWindow value = stats.get(row.policy); return value == null ? 5 : value.rate();
     }
     private long probeDue(String policy, long now) {
         Long due = probes.get(policy);

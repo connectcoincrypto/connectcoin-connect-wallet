@@ -53,6 +53,7 @@ for (const name of ['allowBackup', 'fullBackupContent', 'usesCleartextTraffic'])
 assert.equal(attr(application[0], 'dataExtractionRules'), '@xml/data_extraction_rules');
 assert.equal(attr(application[0], 'icon'), '@mipmap/ic_launcher');
 assert.equal(attr(application[0], 'roundIcon'), '@mipmap/ic_launcher_round');
+assert.equal(attr(application[0], 'label'), '@string/app_name');
 assert.notEqual(attr(application[0], 'debuggable'), 'true');
 for (const component of ['provider', 'receiver', 'activity-alias']) {
   assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the native wallet alpha`);
@@ -71,6 +72,7 @@ const activities = elements(manifest, 'activity').filter((item) => !activityRemo
 assert.deepEqual(activities.map((item) => attr(item, 'name')).sort(), ['.MainActivity', '.PaymentQrCaptureActivity']);
 const mainActivity = activities.find((item) => attr(item, 'name') === '.MainActivity');
 const scannerActivity = activities.find((item) => attr(item, 'name') === '.PaymentQrCaptureActivity');
+assert.equal(attr(mainActivity, 'label'), '@string/title_activity_main');
 assert.equal(attr(mainActivity, 'exported'), 'true'); // Launcher and explicit public payment links only.
 assert.equal(attr(mainActivity, 'launchMode'), 'singleTask');
 assert.equal(attr(scannerActivity, 'exported'), 'false');
@@ -125,7 +127,8 @@ for (const transport of ['cloud-backup', 'device-transfer']) {
 await scanXml(res);
 const strings = await xml(path.join(res, 'values/strings.xml'));
 const stringMap = new Map(elements(strings, 'string').map((item) => [item.getAttribute('name'), item.textContent]));
-assert.equal(stringMap.get('app_name'), 'ConnectWallet Alpha');
+assert.equal(stringMap.get('app_name'), 'ConnectWallet');
+assert.equal(stringMap.get('title_activity_main'), 'ConnectWallet');
 assert.equal(stringMap.get('package_name'), appId);
 for (const name of ['ic_launcher', 'ic_launcher_round']) {
   const adaptive = await xml(path.join(res, `mipmap-anydpi-v26/${name}.xml`));

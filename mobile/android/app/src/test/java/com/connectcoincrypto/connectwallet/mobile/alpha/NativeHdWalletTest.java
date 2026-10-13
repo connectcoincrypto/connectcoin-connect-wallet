@@ -416,6 +416,118 @@ public class NativeHdWalletTest {
             String.class, boolean.class, Integer.class, long.class, boolean.class);
         constructor.setAccessible(true); return constructor.newInstance(code, false, null, 0L, false);
     }
+    /** Serial actor fixture advances virtual delay instead of sleeping. */
+    private static final class RecoveryClock implements HdRecoveryReader.Scheduler {
+        long now; boolean draining;
+        final java.util.ArrayDeque<Runnable> queue = new java.util.ArrayDeque<>();
+        final List<Long> delays = new ArrayList<>();
+        public void execute(Runnable action) {
+            queue.add(action); if (draining) return;
+            draining = true;
+            try { while (!queue.isEmpty()) queue.remove().run(); } finally { draining = false; }
+        }
+        public HdRecoveryReader.Cancel after(long ms, Runnable action) {
+            delays.add(ms); java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+            execute(() -> { if (!cancelled.get()) { now += ms; action.run(); } });
+            return () -> cancelled.set(true);
+        }
+        public void close() { }
+    }
+    @Test public void initialInactiveCheckpointAutomaticallyRecoversWithoutStartingHistoryEarly() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            RecoveryClock clock = new RecoveryClock(); AtomicInteger checkpoints = new AtomicInteger(), histories = new AtomicInteger();
+            List<JSONObject> states = new ArrayList<>();
+            NativeHdWallet.Progress progress = snapshot -> states.add(snapshot.optJSONObject("hd"));
+            try (HdRecoveryReader reader = new HdRecoveryReader((method, params) -> {
+                if (method.equals("getaddresschanges")) {
+                    assertEquals(0, histories.get());
+                    if (checkpoints.incrementAndGet() == 1) throw remoteFailure("RPC_INACTIVE").recoveryHint(false, true);
+                    return CompletableFuture.completedFuture(checkpoint());
+                }
+                assertEquals(2, checkpoints.get()); histories.incrementAndGet();
+                return CompletableFuture.completedFuture(page(params.getString("address"), false));
+            }, LIVE, () -> true, (state, delay, attempt, code) -> fixture.wallet.recoveryStatus(state, delay, attempt, code, progress), clock, () -> clock.now, () -> 0)) {
+                fixture.wallet.recover(reader, LIVE, progress);
+            }
+            assertEquals(2, checkpoints.get()); assertEquals(40, histories.get()); assertEquals(List.of(1000L), clock.delays);
+            JSONObject retry = states.stream().filter(hd -> "retrying".equals(hd.optString("recoveryState"))).findFirst().orElseThrow();
+            assertEquals(0, retry.getInt("scanned")); assertTrue(retry.getBoolean("recovering")); assertFalse(retry.getBoolean("complete"));
+            assertEquals("complete", fixture.wallet.hdSnapshot().getString("recoveryState")); assertEquals(40, fixture.wallet.hdSnapshot().getInt("scanned"));
+            assertEquals(1, fixture.wallet.recoverySnapshots().getJSONArray("groups").length()); fixture.wallet.requireReady();
+        }
+    }
+    @Test public void continuationRetryKeepsValidatedPrefixOriginalCheckpointAndFirstPages() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            RecoveryClock clock = new RecoveryClock(); java.util.Map<String, Integer> reads = new java.util.LinkedHashMap<>();
+            List<JSONObject> retryStates = new ArrayList<>();
+            NativeHdWallet.Progress progress = snapshot -> {
+                JSONObject hd = snapshot.optJSONObject("hd"); if ("retrying".equals(hd.optString("recoveryState"))) retryStates.add(hd);
+            };
+            try (HdRecoveryReader reader = new HdRecoveryReader((method, params) -> {
+                if (method.equals("getaddresschanges")) return CompletableFuture.completedFuture(checkpoint());
+                String address = params.getString("address"), key = address + ":" + params.optString("cursor", "first");
+                int count = reads.merge(key, 1, Integer::sum);
+                boolean continuation = address.equals("native-0-8") && params.has("cursor");
+                if (continuation && count == 1) throw remoteFailure("RPC_TIMEOUT");
+                JSONObject response = page(address, continuation);
+                if (address.equals("native-0-8") && !continuation) response.put("next_cursor", "empty.continuation");
+                return CompletableFuture.completedFuture(response);
+            }, LIVE, () -> true, (state, delay, attempt, code) -> fixture.wallet.recoveryStatus(state, delay, attempt, code, progress), clock, () -> clock.now, () -> 0)) {
+                fixture.wallet.recover(reader, LIVE, progress);
+            }
+            assertEquals(Integer.valueOf(2), reads.remove("native-0-8:empty.continuation"));
+            assertTrue(reads.values().stream().allMatch(count -> count == 1)); assertEquals(49, reads.size());
+            assertFalse(retryStates.isEmpty()); assertTrue(retryStates.stream().allMatch(hd -> hd.optInt("scanned") >= 16 && hd.optBoolean("recovering")));
+            assertEquals(49, fixture.wallet.hdSnapshot().getInt("scanned")); assertEquals(8, fixture.wallet.hdSnapshot().getInt("lastUsedReceive"));
+            JSONObject original = fixture.wallet.recoverySnapshots().getJSONArray("groups").getJSONObject(0);
+            assertEquals("original.checkpoint", original.getJSONObject("sync").getString("next_cursor"));
+            JSONArray histories = original.getJSONArray("histories"); boolean found = false;
+            for (int i = 0; i < histories.length(); i++) if (histories.getJSONObject(i).getString("address").equals("native-0-8")) {
+                found = true; assertEquals("empty.continuation", histories.getJSONObject(i).getString("next_cursor"));
+                assertEquals(0, histories.getJSONObject(i).getJSONArray("items").length());
+            }
+            assertTrue(found); fixture.wallet.requireReady();
+        }
+    }
+    @Test public void staleCursorAndValidationFailuresAreTerminalWithSafeDistinctCodes() throws Exception {
+        for (String code : new String[]{"-32011", "RPC_PROTOCOL", "RPC_INVALID"}) try (Fixture fixture = new Fixture()) {
+            RecoveryClock clock = new RecoveryClock(); AtomicInteger calls = new AtomicInteger();
+            try (HdRecoveryReader reader = new HdRecoveryReader((method, params) -> { calls.incrementAndGet(); throw remoteFailure(code); },
+                    LIVE, () -> true, (state, delay, attempt, error) -> {}, clock, () -> clock.now, () -> 0)) {
+                assertThrows(Exception.class, () -> fixture.wallet.recover(reader, LIVE, ignored -> {}));
+            }
+            assertEquals(1, calls.get()); assertTrue(clock.delays.isEmpty());
+            assertEquals(code.equals("-32011") ? "HD_REFRESH_REQUIRED" : code.equals("RPC_INVALID") ? "HD_INVALID_REQUEST" : "HD_VALIDATION",
+                fixture.wallet.hdSnapshot().getString("errorCode"));
+            assertEquals("failed", fixture.wallet.hdSnapshot().getString("recoveryState")); assertThrows(IllegalStateException.class, fixture.wallet::requireReady);
+        }
+    }
+    @Test public void checkpointEpochChangeRequiresFreshDiscoveryButOrdinaryTipAdvanceDoesNot() throws Exception {
+        for (boolean epochChanged : new boolean[]{true, false}) try (Fixture fixture = new Fixture()) {
+            AtomicInteger checkpoints = new AtomicInteger();
+            NativeHdWallet.Reader reader = (method, params) -> {
+                if (method.equals("getaddresschanges")) {
+                    JSONObject response = checkpoint();
+                    if (checkpoints.incrementAndGet() > 1) {
+                        if (epochChanged) response.put("journal_epoch", 2);
+                        else response.getJSONObject("tip").put("height", 124).put("hash", "dd".repeat(32));
+                    }
+                    return CompletableFuture.completedFuture(response);
+                }
+                String address = params.getString("address");
+                return CompletableFuture.completedFuture(page(address, address.equals("native-0-19")));
+            };
+            if (epochChanged) {
+                assertThrows(NativeHdWallet.RecoveryRefreshException.class, () -> fixture.wallet.recover(reader, LIVE, ignored -> {}));
+                assertEquals("HD_REFRESH_REQUIRED", fixture.wallet.hdSnapshot().getString("errorCode"));
+                assertEquals("failed", fixture.wallet.hdSnapshot().getString("recoveryState"));
+                assertFalse(fixture.wallet.hdSnapshot().getBoolean("complete"));
+                assertEquals(0, fixture.wallet.recoverySnapshots().getJSONArray("groups").length());
+                assertTrue(fixture.vault.payload().getBoolean("needsRecovery"));
+            } else { fixture.wallet.recover(reader, LIVE, ignored -> {}); fixture.wallet.requireReady(); }
+            assertEquals(2, checkpoints.get());
+        }
+    }
     @Test public void onlyExplicitUnsupportedCheckpointFallsBackToUncachedHistory() throws Exception {
         for (String code : new String[]{"-32601", "-32029", "RPC_TIMEOUT", "RPC_CANCELLED"}) try (Fixture fixture = new Fixture()) {
             AtomicInteger checkpoints = new AtomicInteger(), histories = new AtomicInteger();
@@ -467,6 +579,7 @@ public class NativeHdWalletTest {
             }, LIVE, ignored -> {}));
             assertEquals(40, histories.get()); assertEquals(0, fixture.wallet.recoverySnapshots().getJSONArray("groups").length());
             assertFalse(fixture.wallet.snapshot().getJSONObject("hd").getBoolean("complete"));
+            assertEquals("failed", fixture.wallet.hdSnapshot().getString("recoveryState")); assertEquals("HD_STORAGE", fixture.wallet.hdSnapshot().getString("errorCode"));
             fixture.failWrite = false; fixture.recover(Set.of()); assertTrue(fixture.wallet.recoverySnapshots().getJSONArray("groups").length() > 0);
         }
     }

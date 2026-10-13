@@ -143,7 +143,7 @@ public final class AlphaSmokeTest {
             "importRecoveryEnabled:Boolean(document.getElementById('import-recovery') && !document.getElementById('import-recovery').disabled)," +
             "importFileEnabled:Boolean(document.getElementById('import-wallet') && !document.getElementById('import-wallet').disabled)})"));
         assertEquals("en", ui.getString("language"));
-        assertEquals("ConnectWallet Alpha", ui.getString("title"));
+        assertEquals("ConnectWallet", ui.getString("title"));
         assertEquals("https://localhost", ui.getString("origin"));
         assertEquals("android", ui.getString("platform"));
         assertTrue(ui.getBoolean("setupVisible")); assertTrue(ui.getBoolean("walletHidden"));
@@ -273,8 +273,8 @@ public final class AlphaSmokeTest {
         Configuration portuguese = new Configuration(context.getResources().getConfiguration());
         portuguese.setLocale(Locale.forLanguageTag("pt-BR"));
         Context localized = context.createConfigurationContext(portuguese);
-        assertEquals("ConnectWallet Alpha", localized.getString(R.string.app_name));
-        assertEquals("ConnectWallet Alpha", localized.getString(R.string.title_activity_main));
+        assertEquals("ConnectWallet", localized.getString(R.string.app_name));
+        assertEquals("ConnectWallet", localized.getString(R.string.title_activity_main));
     }
 
     @Test public void paymentLinksResolveOnlyToMainActivityAndNeverToTheInternalScanner() {

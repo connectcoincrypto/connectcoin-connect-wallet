@@ -20,7 +20,7 @@ export function buildPlan(args, host = process, base = root) {
   }
   if (!supported[options.platform]?.includes(options.arch)) throw new Error('Unsupported installer platform/architecture.');
   if (options.platform !== host.platform || options.arch !== host.arch) {
-    throw new Error('Native builds only: Node, Python, the claims helper and Electron must use the target OS and architecture.');
+    throw new Error('Native builds only: Node, the claims helper and Electron must use the target OS and architecture.');
   }
   const directory = path.join(base, 'dist', 'installers', `${options.platform}-${options.arch}`);
   const flag = { win32: '--win', darwin: '--mac', linux: '--linux' }[options.platform];
@@ -56,8 +56,8 @@ export async function buildInstallers(args) {
   const plan = buildPlan(args);
   await prepareOutput(plan.directory);
   console.log(`Building ConnectWallet for ${plan.platform}/${plan.arch}; installer language: English; publishing: disabled.`);
-  // setup-claims installs exact provider pins, runs Python regressions, bundles
-  // licenses and builds PyInstaller locally. Never reuse a foreign native helper.
+  // setup-claims builds the pinned C++ provider, runs native/Python regressions, bundles
+  // licenses locally. Never reuse a foreign native helper or package Python.
   await run(process.execPath, ['scripts/setup-claims.mjs', '--build']);
   await run(process.execPath, ['scripts/build-icon.mjs']);
   await run(process.execPath, ['scripts/check-package.mjs']);

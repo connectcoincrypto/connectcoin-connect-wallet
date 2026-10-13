@@ -1,80 +1,50 @@
+// C++ is the desktop runtime. Python is an explicitly selected test reference.
 import { execFile, spawn } from 'node:child_process';
-import { access, readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { availableParallelism } from 'node:os';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
-import { pinnedCryptographyVersion } from './helper-security.mjs';
-import { assertStaticOpenSSL, needsStaticCryptography, staticCryptographyInstall } from './claims-build-policy.mjs';
+import { validateNativeHelperSecurity } from './helper-security.mjs';
+import { NATIVE_LICENSE_FILES, NATIVE_ROOT_SHA256 } from './native-helper-manifest.mjs';
 
 const base = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const windows = process.platform === 'win32';
-const python = resolve(base, '.claims-venv', windows ? 'Scripts/python.exe' : 'bin/python');
-const build = process.argv.slice(2).includes('--build');
-const execFileAsync = promisify(execFile);
-if (process.argv.slice(2).some((arg) => arg !== '--build')) throw new Error('Usage: node scripts/setup-claims.mjs [--build]');
-
-function run(command, args, env = process.env) {
-  return new Promise((accept, reject) => {
-    const child = spawn(command, args, { cwd: base, stdio: 'inherit', shell: false, windowsHide: true, env });
-    child.once('error', reject);
-    child.once('exit', (code) => code === 0 ? accept() : reject(new Error(`${command} exited with ${code}`)));
-  });
-}
-
-try { await access(python); } catch {
-  // PYTHON is an executable path, never a shell command. No silent system mutation.
-  const command = process.env.PYTHON || (windows ? 'py' : 'python3');
-  const prefix = windows && !process.env.PYTHON ? ['-3'] : [];
-  await run(command, [...prefix, '-m', 'venv', resolve(base, '.claims-venv')]);
-}
-await run(python, ['-c', 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"']);
-if (build) await run(python, ['-c',
-  'import platform, struct, sys; expected = {"x64": ("amd64", "x86_64"), "arm64": ("arm64", "aarch64")}; assert struct.calcsize("P") == 8 and platform.machine().lower() in expected.get(sys.argv[1], ()), "Python architecture must match the native Node/Electron target"', process.arch]);
-if (needsStaticCryptography(build)) {
-  // Intel has no upstream wheel at the provider pin. A dynamic source build
-  // collides with CPython's different libssl.3.dylib when PyInstaller bundles it.
-  // https://cryptography.io/en/50.0.1/installation/#building-cryptography-on-macos
-  const directory = process.env.OPENSSL_DIR ?? (await execFileAsync('brew', ['--prefix', 'openssl@3'],
-    { cwd: base, shell: false, timeout: 30000, maxBuffer: 4096 })).stdout.trim();
-  const version = pinnedCryptographyVersion(await readFile(resolve(base, 'helpers/requirements.txt'), 'utf8'));
-  const installation = staticCryptographyInstall(version, directory);
-  for (const file of ['include/openssl/ssl.h', 'lib/libssl.a', 'lib/libcrypto.a']) {
-    try { await access(resolve(directory, file)); }
-    catch { throw new Error(`Static OpenSSL development files are required: ${resolve(directory, file)}`); }
-  }
-  await run(python, installation.args, installation.env);
-}
-await run(python, ['-m', 'pip', 'install', '--disable-pip-version-check', '-r', resolve(base, 'helpers', build ? 'requirements-build.txt' : 'requirements.txt')]);
-if (needsStaticCryptography(build)) {
-  const { stdout } = await execFileAsync(python, ['-I', '-c',
-    'from cryptography.hazmat.bindings import _rust; print(_rust.__file__)'],
-  { cwd: base, shell: false, timeout: 30000, maxBuffer: 4096 });
-  const extension = stdout.trim();
-  if (!extension.startsWith('/') || /[\0\r\n]/.test(extension)) throw new Error('Invalid cryptography extension path.');
-  const dependencies = await execFileAsync('/usr/bin/otool', ['-L', extension],
-    { cwd: base, shell: false, timeout: 30000, maxBuffer: 65536 });
-  assertStaticOpenSSL(dependencies.stdout, extension);
-  console.log(`Verified static OpenSSL linkage for native Intel cryptography ${extension}.`);
-}
-await run(python, ['-I', resolve(base, 'helpers/claims_bridge.py'), '--self-test']);
-// Force the source runtime even if a previously built native helper exists.
-// This is the wallet's actual isolated launch/protocol, with no network or keys.
-const sourcePool = new ConnectionPool({ helper: { command: python, args: ['-I', resolve(base, 'helpers/claims_bridge.py')] } });
-try { await sourcePool.start({}); }
-finally { await sourcePool.close(); }
-console.log('Isolated source protocol-4 startup and shutdown verified.');
-await run(python, ['-m', 'unittest', 'discover', '-s', resolve(base, 'helpers/tests'), '-v']);
-if (build) {
-  await run(python, [resolve(base, 'helpers/collect_licenses.py')]);
-  await run(python, ['-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--name', 'connectwallet-claims',
-    '--distpath', resolve(base, 'helpers/bin'), '--workpath', resolve(base, 'tmp/claims-build'),
-    '--specpath', resolve(base, 'tmp'), '--paths', resolve(base, 'helpers/vendor'),
-    '--add-data', `${resolve(base, 'helpers/p2c_roots_v1.pem')}${windows ? ';' : ':'}.`,
-    '--add-data', `${resolve(base, 'helpers/vendor/LICENSE.connectcoin-p2c-tools')}${windows ? ';' : ':'}licenses`,
-    '--add-data', `${resolve(base, 'helpers/PROVENANCE.md')}${windows ? ';' : ':'}licenses`,
-    '--add-data', `${resolve(base, 'tmp/claims-licenses')}${windows ? ';' : ':'}licenses/dependencies`,
-    resolve(base, 'helpers/claims_bridge.py')]);
-  await run(resolve(base, 'helpers/bin/connectwallet-claims', windows ? 'connectwallet-claims.exe' : 'connectwallet-claims'), ['--self-test']);
-}
-console.log(build ? 'Standalone Automatic Claims helper built and verified.' : 'Automatic Claims helper installed and verified.');
+if (process.argv.slice(2).some(arg => arg !== '--build')) throw new Error('Usage: node scripts/setup-claims.mjs [--build]');
+const cmake = process.env.CMAKE || 'cmake';
+const directory = resolve(base, 'tmp/native-build');
+const destination = resolve(base, 'helpers/native-bin/connectwallet-claims');
+const python = resolve(base, '.claims-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+const parallel = process.env.CONNECTWALLET_BUILD_JOBS ?? String(Math.min(4, availableParallelism()));
+if (!/^[1-9][0-9]*$/.test(parallel) || Number(parallel) > 256) throw new Error('Invalid CONNECTWALLET_BUILD_JOBS.');
+const run = (command, args) => new Promise((accept, reject) => {
+  const child = spawn(command, args, { cwd: base, stdio: 'inherit', shell: false, windowsHide: true });
+  child.once('error', reject);
+  child.once('exit', code => code === 0 ? accept() : reject(new Error(`${command} exited with ${code}`)));
+});
+// This installs only the isolated offline reference and runs its regression suite.
+// The reference is never packaged or used as a silent runtime fallback.
+await run(process.execPath, ['scripts/setup-python-reference.mjs']);
+await run(cmake, ['-S', resolve(base, 'native'), '-B', directory, '-DCMAKE_BUILD_TYPE=Release',
+  `-DCLAIMER_TEST_PYTHON=${python}`, '-DCLAIMER_REQUIRE_FIXTURE_TESTS=ON',
+  ...(process.platform === 'win32' ? ['-A', process.arch === 'arm64' ? 'ARM64' : 'x64'] : []),
+  ...(process.platform === 'darwin' ? ['-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0', `-DCMAKE_OSX_ARCHITECTURES=${process.arch === 'arm64' ? 'arm64' : 'x86_64'}`] : []),
+  `-DCMAKE_INSTALL_PREFIX=${destination}`]);
+await run(cmake, ['--build', directory, '--config', 'Release', '--parallel', parallel]);
+await run(process.env.CTEST || 'ctest', ['--test-dir', directory, '-C', 'Release', '--output-on-failure']);
+await run(cmake, ['--install', directory, '--config', 'Release', '--component', 'claimerRuntime']);
+const name = process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims';
+const command = resolve(destination, name);
+const built = [resolve(directory, 'Release', name), resolve(directory, name)].find(existsSync);
+const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+if (!built || hash(await readFile(built)) !== hash(await readFile(command))) throw new Error('Installed helper differs from the fresh build.');
+const { stdout } = await promisify(execFile)(command, ['--self-test', '--require-native-mbedtls'], { timeout: 30000, windowsHide: true, maxBuffer: 65536 });
+validateNativeHelperSecurity(stdout);
+const pool = new ConnectionPool({ helper: { command, args: [], native: true } });
+try { await pool.start({}); } finally { await pool.close(); }
+const files = [];
+for (const file of NATIVE_LICENSE_FILES) files.push({ file, sha256: hash(await readFile(resolve(destination, 'licenses', file))) });
+await writeFile(resolve(destination, 'licenses/manifest.json'), JSON.stringify({ provider: 'mbedtls', version: '3.6.7', rootsSha256: NATIVE_ROOT_SHA256, files }, null, 2) + '\n');
+console.log('C++ Automatic Claims helper built; Python/native regressions and offline protocol startup/shutdown verified.');

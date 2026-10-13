@@ -228,7 +228,7 @@ public class MobileRpcClientTest {
             assertEquals("localhost", hostname); resolutions.incrementAndGet(); throw new java.net.UnknownHostException("fixture");
         }, 3000)) {
             client.setActive(true); MobileRpcClient.RpcFailure failed = error(client.broadcast(HEX), "RPC_UNAVAILABLE");
-            assertFalse(failed.unknownOutcome); diagnostic(failed, "sendrawtransaction", "dns"); assertEquals(0, failed.bytesReceived);
+            assertFalse(failed.unknownOutcome); assertTrue(failed.notSent); diagnostic(failed, "sendrawtransaction", "dns"); assertEquals(0, failed.bytesReceived);
             assertEquals(1, resolutions.get());
         }
         int refusedPort;
@@ -237,7 +237,7 @@ public class MobileRpcClientTest {
             resolutions.incrementAndGet(); return new InetAddress[] { InetAddress.getLoopbackAddress() };
         }, 3000)) {
             client.setActive(true); MobileRpcClient.RpcFailure failed = error(client.broadcast(HEX), "RPC_UNAVAILABLE");
-            assertFalse(failed.unknownOutcome); diagnostic(failed, "sendrawtransaction", "connect"); assertEquals(0, failed.bytesReceived);
+            assertFalse(failed.unknownOutcome); assertTrue(failed.notSent); diagnostic(failed, "sendrawtransaction", "connect"); assertEquals(0, failed.bytesReceived);
             assertEquals(2, resolutions.get());
         }
     }
@@ -291,7 +291,7 @@ public class MobileRpcClientTest {
                 .put("error", new JSONObject().put("code", -32020).put("message", "untrusted private text").put("data", new JSONObject().put("node_code", nodeCode)))));
                 MobileRpcClient client = server.client(3000)) {
                 MobileRpcClient.RpcFailure error = error(client.broadcast(HEX), "-32020");
-                assertFalse(error.unknownOutcome); assertEquals(Integer.valueOf(nodeCode), error.nodeCode); assertFalse(error.getMessage().contains("private"));
+                assertFalse(error.unknownOutcome); assertFalse(error.notSent); assertEquals(Integer.valueOf(nodeCode), error.nodeCode); assertFalse(error.getMessage().contains("private"));
                 diagnostic(error, "sendrawtransaction", "parse"); assertTrue(error.bytesReceived > 0); assertEquals(1, server.requests.get());
             }
         }
@@ -308,7 +308,7 @@ public class MobileRpcClientTest {
             assertFalse("Pre-write-only cancellation cannot interrupt a broadcast already sent", client.cancelBeforeWrite(pending));
             assertFalse(pending.isDone());
             assertTrue(pending.cancel(false)); MobileRpcClient.RpcFailure failed = error(pending, "RPC_CANCELLED");
-            assertTrue(failed.unknownOutcome); assertEquals("sendrawtransaction", failed.method); assertEquals(0, failed.bytesReceived);
+            assertTrue(failed.unknownOutcome); assertFalse(failed.notSent); assertEquals("sendrawtransaction", failed.method); assertEquals(0, failed.bytesReceived);
             release.countDown(); assertEquals(1, server.requests.get()); assertEquals(1, server.connections.get());
         } finally { release.countDown(); }
     }
@@ -387,12 +387,52 @@ public class MobileRpcClientTest {
                 else client.close();
                 for (CompletableFuture<JSONObject> pending : waiting) {
                     MobileRpcClient.RpcFailure failed = error(pending, "RPC_CANCELLED");
-                    diagnostic(failed, "sendrawtransaction", "quota"); assertFalse(failed.unknownOutcome); assertEquals(0, failed.bytesReceived);
+                    diagnostic(failed, "sendrawtransaction", "quota"); assertFalse(failed.unknownOutcome); assertTrue(failed.notSent); assertEquals(0, failed.bytesReceived);
                     assertFalse(client.cancelBeforeWrite(pending));
                 }
                 // Hold the fixture past the quota wake-up to detect late writes.
                 CountDownLatch delay = new CountDownLatch(1); assertFalse(delay.await(1900, TimeUnit.MILLISECONDS));
                 assertEquals(48, server.requests.get()); assertEquals(1, server.connections.get());
+            }
+        }
+    }
+
+    @Test public void claimWriteFenceRechecksAfterQuotaWithoutDisconnectingOtherMethods() throws Exception {
+        Object owner = new Object(); boolean[] available = { true }; AtomicInteger fences = new AtomicInteger();
+        try (Server server = new Server((request, socket) -> response(request, new JSONObject().put("txid", HASH)));
+             MobileRpcClient client = server.client(1000, 1200)) {
+            for (int i = 0; i < 48; i++) await(client.broadcast(HEX));
+            CompletableFuture<JSONObject> queued = client.broadcast(HEX, owner, () -> {
+                assertTrue(Thread.holdsLock(owner)); fences.incrementAndGet();
+                if (!available[0]) throw new IllegalStateException("Synthetic bounty spent");
+            });
+            assertFalse(queued.isDone()); assertEquals(0, fences.get());
+            synchronized (owner) { available[0] = false; }
+            MobileRpcClient.RpcFailure stopped = error(queued, "RPC_CANCELLED");
+            assertTrue(stopped.notSent); assertFalse(stopped.unknownOutcome); assertEquals(1, fences.get());
+            assertEquals(48, server.requests.get());
+            await(client.call("getchaintip", new JSONObject()));
+            assertEquals(49, server.requests.get()); assertEquals(1, server.connections.get());
+        }
+    }
+
+    @Test public void ownerGuardBeforeRpcLockLetsStopAndDeadlineCancelWithoutDeadlockOrWrite() throws Exception {
+        for (String mode : List.of("stop", "deadline")) {
+            Object owner = new Object(); AtomicInteger fences = new AtomicInteger();
+            try (Server server = new Server((request, socket) -> response(request, new JSONObject().put("txid", HASH)));
+                 MobileRpcClient client = server.client(300)) {
+                await(client.call("getchaintip", new JSONObject()));
+                CompletableFuture<JSONObject> queued;
+                synchronized (owner) {
+                    queued = client.broadcast(HEX, owner, fences::incrementAndGet);
+                    // Give the request worker time to reach the owner guard.
+                    assertFalse(new CountDownLatch(1).await(80, TimeUnit.MILLISECONDS));
+                    if (mode.equals("stop")) assertTrue(client.cancelBeforeWrite(queued));
+                    MobileRpcClient.RpcFailure failed = error(queued, mode.equals("stop") ? "RPC_CANCELLED" : "RPC_TIMEOUT");
+                    assertTrue(failed.notSent); assertFalse(failed.unknownOutcome);
+                }
+                assertEquals(0, fences.get()); assertEquals(1, server.requests.get());
+                await(client.call("getchaintip", new JSONObject())); assertEquals(2, server.requests.get());
             }
         }
     }
@@ -411,6 +451,20 @@ public class MobileRpcClientTest {
                 diagnostic(error(next, "RPC_CANCELLED"), broadcast ? "sendrawtransaction" : "getchaintip", "quota");
                 assertFalse(new CountDownLatch(1).await(450, TimeUnit.MILLISECONDS)); assertEquals(1, server.requests.get());
             }
+        }
+    }
+    @Test public void remoteRetryAfterPreservesFullValidatedInterval() throws Exception {
+        for (long delay : new long[] { 0, 120000, 9007199254740991L }) {
+            JSONObject envelope = new JSONObject().put("jsonrpc", "2.0").put("id", "fixture").put("error", new JSONObject()
+                .put("code", -32029).put("data", new JSONObject().put("retry_after_ms", delay)));
+            MobileRpcClient.RpcFailure error = assertThrows(MobileRpcClient.RpcFailure.class, () -> MobileRpcClient.reply(envelope, "fixture"));
+            assertEquals(delay, error.retryAfterMs); assertFalse(error.notSent);
+        }
+        for (Object delay : new Object[] { -1L, 9007199254740992L, "120000", 1.5, JSONObject.NULL }) {
+            JSONObject envelope = new JSONObject().put("jsonrpc", "2.0").put("id", "fixture").put("error", new JSONObject()
+                .put("code", -32029).put("data", new JSONObject().put("retry_after_ms", delay)));
+            MobileRpcClient.RpcFailure error = assertThrows(MobileRpcClient.RpcFailure.class, () -> MobileRpcClient.reply(envelope, "fixture"));
+            assertEquals("RPC_PROTOCOL", error.code); assertFalse(error.notSent);
         }
     }
 
@@ -482,6 +536,17 @@ public class MobileRpcClientTest {
             }); MobileRpcClient client = server.client(3000)) {
                 MobileRpcClient.RpcFailure error = error(mode.equals("broadcast-id") ? client.broadcast(HEX) : client.call("getchaintip", new JSONObject()), "RPC_PROTOCOL");
                 assertEquals(mode.equals("broadcast-id"), error.unknownOutcome);
+                assertFalse(error.transportLoss); assertFalse(HdRecoveryReader.retryable(error));
+            }
+        }
+    }
+
+    @Test public void eofRetainsInternalTransportLossReasonWithoutChangingBroadcastBehavior() throws Exception {
+        for (boolean broadcast : new boolean[]{false, true}) {
+            try (Server server = new Server((request, socket) -> null); MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(broadcast ? client.broadcast(HEX) : client.call("getaddresshistory", params()), "RPC_PROTOCOL");
+                assertTrue(failure.transportLoss); assertEquals(broadcast, failure.unknownOutcome);
+                assertEquals(!broadcast, HdRecoveryReader.retryable(failure)); assertEquals(1, server.requests.get());
             }
         }
     }

@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -54,6 +55,11 @@ public class MobileClaimsEngineTest {
         java.lang.reflect.Constructor<MobileRpcClient.RpcFailure> constructor = MobileRpcClient.RpcFailure.class.getDeclaredConstructor(String.class, boolean.class, Integer.class, long.class, boolean.class, String.class, String.class, long.class, long.class, long.class);
         constructor.setAccessible(true);
         return constructor.newInstance(code, false, null, retryAfterMs, false, method, "read", 40000L, 125L, 77L);
+    }
+    private static MobileRpcClient.RpcFailure unsentFailure(String code, long retryAfterMs) throws Exception {
+        java.lang.reflect.Method beforeWrite = MobileRpcClient.RpcFailure.class.getDeclaredMethod("beforeWrite", String.class);
+        beforeWrite.setAccessible(true);
+        return (MobileRpcClient.RpcFailure)beforeWrite.invoke(rpcFailure(code, "sendrawtransaction", retryAfterMs), "sendrawtransaction");
     }
     private static JSONObject proof(boolean valid, boolean target, long duration) throws Exception { return new JSONObject().put("proof", valid ? "02aa" : "").put("captured", valid).put("validationPassed", valid).put("validProof", valid).put("meetsTarget", target).put("durationMs", duration); }
     private static <T> CompletableFuture<T> failed(Exception failure) { CompletableFuture<T> value = new CompletableFuture<>(); value.completeExceptionally(failure); return value; }
@@ -136,14 +142,15 @@ public class MobileClaimsEngineTest {
         public void close() { engine.close(); }
     }
 
-    @Test public void emaMatchesExactDecayAndUsesVerifiedProofNotTarget() {
-        MobileClaimsEngine.Ema stats = new MobileClaimsEngine.Ema(); assertEquals(5, stats.rate(), 0);
-        stats.record(false, 0.2); assertEquals(0.0999, stats.connections, 1e-15); assertEquals(0.02018, stats.totalTime, 1e-15);
-        stats.record(true, 0.2); assertEquals(0.999 * 0.0999 + 0.001, stats.connections, 1e-15);
+    @Test public void performanceWindowCountsVerifiedProofNotTargetAndKeepsPriorSeparate() {
+        MobileClaimsEngine.PerformanceWindow stats = new MobileClaimsEngine.PerformanceWindow(); assertEquals(5, stats.rate(), 0);
+        assertEquals(0, stats.connections); assertEquals(0, stats.totalTime, 0);
+        stats.record(false, 0.2); assertEquals(0, stats.connections); assertEquals(0.2, stats.totalTime, 1e-15);
+        stats.record(true, 0.2); assertEquals(1, stats.connections); assertEquals(6 / 1.4, stats.rate(), 1e-15);
         assertEquals(2, stats.completed);
         for (int index = 0; index < 800000; index++) stats.record(false, 0.2);
         assertTrue(stats.rate() > 0); assertTrue(Double.isFinite(stats.rate()));
-        MobileClaimsEngine.Ema instant = new MobileClaimsEngine.Ema();
+        MobileClaimsEngine.PerformanceWindow instant = new MobileClaimsEngine.PerformanceWindow();
         for (int index = 0; index < 800000; index++) instant.record(false, 0);
         assertTrue(instant.rate() > 0); assertTrue(Double.isFinite(instant.rate()));
     }
@@ -151,12 +158,26 @@ public class MobileClaimsEngineTest {
         MobileClaimsEngine.Candidate hard = candidate(bounty("example.com", TXID, 1, "0000" + repeat("ff", 30), "10000000000"));
         MobileClaimsEngine.Candidate easy = candidate(bounty("example.com", TXID, 2, "00" + repeat("ff", 31), "10000000000"));
         MobileClaimsEngine.Candidate rich = candidate(bounty("other.com", TXID, 3, "00" + repeat("ff", 31), "10000000000"));
-        Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>();
-        MobileClaimsEngine.Ema slow = new MobileClaimsEngine.Ema(); slow.totalTime = 1; stats.put("other.com:7", slow);
+        Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>();
+        MobileClaimsEngine.PerformanceWindow slow = new MobileClaimsEngine.PerformanceWindow(); slow.record(false, 1); stats.put("other.com:7", slow);
         assertSame(easy, MobileClaimsEngine.select(Arrays.asList(hard, easy, rich), stats, new HashSet<>()));
-        stats.get("other.com:7").totalTime = 0.001;
+        for (int index = 0; index < 6; index++) slow.record(true, 0);
         assertSame(rich, MobileClaimsEngine.select(Arrays.asList(hard, easy, rich), stats, new HashSet<>()));
         assertSame(hard, MobileClaimsEngine.select(Arrays.asList(easy, hard), new HashMap<>(), new HashSet<>(Arrays.asList(easy.key))));
+    }
+    @Test public void performanceWindowExpiresWithoutNewConnectionsAndDoesNotRollBackClock() {
+        AtomicLong clock = new AtomicLong(0); MobileClaimsEngine.PerformanceWindow stats = new MobileClaimsEngine.PerformanceWindow(clock::get);
+        stats.record(true, 2);
+        clock.set(59 * 60000L); assertEquals(6.0 / 3, stats.rate(), 0); stats.record(false, 3);
+        clock.set(60 * 60000L); assertEquals(5.0 / 4, stats.rate(), 0);
+        assertEquals(1, stats.observations); assertEquals(0, stats.connections); assertEquals(2, stats.completed);
+        clock.set(0); stats.record(true, 1); assertEquals(6.0 / 5, stats.rate(), 0);
+        clock.set(119 * 60000L); assertEquals(6.0 / 2, stats.rate(), 0);
+        clock.set(120 * 60000L); assertEquals(5, stats.rate(), 0);
+        assertEquals(0, stats.observations); assertEquals(0, stats.connections); assertEquals(0, stats.totalTime, 0); assertEquals(3, stats.completed);
+        assertThrows(IllegalArgumentException.class, () -> stats.record(true, Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> stats.record(true, -1));
+        assertEquals(3, stats.completed);
     }
     @Test public void tieBreakUsesInternalTxidBytesThenNumericVoutAndClonesPreserveFee() throws Exception {
         MobileClaimsEngine.Candidate smallInternal = candidate(bounty("example.com", "ff" + repeat("00", 31), 10, MAX_TARGET, "10000"));
@@ -179,13 +200,30 @@ public class MobileClaimsEngineTest {
             assertEquals(Arrays.asList("getbountychanges", "getrecentblockhashes", "getbountychanges", "stream", "getbountychanges", "gettransaction"), f.calls);
             assertEquals(1, f.captures); assertEquals(1, f.prepared); assertEquals(1, f.destroys); assertEquals(0, f.broadcasts);
             JSONObject state = f.engine.snapshot(); assertEquals(1, state.getLong("attempts")); assertEquals(1, state.getLong("valid")); assertEquals(0, state.getLong("targetHits"));
-            assertEquals(0.1009, state.getJSONArray("domains").getJSONObject(0).getDouble("connections"), 1e-15);
+            assertEquals(1, state.getJSONArray("domains").getJSONObject(0).getLong("connections"));
             assertEquals(100, state.getInt("connectionsPerSecondLimit")); assertEquals(100, state.getInt("concurrency")); assertTrue(state.getBoolean("discoveryComplete"));
         }
     }
     @Test public void invalidCompletedHandshakeCountsFailureButDnsFailureIsNeutral() throws Exception {
-        try (Fixture f = new Fixture()) { f.nativeResult = proof(false, false, 200).put("errorCode", "CLAIM_CERTIFICATE"); f.start(); f.engine.tick(); assertEquals(1, f.engine.snapshot().getLong("invalid")); assertEquals("CLAIM_CERTIFICATE", f.engine.snapshot().getString("lastError")); assertEquals(0.0999, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getDouble("connections"), 1e-15); }
+        try (Fixture f = new Fixture()) { f.nativeResult = proof(false, false, 200).put("errorCode", "CLAIM_CERTIFICATE"); f.start(); f.engine.tick(); assertEquals(1, f.engine.snapshot().getLong("invalid")); assertEquals("CLAIM_CERTIFICATE", f.engine.snapshot().getString("lastError")); assertEquals(0, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getLong("connections")); }
         try (Fixture f = new Fixture()) { f.nativeFailure = new IllegalStateException("CLAIM_DNS"); f.start(); f.engine.tick(); assertEquals(0, f.engine.snapshot().getLong("invalid")); assertEquals(0, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getLong("completed")); assertTrue(f.engine.snapshot().getBoolean("enabled")); }
+    }
+    @Test public void locallyUnavailableStartedConnectionKeepsCountersButDoesNotPoisonDomainScore() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.nativeResult = proof(false, false, 1).put("errorCode", "CLAIM_LOCAL_UNAVAILABLE");
+            f.start(); f.engine.tick(); JSONObject state = f.engine.snapshot();
+            assertEquals(1, state.getLong("attempts")); assertEquals(1, state.getLong("invalid")); assertEquals(0, state.getLong("valid"));
+            assertEquals("CLAIM_LOCAL_UNAVAILABLE", state.getString("lastError"));
+            JSONObject domain = state.getJSONArray("domains").getJSONObject(0);
+            assertEquals(0, domain.getLong("completed")); assertEquals(5, domain.getDouble("rate"), 0);
+            assertTrue(state.getBoolean("enabled"));
+        }
+        try (Fixture f = new Fixture()) {
+            f.nativeResult = proof(true, false, 1).put("errorCode", "CLAIM_LOCAL_UNAVAILABLE");
+            f.start(); f.engine.tick();
+            assertEquals("CLAIMS_NATIVE_DATA", f.engine.snapshot().getString("lastError"));
+            assertEquals(0, f.engine.snapshot().getLong("valid")); assertEquals(0, f.broadcasts);
+        }
     }
     @Test public void streamFailureNeverPublishesPartialCatalogAndBackoffDoesNotHammerRpc() throws Exception {
         try (Fixture f = new Fixture()) { f.incomplete = true; f.start(); f.engine.tick(); assertEquals(0, f.captures); assertEquals(0, f.engine.snapshot().getInt("discoveredBlocks")); assertEquals(0, f.engine.snapshot().getInt("eligible")); int count = f.calls.size(); for (int i = 0; i < 10; i++) f.engine.tick(); assertEquals(count, f.calls.size()); }
@@ -254,7 +292,8 @@ public class MobileClaimsEngineTest {
         try (Fixture f = new Fixture(true)) {
             f.nativeResult = proof(true, true, 20); f.onAttach = () -> f.clock.addAndGet(TimeUnit.SECONDS.toNanos(60));
             f.start(); f.engine.tick(); assertEquals(1, f.attaches); assertEquals(0, f.broadcasts); assertTrue(f.receipts.isEmpty());
-            assertEquals("Unsent winner must become eligible again", 1, f.engine.snapshot().getInt("eligible"));
+            assertEquals("The retained winner must not trigger another TLS attempt", 0, f.engine.snapshot().getInt("eligible"));
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).size());
         }
     }
     @Test public void interruptedDiscoveryDoesNotPublishNewBlockIndexBeforeDeltaReplay() throws Exception {
@@ -298,13 +337,15 @@ public class MobileClaimsEngineTest {
             assertEquals("waiting", f.engine.snapshot().getString("status")); assertEquals(0, f.captures);
         }
     }
-    @Test public void replayCapacityFailureDoesNotPublishAnyPartOfProspectiveCatalog() throws Exception {
-        try (Fixture f = new Fixture(true)) {
+    @Test public void replayAllowsTwoHundredProtectedRowsAndRejectsExcessWithoutPartialPublication() throws Exception {
+        // One protected active capture plus 199 reservations is legal. An
+        // impossible extra reservation must still fail closed transactionally.
+        for (int reserveCount : List.of(199, 200)) try (Fixture f = new Fixture(true)) {
             f.start(); f.engine.tick(); f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(10)); Object held = reserve(f.engine); assertNotNull(held);
             @SuppressWarnings("unchecked") Map<String, MobileClaimsEngine.Candidate.Progress> retained = (Map<String, MobileClaimsEngine.Candidate.Progress>)engineField(f.engine, "progress");
             @SuppressWarnings("unchecked") java.util.Set<String> reserved = (java.util.Set<String>)engineField(f.engine, "reservations");
             try {
-                for (int index = 1; index <= 100; index++) {
+                for (int index = 1; index <= reserveCount; index++) {
                     MobileClaimsEngine.Candidate old = candidate(bounty("example.com", TXID, index, MAX_TARGET, "10000000000"));
                     retained.put(old.key, old.progress); reserved.add(old.key);
                 }
@@ -317,11 +358,20 @@ public class MobileClaimsEngineTest {
                 Object oldTip = engineField(f.engine, "tip"); String oldCursor = (String)engineField(f.engine, "cursor");
                 java.lang.reflect.Method method = MobileClaimsEngine.class.getDeclaredMethod("replay", long.class, String.class, Map.class, Map.class, String.class); method.setAccessible(true);
                 f.currentTip = tip().put("hash", newBlock);
-                try { method.invoke(f.engine, ((Number)engineField(f.engine, "generation")).longValue(), null, staged, Map.of(newBlock, 0L), oldCursor); fail("Protected progress must stay bounded"); }
-                catch (java.lang.reflect.InvocationTargetException expected) { assertEquals("CLAIMS_CAPACITY", expected.getCause().getMessage()); }
-                assertSame(oldTip, engineField(f.engine, "tip")); assertEquals(oldCursor, engineField(f.engine, "cursor"));
-                assertEquals(1, f.engine.snapshot().getInt("eligible")); assertEquals(1, f.engine.snapshot().getInt("discoveredBlocks"));
-                assertEquals(Map.of(GENESIS, 0L), engineField(f.engine, "blocks")); assertEquals(101, retained.size());
+                if (reserveCount == 199) {
+                    method.invoke(f.engine, ((Number)engineField(f.engine, "generation")).longValue(), null, staged, Map.of(newBlock, 0L), oldCursor);
+                    assertEquals(10200, retained.size());
+                    assertEquals(10000, ((Map<?, ?>)engineField(f.engine, "catalog")).size());
+                    assertEquals(Map.of(newBlock, 0L), engineField(f.engine, "blocks"));
+                    assertEquals(199, reserved.size());
+                    assertTrue(f.engine.snapshot().getBoolean("enabled"));
+                } else {
+                    try { method.invoke(f.engine, ((Number)engineField(f.engine, "generation")).longValue(), null, staged, Map.of(newBlock, 0L), oldCursor); fail("Protected progress must stay bounded at 10200"); }
+                    catch (java.lang.reflect.InvocationTargetException expected) { assertEquals("CLAIMS_CAPACITY", expected.getCause().getMessage()); }
+                    assertSame(oldTip, engineField(f.engine, "tip")); assertEquals(oldCursor, engineField(f.engine, "cursor"));
+                    assertEquals(1, f.engine.snapshot().getInt("eligible")); assertEquals(1, f.engine.snapshot().getInt("discoveredBlocks"));
+                    assertEquals(Map.of(GENESIS, 0L), engineField(f.engine, "blocks")); assertEquals(201, retained.size());
+                }
             } finally { reserved.clear(); release(f.engine, held); }
         }
     }
@@ -352,6 +402,130 @@ public class MobileClaimsEngineTest {
     }
     @Test public void explicitRejectionIsNotUnknownAndDoesNotRetryThatOutput() throws Exception {
         try (Fixture f = new Fixture()) { f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(rejected(-26)); f.start(); f.engine.tick(); assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(Arrays.asList("pending", "rejected"), f.receipts); f.engine.tick(); assertEquals(1, f.broadcasts); }
+    }
+    @Test public void provenUnsentTransientFailureRetriesIdenticalWinnerWithoutNewCaptureOrAttach() throws Exception {
+        for (String code : List.of("RPC_UNAVAILABLE", "RPC_TIMEOUT", "RPC_BUSY", "-32029", "-32030")) try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure(code, 4500));
+            f.start(); f.engine.tick();
+            assertEquals(Arrays.asList("pending", "not-sent"), f.receipts);
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).size());
+            assertEquals(1, ((Set<?>)engineField(f.engine, "reservations")).size());
+            assertEquals(1, f.captures); assertEquals(1, f.attaches); assertEquals(1, f.broadcasts);
+            f.broadcastFuture = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(4499)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(1, f.captures);
+            f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1)); f.engine.tick();
+            assertEquals(2, f.broadcasts); assertEquals(1, f.prepared); assertEquals(1, f.attaches); assertEquals(1, f.captures);
+            assertEquals(Arrays.asList("pending", "not-sent", "pending", "submitted"), f.receipts);
+            JSONObject state = f.engine.snapshot();
+            assertEquals(1, state.getLong("attempts")); assertEquals(1, state.getLong("valid"));
+            assertEquals(1, state.getLong("targetHits")); assertEquals(1, state.getLong("submitted")); assertEquals(0, state.getLong("unknown"));
+            assertTrue(((Map<?, ?>)engineField(f.engine, "pendingWinners")).isEmpty());
+        }
+    }
+    @Test public void repeatedUnsentFailureUsesBoundedBackoffAndDoesNotChangeProofCounters() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_UNAVAILABLE", 0));
+            f.start(); f.engine.tick();
+            for (long delay : new long[] { 1000, 2000, 4000, 8000, 16000, 30000, 30000 }) {
+                int previous = f.broadcasts;
+                f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(delay - 1)); f.engine.tick(); assertEquals(previous, f.broadcasts);
+                f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1)); f.engine.tick(); assertEquals(previous + 1, f.broadcasts);
+                assertEquals(1, f.attaches); assertEquals(1, f.captures); assertEquals(1, f.engine.snapshot().getLong("valid"));
+            }
+        }
+    }
+    @Test public void retainedWinnerWaitsForFreshCatalogWithoutAnotherProof() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_UNAVAILABLE", 0));
+            f.start(); f.engine.tick();
+            f.clock.addAndGet(TimeUnit.SECONDS.toNanos(61));
+            f.readFailures.put("getrecentblockhashes", rpcFailure("RPC_UNAVAILABLE", "getrecentblockhashes", 0));
+            f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(1, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).size());
+            f.readFailures.clear(); f.broadcastFuture = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clock.addAndGet(TimeUnit.SECONDS.toNanos(5)); f.engine.tick();
+            assertEquals(2, f.broadcasts); assertEquals(1, f.captures); assertEquals(1, f.attaches);
+            assertEquals(1, f.engine.snapshot().getLong("submitted"));
+        }
+    }
+    @Test public void winnerWhoseCatalogExpiresDuringAttachmentIsKeptBeforeFirstEnqueue() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200);
+            f.onAttach = () -> f.clock.addAndGet(TimeUnit.SECONDS.toNanos(61));
+            f.start(); f.engine.tick();
+            assertEquals(0, f.broadcasts); assertTrue(f.receipts.isEmpty());
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).size());
+            f.onAttach = null; f.clock.addAndGet(TimeUnit.SECONDS.toNanos(1)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(1, f.captures); assertEquals(1, f.attaches);
+            assertEquals(Arrays.asList("pending", "submitted"), f.receipts);
+        }
+    }
+    @Test public void verifiedWinnerRetainsProofWhenCatalogExpiresAtCaptureCompletion() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.onCapture = () -> f.clock.addAndGet(TimeUnit.SECONDS.toNanos(61));
+            f.start(); f.engine.tick();
+            assertEquals(0, f.broadcasts); assertTrue(f.receipts.isEmpty());
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).size());
+            assertEquals(1, f.engine.snapshot().getLong("valid")); assertEquals(1, f.engine.snapshot().getLong("targetHits"));
+            f.onCapture = null; f.clock.addAndGet(TimeUnit.SECONDS.toNanos(1)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(1, f.captures); assertEquals(1, f.attaches);
+            assertEquals(Arrays.asList("pending", "submitted"), f.receipts);
+        }
+    }
+    @Test public void retryAfterLongerThanMinuteIsNotShortenedForRetainedWinner() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_BUSY", 120000));
+            f.start(); f.engine.tick(); f.broadcastFuture = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(119999)); f.engine.tick(); assertEquals(1, f.broadcasts);
+            f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1)); f.engine.tick();
+            assertEquals(2, f.broadcasts); assertEquals(1, f.captures); assertEquals(1, f.attaches);
+        }
+    }
+    @Test public void unsentRetryBackoffDoesNotBlockOtherBountiesOrTheirCounters() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.rows.put(new JSONObject(bounty().toString()).put("vout", 1));
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_UNAVAILABLE", 30000));
+            f.start(); f.engine.tick();
+            f.nativeResult = proof(true, false, 200); f.clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(20)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(2, f.captures); assertEquals(2, f.prepared);
+            assertEquals(2, f.engine.snapshot().getLong("attempts")); assertEquals(2, f.engine.snapshot().getLong("valid"));
+            assertEquals(1, f.engine.snapshot().getLong("targetHits"));
+        }
+    }
+    @Test public void stoppingPausingOrInvalidatingRetainedWinnerCancelsOnlyItsRetry() throws Exception {
+        for (String action : List.of("stop", "pause", "spent", "pending_spend", "window_exit")) try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_UNAVAILABLE", 0));
+            f.start(); f.engine.tick();
+            if (action.equals("stop")) f.engine.stop();
+            else if (action.equals("pause")) f.engine.setAllowed(false);
+            else {
+                JSONObject event = new JSONObject().put("sequence", 1).put("type", action).put("txid", TXID).put("vout", 0);
+                if (!action.equals("window_exit")) event.put("spending_txid", CLAIM);
+                while (f.changes.size() < f.changesCount) f.changes.add(new JSONArray());
+                f.changes.add(new JSONArray().put(event)); setEngineField(f.engine, "nextDiscovery", 0L);
+            }
+            f.clock.addAndGet(TimeUnit.SECONDS.toNanos(2)); f.engine.tick();
+            assertEquals(action, 1, f.broadcasts); assertEquals(action, 1, f.captures);
+            assertTrue(action, ((Map<?, ?>)engineField(f.engine, "pendingWinners")).isEmpty());
+            assertTrue(action, ((Set<?>)engineField(f.engine, "reservations")).isEmpty());
+            assertEquals(Arrays.asList("pending", "not-sent"), f.receipts);
+        }
+    }
+    @Test public void missingUnsentEvidenceAndFailedDurableReceiptNeverAuthorizeRetry() throws Exception {
+        for (String code : List.of("RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "RPC_CANCELLED")) try (Fixture f = new Fixture(true)) {
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(rpcFailure(code, "sendrawtransaction", 0));
+            f.start(); f.engine.tick(); f.clock.addAndGet(TimeUnit.SECONDS.toNanos(60)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(Arrays.asList("pending", "unknown"), f.receipts);
+            assertEquals("unknown-outcome", f.engine.snapshot().getString("status"));
+        }
+        try (Fixture f = new Fixture(true)) {
+            f.engine.setReceiptStore((txid, status) -> { if (status.equals("not-sent")) throw new IOException("failed durable unsent receipt"); f.receipts.add(status); });
+            f.nativeResult = proof(true, true, 200); f.broadcastFuture = failed(unsentFailure("RPC_UNAVAILABLE", 0));
+            f.start(); f.engine.tick(); f.clock.addAndGet(TimeUnit.SECONDS.toNanos(60)); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(Arrays.asList("pending", "unknown"), f.receipts);
+            assertEquals("unknown-outcome", f.engine.snapshot().getString("status"));
+        }
     }
     @Test public void stopDuringBroadcastRetainsUnknownReceipt() throws Exception {
         try (Fixture f = new Fixture()) {
@@ -436,7 +610,7 @@ public class MobileClaimsEngineTest {
             f.nativeResult = proof(false, false, 10001).put("captured", true).put("validationPassed", true).put("errorCode", "CLAIM_TIMEOUT");
             f.start(); f.engine.tick();
             assertEquals(1, f.engine.snapshot().getLong("valid")); assertEquals(0, f.engine.snapshot().getLong("invalid")); assertEquals(0, f.broadcasts);
-            assertEquals(0.1009, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getDouble("connections"), 1e-15);
+            assertEquals(1, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getLong("connections"));
         }
     }
     @Test public void inconsistentNativeCaptureValidationFlagsFailClosed() throws Exception {
@@ -687,7 +861,7 @@ public class MobileClaimsEngineTest {
         // Synthetic parameters place the learned return just below its floor
         // at each reported count. This reproduces the UI state, not the user's
         // unknown on-chain amounts/targets or measured handshake durations.
-        for (long[] scenario : new long[][]{{949, 65564659}, {2147, 68150639}}) {
+        for (long[] scenario : new long[][]{{949, 68586034}, {2147, 68748756}}) {
             try (Fixture f = new Fixture(true)) {
                 f.rows = new JSONArray();
                 for (int vout = 0; vout < 9; vout++) f.rows.put(bounty("example.com", TXID, vout, "0000" + repeat("ff", 30), Long.toString(scenario[1] + 10)));

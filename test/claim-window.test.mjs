@@ -94,6 +94,32 @@ test('retries reuse the fixed claim fee, payout and receiving address while refr
   assert.equal(calls.length, 0, 'unit preparation makes no RPC network request');
 });
 
+test('a proven-unsent claim failure releases its reservation without disabling claims', async () => {
+  const { service, bounty, rpc } = serviceFixture();
+  const prepared = await service.prepareAutomaticClaim(bounty);
+  const failure = Object.assign(new Error('Connection failed before writing'), { notSent: true });
+  rpc.request = async () => { throw failure; };
+  await assert.rejects(service.submitAutomaticClaim(prepared, structuralProof(prepared)), error => error === failure);
+  assert.equal(service.reserved.has(bountyKey(bounty)), false);
+  assert.equal(service.engine.enabled, true);
+});
+
+test('a claim queued behind RPC capacity rechecks availability at the actual write fence', async () => {
+  const { service, bounty, rpc } = serviceFixture();
+  const prepared = await service.prepareAutomaticClaim(bounty);
+  let writes = 0, fence;
+  rpc.request = async (_method, _params, options) => {
+    fence = options.beforeSend;
+    service.claimOutpoints.delete(bountyKey(bounty));
+    try { fence(); } catch (error) { throw Object.assign(error, { notSent: true }); }
+    writes++; return { txid: prepared.txid };
+  };
+  await assert.rejects(service.submitAutomaticClaim(prepared, structuralProof(prepared)), /availability changed/);
+  assert.equal(typeof fence, 'function'); assert.equal(writes, 0);
+  assert.equal(service.reserved.has(bountyKey(bounty)), false);
+  assert.equal(service.engine.enabled, true);
+});
+
 for (const boundary of ['epoch', 'RPC']) test(`a retained claim cannot reuse its proposal across a changed ${boundary}`, async () => {
   const { service, bounty } = serviceFixture();
   const prepared = await service.prepareAutomaticClaim(bounty);
@@ -264,6 +290,56 @@ function mockDiscovery(service, { height, reorg = false, event = null, rows = []
   };
   service.blockBounties = async blockHash => rows.filter(value => value.block_hash === blockHash);
 }
+
+test('discovery preserves a verified automatic winner reserved while waiting for RPC capacity', async t => {
+  const { service, bounty, rpc } = serviceFixture();
+  const gate = deferred(); let prepared, signal, entered = false, writes = 0, captures = 0;
+  service.createEngine();
+  const prepare = service.engine.prepare;
+  service.engine.prepare = async (...args) => { prepared = await prepare(...args); return prepared; };
+  service.testProofRunner = async () => { captures++; return structuralProof(prepared); };
+  mockDiscovery(service, { height: 600, rows: [bounty] });
+  const discoveryRequest = rpc.request;
+  rpc.request = async (method, params, options) => {
+    if (method !== 'sendrawtransaction') return discoveryRequest(method, params, options);
+    entered = true; signal = options.signal;
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(Object.assign(new Error('Unsent request cancelled'), { name: 'AbortError', notSent: true }));
+      signal.addEventListener('abort', abort, { once: true });
+      gate.promise.then(() => { signal.removeEventListener('abort', abort); resolve(); });
+      if (signal.aborted) abort();
+    });
+    options.beforeSend(); writes++;
+    return { txid: transactionId(parseTransaction(params.transaction_hex)) };
+  };
+  t.after(async () => { gate.resolve(); await service.engine.stop(); });
+  service.engine.enqueue([bounty]); service.engine.start(); await until(() => entered);
+  const key = bountyKey(bounty);
+  assert.equal(service.reserved.has(key), true);
+  assert.equal(service.engine.pendingProofs.has(key), true);
+  for (let repeat = 0; repeat < 3; repeat++) await service.syncBountiesInternal(service.epoch);
+  assert.equal(signal.aborted, false, 'a local reservation must not cancel its own unsent winner');
+  assert.equal(service.engine.pendingProofs.has(key), true);
+  assert.equal(service.engine.queue.get(key).submitting, true);
+  assert.equal(writes, 0); assert.equal(captures, 1, 'discovery must not duplicate the reserved work');
+  gate.resolve(); await until(() => service.engine.snapshot().completed === 1);
+  assert.equal(writes, 1); assert.equal(service.engine.pendingProofs.has(key), false);
+});
+
+test('discovery still removes a bounty reserved outside its active automatic submission', async t => {
+  const { service, bounty } = serviceFixture();
+  service.createEngine(); service.engine.enabled = true; service.engine.kick = () => {};
+  t.after(() => service.engine.stop());
+  const key = bountyKey(bounty);
+  service.engine.enqueue([bounty]); service.reserved.add(key);
+  // A pending proof alone cannot bypass a reservation owned by another flow.
+  service.engine.pendingProofs.set(key, { proof: '020100', due: 0, failures: 0 });
+  mockDiscovery(service, { height: 600, rows: [bounty] });
+  await service.syncBountiesInternal(service.epoch);
+  assert.equal(service.engine.queue.has(key), false);
+  assert.equal(service.engine.pendingProofs.has(key), false);
+  assert.equal(service.reserved.has(key), true, 'discovery must not release another flow\'s reservation');
+});
 
 test('a complete discovery rescan keeps each surviving bounty factor and domain history', async t => {
   const { service, bounty } = serviceFixture();

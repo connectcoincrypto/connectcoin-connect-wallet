@@ -1,4 +1,4 @@
-import { compareClaimPriority, domainPriority, isWorthAttempting, PRIORITY_FACTOR_SCALE } from './claim-priority.mjs';
+import { compareClaimPriority, domainPriority, isWorthAttempting, validateMinExpectedReturn, MIN_EXPECTED_RETURN, PRIORITY_FACTOR_SCALE } from './claim-priority.mjs';
 
 const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const keyOf = job => `${job.bounty.txid}:${job.bounty.vout}`;
@@ -106,8 +106,9 @@ const deadline = value => {
  * next is a peek; commit consumes a turn only after a connection is dispatched.
  */
 export class ClaimScheduler {
-  constructor({ connectionRate = () => 5, isReady = eligible } = {}) {
+  constructor({ connectionRate = () => 5, isReady = eligible, minExpectedReturn = MIN_EXPECTED_RETURN } = {}) {
     if (typeof connectionRate !== 'function' || typeof isReady !== 'function') throw new Error('Invalid claim scheduler callbacks');
+    this.minExpectedReturn = validateMinExpectedReturn(minExpectedReturn);
     this.connectionRate = connectionRate;
     this.isReady = isReady;
     this.domainAfter = null;
@@ -140,7 +141,7 @@ export class ClaimScheduler {
       const policy = `${name}:${job.bounty.signature_algorithms_mask}`;
       if (!rates.has(policy)) rates.set(policy, this.connectionRate(job));
       const rate = rates.get(policy);
-      if (!eligible(job) || (!isWorthAttempting(job.rawPriority, rate) && !job.recoveryProbe)) continue;
+      if (!eligible(job) || (!isWorthAttempting(job.rawPriority, rate, this.minExpectedReturn) && !job.recoveryProbe)) continue;
       if (this.entries.has(key)) throw new Error('Duplicate bounty in claim schedule');
       const rank = rankSnapshot(job), score = domainPriority(rank.priority, rate, PRIORITY_FACTOR_SCALE);
       if (!Number.isFinite(score)) continue;

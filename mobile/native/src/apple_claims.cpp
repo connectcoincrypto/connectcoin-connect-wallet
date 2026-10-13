@@ -14,7 +14,7 @@ void Error(char* destination, const char* candidate) noexcept {
     std::string_view code = candidate ? candidate : "";
     bool known = false;
     for (const auto allowed : {"CLAIM_CONTEXT", "CLAIM_MEMORY", "CLAIM_CANCELLED", "CLAIM_TIMEOUT",
-            "CLAIM_BUSY", "CLAIM_NETWORK", "CLAIM_DNS", "CLAIM_TLS", "CLAIM_CERTIFICATE",
+            "CLAIM_BUSY", "CLAIM_NETWORK", "CLAIM_LOCAL_UNAVAILABLE", "CLAIM_DNS", "CLAIM_TLS", "CLAIM_CERTIFICATE",
             "CLAIM_CRYPTO", "CLAIM_NATIVE"}) {
         if (code == allowed) { known = true; break; }
     }
@@ -85,10 +85,12 @@ extern "C" int32_t cw_claim_capture(const cw_claim_context* input, int32_t timeo
             Text(input->target_hex, 64), input->roots_version, input->signature_mask, input->validation_time};
         const auto result = connectwallet::CaptureAndVerify(context, timeout, handle);
         if (result.proof_hex.size() > 2 * 64 * 1024) throw std::runtime_error("CLAIM_NATIVE");
-        char* proof = static_cast<char*>(std::malloc(result.proof_hex.size() + 1));
-        if (!proof) throw std::bad_alloc();
-        std::memcpy(proof, result.proof_hex.c_str(), result.proof_hex.size() + 1);
-        output->proof_hex = proof;
+        if (!result.proof_hex.empty()) {
+            char* proof = static_cast<char*>(std::malloc(result.proof_hex.size() + 1));
+            if (!proof) throw std::bad_alloc();
+            std::memcpy(proof, result.proof_hex.c_str(), result.proof_hex.size() + 1);
+            output->proof_hex = proof;
+        }
         output->captured = result.captured;
         output->validation_passed = result.validation_passed;
         output->valid_proof = result.valid_proof;

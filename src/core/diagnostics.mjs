@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, open, rename, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 
 const EVENTS = new Set([
   'wallet.unlock_started', 'wallet.unlocked', 'wallet.snapshot_ready', 'wallet.render_ready',
@@ -13,6 +14,8 @@ const EVENTS = new Set([
 const STAGES = new Set(['prepare', 'network', 'outputs', 'funding', 'signing', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
 const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
 const DURATION_SCOPES = new Set(['stage', 'run']);
+const RPC_FAILURE_SOURCES = new Set(['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout',
+  'stream-deadline', 'stream-incomplete', 'socket-close', 'socket-write', 'protocol', 'client-close']);
 const PROCESS_SIGNALS = new Set([
   'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGILL', 'SIGTRAP', 'SIGABRT', 'SIGIOT', 'SIGBUS', 'SIGFPE',
   'SIGKILL', 'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGSTKFLT',
@@ -135,7 +138,7 @@ const NUMBERS = Object.freeze({
   stderrBytes: [0, 1073741824], exitCode: [-2147483648, 0xffffffff],
   runId: [0, Number.MAX_SAFE_INTEGER], operationsStarted: [0, 1000000000], operationsCompleted: [0, 1000000000],
   operationsFailed: [0, 1000000000], operationsCancelled: [0, 1000000000], captures: [0, 1000000000], suppressedEvents: [0, 1000000000],
-  prepareActive: [0, 4], dnsActive: [0, 2], captureActive: [0, 256], submitActive: [0, 4],
+  prepareActive: [0, 4], dnsActive: [0, 2], captureActive: [0, MAX_CONNECTION_LIMIT], submitActive: [0, 4],
   activeMaxDurationMs: [0, Number.MAX_SAFE_INTEGER], durationTotalMs: [0, Number.MAX_SAFE_INTEGER], durationMaxMs: [0, Number.MAX_SAFE_INTEGER],
   cancelledStop: [0, 1000000000], cancelledLocked: [0, 1000000000], cancelledSuspend: [0, 1000000000],
   cancelledClear: [0, 1000000000], cancelledUnavailable: [0, 1000000000], cancelledWindowExit: [0, 1000000000],
@@ -149,13 +152,15 @@ function sanitize(details) {
   const reason = own(details, 'reason'), durationScope = own(details, 'durationScope');
   if (REASONS.has(reason)) clean.reason = reason;
   if (DURATION_SCOPES.has(durationScope)) clean.durationScope = durationScope;
+  const failureSource = own(details, 'failureSource');
+  if (RPC_FAILURE_SOURCES.has(failureSource)) clean.failureSource = failureSource;
   const signal = own(details, 'signal');
   if (PROCESS_SIGNALS.has(signal)) clean.signal = signal;
   for (const [key, [minimum, maximum]] of Object.entries(NUMBERS)) {
     const value = own(details, key);
     if (Number.isFinite(value) && value >= minimum && value <= maximum && (key === 'durationMs' || Number.isSafeInteger(value))) clean[key] = value;
   }
-  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady']) {
+  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady', 'sent', 'notSent']) {
     const value = own(details, key);
     if (typeof value === 'boolean') clean[key] = value;
   }

@@ -19,7 +19,7 @@ test('autosave allows only valid preferences and keeps RPC edits atomic until le
   }
   edits.settings.host = '::1';
   assert.deepEqual(preferenceBatch(config(), edits, { rpcReady: true }).patch.rpc, { host: '::1', port: 12345 });
-  for (const invalid of ['', ' ', '-1', '1.5', '1e2', '257', 'Infinity']) {
+  for (const invalid of ['', ' ', '-1', '1.5', '1e2', '2147483648', 'Infinity']) {
     edits.claims.maxConnectionsPerSecond = invalid;
     assert.equal(preferenceBatch(config(), edits).patch.claims, undefined);
   }
@@ -38,7 +38,7 @@ test('trailing separators save integer preferences without changing raw acknowle
     acknowledgePreferences(edits, batch);
     assert.deepEqual(edits, { claims: {}, settings: {}, send: {} });
   }
-  for (const value of ['257.', '1.5', '1.5.', '1..', '.', '1e2.', '0.']) {
+  for (const value of ['2147483648.', '1.5', '1.5.', '1..', '.', '1e2.', '0.']) {
     const edits = draft(); edits.claims.maxConcurrent = value;
     assert.deepEqual(preferenceBatch(config(), edits).patch, {});
   }

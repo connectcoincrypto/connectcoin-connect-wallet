@@ -498,8 +498,16 @@ test.describe('General settings', () => {
   });
 
   test('server switch clears public state and sweep drafts before ignoring old reads and events', async ({ page }) => {
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
     await openNativeWallet(page, { history: [confirmedHistory], watchConnected: false, deferredMethods: { watchAccount: true } });
+    // Finish startup's lightweight balance catch-up before deferring manual
+    // reads. Otherwise its timer can consume the deferred balance response,
+    // leave Refresh disabled and never issue the history read under test.
+    await page.clock.pauseAt(new Date('2026-01-01T00:01:00Z'));
+    await page.clock.runFor(3000);
     await expect(page.locator('#balance')).toHaveText('1');
+    await expect(page.locator('#history li')).toHaveCount(1);
+    await expect(page.locator('#refresh')).toBeEnabled();
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await page.locator('#send-address').fill(otherAddress); await page.locator('#send-use-all').click();
     await page.evaluate(() => { window.testNative.deferredMethods = { balance: true, history: true }; });
@@ -607,10 +615,47 @@ test.describe('HD wallet', () => {
     [changeAddress]: [utxo('3'.repeat(64), '40000000000')],
   });
 
+  for (const platform of ['android', 'ios']) test(`${platform} HD network recovery shows retry progress without enabling payments or starting another scan`, async ({ page }) => {
+    await openNativeWallet(page, { platform, hd: { complete: false, recovering: true, scanned: 17,
+      recoveryState: 'waiting-network', errorCode: 'RPC_INACTIVE' } });
+    await expect(page.locator('#hd-status')).toContainText('Waiting for a usable network · 17 checked');
+    await expect(page.locator('#recover-addresses')).toBeDisabled();
+    await expect(page.locator('#hd-error')).toBeEmpty();
+    await page.evaluate(() => {
+      const native = window.testNative;
+      native.setHd({ hd: { ...native.vault.hd, recoveryState: 'retrying', retryAfterMs: 7100, errorCode: '-32029' } });
+      native.emit('NativeWallet', 'walletStateChanged', native.vault);
+    });
+    await expect(page.locator('#hd-status')).toContainText('Retrying address discovery in 8 s · 17 checked');
+    await expect(page.locator('#hd-status')).toContainText('-32029');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.locator('#send-use-all')).toBeDisabled();
+    await expect(page.locator('#review-payment')).toBeDisabled();
+    await page.evaluate(() => {
+      const native = window.testNative;
+      native.setHd({ locked: true, hd: { ...native.vault.hd, recovering: false, recoveryState: 'paused' } });
+      native.emit('NativeWallet', 'walletStateChanged', native.vault);
+    });
+    await expect(page.locator('#hd-status')).toContainText('Unlock the wallet to resume');
+    await expect(page.locator('#recover-addresses')).toBeDisabled();
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => ['recoverAddresses', 'reviewPayment', 'reviewP2C', 'claimsStart'].includes(call.method)))).toEqual([]);
+  });
+
+  test('HD terminal failure at zero is not presented as active discovery', async ({ page }) => {
+    await openNativeWallet(page, { hd: { complete: false, recovering: false, scanned: 0, recoveryState: 'failed',
+      error: 'The server returned invalid address data.', errorCode: 'HD_INVALID_DATA' } });
+    await expect(page.locator('#hd-status')).toContainText('Address discovery stopped · 0 checked');
+    await expect(page.locator('#hd-status')).not.toContainText('Discovering');
+    await expect(page.locator('#hd-error')).toContainText('HD_INVALID_DATA');
+    await expect(page.locator('#recover-addresses')).toBeEnabled();
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.locator('#review-payment')).toBeDisabled();
+  });
+
   test('incomplete recovery gates sweep and review, then verifies all owned addresses', async ({ page }) => {
     await openNativeWallet(page, { hd: { complete: false, recovering: false, scanned: 1 }, hdUtxosByAddress: funds(),
       deferredMethods: { recoverAddresses: true } });
-    await expect(page.locator('#hd-status')).toContainText('Discovering');
+    await expect(page.locator('#hd-status')).toContainText('Address discovery incomplete');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await page.locator('#send-address').fill(otherAddress);
     await page.locator('#send-amount').fill('1');

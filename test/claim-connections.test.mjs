@@ -442,3 +442,35 @@ test('releasing a DNS slot skips a removed parked domain and wakes the next vali
   assert.equal(engine.scheduler.domainAfter, null);
   assert.equal(engine.preferReward, false);
 });
+
+test('started local route failures count without degrading remote proof quality', async t => {
+  const bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 1, concurrency: 1 } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ localUnavailable: true, message: 'Local network route is unavailable' });
+  await until(() => engine.diagnosticSnapshot().operationsFailed === 1);
+  assert.equal(engine.state.attempts, 1); assert.equal(engine.domainStats.size, 0);
+  assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
+});
+
+test('retired verified proofs keep identical retries, while reorg invalidation still discards them', async t => {
+  const submitted = [], bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 }, retryDelayMs: 300000,
+    submit: async (prepared, proof) => {
+      submitted.push({ prepared, proof });
+      throw Object.assign(new Error('Quota before sending.'), { code: -32029 });
+    } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => submitted.length === 1 && !engine.hasActive(key(bounty)));
+  engine.retire(bounty.txid, bounty.vout); engine.retainCatalog([]);
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(engine.queue.size, 1);
+  const pending = engine.pendingProofs.get(key(bounty)); pending.due = 0; engine.kick();
+  await until(() => submitted.length === 2 && !engine.hasActive(key(bounty)));
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(attempts.length, 1);
+  assert.strictEqual(submitted[0].prepared, submitted[1].prepared); assert.equal(submitted[0].proof, submitted[1].proof);
+  engine.remove(bounty.txid, bounty.vout);
+  assert.equal(engine.pendingProofs.size, 0); assert.equal(engine.queue.size, 0);
+  engine.kick(); await tick();
+  assert.equal(submitted.length, 2); assert.equal(engine.snapshot().completed, 0);
+});

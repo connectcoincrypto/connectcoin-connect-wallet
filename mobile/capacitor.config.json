@@ -1,6 +1,6 @@
 {
   "appId": "com.connectcoincrypto.connectwallet.mobile.alpha",
-  "appName": "ConnectWallet Alpha",
+  "appName": "ConnectWallet",
   "webDir": "dist",
   "ios": {
     "webContentsDebuggingEnabled": false,

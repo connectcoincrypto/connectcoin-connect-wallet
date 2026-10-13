@@ -6,6 +6,9 @@ import CConnectWallet
 public struct RpcFailure: Error, LocalizedError {
     public let code: String
     public var unknownOutcome = false
+    /// Set only by the transport while it knows no write was started. A parsed
+    /// server response or unknownOutcome=false alone never establishes this.
+    public var notSent = false
     public var nodeCode: Int?
     public var retryAfterMs = 0
     public var explicitRejection = false
@@ -22,11 +25,19 @@ public struct RpcFailure: Error, LocalizedError {
 public final class RpcBroadcastPermit: @unchecked Sendable {
     private let mutex = NSLock()
     private var valid = true
-    public init() {}
+    private let validUntil: Double?
+    private let now: () -> Double
+    public init(validUntil: Double? = nil, now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+        self.validUntil = validUntil; self.now = now
+    }
     public func cancel() { mutex.lock(); valid = false; mutex.unlock() }
-    public var isValid: Bool { mutex.lock(); defer { mutex.unlock() }; return valid }
+    private var current: Bool { valid && (validUntil.map { now() < $0 } ?? true) }
+    public var isValid: Bool { mutex.lock(); defer { mutex.unlock() }; return current }
+    /// Expiry is distinguishable from explicit lifecycle revocation. Only the
+    /// former may preserve an unsent claim while its catalog is refreshed.
+    public var expired: Bool { mutex.lock(); defer { mutex.unlock() }; return valid && (validUntil.map { now() >= $0 } ?? false) }
     fileprivate func perform(_ action: () -> Void) -> Bool {
-        mutex.lock(); defer { mutex.unlock() }; guard valid else { return false }; action(); return true
+        mutex.lock(); defer { mutex.unlock() }; guard current else { return false }; action(); return true
     }
 }
 
@@ -240,7 +251,10 @@ public final class MobileRpcClient: @unchecked Sendable {
         let id = UUID().uuidString
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler(operation: {
-            try Task.checkCancellation()
+            if Task.isCancelled {
+                var failure = RpcFailure("RPC_CANCELLED"); failure.notSent = method == "sendrawtransaction"
+                throw failure
+            }
             return try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     do {
@@ -251,7 +265,12 @@ public final class MobileRpcClient: @unchecked Sendable {
                         guard permit?.isValid != false else { throw RpcFailure("RPC_CANCELLED") }
                         self.jobs[id] = Job(id, method, clean, permit) { continuation.resume(with: $0) }
                         self.order.append(id); self.pump()
-                    } catch { continuation.resume(throwing: error) }
+                    } catch {
+                        if var failure = (error as? RpcFailure) ?? (error as? WalletError).flatMap({ $0.message.hasPrefix("RPC_") ? RpcFailure($0.message) : nil }) {
+                            failure.notSent = method == "sendrawtransaction"
+                            continuation.resume(throwing: failure)
+                        } else { continuation.resume(throwing: error) }
+                    }
                 }
             }
         }, onCancel: { cancellation.cancel(); self.queue.async { self.cancel(id) } })
@@ -260,6 +279,7 @@ public final class MobileRpcClient: @unchecked Sendable {
         guard let job = jobs[id] else { return }
         var failure = RpcFailure("RPC_CANCELLED")
         failure.unknownOutcome = job.method == "sendrawtransaction" && job.written
+        failure.notSent = job.method == "sendrawtransaction" && !job.written
         job.completion?(.failure(failure)); job.completion = nil
         retainedStreamBytes -= job.retainedBytes; job.retainedBytes = 0; job.chunks = []
         if !job.written { remove(job); pump() }
@@ -354,7 +374,7 @@ public final class MobileRpcClient: @unchecked Sendable {
                 var error = RpcFailure(String(try remote.integer("code", min: Int64(Int32.min), max: Int64(Int32.max))))
                 if let details = remote["data"] as? JSONObject {
                     if let node = try? details.integer("node_code"), [-22, -25, -26, -27, -8].contains(node) { error.nodeCode = Int(node) }
-                    if let delay = try? details.integer("retry_after_ms", min: 0) { error.retryAfterMs = Int(min(60_000, delay)) }
+                    if let delay = try? details.integer("retry_after_ms", min: 0, max: 9_007_199_254_740_991) { error.retryAfterMs = Int(delay) }
                 }
                 error.explicitRejection = error.code == "-32020" && error.nodeCode != nil
                 error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection
@@ -402,7 +422,13 @@ public final class MobileRpcClient: @unchecked Sendable {
         jobs.removeValue(forKey: job.id); order.removeAll { $0 == job.id }
     }
     private func finish(_ job: Job, _ result: Result<JSONObject, Error>) {
-        remove(job); let completion = job.completion; job.completion = nil; completion?(result)
+        var outcome = result
+        if case .failure(let error) = result,
+           var failure = (error as? RpcFailure) ?? (error as? WalletError).flatMap({ $0.message.hasPrefix("RPC_") ? RpcFailure($0.message) : nil }) {
+            failure.notSent = job.method == "sendrawtransaction" && !job.written
+            outcome = .failure(failure)
+        }
+        remove(job); let completion = job.completion; job.completion = nil; completion?(outcome)
     }
     private func failWire(_ code: String) {
         epoch &+= 1; wire?.cancel(); wire = nil; ready = false; connectStarted = nil; buffer.removeAll(keepingCapacity: false)

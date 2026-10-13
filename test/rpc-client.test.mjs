@@ -39,6 +39,29 @@ async function bounded(promise) {
   finally { clearTimeout(timer); }
 }
 
+test('only well-framed explicit stream invalidations preserve recoverable server codes', async () => {
+  for (const [ending, expectedCode] of [
+    [{ complete: false, chunks: 0, error: { code: -32011, message: 'Block aged out' } }, -32011],
+    [{ complete: false, chunks: 0, error: { code: -32001, message: 'Index not ready' } }, -32001],
+    [{ complete: false, chunks: 0, error: { code: -32002, message: 'Backend failed' } }, undefined],
+    [{ complete: false, chunks: 1, error: { code: -32011, message: 'Wrong chunk count' } }, undefined],
+    [{ complete: true, chunks: 0, error: { code: -32011, message: 'Missing stream state' } }, undefined],
+    [{ complete: false, chunks: 0, error: { code: -32011, message: {} } }, undefined],
+  ]) {
+    const server = await mock((request, socket) => {
+      socket.write(line(response(request, { stream_id: 'recoverability-test' })) +
+        line(note('stream.end', { stream_id: 'recoverability-test', ...ending })));
+    });
+    try {
+      await assert.rejects(bounded(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} })), error => {
+        assert.match(error.message, /Bounty stream was incomplete/);
+        assert.equal(error.code, expectedCode);
+        return true;
+      });
+    } finally { await server.close(); }
+  }
+});
+
 test('method/parameter allowlist cannot leak secrets or invoke getters', () => {
   for (const method of ['getblocktemplate', 'stop', '__proto__', 'constructor']) assert.throws(() => validateRpcParams(method, {}), /not allowed/);
   assert.throws(() => validateRpcParams('getchaintip', { mnemonic: 'secret' }), /Unexpected/);
@@ -137,7 +160,8 @@ test('incomplete stream diagnostics preserve numeric server classifications with
   try {
     await assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} }), error => {
       assert.equal(error.message, 'Bounty stream was incomplete; nothing from this block was applied.');
-      assert.equal(error.code, undefined);
+      assert.equal(error.code, -32001);
+      assert.equal(error.data, undefined);
       return true;
     });
     const failures = events.filter(item => item.event === 'rpc.failed');
@@ -386,7 +410,7 @@ test('diagnostics record RPC error metadata without request params or endpoint d
     const failures = events.filter(item => item.event === 'rpc.failed');
     assert.deepEqual(failures.map(item => item.details.method), params.map(([method]) => method));
     for (const { details } of failures) {
-      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'method', 'stage', 'unknownOutcome']);
+      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'failureSource', 'method', 'notSent', 'sent', 'stage', 'unknownOutcome']);
       assert.equal(details.stage, 'request');
       assert.equal(details.unknownOutcome, false);
       assert.ok(details.durationMs >= 0);

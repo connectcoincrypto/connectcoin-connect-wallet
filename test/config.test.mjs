@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { validateConnectionOptions } from '../src/core/claim-pool.mjs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -121,7 +122,7 @@ test('mainnet is the default, test networks require explicit selection and profi
   for (const network of ['mainnet', '', '__proto__', null, 1]) assert.throws(() => validateConfig({ network }), /network/);
   assert.throws(() => validateConfig({ network: 'regtest' }), /development/);
   assert.equal(validateConfig({ network: 'regtest' }, { allowRegtest: true }).network, 'regtest');
-  for (const input of [{ version: 2 }, { autoLockMinutes: -1 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 257 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
+  for (const input of [{ version: 2 }, { autoLockMinutes: -1 }, { autoLockMinutes: 61 }, { feeRate: 1200 }, { feeRate: 100001 }, { claims: { maxConcurrent: 0 } }, { claims: { maxConnectionsPerSecond: 2147483648 } }, { claims: { lookbackBlocks: 601 } }]) assert.throws(() => validateConfig(input));
 });
 
 test('appearance defaults to the system, accepts only explicit supported preferences and persists', async () => {
@@ -225,5 +226,14 @@ test('config file creation is bounded, atomic, sanitized and rejects malformed U
   } finally {
     assert.ok(path.basename(directory).startsWith('connectwallet-config-test-'));
     await rm(directory, { recursive: true, force: true });
+  }
+});
+test('claims retain their defaults and accept high limits consistently through configuration and helper admission', () => {
+  assert.deepEqual(validateConnectionOptions(), { connectionsPerSecond: 100, concurrency: 100 });
+  for (const value of [257, 400, 800, 1000, 2147483647]) {
+    const config = validateConfig({ claims: { maxConcurrent: value, maxConnectionsPerSecond: value } });
+    assert.equal(config.claims.maxConcurrent, value);
+    assert.equal(config.claims.maxConnectionsPerSecond, value);
+    assert.equal(validateConnectionOptions({ concurrency: value, connectionsPerSecond: value }).concurrency, value);
   }
 });

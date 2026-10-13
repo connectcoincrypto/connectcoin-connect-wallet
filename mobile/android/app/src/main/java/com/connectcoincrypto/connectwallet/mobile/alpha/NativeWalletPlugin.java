@@ -75,6 +75,7 @@ public final class NativeWalletPlugin extends Plugin {
     private NativeHdWallet hdWallet;
     private JSONObject publicHd;
     private final AtomicBoolean recoveryRunning = new AtomicBoolean();
+    private HdRecoveryReader hdRecoveryReader;
     private final java.util.LinkedHashSet<String> pendingHdUsed = new java.util.LinkedHashSet<>();
     private boolean hdObservationQueued;
     private final Runnable hdObservationRetry = this::queueHdObservations;
@@ -169,7 +170,7 @@ public final class NativeWalletPlugin extends Plugin {
             return new JSObject().put("exists", stored(file)).put("locked", session == null || session.isLocked())
                 .put("account", account == null ? JSONObject.NULL : account).put("accountScope", "hd-wallet")
                 .put("walletId", walletId() == null ? JSONObject.NULL : walletId()).put("accounts", ownedAccounts())
-                .put("hd", publicHd == null ? JSONObject.NULL : publicHd.opt("hd"))
+                .put("hd", hdWallet != null ? hdWallet.hdSnapshot() : publicHd == null ? JSONObject.NULL : publicHd.opt("hd"))
                 .put("watch", watchState())
                 .put("lastPayment", lastPayment == null ? JSONObject.NULL : lastPayment)
                 .put("rpcTransport", "tcp").put("rpcEndpoint", settings.rpcHost + ":" + settings.rpcPort);
@@ -211,9 +212,9 @@ public final class NativeWalletPlugin extends Plugin {
         });
     }
     private void startRecovery(PluginCall call) {
-        final NativeHdWallet owner; final long expected;
+        final NativeHdWallet owner; final long expected; final MobileRpcClient sourceRpc;
         synchronized (lifecycle) {
-            owner = hdWallet; expected = generation;
+            owner = hdWallet; expected = generation; sourceRpc = runtime.rpc;
             if (!active || destroyed || owner == null) { if (call != null) finish(call, new IllegalStateException("Unlock your wallet to discover addresses.")); return; }
             if (!recoveryRunning.compareAndSet(false, true)) { if (call != null) finish(call, new IllegalStateException("Address discovery is already running.")); return; }
         }
@@ -221,12 +222,23 @@ public final class NativeWalletPlugin extends Plugin {
             Exception failure = null;
             try {
                 NativeHdWallet.Check check = () -> {
-                    synchronized (lifecycle) { requireLive(expected); if (hdWallet != owner || session == null) throw new IllegalStateException("Address discovery interrupted. Unlock to resume."); }
+                    synchronized (lifecycle) { requireLive(expected); if (hdWallet != owner || session == null || runtime.rpc != sourceRpc) throw new IllegalStateException("Address discovery interrupted. Unlock to resume."); }
                 };
                 if (call != null) owner.requestRecovery(check);
-                owner.recover((method, params) -> runtime.rpc.call(method, params), check, snapshot -> {
+                NativeHdWallet.Progress progress = snapshot -> {
                     try { publishHd(owner, expected); } catch (Exception interrupted) { /* The next check revokes this generation. */ }
-                });
+                };
+                try (HdRecoveryReader reader = new HdRecoveryReader(sourceRpc::call, check, sourceRpc::isActive,
+                        (state, delay, attempt, code) -> owner.recoveryStatus(state, delay, attempt, code, progress))) {
+                    synchronized (lifecycle) { check.check(); hdRecoveryReader = reader; }
+                    Runnable networkWake = reader::wake;
+                    runtime.addRecoveryNetworkListener(networkWake);
+                    try { owner.recover(reader, check, progress); }
+                    finally {
+                        runtime.removeRecoveryNetworkListener(networkWake);
+                        synchronized (lifecycle) { if (hdRecoveryReader == reader) hdRecoveryReader = null; }
+                    }
+                }
                 publishHd(owner, expected);
             } catch (Exception error) {
                 failure = error;
@@ -543,10 +555,13 @@ public final class NativeWalletPlugin extends Plugin {
             // them over an ordinary lock, so a consumed journal event can
             // extend the derivation gap after the next unlock.
             subscriptionHandler.removeCallbacks(hdObservationRetry);
+            if (hdRecoveryReader != null) { hdRecoveryReader.close(); hdRecoveryReader = null; }
             if (hdWallet != null) { hdWallet.close(); hdWallet = null; }
             if (publicHd != null && publicHd.optJSONObject("hd") != null) {
                 JSONObject metadata = publicHd.optJSONObject("hd");
-                try { metadata.put("recovering", false); } catch (org.json.JSONException ignored) { }
+                try { metadata.put("recovering", false).put("retryAfterMs", 0);
+                    if (!metadata.optBoolean("complete")) metadata.put("recoveryState", "paused");
+                } catch (org.json.JSONException ignored) { }
             }
             if (session != null) session.close(); session = null;
         }

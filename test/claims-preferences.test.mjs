@@ -36,6 +36,7 @@ class Backend extends EventEmitter {
     const currentTip = this.control.validChain ? tip : { ...tip, chain: 'main' };
     if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) return {
       subscription_id: `${method}-${params.address ?? 'global'}`, tip: currentTip, cursor: 'empty-journal',
+      ...(method === 'subscribeaddress' ? { changes_only: true } : {}),
     };
     if (method === 'unsubscribe') return { removed: true };
     if (method === 'getchaintip') return currentTip;

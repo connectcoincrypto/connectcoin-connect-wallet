@@ -14,6 +14,7 @@ import { createP2CRequest } from './p2c-request.mjs';
 import { availableSendAmount, createSendRequest } from './send-request.mjs';
 import { DEFAULT_CLAIMS_POLICY, DEFAULT_CLAIMS_LIMITS, evaluateClaimsPolicy, parseClaimsLimits } from './claims-policy.mjs';
 import { HdWalletSession, nativeHdAccounts } from './hd-session.mjs';
+import { hdRecoveryStatus } from './hd-recovery-status.mjs';
 import { LiveBalance } from './live-balance.mjs';
 import { nativeActionState, nativeControlState } from './native-controls.mjs';
 import { paymentProgressText } from './payment-progress.mjs';
@@ -581,7 +582,8 @@ function renderVault() {
   $('account-kind').textContent = hd ? 'NATIVE HD WALLET · RECEIVING ADDRESS' : 'NATIVE WALLET · FIRST ADDRESS';
   $('vault-status').textContent = !vault.exists ? 'Create or import a native wallet first.' : vault.locked ? 'Wallet locked. Unlock to review a payment.' : recovering ? 'Unlocked · discovering wallet addresses…' : hd ? 'Unlocked' : 'Unlocked · first receiving address only';
   $('hd-panel').hidden = !hd;
-  $('hd-status').textContent = recovering ? `Discovering receiving and change addresses · ${vault.hd?.scanned ?? 0} checked. Payments become available when recovery is complete.` : `${vault.accounts?.length ?? 0} owned addresses tracked · receiving and change branches recovered.`;
+  const recoveryDisplay = hdRecoveryStatus(vault, environment);
+  $('hd-status').textContent = recoveryDisplay.status;
   const progress = session.state.progress;
   $('wallet-load-progress').hidden = !hd || !progress;
   if (progress) {
@@ -590,9 +592,9 @@ function renderVault() {
     $('wallet-load-progress-bar').max = Math.max(1, progress.total);
     $('wallet-load-progress-bar').value = progress.completed;
   } else $('wallet-load-progress-text').textContent = '';
-  $('hd-error').textContent = vault.hd?.error || '';
+  $('hd-error').textContent = recoveryDisplay.error;
   $('recover-addresses').disabled = !native || nativeBusy || vault.locked || vault.hd?.recovering === true || !environment.active || !environment.connected;
-  $('recover-addresses').textContent = recovering ? 'Retry recovery' : 'Rescan addresses';
+  $('recover-addresses').textContent = recoveryDisplay.retryLabel;
   $('new-receive-address').hidden = !hd;
   $('new-receive-address').disabled = !native || nativeBusy || vault.locked || recovering || !environment.active;
   $('receive-path').textContent = hd ? vault.account?.path || '' : '';

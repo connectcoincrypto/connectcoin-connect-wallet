@@ -4,7 +4,7 @@ name: Mobile alpha checks
 # profile, production claims, signing key, or live RPC query is used by these jobs.
 on:
   push:
-    branches: [mobile-alpha]
+    branches: [mobile-alpha, wallet-claims-port-validation]
   workflow_dispatch:
 
 permissions:

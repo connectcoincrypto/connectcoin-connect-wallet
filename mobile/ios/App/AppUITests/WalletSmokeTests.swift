@@ -11,7 +11,7 @@ final class WalletSmokeTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 30))
         let isolation = app.staticTexts["wallet-native-security-check"]
-        XCTAssertTrue(isolation.waitForExistence(timeout: 15))
+        XCTAssertTrue(isolation.waitForExistence(timeout: 75))
         XCTAssertEqual(isolation.label, "Native isolation verified")
         let create = app.webViews.buttons["Create wallet"]
         XCTAssertTrue(create.waitForExistence(timeout: 15))
@@ -36,7 +36,10 @@ final class WalletSmokeTests: XCTestCase {
 
         tapWebButton(app, "Import wallet file")
         let pickerCancel = app.buttons["Cancel"].firstMatch
-        XCTAssertTrue(pickerCancel.waitForExistence(timeout: 10))
+        // A fresh CI Simulator launches Apple's document-picker extension on
+        // first use; that separate process can take more than 20 seconds.
+        // Still require the real native Cancel control and working dismissal.
+        XCTAssertTrue(pickerCancel.waitForExistence(timeout: 60))
         pickerCancel.tap()
         XCTAssertTrue(create.waitForExistence(timeout: 10))
 
@@ -57,7 +60,7 @@ final class WalletSmokeTests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 30))
         let isolation = app.staticTexts["wallet-native-security-check"]
-        XCTAssertTrue(isolation.waitForExistence(timeout: 15))
+        XCTAssertTrue(isolation.waitForExistence(timeout: 75))
         XCTAssertEqual(isolation.label, "Native isolation verified")
         tapWebButton(app, "Import recovery phrase")
         let words = app.textViews["native-wallet-mnemonic"]

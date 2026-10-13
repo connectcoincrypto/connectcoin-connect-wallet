@@ -12,6 +12,9 @@ const [manifest, lock, project, plist, scene, bridge, spm, config, packageManife
   read('capacitor.config.json'), read('ios/WalletCore/Package.swift'),
 ]);
 const pkg = JSON.parse(manifest), locked = JSON.parse(lock), capacitor = JSON.parse(config);
+assert.equal(capacitor.appName, 'ConnectWallet');
+assert.match(plist, /<key>CFBundleDisplayName<\/key>\s*<string>ConnectWallet<\/string>/);
+assert.match(await read('index.html'), /<title>ConnectWallet<\/title>/);
 assert.equal(pkg.dependencies['@capacitor/ios'], '8.5.2');
 assert.equal(locked.packages['node_modules/@capacitor/ios'].version, '8.5.2');
 assert.equal(capacitor.ios.webContentsDebuggingEnabled, false);
@@ -34,6 +37,13 @@ assert.doesNotMatch(bridge, /setURLSchemeHandler\(nil/, 'WebKit cannot unregiste
 assert.match(bridge, /configuration\.copy\(\) as! WKWebViewConfiguration/);
 assert.match(bridge, /webView\.topAnchor\.constraint\(equalTo: container\.safeAreaLayoutGuide\.topAnchor\)/);
 assert.match(bridge, /webView\?\.uiDelegate = restrictedUIDelegate/);
+const smokeProbe = bridge.match(/#if DEBUG && targetEnvironment\(simulator\)([\s\S]*?)#endif/)?.[1];
+assert.ok(smokeProbe?.includes('--wallet-ui-smoke'), 'The isolation probe must stay confined to explicit Debug Simulator smoke tests.');
+for (const check of ['pluginsBlocked && (self.scriptGuard?.rejected ?? 0) >= 3',
+  'Native isolation failed (startup timeout)', 'Native isolation failed (probe error)']) {
+  assert.ok(smokeProbe.includes(check), 'Isolation success checks and explicit startup failure diagnostics must be retained.');
+}
+assert.doesNotMatch(bridge.replace(smokeProbe, ''), /showIsolationResult\(/, 'Smoke markers must not enter production startup.');
 assert.match(project, /PrivacyInfo\.xcprivacy in Resources/);
 assert.match(plist, /<string>connectcoin<\/string>/);
 assert.match(plist, /NSCameraUsageDescription/);
