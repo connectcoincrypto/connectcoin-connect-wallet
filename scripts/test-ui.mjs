@@ -1541,7 +1541,9 @@ try {
   assert.equal(await page.locator('#claims-concurrent').inputValue(), '77');
   assert.equal(await page.locator('#claims-lookback').inputValue(), '345');
   await page.locator('#claims-rate').fill('');
-  await page.locator('#claims-concurrent').fill('999');
+  // 999 is allowed by the native helper. Keep this draft above int32 max so
+  // navigation cannot legitimately persist it under the expanded limits.
+  await page.locator('#claims-concurrent').fill('2147483648');
   await page.locator('#claims-lookback').fill('0');
   await page.locator('[data-view="overview"]').first().click();
   const invalidClaims = (await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims;

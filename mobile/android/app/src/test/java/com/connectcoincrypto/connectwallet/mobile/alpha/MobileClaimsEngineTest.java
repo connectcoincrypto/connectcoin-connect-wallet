@@ -194,7 +194,7 @@ public class MobileClaimsEngineTest {
         rows.add(candidate(bounty().put("domain", "127.0.0.1"))); rows.add(candidate(bounty().put("domain", "server.local"))); rows.add(candidate(bounty().put("root_certificates_version", 2)));
         assertNull(MobileClaimsEngine.select(rows, new HashMap<>(), new HashSet<>()));
     }
-    @Test public void watermarkPrecedesStreamReplayThenFundingAndValidMissUpdatesEma() throws Exception {
+    @Test public void watermarkPrecedesStreamReplayThenFundingAndValidMissUpdatesPerformanceWindow() throws Exception {
         try (Fixture f = new Fixture()) {
             f.start(); f.engine.tick();
             assertEquals(Arrays.asList("getbountychanges", "getrecentblockhashes", "getbountychanges", "stream", "getbountychanges", "gettransaction"), f.calls);
@@ -605,7 +605,7 @@ public class MobileClaimsEngineTest {
             assertEquals(7, f.engine.snapshot().getJSONArray("domains").getJSONObject(0).getInt("signatureAlgorithmsMask"));
         }
     }
-    @Test public void validatedCapturePastDeadlineRemainsASuccessfulEmaWithoutBroadcast() throws Exception {
+    @Test public void validatedCapturePastDeadlineRemainsASuccessfulObservationWithoutBroadcast() throws Exception {
         try (Fixture f = new Fixture()) {
             f.nativeResult = proof(false, false, 10001).put("captured", true).put("validationPassed", true).put("errorCode", "CLAIM_TIMEOUT");
             f.start(); f.engine.tick();

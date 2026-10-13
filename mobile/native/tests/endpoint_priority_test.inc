@@ -34,7 +34,7 @@ void CheckEndpointSequenceForTest() {
     for(int i=0;i<1000;++i) changed->Record(false,10);
     for(unsigned mask=2;mask<=7;++mask) {
         auto selected=priority.Select(mask);
-        CapacityExpect(SameEndpoint(selected.endpoint,endpoints[0]) && selected.score!=changed && selected.score->Rate()==5.0,"Every exact signature mask has independent EMA and cursor");
+        CapacityExpect(SameEndpoint(selected.endpoint,endpoints[0]) && selected.score!=changed && selected.score->Rate()==5.0,"Every exact signature mask has independent performance history and cursor");
     }
     EndpointPriority other; other.Refresh(endpoints);
     auto unrelated=other.Select(1);
@@ -204,7 +204,7 @@ void CheckKnownValidationFinalizationForTest() {
     auto state=std::make_shared<Cancellation>();
     ClaimResult valid; valid.valid_proof=true; valid.meets_target=true; valid.proof_hex="abcdef";
     auto late=FinalizeKnownCapture(valid,200,state,Clock::now()-std::chrono::seconds(1));
-    CapacityExpect(late.captured && late.validation_passed && !late.valid_proof && !late.meets_target && late.proof_hex.empty() && late.error_code=="CLAIM_TIMEOUT" && late.duration_ms==200,"Known-valid expired result retains EMA observation but cannot expose usable proof");
+    CapacityExpect(late.captured && late.validation_passed && !late.valid_proof && !late.meets_target && late.proof_hex.empty() && late.error_code=="CLAIM_TIMEOUT" && late.duration_ms==200,"Known-valid expired result retains performance observation but cannot expose usable proof");
     auto timely=FinalizeKnownCapture(valid,200,state,Clock::now()+std::chrono::seconds(1));
     CapacityExpect(timely.captured && timely.validation_passed && timely.valid_proof && timely.proof_hex=="abcdef","Unexpired valid result remains usable");
     valid.meets_target=false;

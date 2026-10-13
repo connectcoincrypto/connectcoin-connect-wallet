@@ -301,6 +301,14 @@ assert.match(nativeWallet, /new VaultSession\(payload\.getString\("mnemonic"\), 
   'Removing the setup field must not change keys in an existing encrypted wallet');
 const exposed = [...nativeWallet.matchAll(/@PluginMethod\s+public\s+void\s+(\w+)\s*\(/g)].map(x => x[1]).sort();
 assert.deepEqual(exposed, ['changePassword', 'claimsCheckSubmission', 'claimsLimits', 'claimsPolicy', 'claimsStart', 'claimsState', 'claimsStop', 'create', 'dismissPaymentBatch', 'exportWallet', 'getPaymentBatch', 'getRecoverySnapshots', 'getSettings', 'getState', 'importRecovery', 'importWallet', 'lock', 'newAddress', 'queryPublic', 'readPaymentClipboard', 'recoverAddresses', 'reviewP2C', 'reviewPayment', 'saveSettings', 'unlock', 'viewRecoveryPhrase', 'watchAccount'].sort());
+const alphaSmoke = await read(path.join(mobile, 'android/app/src/androidTest/java/com/connectcoincrypto/connectwallet/mobile/alpha/AlphaSmokeTest.java'));
+const smokeWalletMethods = alphaSmoke.match(/private static final String\[\] NATIVE_WALLET_METHODS\s*=\s*\{([^}]+)\}/);
+assert(smokeWalletMethods, 'The emulator must retain an explicit exact native wallet allowlist');
+assert.deepEqual([...smokeWalletMethods[1].matchAll(/"(\w+)"/g)].map(match => match[1]).sort(),
+  [...exposed, 'addListener', 'removeListener', 'removeAllListeners', 'checkPermissions', 'requestPermissions'].sort(),
+  'Keep the exact emulator allowlist in sync with reviewed native APIs and inherited framework methods');
+assert.match(alphaSmoke, /assertEquals\(new HashSet<>\(Arrays\.asList\(NATIVE_WALLET_METHODS\)\), wallet\)/,
+  'The actual runtime bridge must equal the allowlist, not merely contain a subset');
 const recoverySnapshots = nativeWallet.slice(nativeWallet.indexOf('@PluginMethod public void getRecoverySnapshots('), nativeWallet.indexOf('@PluginMethod public void readPaymentClipboard('));
 assert.match(recoverySnapshots, /if \(!empty\(call\)\) return/);
 assert.match(recoverySnapshots, /hdWallet\.recoverySnapshots\(\)/);

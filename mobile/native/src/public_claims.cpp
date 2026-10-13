@@ -928,7 +928,7 @@ static std::string ProbeRsaInternal(const std::string& domain,int64_t validation
             ,test_port,test_roots
 #endif
         );
-        // validation_passed alone can survive expiry for claim EMA accounting;
+        // validation_passed alone can survive expiry for performance-window accounting;
         // capability success instead requires an unexpired completed handshake.
         if(result.valid_proof && result.captured && result.meets_target && result.error_code.empty()) return "verified";
         return result.error_code=="CLAIM_TIMEOUT"?"timeout":"failed";
