@@ -125,6 +125,16 @@ test('desktop release notes preserve their content with neutral mobile naming', 
   }
 });
 
+test('native helper disclosure applies only after the existing desktop releases', () => {
+  for (const version of ['1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', '1.1.5']) {
+    assert.ok(releaseNotes(version, '5678', sha).includes('The native claims helper and Python runtime are bundled.'), version);
+    assert.ok(!releaseNotes(version, '5678', sha).includes('no Python runtime is required'), version);
+  }
+  for (const version of ['1.1.6', '1.2.0', '2.0.0']) {
+    assert.ok(releaseNotes(version, '5678', sha).includes('The C++ claims helper and its statically linked Mbed TLS provider are bundled; no Python runtime is required.'), version);
+  }
+});
+
 test('1.1.3 release notes describe bounded-debt pacing and retain distribution disclosures', () => {
   const notes = releaseNotes('1.1.3', '5678', sha);
   for (const text of ['# ConnectWallet 1.1.3', '## New in 1.1.3', 'configured connection rate',

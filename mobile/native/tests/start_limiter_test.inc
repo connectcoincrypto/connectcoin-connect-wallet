@@ -1,4 +1,23 @@
 // Host-only tests exercise the production clock policy and exact connect gate.
+namespace {
+// Xcode's libc++ does not provide std::jthread on all supported hosts. These
+// workers use the production cancellation/deadline mechanism, not stop_token;
+// retain automatic joining so a failed assertion can safely unwind the test.
+class JoiningTestThread {
+    std::thread thread_;
+public:
+    template<typename Function>
+    explicit JoiningTestThread(Function function):thread_(std::move(function)) {}
+    JoiningTestThread(JoiningTestThread&&) noexcept=default;
+    JoiningTestThread(const JoiningTestThread&)=delete;
+    JoiningTestThread& operator=(const JoiningTestThread&)=delete;
+    JoiningTestThread& operator=(JoiningTestThread&&)=delete;
+    ~JoiningTestThread() { if(thread_.joinable()) thread_.join(); }
+    bool joinable() const noexcept { return thread_.joinable(); }
+    void join() { thread_.join(); }
+};
+} // namespace
+
 void CheckNativeStartLimiterForTest() {
     auto require=[](bool value) { if(!value) throw std::runtime_error("TEST_START_LIMITER"); };
     const auto base=Deadline{}+std::chrono::seconds(10);
@@ -238,7 +257,7 @@ void CheckNativeStartLimiterForTest() {
 
     std::vector<int> order;
     std::vector<std::string> outcomes(8);
-    std::vector<std::jthread> workers;
+    std::vector<JoiningTestThread> workers;
     for(int i=0;i<8;++i) {
         workers.emplace_back([&,i] {
             try {
@@ -263,12 +282,12 @@ void CheckNativeStartLimiterForTest() {
 
     // A head deadline (not cancellation) also hands off without a fake start.
     SetStartRate(limiter,1);
-    std::jthread expiring([&] {
+    JoiningTestThread expiring([&] {
         try { WithStartPermit(states[2],Clock::now()+60*millisecond,[] { return 0; }); outcomes[2]="BAD"; }
         catch(const std::runtime_error& error) { outcomes[2]=error.what(); }
     });
     wait_queued(1);
-    std::jthread successor([&] {
+    JoiningTestThread successor([&] {
         try { WithStartPermit(states[1],deadline(),[] { return 0; }); outcomes[1]="OK"; }
         catch(const std::runtime_error& error) { outcomes[1]=error.what(); }
     });

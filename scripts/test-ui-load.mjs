@@ -119,22 +119,26 @@ try {
   assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - scrollBefore) <= 2, 'Retry warnings reset scroll.');
 
   stage = 'numeric caret and DOM identity survive background progress';
-  // Number inputs do not expose selectionStart/selectionEnd. Type in the
-  // middle, let background state render, then type again at that exact caret.
-  // Lookback remains limited to 600, while connection limits accept these
-  // values. Keep this presentation-only draft invalid so autosave cannot publish
-  // the real service's wallet-free state over our synthetic progress fixture.
-  assert.equal(await page.locator('#claims-lookback').getAttribute('max'), '600');
-  await page.locator('#claims-lookback').fill('1000');
+  // Replace a digit in the middle, let background state render, then replace
+  // the next digit at that exact native caret without blur/refocus.
+  // Stay above the configurable int32 limit even before the first keystroke.
+  // This presentation-only fixture must not autosave into the real service,
+  // which intentionally has no wallet. 1000 is now a valid desktop rate.
+  assert.equal(await page.locator('#claims-rate').getAttribute('data-integer-digits'), '10');
+  assert.equal(await page.locator('#claims-concurrent').getAttribute('data-integer-digits'), '10');
+  await page.locator('#claims-rate').fill('3000000000');
   await page.keyboard.press('Home');
   await page.keyboard.press('ArrowRight');
+  // One replacement edit avoids a temporarily shorter, valid value that a
+  // slow runner could autosave between separate Delete and digit key events.
+  await page.keyboard.press('Shift+ArrowRight');
   await page.keyboard.press('2');
-  assert.equal(await page.locator('#claims-lookback').inputValue(), '12000');
+  assert.equal(await page.locator('#claims-rate').inputValue(), '3200000000');
   await page.evaluate(() => {
-    window.numericEditingField = document.querySelector('#claims-lookback');
+    window.numericEditingField = document.querySelector('#claims-rate');
     window.numericEditingEvents = { focus: 0, blur: 0 };
     for (const type of ['focus', 'blur']) document.addEventListener(type, event => {
-      if (event.target.id === 'claims-lookback') window.numericEditingEvents[type]++;
+      if (event.target.id === 'claims-rate') window.numericEditingEvents[type]++;
     }, true);
   });
   await burst(20, true); await waitForLatest();
@@ -148,13 +152,14 @@ try {
     await page.waitForFunction(expected => Boolean(document.querySelector('.page-error')) === expected &&
       Boolean([...document.querySelectorAll('.form-card .notice.danger')].find(node => node.textContent.includes('Presentation fixture connection alert.'))) === expected, message !== null);
   }
+  await page.keyboard.press('Shift+ArrowRight');
   await page.keyboard.press('3');
   assert.deepEqual(await page.evaluate(() => ({
-    value: document.querySelector('#claims-lookback').value,
-    sameNode: window.numericEditingField === document.querySelector('#claims-lookback'),
+    value: document.querySelector('#claims-rate').value,
+    sameNode: window.numericEditingField === document.querySelector('#claims-rate'),
     focused: document.activeElement === window.numericEditingField,
     ...window.numericEditingEvents,
-  })), { value: '123000', sameNode: true, focused: true, focus: 0, blur: 0 }, 'Background progress must preserve the actual number input and its native caret without blur/refocus.');
+  })), { value: '3230000000', sameNode: true, focused: true, focus: 0, blur: 0 }, 'Background progress must preserve the actual number input and its native caret without blur/refocus.');
 
   stage = 'navigation during a held pointer and transient errors';
   const settings = page.locator('[data-view="settings"]').first();

@@ -10,6 +10,8 @@ struct PublicClaimContext {
     int64_t validation_time;
 };
 struct ClaimResult {
+    // Empty for invalid proofs and valid target misses; only winning proofs
+    // are serialized. These flags/counters do not depend on serialization.
     std::string proof_hex;
     bool captured{false}, validation_passed{false}, valid_proof{false}, meets_target{false};
     int64_t duration_ms{0};
@@ -39,10 +41,16 @@ ClaimResult CaptureAndVerify(const PublicClaimContext&, int timeout_ms, int64_t 
 std::string ProbeRsa(const std::string& domain, int64_t validation_time, int timeout_ms, int64_t handle);
 ClaimResult VerifyProof(const PublicClaimContext&, std::span<const unsigned char> proof);
 #ifdef CONNECTWALLET_NATIVE_TESTS
+struct NativeWorkStats {
+    size_t context_builds{}, context_hits{}, context_hex_decodes{}, time_checks{}, proof_serializations{}, serialized_bytes{};
+};
+NativeWorkStats NativeWorkStatsForTest();
+ClaimResult CheckPreparedVerificationForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
 void SetVerificationObserverForTest(void (*observer)(const void*));
 // Test-only APIs cannot be compiled into an Android library. No production call
 // can select another root, port, or endpoint (even via a private JNI method).
 ClaimResult VerifyProofForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
+ClaimResult CheckVerifierCacheForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
 ClaimResult CaptureLoopbackForTest(const PublicClaimContext&, int timeout_ms, int64_t handle, uint16_t port, std::span<const unsigned char> roots);
 std::string ProbeRsaLoopbackForTest(const std::string& domain, int64_t validation_time, int timeout_ms, int64_t handle, uint16_t port, std::span<const unsigned char> roots);
 #endif

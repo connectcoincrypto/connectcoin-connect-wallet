@@ -18,7 +18,7 @@ Each filename includes the version, OS and architecture. Outputs are in
 `dist/installers/win32-x64`, `darwin-x64`, `darwin-arm64`, or `linux-x64`.
 The command refuses nonempty output directories to avoid mixing releases or
 erasing old files. Move an earlier output directory aside before rebuilding.
-The helper build itself refreshes its generated files under `helpers/bin/` and
+The helper build itself refreshes its generated files under `helpers/native-bin/` and
 `tmp/`; it does not replace an already-open wallet's `dist/win-unpacked` files.
 
 All installer-controlled text is English. Windows explicitly restricts NSIS to
@@ -30,21 +30,18 @@ ConnectWallet artwork. Windows taskbar IDs and Linux desktop IDs match the app.
 
 ## Local build
 
-Use Node.js 24+, npm, Python 3.11+ with venv/pip, and Git. The Node and Python
-architectures must match the target. Builds download the exact dependencies in
-the lockfiles, builder toolchains and original third-party license files.
-End users do not need Node.js or Python: the native helper includes its runtime.
+Use Node.js 24+, npm, CMake 3.22+, a C++20 compiler (MSVC on Windows,
+GCC/Clang on Linux, Xcode command-line tools on macOS), Python 3.11+ with
+venv/pip, and Git. Node and the C++ compiler must target the host architecture.
+Builds download locked dependencies and the SHA-256-pinned Mbed TLS 3.6.7 archive.
+End users do not need Node.js, Python or OpenSSL: the desktop helper is C++ with
+statically linked Mbed TLS and its own embedded consensus-v1 root bundle.
 
-The pinned cryptography 50.0.1 release has no macOS Intel wheel, so Intel builds
-also need the native C/Rust compiler toolchain and OpenSSL static libraries and
-headers. Packaging rebuilds that provider with static OpenSSL linkage to avoid
-colliding with CPython's bundled OpenSSL library, and checks the result with
-`otool` before bundling. Set `OPENSSL_DIR` to the development prefix, or the build
-uses `brew --prefix openssl@3`. The macOS Intel Actions runner supplies these
-build dependencies. License
-collection supports both binary wheels and source builds: the latter uses the
-reviewed SHA-256 of the exact cryptography source archive and its locked Rust
-dependency checksums, and includes notices for the actual OpenSSL providers.
+Python cryptography 50.0.1 is retained only as an offline differential-test
+reference in `.claims-venv`. The Intel macOS reference may require C/Rust
+compilers and OpenSSL development libraries when no wheel exists; it is never
+packaged or silently selected instead of C++. Missing Python fixture dependencies
+fail the desktop build, rather than producing a misleading partial test pass.
 
 ```sh
 npm ci
@@ -63,18 +60,24 @@ npm run dist:mac
 
 # Ubuntu 22.04 x86_64: install build tools, then all four Linux formats
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip rpm fakeroot dpkg-dev libarchive-tools libfuse2
+sudo apt-get install -y build-essential cmake python3 python3-venv python3-pip rpm fakeroot dpkg-dev libarchive-tools libfuse2
 npm run dist:linux
 ```
 
 `PYTHON` can select an exact Python executable before the first helper setup.
-An existing `.claims-venv` is reused and its architecture checked; do not copy
+An existing `.claims-venv` is reused for tests only; do not copy
 venvs or native helpers between computers/architectures. The generic `npm run
 dist` selects the native host. Unsupported targets and cross-compilation are
 rejected instead of shipping a helper for the wrong OS.
 
-The build runs Python regressions, collects dependency licenses, compiles the
-helper, regenerates icons, checks the helper's pinned crypto provider/protocol,
+`CMAKE` and `CTEST` can select exact build-tool executable paths, and
+`CONNECTWALLET_BUILD_JOBS` controls local parallelism (default at most four).
+Both `npm run setup:claims` and `npm run build:claims` build the C++ helper;
+`npm run setup:python-reference` only prepares and tests the isolated reference.
+
+The build runs Python regressions and eight native test suites (including
+offline loopback TLS/differential certificate fixtures), collects native licenses,
+compiles the helper, regenerates icons, checks the embedded root hash and pinned crypto provider/protocol,
 and invokes the pinned electron-builder with `--publish never`. It then checks
 the packaged app and helper, validates installer metadata/container signatures,
 and creates `SHA256SUMS` and `manifest.json`. No secrets or signing credentials

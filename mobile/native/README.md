@@ -2,7 +2,7 @@
 
 This standalone CMake library captures **TLS 1.3 P2C version-2 proofs** and
 verifies the complete certificate chain and CertificateVerify signature using
-the Core consensus parser/verifier with thread-local root-cache ownership. It contains no wallet seed, reward address,
+the Core consensus parser/verifier with thread-local immutable-data caches. It contains no wallet seed, reward address,
 normal-transaction signer, broadcast method, or automatic startup.
 
 Capture stops immediately after the server's `CertificateVerify`, like Core's
@@ -24,8 +24,8 @@ revision. Only LF normalization is permitted in those copies. The small
 serialization; they do not reimplement the certificate verifier. Core-derived
 code is under `vendor/core/COPYING` (MIT). The mobile build generates a derivative
 of `p2c_x509.cpp` using `cmake/ThreadLocalVerifier.cmake`, which verifies the full
-pinned source hash before changing only root-store ownership and removing its
-now-unneeded shared-cache lock. Certificate rules, root bytes and path selection stay unchanged;
+pinned source hash before adapting root-store ownership, removing its
+now-unneeded shared-cache lock and inserting exact-DER caches. Certificate rules, root bytes and path selection stay unchanged;
 the vendored source remains pristine. Each worker owns its parsed root keys,
 including Mbed TLS's mutable RSA/EC precomputation caches, and releases them when
 its OS thread exits on Android/Apple/Unix. Windows uses an exception-safe outer
@@ -47,6 +47,58 @@ The version-1 trust bundle is immutable and checked by CMake against SHA256
 No Android/Apple platform trust substitution or local-clock chain selection is
 used for P2C consensus validation.
 
+### Claimer performance backport
+
+The native acceleration, bounded performance window and abbreviated Certificate
+adapters are ported from `connectcoin-claimer` commit
+`f97fe7f5b8078957ca514f72133a5b0b6db2f829`. Both Android and iOS use this shared
+engine. The adaptations preserve all consensus checks:
+
+- PSA still validates each private key and public point before dispatching the
+  two X25519 multiplications to the HACL primitive bundled in pinned Mbed TLS.
+  Fresh ephemeral randomness, all-zero rejection and zeroization are retained.
+- SHA-224/256 compression uses runtime-gated SHA-NI on supported x86-64 CPUs,
+  with stock portable compression otherwise. No hash, MAC or CV result is cached.
+- Each worker retains at most one exact Certificate message/DER chain and its
+  immutable RSA-policy, KU/EKU and decoded date metadata. The current block
+  validation time is checked again on every proof against every supplied cert.
+- At most eight successful static certificate-signature results (64 KiB DER)
+  are memoized per worker, keyed by exact child and parent bytes. Hostnames,
+  root selection, path rules and the dynamic CertificateVerify remain live.
+- Each worker also retains just one immutable prepared public context: exact
+  domain, challenge hex, target hex, root version and signature mask. It decodes
+  the two uint256 values and builds the output/signature list once, sharing that
+  object between capture and verification. A changed field replaces the cache;
+  each attempt validates its own timestamp and checks all certificate dates.
+  Private keys, ephemeral randomness and proof/authentication results are never
+  cached; one-shot random probe contexts are not retained either. Strong
+  ownership keeps in-flight references valid during replacement.
+- Only valid proofs meeting the work target are hex-encoded and copied across
+  the mobile bridge. Target misses still run every validation and retain the
+  same captured/valid counters, but return an empty proof. Completed RSA probes
+  keep all handshake/verifier checks and never serialize a proof.
+- Ordinary captures skip the duplicate TLS-owned DER parsing/CV verification;
+  they still enforce the original TLS Certificate envelope and extension rules
+  and perform the complete independent proof verification before returning.
+  Completed RSA capability probes keep the full stock TLS handshake.
+- Reassembly allows bounded fragmented Certificate messages without increasing
+  the 16 KiB TLS record limit or 48 KiB Certificate/64 KiB proof limits.
+- Endpoint rates use at most 2048 lazy one-hour histories, each 60 minute
+  buckets, with the claimer's five-valid-connection/one-second prior. Uniform
+  exploration and exact signature-mask isolation remain unchanged.
+- Conclusive local unsupported-family failures exclude that family for one
+  minute; route failures exclude only that numeric IP. Refusals, timeouts and
+  ephemeral-port exhaustion never mark an IP/family impossible. Rechecks allow
+  network changes to recover. These failures do not penalize remote quality;
+  actual TCP starts and completed failure counters remain truthful.
+
+Host regression tests cover provider differential vectors, invalid keys,
+parallel captures, cache reuse with changed validation time/trust/CV, endpoint
+expiration/eviction and local reachability. The SHA implementation retains
+Bitcoin Core attribution in `vendor/bitcoin-core/COPYING` and the packaged
+`vendor/licenses/Bitcoin-Core-MIT.txt`. Disable `CONNECTWALLET_X25519_ACCELERATION`
+or `CONNECTWALLET_SHA256_ACCELERATION` for differential reference builds.
+
 ## Native contract
 
 `NativeClaims.captureAndVerify` is a worker-thread-only JNI call. The caller
@@ -64,24 +116,28 @@ are fixed internally; no wallet or transaction data is supplied. It returns
 only `verified`, `failed`, `timeout`, `busy` or `unavailable`, never proof bytes.
 Cancellation/context errors throw and must abort the owning review. Late
 verification cannot produce `verified`; fallback does not prove incompatibility.
-An ordinary claim's valid-proof EMA observation is not updated by these probes.
+An ordinary claim's valid-proof performance observation is not updated by these probes.
 
 Successful attempts return public JSON fields `proof`, `captured`, `validationPassed`, `validProof`,
 `meetsTarget`, `durationMs`, and `errorCode`. A valid certificate/signature counts
 as a valid proof even when its hash misses the target. Completed TCP/TLS failures
 return false plus a fixed error code and TCP/TLS duration. Cancellation, local
 configuration/setup failures and pre-TCP DNS failures throw; do not count these
-neutral failures as certificate-invalid EMA samples. Duration excludes DNS and
+neutral failures as certificate-invalid performance samples. Duration excludes DNS and
 the final synchronous certificate verification.
 
 `NativeClaims.hasStarted(handle)` acknowledges the actual TCP `connect` call,
 not DNS, a queued task, or socket allocation. The owner checks it before
 destroying the handle; unknown/destroyed handles return false. `captured` marks
 a complete raw P2C transcript through `CertificateVerify`, independently of certificate validity or work target,
-so successful-capture budgets are separate from validated-proof EMA samples.
-`validationPassed` is the known certificate/signature result used for EMA and
-validated-connection counters, while `validProof` means the proof is still usable
-for submission. If validation completes successfully after the deadline,
+so successful-capture budgets are separate from validated-proof performance samples.
+`validationPassed` is the known certificate/signature result used for performance ranking and
+validated-connection counters. `validProof` means that validation succeeded
+within the deadline; `meetsTarget` independently controls submission eligibility.
+A valid target miss has both validation flags true, `captured=true`,
+`meetsTarget=false` and empty `proof`. The Apple C bridge represents an empty
+proof as NULL; its owning Swift wrapper maps that to an empty string. If
+validation completes successfully after the deadline,
 `validationPassed` remains true but `validProof`/`meetsTarget` are false, `proof`
 is empty, and `errorCode` is `CLAIM_TIMEOUT`; no late proof can be broadcast.
 
@@ -111,9 +167,9 @@ handle constructor binds a process-shared 100/s limiter, never an unlimited path
 (or -1 before starting/after destruction), avoiding a native/Java clock-epoch
 assumption. The Java owner converts this age when recording real starts.
 
-Within a domain, IP selection matches Core/desktop: independent success/time
-EMA per public IP and **exact signature mask**, starting at 0.1 successes and
-0.02 seconds, updated with `old * 0.999 + sample * 0.001`. Smooth weighted
+Within a domain, IP selection uses independent success/time histories per
+public IP and **exact signature mask**, with 60 one-minute buckets and a
+persistent prior of five valid connections per second. Smooth weighted
 round-robin assigns 99% by validated connections per TCP/TLS second and 1%
 uniform exploration. Equal credits rotate using a per-mask cursor. DNS refresh
 preserves statistics/credits for unchanged IPs and drops removed IPs. Late

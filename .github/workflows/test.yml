@@ -31,7 +31,7 @@ jobs:
         timeout-minutes: 5
         run: npm test
       - run: npm run setup:claims
-        timeout-minutes: 5
+        timeout-minutes: 15
         env:
           # On Windows `py -3` can select a different installed Python than
           # setup-python. Build and test the helper with the selected runtime.

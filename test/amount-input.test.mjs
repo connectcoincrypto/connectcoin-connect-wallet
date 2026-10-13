@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { installAmountInputRestrictions, normalizeAmountInput } from '../src/ui/amount-input.mjs';
+import { MAX_CONNECTION_LIMIT } from '../src/core/connection-limits.mjs';
 
 class FakeEvent {
   constructor(type, options = {}) { Object.assign(this, { type, cancelable: false, defaultPrevented: false }, options); }
@@ -123,6 +124,41 @@ test('integer fields use their own rules during typing, paste, and input fallbac
   f.fire('input', { inputType: 'insertReplacementText' });
   assert.equal(f.input.value, '321.');
   assert.deepEqual(f.drafts, ['123.', '321.']);
+});
+
+test('connection integer fields retain the full int32 ceiling without broadening other input rules', () => {
+  assert.equal(MAX_CONNECTION_LIMIT, 2147483647);
+  const maximum = String(MAX_CONNECTION_LIMIT);
+  const dataset = { numeric: 'integer', integerDigits: String(maximum.length) };
+  const typed = fixture('', { dataset });
+  for (const digit of maximum) assert.equal(typed.edit(digit).defaultPrevented, false);
+  assert.equal(typed.input.value, maximum);
+  assert.equal(typed.input.selectionStart, 10);
+  assert.equal(typed.edit('0').defaultPrevented, true, 'an eleventh digit must not be truncated or published');
+  assert.equal(typed.input.value, maximum);
+  assert.equal(typed.drafts.at(-1), maximum);
+
+  const pasted = fixture('100', { dataset });
+  pasted.input.setSelectionRange(0, 3);
+  assert.equal(pasted.transfer('paste', maximum).defaultPrevented, false);
+  assert.equal(pasted.input.value, maximum);
+  pasted.input.setSelectionRange(0, 10, 'backward');
+  assert.equal(pasted.transfer('paste', `${maximum}0`).defaultPrevented, true);
+  assert.equal(pasted.input.value, maximum);
+  assert.equal(pasted.input.selectionDirection, 'backward');
+  pasted.dispose.sync();
+  pasted.input.value = `${maximum}0`;
+  pasted.fire('input', { inputType: 'insertReplacementText' });
+  assert.equal(pasted.input.value, maximum, 'uncancelable input uses the same ten-digit boundary');
+  assert.deepEqual(pasted.drafts, [maximum]);
+
+  // Text editing preserves a ten-digit overflow draft; preference validation,
+  // not silent rounding/clamping by this guard, must reject it for autosave.
+  typed.input.setSelectionRange(9, 10);
+  assert.equal(typed.edit('8').defaultPrevented, false);
+  assert.equal(typed.input.value, '2147483648');
+  assert.equal(normalizeAmountInput(maximum), null, 'monetary inputs keep their nine-digit ceiling');
+  assert.equal(fixture('999999999', { dataset: { numeric: 'integer' } }).edit('9').defaultPrevented, true);
 });
 
 test('candidate integer fields preserve large exact values across paste, edits, and render resets', () => {

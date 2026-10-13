@@ -261,6 +261,8 @@ test('RPC endpoint edits clear old discovery state and resume saved claims on th
   const s = f.service;
   await unlock(s);
   const oldRpc = s.rpc;
+  const oldWindow = s.claimWindow;
+  assert.ok(oldWindow, 'The old endpoint must already own a complete cached discovery window.');
   const cleared = t.mock.method(s.engine, 'clear');
   const staleHash = 'ab'.repeat(32);
   s.claimBlocks.set(staleHash, []);
@@ -270,6 +272,9 @@ test('RPC endpoint edits clear old discovery state and resume saved claims on th
   assert.equal(oldRpc.socket, null);
   assert.deepEqual(s.config.rpc, { host: 'replacement.invalid', port: 18001 });
   assert.equal(s.claimBlocks.has(staleHash), false);
+  assert.notStrictEqual(s.claimWindow, oldWindow);
+  assert.equal(s.rpc.calls.filter(method => method === 'getrecentblockhashes').length, 1,
+    'The replacement endpoint must establish its own full hash window even when its tip matches.');
   assert.ok(cleared.mock.callCount() > 0);
   assert.ok(s.rpc.calls.includes('getblockbounties'));
   assert.equal(s.engine.enabled, true);

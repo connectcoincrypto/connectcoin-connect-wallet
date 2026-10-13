@@ -1,5 +1,6 @@
 // Build-time checks only. Old executables can pass their own legacy self-test,
 // so packaging must verify the provider actually bundled, not the source venv.
+import { NATIVE_ROOT_SHA256 } from './native-helper-manifest.mjs';
 export function pinnedCryptographyVersion(requirements) {
   const pins = [...requirements.matchAll(/^cryptography==([0-9]+\.[0-9]+\.[0-9]+)\s*$/gm)];
   if (pins.length !== 1) throw new Error('Expected one exact cryptography release pin.');
@@ -16,6 +17,18 @@ export function validateHelperSecurity(output, expectedVersion) {
       typeof report.security?.opensslVersion !== 'string' ||
       !/^OpenSSL [0-9]+\.[0-9]+\.[0-9]+(?: |$)/.test(report.security.opensslVersion)) {
     throw new Error('Bundled helper has missing or outdated security metadata. Run npm run build:claims.');
+  }
+  return report.security;
+}
+
+export function validateNativeHelperSecurity(output) {
+  let report;
+  try { report = JSON.parse(output); } catch { /* Reject malformed/extra output. */ }
+  if (report?.type !== 'ready' || report.protocol !== 4 || report.roots !== 1 ||
+      report.security?.provider !== 'mbedtls' || report.security?.mbedtlsVersion !== '3.6.7' ||
+      report.security?.rootsSha256 !== NATIVE_ROOT_SHA256 ||
+      report.security?.rsaPublicExponentMaxBits !== 64) {
+    throw new Error('Expected the pinned C++/Mbed TLS protocol-4 helper. Run npm run build:claims.');
   }
   return report.security;
 }

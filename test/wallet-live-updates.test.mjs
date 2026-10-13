@@ -307,7 +307,7 @@ test('transient claim startup failures retry without another push or a periodic 
   assert.equal(s.claimsResumePending, true);
   await until(() => s.engine.enabled && s.engine.resumes === 1,
     'Transient startup failure left Automatic Claims idle without a new notification');
-  assert.equal(tipAttempts, 3);
+  assert.equal(tipAttempts, 4, 'Two failed startup reads, one successful startup tip and the final discovery tip fence.');
   assert.equal(notifications, 0);
   assert.equal(s.claimsResumePending, false);
   assert.equal(s.claimCursor, 'journal-0');

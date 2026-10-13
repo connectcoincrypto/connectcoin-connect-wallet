@@ -254,11 +254,18 @@ class NativeOracleTests(unittest.TestCase):
         decoded = json.loads(result.stdout)
         self.assertEqual(decoded["validProof"], valid)
         self.assertEqual(decoded["meetsTarget"], valid and target)
+        self.assertEqual(decoded["testWork"]["contextBuilds"], 1)
+        self.assertEqual(decoded["testWork"]["contextHexDecodes"], 2)
+        self.assertEqual(decoded["testWork"]["timeChecks"], 1)
+        self.assertEqual(decoded["testWork"]["proofSerializations"], int(valid and target))
         if valid and target:
             verified = verify_connection_proof(envelope, self.roots, enforce_root_pin=False)
             self.assertEqual(verified.challenge, envelope.challenge.hex())
             self.assertEqual(decoded["proof"], envelope.proof.hex())
+            self.assertEqual(decoded["testWork"]["serializedBytes"], len(envelope.proof) * 2)
         else:
+            self.assertEqual(decoded["proof"], "")
+            self.assertEqual(decoded["testWork"]["serializedBytes"], 0)
             with self.assertRaises((ProofFormatError, ProofVerificationError)):
                 verify_connection_proof(envelope, self.roots, enforce_root_pin=False)
         return decoded
@@ -283,6 +290,17 @@ class NativeOracleTests(unittest.TestCase):
                 result = self.run_native(envelope, mode="verify-parallel")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(json.loads(result.stdout)["validProof"])
+
+    def test_prepared_context_reuses_only_exact_static_fields_and_never_authentication(self):
+        for envelope in (self.envelope, rsa_proof(self.root, rsa_identity(self.root), 0x0804),
+                         rsa_proof(self.root, rsa_identity(self.root, restricted=True), 0x0809)):
+            with self.subTest(mask=envelope.signature_algorithms_mask):
+                result = self.run_native(envelope, mode="verify-prepared")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                decoded = json.loads(result.stdout)
+                self.assertTrue(decoded["validProof"])
+                self.assertEqual(decoded["proof"], envelope.proof.hex())
+                self.assertGreater(decoded["testWork"]["contextHits"], 3)
 
     def test_signature_challenge_domain_time_mask_and_framing_rejections(self):
         self.assert_agreement(dataclasses.replace(self.envelope, proof=self.envelope.proof[:-1]
@@ -310,7 +328,7 @@ class NativeOracleTests(unittest.TestCase):
         self.assert_agreement(signed_proof("foo.example.com", leaf, [intermediate[1]]), False)
 
     def loopback(self, *, rsa_leaf=False, restricted_pss=False, stalled=False, cancel=None, timeout=5000,
-                 without_finished=False, mutation=None):
+                 without_finished=False, mutation=None, target_miss=False):
         if restricted_pss:
             leaf_key, leaf = rsa_identity(self.root, restricted=True)
             root, cert, key = self.root[1].public_bytes(PEM), leaf.public_bytes(PEM), pss_private_pem(leaf_key)
@@ -356,6 +374,8 @@ class NativeOracleTests(unittest.TestCase):
         worker.start()
         context, _ = claims_bridge.parse_request(request())
         context = dataclasses.replace(context, signature_algorithms_mask=4 if restricted_pss else 2 if rsa_leaf else 1)
+        if target_miss:
+            context = dataclasses.replace(context, connection_work_target="00" * 32)
         started = time.monotonic()
         try:
             result = self.run_native(context, mode="capture", endpoint=listener.getsockname()[1], timeout=timeout, cancel=cancel)
@@ -384,6 +404,11 @@ class NativeOracleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(completed, ["through CV" if without_finished else "server flight"])
         decoded = json.loads(result.stdout)
+        self.assertEqual(decoded["testWork"]["contextBuilds"], 1)
+        self.assertEqual(decoded["testWork"]["contextHits"], 0)
+        self.assertEqual(decoded["testWork"]["contextHexDecodes"], 2)
+        self.assertEqual(decoded["testWork"]["timeChecks"], 1)
+        self.assertEqual(decoded["testWork"]["proofSerializations"], int(not mutation and not target_miss))
         if mutation:
             self.assertFalse(decoded["validationPassed"])
             self.assertFalse(decoded["validProof"])
@@ -395,6 +420,12 @@ class NativeOracleTests(unittest.TestCase):
         self.assertTrue(decoded["captured"])
         self.assertTrue(decoded["validationPassed"])
         self.assertTrue(decoded["validProof"])
+        self.assertEqual(decoded["errorCode"], "")
+        if target_miss:
+            self.assertFalse(decoded["meetsTarget"])
+            self.assertEqual(decoded["proof"], "")
+            self.assertEqual(decoded["testWork"]["serializedBytes"], 0)
+            return decoded
         self.assertTrue(decoded["meetsTarget"])
         proof = dataclasses.replace(context, proof=bytes.fromhex(decoded["proof"]))
         verify_connection_proof(proof, self.roots, enforce_root_pin=False)
@@ -407,6 +438,14 @@ class NativeOracleTests(unittest.TestCase):
                 second = self.loopback(rsa_leaf=rsa_leaf)
                 # Same challenge is intentional; ephemeral ECDHE must not repeat.
                 self.assertNotEqual(split_messages(first.proof)[0], split_messages(second.proof)[0])
+
+    def test_target_misses_keep_valid_counts_without_serialization_and_still_validate(self):
+        for rsa_leaf in (False, True):
+            with self.subTest(rsa_leaf=rsa_leaf):
+                self.loopback(rsa_leaf=rsa_leaf, without_finished=True, target_miss=True)
+        for mutation in ("certificate_signature", "cv_signature", "cv_mask"):
+            with self.subTest(mutation=mutation):
+                self.loopback(without_finished=True, mutation=mutation, target_miss=True)
 
     def test_capture_succeeds_with_server_finished_withheld(self):
         for rsa_leaf, restricted_pss, scheme in ((False, False, 0x0403), (True, False, 0x0804), (False, True, 0x0809)):

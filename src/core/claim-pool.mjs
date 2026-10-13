@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { getClaimsHelper, validateClaimContext } from './claims.mjs';
 import { diagnosticProcessExit } from './diagnostics.mjs';
 import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
+import { CLAIMS_ROOT_SHA256, CLAIMS_MBEDTLS_VERSION } from './claims-helper-policy.mjs';
 
 export const CONNECTION_DEFAULTS = Object.freeze({ connectionsPerSecond: 100, concurrency: 100 });
 export function validateConnectionOptions(input = {}) {
@@ -15,6 +16,7 @@ const MAX_COUNTER = (1n << 64n) - 1n;
 const ATTEMPT_MESSAGES = new Set([
   'TLS capture cancelled', 'TLS connection timed out',
   'TLS capture or proof validation failed', 'Public DNS resolution is required',
+  'Local network endpoint is temporarily unavailable', 'Local IP family is unsupported', 'Local network route is unavailable',
 ]);
 function counter(value) {
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,19})$/.test(value) || BigInt(value) > MAX_COUNTER) throw new Error('Invalid helper connection counter');
@@ -34,13 +36,14 @@ export class ConnectionPool {
     this.options = validateConnectionOptions(options);
     const runtime = this.helper ?? getClaimsHelper({ basePath: this.basePath, resourcesPath: this.resourcesPath });
     if (!runtime) throw new Error('Automatic Claims helper is not installed. Run npm run build:claims.');
+    this.requireNative = runtime.native === true;
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
     this.closed = new Promise(resolve => { this.closedResolve = resolve; });
     this.startedAt = performance.now();
     const allowed = new Set(['path', 'systemroot', 'systemdrive', 'windir', 'temp', 'tmp', 'tmpdir', 'home', 'userprofile', 'localappdata', 'appdata', 'user', 'username', 'lang', 'lc_all', 'tz']);
     const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toLowerCase())));
     try {
-      this.child = this.spawnProcess(runtime.command, [...runtime.args ?? [], '--service'], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
+      this.child = this.spawnProcess(runtime.command, [...runtime.args ?? [], '--service', ...(runtime.native ? ['--require-native-mbedtls'] : [])], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
       this.buffer = ''; this.stderrBytes = 0;
       this.child.once('error', error => { this.fail(new Error('Claims helper could not start', { cause: error })); this.closedResolve(); });
       this.child.stdin.on('error', error => { if (!this.closing) this.fail(new Error(`Claims helper input failed: ${error.message}`)); });
@@ -124,7 +127,9 @@ export class ConnectionPool {
   receive(message) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('Malformed claims helper response');
     if (message.type === 'ready') {
-      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64) {
+      if (this.started || message.protocol !== 4 || message.roots !== 1 || message.security?.rsaPublicExponentMaxBits !== 64 ||
+          (this.requireNative && (message.security?.provider !== 'mbedtls' ||
+            message.security?.mbedtlsVersion !== CLAIMS_MBEDTLS_VERSION || message.security?.rootsSha256 !== CLAIMS_ROOT_SHA256))) {
         throw new Error('Incompatible claims helper: validated observations require protocol 4 and a 64-bit RSA public-exponent limit. Update the app or run npm run build:claims.');
       }
       this.started = true; clearTimeout(this.startTimer);
@@ -159,7 +164,7 @@ export class ConnectionPool {
     const minimum = BigInt(request.body.successfulConnections) + (message.captured ? 1n : 0n);
     if (BigInt(message.successfulConnections) < (minimum > MAX_COUNTER ? MAX_COUNTER : minimum)) throw new Error('Helper connection counter moved backwards');
     if (message.type === 'capture') {
-      if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs')) throw new Error('Invalid blocked capture observation');
+      if (Object.hasOwn(message, 'blocked') || Object.hasOwn(message, 'retryAfterMs') || Object.hasOwn(message, 'localUnavailable')) throw new Error('Invalid blocked capture observation');
       if (!request.started || request.capture) throw new Error('Unexpected or duplicate capture');
       request.capture = message; request.onCapture?.(message); return;
     }
@@ -169,6 +174,9 @@ export class ConnectionPool {
           message.verified !== false || message.validationPassed !== null || message.seconds !== 0) throw new Error('Invalid blocked helper result');
     }
     if (Object.hasOwn(message, 'retryAfterMs')) throw new Error('Unexpected endpoint retry delay');
+    if (Object.hasOwn(message, 'localUnavailable') && (message.localUnavailable !== true ||
+        message.captured || message.proof !== null || message.verified !== false || message.validationPassed === true ||
+        Object.hasOwn(message, 'blocked'))) throw new Error('Invalid local-unavailable helper result');
     if (request.capture && (request.capture.captured !== message.captured || request.capture.seconds !== message.seconds ||
         request.capture.successfulConnections !== message.successfulConnections)) throw new Error('Conflicting helper capture observation');
     if (![true, false, null].includes(message.validationPassed) ||

@@ -81,7 +81,7 @@ export class WalletService extends EventEmitter {
     this.accountDerivation = null;
     this.balance = null; this.qrDataUrl = null; this.error = null; this.rpc = null;
     this.network = { status: 'offline', chain: network, height: null };
-    this.claimBlocks = new Map(); this.claimCursor = null; this.claimInfo = {}; this.retiredClaims = new Map(); this.tip = null;
+    this.claimBlocks = new Map(); this.claimCursor = null; this.claimWindow = null; this.claimInfo = {}; this.retiredClaims = new Map(); this.tip = null;
     this.reserved = new Set(); this.fundingCache = new Map(); this.fundingPending = new Map(); this.lastActivity = Date.now(); this.persisting = Promise.resolve();
     this.statePublisher = new StatePublisher({ publish: () => this.emit('state', this.getState()) });
     this.statePriority = null;
@@ -112,7 +112,7 @@ export class WalletService extends EventEmitter {
     this.batchFundingSupported = undefined;
     this.rpc?.close(); this.refreshing = null; this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
-    this.tip = null;
+    this.tip = null; this.claimWindow = null;
     this.confirmationTip = null; this.confirmationsStale = false; this.walletChainRevision = 0;
     this.liveUpdateWarning = null;
     this.network = { status: 'offline', chain: this.config.network, height: null };
@@ -155,6 +155,8 @@ export class WalletService extends EventEmitter {
           this.addressSync = null; this.addressSyncPending = null;
           // Reject an in-flight pre-reorg snapshot before it can resume workers.
           this.claimRevision++; this.claimCursor = null; this.claimBlocks.clear();
+          // Keep only the immutable hash anchor. With no cursor, discovery
+          // must fetch a fresh prefix and reload the complete bounty catalog.
           this.claimSuspending = this.engine.suspend();
         } else if (tip) {
           this.observeConfirmationTip(tip);
@@ -191,7 +193,7 @@ export class WalletService extends EventEmitter {
       this.claimRevision++; this.claimToggleGeneration++;
       this.walletUpdateRevision++;
       this.walletChainRevision++; this.confirmationsStale = true;
-      this.tip = null;
+      this.tip = null; this.claimWindow = null;
       this.confirmationTip = null;
       this.network.status = 'offline';
       this.cancelSendPreview();
@@ -215,7 +217,7 @@ export class WalletService extends EventEmitter {
       options: { connectionsPerSecond: this.config.claims.maxConnectionsPerSecond, concurrency: this.config.claims.maxConcurrent },
       onState: state => {
         this.claimInfo = state;
-        for (const [key, row] of this.retiredClaims) if (!this.engine?.hasActive(key)) {
+        for (const [key, row] of this.retiredClaims) if (!this.engine?.hasActive(key) && !this.engine?.pendingProofs?.has(key)) {
           if (this.claimOutpoints?.get(key) === row) this.claimOutpoints.delete(key);
           this.retiredClaims.delete(key);
         }
@@ -525,7 +527,7 @@ export class WalletService extends EventEmitter {
     const epoch = this.epoch;
     this.session = null; this.accounts = []; this.utxos = []; this.history = []; this.balance = null; this.qrDataUrl = null;
     this.tip = null; this.retiredClaims.clear();
-    this.fundingCache.clear(); this.fundingPending.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.reserved.clear(); this.clearAccountDerivation();
+    this.fundingCache.clear(); this.fundingPending.clear(); this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.claimWindow = null; this.reserved.clear(); this.clearAccountDerivation();
     // Install an idle client while still locked. Password entry can finish
     // before a slow claims helper drains; that newer session must not inherit
     // the permanently closed RPC/live-update objects from the previous one.
@@ -1215,7 +1217,7 @@ export class WalletService extends EventEmitter {
       if (reconnect) {
         this.cancelSendPreview(); this.epoch++; this.replacement = null; this.setup = null;
         this.rpc?.close(); this.refreshing = null;
-        this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null;
+        this.claimBlocks.clear(); this.claimOutpoints?.clear(); this.claimCursor = null; this.claimWindow = null;
         this.retiredClaims.clear(); this.fundingCache.clear(); this.fundingPending.clear();
         this.connectClient();
       }
@@ -1353,13 +1355,13 @@ export class WalletService extends EventEmitter {
     check(); this.scanningBounties = true; this.emitState();
     const result = await discoverBounties({
       rpc, network: this.config.network, lookback: this.config.claims.lookbackBlocks,
-      previous: this.claimBlocks, cursor: this.claimCursor, check,
+      previous: this.claimBlocks, previousWindow: this.claimWindow, cursor: this.claimCursor, check,
       onInvalidate: (row, reason) => reason === 'window_exit' ? engine.retire(row.txid, row.vout) : engine.remove(row.txid, row.vout),
       onWindow: snapshot => {
         // A retained in-flight row is no longer in the discovery block cache.
         // Still cancel it if a subsequent window reveals its block was replaced.
         const canonical = new Map(snapshot.blocks.map(block => [block.height, block.hash]));
-        for (const key of engine.activeKeys()) {
+        for (const key of new Set([...engine.activeKeys(), ...engine.pendingProofs?.keys() ?? []])) {
           const row = this.claimOutpoints?.get(key);
           if (!row) continue;
           const blockHash = canonical.get(row.block_height);
@@ -1373,17 +1375,24 @@ export class WalletService extends EventEmitter {
     const available = [], outpoints = new Map();
     for (const rows of result.blocks.values()) for (const row of rows) {
       const key = bountyKey(row); outpoints.set(key, row);
-      if (row.status === 'available' && row.root_certificates_version === 1 && !this.reserved.has(key)) available.push(row);
-      else engine.remove(row.txid, row.vout);
+      if (row.status === 'available' && row.root_certificates_version === 1) {
+        if (!this.reserved.has(key)) available.push(row);
+        // An automatic submission reserves its own outpoint before waiting for
+        // RPC quota/capacity. That local lock is not evidence of an unavailable
+        // bounty: keep its verified winner, but never admit duplicate work.
+        else if (!(engine.queue.get(key)?.submitting && engine.pendingProofs.has(key))) engine.remove(row.txid, row.vout);
+      } else engine.remove(row.txid, row.vout);
     }
     // Only already-running, normally aged-out work can outlive discovery.
     // Preserve each outpoint until all its captures/submission have settled.
     for (const [key, row] of this.claimOutpoints ?? []) if (!outpoints.has(key)) {
-      if (engine.hasActive(key) && engine.queue.get(key)?.retired) {
+      if ((engine.hasActive(key) || engine.pendingProofs?.has(key)) && engine.queue.get(key)?.retired) {
         outpoints.set(key, row); this.retiredClaims.set(key, row);
       } else engine.remove(row.txid, row.vout);
     }
-    check(); this.claimBlocks = result.blocks; this.claimOutpoints = outpoints; this.claimCursor = result.cursor;
+    // Hashes, bounty rows and cursor are one committed discovery snapshot.
+    // A failed/cancelled cycle must never publish its intermediate prefix.
+    check(); this.claimBlocks = result.blocks; this.claimOutpoints = outpoints; this.claimCursor = result.cursor; this.claimWindow = result.window;
     this.tip = validateTip(result.tip, this.config.network);
     engine.retainCatalog(outpoints.values());
     engine.enqueue(available);
@@ -1429,11 +1438,17 @@ export class WalletService extends EventEmitter {
     const signed = attachClaimProof(prepared, proof); check();
     this.reserved.add(key);
     try {
-      const result = await prepared.rpc.request('sendrawtransaction', { transaction_hex: signed.hex }, { signal });
+      const result = await prepared.rpc.request('sendrawtransaction', { transaction_hex: signed.hex }, {
+        signal, beforeSend: () => {
+          check();
+          const latest = this.claimOutpoints?.get(key);
+          if (!latest || latest.status !== 'available') throw new Error('Bounty availability changed before submitting its claim.');
+        },
+      });
       if (result?.txid !== signed.txid) throw new Error('RPC returned an unexpected claim transaction ID.');
       return { txid: signed.txid };
     } catch (error) {
-      if (error?.name === 'AbortError' && error.notSent === true && !error.unknownOutcome) {
+      if (error?.notSent === true && !error.unknownOutcome) {
         // The transport proves no bytes were submitted. STOP during pacing or
         // connection setup must neither reserve an unspent bounty indefinitely
         // nor report an uncertain broadcast. Sent requests keep their outcome.

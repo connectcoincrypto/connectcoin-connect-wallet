@@ -44,12 +44,62 @@ function observation(command, overrides = {}) {
   // Test captures are valid unless explicitly overridden by a validation test.
   return { ...value, validationPassed: value.started && !value.cancelled ? value.captured : null, ...overrides };
 }
+
+test('auto-selected native helpers reject stale Python metadata before any requests', async t => {
+  const { pool, commands } = fixture(t, () => {}, { helper: { command: 'native-helper', args: [], native: true } });
+  await assert.rejects(pool.start({}), /Incompatible claims helper/);
+  assert.deepEqual(commands.map(command => command.type), ['start']);
+});
+
+test('explicit native helper accepts only the pinned Mbed TLS provider', async t => {
+  const { pool, children } = fixture(t, () => {}, { autoReady: false, helper: { command: 'native-helper', args: [], native: true } });
+  const ready = pool.start({});
+  children[0].send({ type: 'ready', protocol: 4, roots: 1,
+    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64,
+      rootsSha256: 'f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9' } });
+  await ready;
+  assert.equal(pool.started, true);
+});
+
+for (const rootsSha256 of [undefined, '0'.repeat(64)]) test('native helper rejects missing or changed consensus roots', async t => {
+  const { pool, children, commands } = fixture(t, () => {}, { autoReady: false, helper: { command: 'native-helper', args: [], native: true } });
+  const rejected = assert.rejects(pool.start({}), /Incompatible claims helper/);
+  children[0].send({ type: 'ready', protocol: 4, roots: 1,
+    security: { provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64, rootsSha256 } });
+  await rejected;
+  assert.deepEqual(commands.map(command => command.type), ['start']);
+});
 function complete(command, child, overrides = {}) {
   const value = observation(command, overrides);
   child.send({ type: 'started', id: command.id });
   child.send({ type: 'capture', ...value });
   child.send({ type: 'attempt', ...value, proof: '020100', verified: true });
 }
+
+test('capture frames may overtake other requests without changing each request counter snapshot', async t => {
+  const pending = [];
+  const { pool, children } = fixture(t, command => pending.push(command));
+  await pool.start({ connectionsPerSecond: 400, concurrency: 3 });
+  const captures = [], starts = [];
+  const requests = Array.from({ length: 3 }, () => pool.attempt(context(), {
+    bountyId, successfulConnections: 7n,
+    onStarted: () => starts.push(true), onCapture: frame => captures.push(frame.successfulConnections),
+  }));
+  const child = children[0];
+  for (const command of pending) child.send({ type: 'started', id: command.id });
+  // Accounting happened 8,9,10, but independent workers acquire the output
+  // lock in a different order. Each request still emits capture before result.
+  const frames = pending.map((command, index) => observation(command, { successfulConnections: String(8 + index) }));
+  for (const index of [2, 0, 1]) child.send({ type: 'capture', ...frames[index] });
+  for (const index of [1, 2, 0]) child.send({ type: 'attempt', ...frames[index], proof: null, verified: false });
+  const results = await Promise.all(requests);
+  assert.equal(starts.length, 3);
+  assert.deepEqual(captures, ['10', '8', '9']);
+  assert.deepEqual(results.map(frame => frame.successfulConnections), ['8', '9', '10']);
+  assert.ok(results.every(frame => frame.validationPassed === true));
+  assert.equal(pool.failure, undefined);
+  assert.equal(pool.requests.size, 0);
+});
 
 test('exhausted capture budget is a no-start result, not an attempt or failed observation', async t => {
   const { pool } = fixture(t, (command, child) => child.send({ type: 'attempt', ...observation(command, {
@@ -289,6 +339,34 @@ for (const [message, expected, category] of [
   assert.equal(children[0].killed, false);
   assert.equal(pool.requests.size, 0);
 });
+
+for (const started of [false, true]) test(`local route limitation preserves its actual TCP start: ${started}`, async t => {
+  const { pool } = fixture(t, (command, child) => {
+    const value = observation(command, { started, captured: false, seconds: started ? 0.1 : 0,
+      successfulConnections: command.successfulConnections });
+    if (started) { child.send({ type: 'started', id: command.id }); child.send({ type: 'capture', ...value }); }
+    child.send({ type: 'attempt', ...value, proof: null, verified: false, localUnavailable: true,
+      message: 'Local network route is unavailable' });
+  });
+  await pool.start({}); let starts = 0;
+  const result = await pool.attempt(context(), { bountyId, successfulConnections: 3n, onStarted: () => starts++ });
+  assert.equal(starts, Number(started)); assert.equal(result.localUnavailable, true);
+  assert.equal(result.validationPassed, started ? false : null);
+  assert.equal(result.successfulConnections, '3'); assert.equal(pool.failure, undefined);
+});
+
+for (const overrides of [{ localUnavailable: 'true' }, { localUnavailable: false },
+  { captured: true }, { validationPassed: true }, { proof: '020100', verified: true }, { blocked: 'budget' }]) {
+  test(`local-unavailable marker cannot conceal invalid proof state ${JSON.stringify(overrides)}`, async t => {
+    const { pool } = fixture(t, (command, child) => {
+      const value = observation(command, { captured: false, successfulConnections: command.successfulConnections });
+      child.send({ type: 'started', id: command.id }); child.send({ type: 'capture', ...value });
+      child.send({ type: 'attempt', ...value, proof: null, verified: false, localUnavailable: true, ...overrides });
+    });
+    await pool.start({});
+    await assert.rejects(pool.attempt(context(), { bountyId }), error => error.helperFatal === true);
+  });
+}
 
 test('fatal helper error frames never expose arbitrary message text', async t => {
   const { pool, children } = fixture(t, (_command, child) => child.send({ type: 'error', message: 'private-peer-details: timed out' }));

@@ -18,7 +18,7 @@ typedef struct cw_claim_context {
 } cw_claim_context;
 
 typedef struct cw_claim_result {
-    char *proof_hex; /* At most 128 KiB hex plus NUL. Owned; free with cw_claim_result_free. */
+    char *proof_hex; /* NULL without a winning proof; otherwise at most 128 KiB hex plus NUL. Owned; free with cw_claim_result_free. */
     int32_t captured;
     int32_t validation_passed;
     int32_t valid_proof;

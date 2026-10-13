@@ -6,7 +6,7 @@ import { ClaimScheduler } from './claim-scheduler.mjs';
 import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES } from './claim-connection-policy.mjs';
 import { diagnosticError } from './diagnostics.mjs';
 import { claimPriority, selectionPriority, domainPriority, isWorthAttempting, compareClaimPriority, P2CDomainStats, validateAttemptStats,
-  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, isP2CClaimConnectionLimitExceeded, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
+  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, claimConnectionStopCount, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
 
 const keyOf = bounty => `${bounty.txid}:${bounty.vout}`;
 const policyOf = job => `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
@@ -92,7 +92,7 @@ export class ClaimsEngine {
   }
   beginOperation(stage, controller) {
     // Only active work is retained: at most 4 preparations, 2 DNS requests,
-    // the configured active captures and 4 submissions. No history is retained.
+    // the configured active captures and 4 submissions. No historical IDs or payloads are stored.
     const operation = { stage, controller, started: performance.now() };
     this.diagnosticOperations.add(operation); this.countDiagnostic('operationsStarted');
     return operation;
@@ -159,7 +159,7 @@ export class ClaimsEngine {
     const tracked = Promise.resolve(promise).finally(() => {
       const count = this.live.get(key) - 1; if (count) this.live.set(key, count); else this.live.delete(key);
       this.tasks.delete(tracked);
-      if (job.retired && !this.hasActive(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
+      if (job.retired && !this.hasActive(key) && !this.pendingProofs.has(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
       this.notify(); this.kick();
     });
     this.tasks.add(tracked); return tracked;
@@ -175,7 +175,16 @@ export class ClaimsEngine {
   updatePriority(job) {
     const net = job.prepared?.payout !== undefined ? BigInt(job.prepared.payout) : this.getNetReward(job.bounty);
     job.rawPriority = claimPriority(job.bounty.connection_work_target, net); job.priority = selectionPriority(job.rawPriority, job.factor);
-    job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+    job.budgetExceeded = this.connectionBudgetExceeded(job, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+  }
+  connectionBudgetExceeded(job, successes) {
+    const target = job.bounty.connection_work_target;
+    if (job.budgetTarget !== target || job.connectionStopCount === undefined) {
+      job.connectionStopCount = claimConnectionStopCount(target); job.budgetTarget = target;
+    }
+    if (typeof successes === 'number' && Number.isSafeInteger(successes)) successes = BigInt(successes);
+    if (typeof successes !== 'bigint' || successes < 0n) throw new Error('Invalid successful connection count');
+    return successes >= job.connectionStopCount;
   }
   connectionRate(job, cache) {
     const key = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
@@ -267,6 +276,10 @@ export class ClaimsEngine {
       keys.add(key); const job = this.queue.get(key) ?? [...this.connections.values()].find(item => keyOf(item.job.bounty) === key)?.job;
       if (job) { masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain); }
     }
+    // Verified work still owns its proposal after leaving the discovery window.
+    for (const [key, job] of this.queue) if (!job.unavailable && this.pendingProofs.has(key)) {
+      keys.add(key); masks.add(policyOf(job)); domains.add(job.bounty.domain);
+    }
     for (const map of [this.factors, this.successCounts, this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
     for (const key of this.domainStats.keys()) if (!masks.has(key)) this.domainStats.delete(key);
     for (const domain of this.dns.keys()) if (!domains.has(domain)) this.dns.delete(domain);
@@ -275,7 +288,7 @@ export class ClaimsEngine {
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
     // Legacy tooling only. Production observes every protocol-4 validation result.
-    // A truncated snapshot cannot reconstruct an EMA: never silently drop
+    // A truncated snapshot cannot reconstruct an performance history: never silently drop
     // missing observations as the former last-100 window permitted.
     validateAttemptStats(snapshot, Number.MAX_SAFE_INTEGER);
     if (!Number.isSafeInteger(previousCompleted) || previousCompleted < 0 ||
@@ -301,21 +314,20 @@ export class ClaimsEngine {
     const key = `${txid}:${vout}`, job = this.queue.get(key);
     if (!job || job.retired) return;
     job.retired = true; this.scheduler.remove(key);
-    if (!job.submitting) this.pendingProofs.delete(key);
     // Normal window exit does not cancel captures already on the wire.
     for (const request of this.connections.values()) if (request.job === job && !request.started) this.cancelOperation(request.controller, 'window-exit');
-    if (!this.hasActive(key)) this.queue.delete(key);
+    if (!this.hasActive(key) && !this.pendingProofs.has(key)) this.queue.delete(key);
     this.notify(); this.kick();
   }
   clear({ preserveSelection = false } = {}) {
     this.startIdle = true;
     for (const job of this.queue.values()) job.unavailable = true;
-    this.queue.clear(); this.completed.clear();
+    this.queue.clear();
     this.recoveryJobs.clear();
     this.waitingPrepare.clear(); this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
-    if (!preserveSelection) { this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
+    if (!preserveSelection) { this.completed.clear(); this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
     // A catalog resync keeps both activity totals. A full context reset must
     // clear both together so the UI never compares counters from different periods.
     this.notify(preserveSelection ? {} : { completed: 0, attempts: 0 });
@@ -404,6 +416,8 @@ export class ClaimsEngine {
       await this.poolReady;
     } else await this.poolReady;
     if (!this.enabled || this.paused || generation !== this.generation) return;
+    this.refreshPreparationReadiness();
+    this.refreshDnsReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
       // At least two pending starts let one slow admission be bypassed. The
@@ -482,7 +496,6 @@ export class ClaimsEngine {
       job.preparing = false; job.prepareController = null; this.preparing.delete(job); this.controllers.delete(controller);
       if (this.queue.get(key) === job && this.ready(job) && this.attemptable(job)) this.scheduler.setReady(key, true, { due: this.jobDue(job) });
       else this.scheduler.remove(key);
-      this.releasePreparationSlot();
     });
     void this.track(job, task);
   }
@@ -511,19 +524,23 @@ export class ClaimsEngine {
     if (observation.captured) {
       this.countDiagnostic('captures');
       const count = this.successCounts.get(key) ?? 0n;
-      // The raw-capture budget is independent of the validated domain EMA. Replies
+      // The raw-capture budget is independent of the validated domain performance history. Replies
       // from parallel workers may arrive out of order, so never add it twice.
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
         : BigInt(observation.successfulConnections);
       this.successCounts.set(key, observed > count ? observed : count);
-      job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(key));
+      job.budgetExceeded = this.connectionBudgetExceeded(job, this.successCounts.get(key));
       if (job.budgetExceeded) this.scheduler.remove(key); // Keep already-running attempts alive.
     }
   }
   observeResult(request, result) {
     if (request.resultObserved) throw new Error('Duplicate connection validation observation');
     request.resultObserved = true;
+    if (Object.hasOwn(result, 'localUnavailable') && (result.localUnavailable !== true ||
+        result.captured || result.proof !== null || result.verified !== false || result.validationPassed === true || result.blocked)) {
+      throw new Error('Invalid local-unavailable connection observation');
+    }
     if (![true, false, null].includes(result.validationPassed) ||
         typeof result.seconds !== 'number' || !Number.isFinite(result.seconds) || result.seconds < 0 || result.seconds > 3600 ||
         (result.validationPassed !== null && !result.started) ||
@@ -533,7 +550,9 @@ export class ClaimsEngine {
     }
     // Null means no conclusive observation, e.g. cancellation before validation.
     // A target miss is still true: work probability already enters rawPriority.
-    if (result.validationPassed === null) return;
+    // Machine-local route/family failures still count as failed started
+    // attempts, but say nothing about a remote domain's proof quality.
+    if (result.validationPassed === null || result.localUnavailable === true) return;
     const { job } = request;
     const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
     const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
@@ -565,7 +584,7 @@ export class ClaimsEngine {
       this.pendingRecovery.set(request.policy, request); this.scheduler.setReady(key, false);
     }
     // Reserve turns in dispatch order, not callback arrival order. A failure
-    // before TCP spends no attempt/EMA/probe cooldown, but cannot rewind turns
+    // before TCP spends no attempt/performance history/probe cooldown, but cannot rewind turns
     // already reserved by other concurrent requests.
     this.scheduler.commit(selection);
     const pool = this.pool;
@@ -650,34 +669,43 @@ export class ClaimsEngine {
     let due = Infinity;
     for (const [key, pending] of this.pendingProofs) {
       const job = this.queue.get(key);
-      if (job && !job.retired && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
+      if (job && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
     }
     return due;
   }
-  releasePreparationSlot() {
+  refreshPreparationReadiness() {
+    if (this.preparing.size >= 4) return;
+    // Capacity is not a reservation: removing a woken candidate must not strand
+    // the remaining waiters. The pump still enforces four preparations.
     for (const job of this.waitingPrepare) {
       this.waitingPrepare.delete(job); job.waitingPrepare = false;
       const key = keyOf(job.bounty);
-      if (this.queue.get(key) !== job || !this.ready(job)) continue;
-      if (this.scheduler.setReady(key, true, { due: this.jobDue(job) }) && this.jobDue(job) <= Date.now()) break;
+      if (this.queue.get(key) !== job) continue;
+      this.scheduler.setReady(key, this.ready(job) && this.attemptable(job), { due: this.jobDue(job) });
     }
   }
-  releaseDnsSlot() {
+  refreshDnsReadiness() {
+    if (this.resolving.size >= 2) return;
+    // Waking a domain does not reserve a resolution slot. Reopen all capacity
+    // waiters so removing a woken candidate cannot strand the others forever.
+    // The pump still enforces two resolutions and each cached DNS deadline.
     for (const domain of this.waitingDns) {
+      if (this.resolving.has(domain)) continue;
       this.waitingDns.delete(domain);
       // Remove a remembered closed gate even if a rebuild excluded all of its
       // candidates. Otherwise a later eligible candidate would stay stuck.
       this.scheduler.domainGates.delete(domain);
-      if (this.scheduler.setDomainReady(domain, true) && this.scheduler.groups.get(domain)?.ready.total) break;
+      this.scheduler.setDomainReady(domain, true);
     }
   }
+  releaseDnsSlot() { this.refreshDnsReadiness(); }
   retrySubmissions(generation) {
     // At most 256 cached proposals. A proof retry never spends a TLS slot or
     // resets the successful-capture budget/challenge.
     for (const [key, pending] of this.pendingProofs) {
       if (this.submitting.size >= 4) return;
       const job = this.queue.get(key);
-      if (!job || job.retired || job.unavailable || job.submitting || pending.due > Date.now()) continue;
+      if (!job || job.unavailable || job.submitting || pending.due > Date.now()) continue;
       const controller = new AbortController(); this.controllers.add(controller);
       const task = this.submitVerified(job, controller, generation).finally(() => this.controllers.delete(controller));
       void this.track(job, task);
@@ -707,7 +735,7 @@ export class ClaimsEngine {
     } catch (error) {
       this.finishOperation(operation, error.name === 'AbortError' && !error.unknownOutcome ? 'cancelled' : 'failed');
       if (error.unknownOutcome || error.helperFatal) { this.fatal(error); return; }
-      if (job.retired || job.unavailable) this.pendingProofs.delete(key);
+      if (job.unavailable) this.pendingProofs.delete(key);
       if (error.name !== 'AbortError') {
         this.jobError(job, error, 'submit', true, { durationMs: Math.round(performance.now() - started), attempts: 1 });
         pending.due = job.due; pending.failures = job.failures;

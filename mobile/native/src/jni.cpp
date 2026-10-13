@@ -15,7 +15,7 @@ void Error(JNIEnv* env,const char* code) {
     if(env->ExceptionCheck()) return;
     // Never return implementation/path/OS exception strings to the renderer.
     bool known=false;
-    for(auto allowed:{"CLAIM_CONTEXT","CLAIM_MEMORY","CLAIM_CANCELLED","CLAIM_TIMEOUT","CLAIM_BUSY","CLAIM_NETWORK","CLAIM_DNS","CLAIM_TLS","CLAIM_CERTIFICATE","CLAIM_CRYPTO","CLAIM_NATIVE"}) {
+    for(auto allowed:{"CLAIM_CONTEXT","CLAIM_MEMORY","CLAIM_CANCELLED","CLAIM_TIMEOUT","CLAIM_BUSY","CLAIM_NETWORK","CLAIM_LOCAL_UNAVAILABLE","CLAIM_DNS","CLAIM_TLS","CLAIM_CERTIFICATE","CLAIM_CRYPTO","CLAIM_NATIVE"}) {
         if(std::string_view(code)==allowed) { known=true; break; }
     }
     if(!known) code="CLAIM_NATIVE";

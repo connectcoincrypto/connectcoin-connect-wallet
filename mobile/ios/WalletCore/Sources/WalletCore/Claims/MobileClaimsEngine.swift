@@ -6,7 +6,6 @@ import CConnectWallet
 /// automatic startup. The runtime supplies a natively derived reward address.
 public actor MobileClaimsEngine {
     private static let maximum: Int64 = 9_007_199_254_740_991
-    private static let genesis = "30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e"
     private let rpc: MobileRpcClient
     private let receiptURL: URL
     private let network = NWPathMonitor()
@@ -17,6 +16,7 @@ public actor MobileClaimsEngine {
     private var enabled = false, allowed = false, closed = false, healthy = false, unknownBlocked = false
     private var epoch: UInt64 = 0, run: UInt64 = 0, nextCapture: UInt64 = 0
     private var address = "", cursor: String?, tip: JSONObject?
+    private var recentWindow: ClaimRecentWindow?
     private var status = "stopped", lastError = "", lastTxid = "", receiptStatus = ""
     private var lastRpcError: JSONObject?
     private var rate = 100, concurrency = 100
@@ -28,7 +28,7 @@ public actor MobileClaimsEngine {
     private var dirty = true, admissionIdle = true
     private var blocks: [String: Int64] = [:], blockOrder: [String] = [], loaded = Set<String>()
     private var catalog: [String: ClaimCandidate] = [:], progress: [String: ClaimProgress] = [:]
-    private var stats: [String: ClaimEMA] = [:]
+    private var stats: [String: ClaimPerformanceWindow] = [:]
     private var scheduler = ClaimScheduler(), retired = Set<String>(), reservations = Set<String>()
     private var parentCache: [String: String] = [:], parentOrder: [String] = []
     private var parentBytes = 0
@@ -39,10 +39,18 @@ public actor MobileClaimsEngine {
         var started = false, cancelled = false
     }
     private var active: [UInt64: Capture] = [:]
-    private struct Winner {
-        let row: ClaimCandidate, prepared: JSONObject, proof: String, epoch: UInt64
-        let permit: RpcBroadcastPermit
+    private final class Winner {
+        let row: ClaimCandidate, epoch: UInt64
+        var retry: ClaimSubmissionRetry
+        var permit: RpcBroadcastPermit
+        init(row: ClaimCandidate, completed: JSONObject, epoch: UInt64, validUntil: Double) throws {
+            self.row = row; self.epoch = epoch
+            retry = ClaimSubmissionRetry(hex: try PJ.string(completed["hex"]), txid: try PJ.hash(completed["txid"]))
+            permit = RpcBroadcastPermit(validUntil: validUntil)
+        }
     }
+    // Admission stops at 100 reservations. At most 100 captures already in
+    // flight can finish, so retained public proofs are bounded by 200 total.
     private var winners: [Winner] = [], transmitting: Winner?
     private var submissionTask: Task<Void, Never>?
 
@@ -124,7 +132,7 @@ public actor MobileClaimsEngine {
         attempts = 0; valid = 0; invalid = 0; hits = 0; submitted = 0; unknown = 0; cancelled = 0
         elapsed = 0; recentStarts.removeAll(); activeSince = nil
         blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); catalog.removeAll(); scheduler.clear()
-        cursor = nil; tip = nil; healthy = false; dirty = true; catalogAt = 0
+        cursor = nil; tip = nil; recentWindow = nil; healthy = false; dirty = true; catalogAt = 0
         lastError = ""; lastRpcError = nil; nextDiscovery = 0; nextBlock = 0; nextPreparation = 0; retryAt = 0
         status = "paused"; refreshAllowed()
         if dispatchTask == nil {
@@ -188,11 +196,7 @@ public actor MobileClaimsEngine {
         try record(expected, "submitted"); unknownBlocked = false; lastError = ""; stop(); return state()
     }
     private static func validateTip(_ value: Any?) throws -> JSONObject {
-        let value = try PJ.object(value)
-        try walletRequire(value["chain"] as? String == "main" && value["genesis_hash"] as? String == genesis, "CLAIMS_WRONG_NETWORK")
-        _ = try PJ.hash(value["hash"]); _ = try PJ.integer(value["height"], 0, maximum)
-        _ = try PJ.integer(value["mediantime"], 1, 253_402_300_799)
-        return value
+        try ClaimRecentWindow.Tip(value).json
     }
     private func request(_ method: String, _ params: JSONObject, _ token: UInt64) async throws -> JSONObject {
         try check(token)
@@ -203,9 +207,6 @@ public actor MobileClaimsEngine {
             }
             throw failure
         }
-    }
-    private func validCursor(_ value: Any?) throws -> String {
-        let text = try PJ.string(value); try walletRequire(PJ.matches(text, "[A-Za-z0-9_.-]{1,1024}"), "CLAIMS_RPC_DATA"); return text
     }
     private func launchMaintenance() {
         guard maintenanceTask == nil else { return }
@@ -230,25 +231,7 @@ public actor MobileClaimsEngine {
         catch { handleReadFailure(error, token) }
     }
     private func discover(_ token: UInt64) async throws {
-        var start = cursor
-        if start == nil {
-            let watermark = try await request("getbountychanges", [:], token)
-            _ = try Self.validateTip(watermark["tip"])
-            try walletRequire(try PJ.array(watermark["changes"]).isEmpty && !PJ.bool(watermark["has_more"]), "CLAIMS_RPC_DATA")
-            start = try validCursor(watermark["next_cursor"])
-        }
-        let response = try await request("getrecentblockhashes", [:], token)
-        let snapshot = try Self.validateTip(response["tip"]), height = try PJ.integer(snapshot["height"])
-        let list = try PJ.objects(response["blocks"])
-        try walletRequire(try PJ.integer(response["window"]) == 600 && list.count == min(600, height + 1), "CLAIMS_RPC_DATA")
-        var nextBlocks: [String: Int64] = [:], order: [String] = []
-        for (index, row) in list.enumerated() {
-            let hash = try PJ.hash(row["hash"])
-            try walletRequire(try PJ.integer(row["height"]) == height - Int64(index) && nextBlocks[hash] == nil, "CLAIMS_RPC_DATA")
-            if index == 0 { try walletRequire(hash == snapshot["hash"] as? String, "CLAIMS_RPC_DATA") }
-            nextBlocks[hash] = height - Int64(index); order.append(hash)
-        }
-        try await replay(token, recent: nextBlocks, recentOrder: order, start: start)
+        try await replay(token)
         nextDiscovery = now() + 10
     }
     private func loadBlock(_ hash: String, _ token: UInt64) async throws {
@@ -261,7 +244,7 @@ public actor MobileClaimsEngine {
             guard chunk["type"] as? String == "bounties" else { continue }
             for item in try PJ.objects(chunk["items"]) {
                 var candidate = try ClaimCandidate(item, block: hash, fee: NativeTransactions.claimFee(1500))
-                try walletRequire(blocks[hash] == candidate.height && staged[candidate.key] == nil && staged.count < 10_000, "CLAIMS_CAPACITY")
+                try walletRequire(blocks[hash] == candidate.height && staged[candidate.key] == nil && staged.count < ClaimSubmissionRetry.maximumCatalogEntries, "CLAIMS_CAPACITY")
                 if let previous = progress[candidate.key] { candidate.progress = previous }
                 staged[candidate.key] = candidate
             }
@@ -269,58 +252,25 @@ public actor MobileClaimsEngine {
         try await replay(token, newBlock: hash, staged: staged)
         nextBlock = now() + 1.5
     }
-    private func replay(_ token: UInt64, newBlock: String? = nil, staged: [String: ClaimCandidate] = [:],
-                        recent: [String: Int64]? = nil, recentOrder: [String]? = nil, start: String? = nil) async throws {
+    private func replay(_ token: UInt64, newBlock: String? = nil, staged: [String: ClaimCandidate] = [:]) async throws {
         try check(token)
         let began = now()
-        var next = catalog.filter { recent == nil || recent![$0.value.block] != nil }
-        for (key, source) in staged {
-            var row = source
-            if let previous = next[key] { row.progress = previous.progress }
-            next[key] = row
-        }
-        try walletRequire(next.count <= 10_000, "CLAIMS_CAPACITY")
-        var nextCursor = start ?? cursor, nextTip = tip, more = true, lastSequence: Int64 = -1
-        for _ in 0..<20 {
-            guard more, let current = nextCursor else { break }
-            let response = try await request("getbountychanges", ["cursor": current], token)
-            nextTip = try Self.validateTip(response["tip"])
-            let events = try PJ.objects(response["changes"])
-            more = try PJ.bool(response["has_more"])
-            let following = try validCursor(response["next_cursor"])
-            try walletRequire(events.count <= 500 && (!more || !events.isEmpty && following != current), "CLAIMS_RPC_DATA")
-            for event in events {
-                let sequence = try PJ.integer(event["sequence"], 0, Self.maximum)
-                try walletRequire(sequence > lastSequence, "CLAIMS_RPC_DATA"); lastSequence = sequence
-                let key = try PJ.outpoint(event), kind = try PJ.string(event["type"])
-                switch kind {
-                case "window_exit": next.removeValue(forKey: key)
-                case "added": _ = try PJ.hash(event["block_hash"]); _ = try PJ.integer(event["block_height"], 0, Self.maximum)
-                case "spent", "pending_spend": _ = try PJ.hash(event["spending_txid"]); next[key]?.state = kind
-                case "available_again", "matured":
-                    if var row = next[key], row.state != "spent", kind == "available_again" || row.state == "immature" {
-                        row.state = try row.coinbase && PJ.integer(nextTip!["height"]) - row.height + 1 < 100 ? "immature" : "available"
-                        next[key] = row
-                    }
-                default: throw WalletError("CLAIMS_RPC_DATA")
-                }
+        let result = try await ClaimDiscoveryReplay.read(known: recentWindow, cursor: cursor, catalog: catalog,
+            loaded: loaded, newBlock: newBlock, staged: staged) { method, params in
+                try await self.request(method, params, token)
             }
-            nextCursor = following
-        }
-        try walletRequire(!more, "CLAIMS_SYNC_BUSY"); try check(token)
-        if let newBlock { try walletRequire(blocks[newBlock] != nil, "CLAIMS_SYNC_BUSY") }
-        let nextBlocks = recent ?? blocks
-        var nextLoaded = loaded.intersection(Set(nextBlocks.keys)); if let newBlock { nextLoaded.insert(newBlock) }
+        try check(token)
+        let next = result.catalog, nextLoaded = result.loaded, nextBlocks = result.window.heights
         var nextProgress = progress
         for row in next.values { nextProgress[row.key] = row.progress }
         let protected = reservations.union(Set(active.values.map { $0.selection.row.key }))
         nextProgress = nextProgress.filter { key, item in protected.contains(key) || nextBlocks[item.block] != nil && (!nextLoaded.contains(item.block) || next[key] != nil) }
-        try walletRequire(nextProgress.count <= 10_100, "CLAIMS_CAPACITY")
-        blocks = nextBlocks; if let recentOrder { blockOrder = recentOrder }
+        try walletRequire(ClaimSubmissionRetry.validProgressCount(nextProgress.count), "CLAIMS_CAPACITY")
+        blocks = nextBlocks; blockOrder = result.window.order; recentWindow = result.window
         loaded = nextLoaded; catalog = next; progress = nextProgress
         let policies = Set(nextProgress.values.map(\.policy)); stats = stats.filter { policies.contains($0.key) }
         retired = retired.intersection(Set(progress.keys).union(reservations))
-        cursor = nextCursor; tip = nextTip; healthy = true; catalogAt = began; dirty = true
+        cursor = result.cursor; tip = result.window.tip.json; healthy = true; catalogAt = began; dirty = true
         lastRpcError = nil; lastError = ""; invalidateQueued()
     }
     private func prepare(_ row: ClaimCandidate, _ token: UInt64) async throws {
@@ -364,7 +314,7 @@ public actor MobileClaimsEngine {
             } ?? false
             if !transient {
                 healthy = false; epoch &+= 1; cancelCaptures(); resetAdmission(); acknowledgeStarts(); invalidateQueued()
-                if code == "-32011" {
+                if ["-32011", "-32004"].contains(code) {
                     catalog.removeAll(); blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); scheduler.clear()
                     cursor = nil; tip = nil; catalogAt = 0; dirty = true
                 }
@@ -385,9 +335,18 @@ public actor MobileClaimsEngine {
         }
     }
     private func invalidateQueued() {
-        for winner in winners + (transmitting.map { [$0] } ?? []) {
-            if !enabled || !allowed || !fresh || winner.epoch != epoch || catalog[winner.row.key]?.state != "available" { winner.permit.cancel() }
+        if let transmitting, !winnerCurrent(transmitting) { transmitting.permit.cancel() }
+        winners.removeAll { winner in
+            guard !winnerCurrent(winner) else { return false }
+            winner.permit.cancel(); reservations.remove(winner.row.key)
+            retired.remove(winner.row.key); dirty = true
+            return true
         }
+    }
+    private func winnerCurrent(_ winner: Winner) -> Bool {
+        !closed && enabled && allowed && !unknownBlocked && winner.epoch == epoch &&
+            reservations.contains(winner.row.key) &&
+            ClaimSubmissionRetry.matchesAvailableBounty(catalog[winner.row.key], captured: winner.row)
     }
     private func acknowledge(_ id: UInt64) {
         guard var capture = active[id], !capture.started else { return }
@@ -402,6 +361,7 @@ public actor MobileClaimsEngine {
     private func dispatchTick() -> UInt64 {
         if now() >= nextAck { acknowledgeStarts() }
         if !fresh { cancelCaptures(); invalidateQueued(); admissionIdle = true }
+        launchSubmission()
         guard !closed && enabled && allowed && !unknownBlocked && fresh && reservations.count < 100 else { admissionIdle = true; return 100_000_000 }
         guard active.count < concurrency && now() >= nextAdmission else { return 2_000_000 }
         refreshSchedule()
@@ -409,13 +369,14 @@ public actor MobileClaimsEngine {
         let row = selected.row
         guard available(row.key) && row.budget else { scheduler.remove(row.key); return 2_000_000 }
         if !selected.recovering && !ClaimScheduler.worth(row, rate: stats[row.policy]?.rate ?? 5) { dirty = true; return 2_000_000 }
-        if stats[row.policy] == nil { guard stats.count < 3584 else { handleReadFailure(WalletError("CLAIMS_CAPACITY"), epoch); return 100_000_000 }; stats[row.policy] = ClaimEMA() }
+        if stats[row.policy] == nil { guard stats.count < 3584 else { handleReadFailure(WalletError("CLAIMS_CAPACITY"), epoch); return 100_000_000 }; stats[row.policy] = ClaimPerformanceWindow() }
         var error = [CChar](repeating: 0, count: 32)
         let handle = cw_claim_cancellation_create(limiter, &error)
         guard handle != 0 else { lastError = String(cString: error); return 100_000_000 }
+        guard scheduler.reserve(selected) else { cw_claim_cancellation_destroy(handle); return 2_000_000 }
         nextCapture &+= 1
         let capture = Capture(id: nextCapture, epoch: epoch, run: run, handle: handle, selection: selected)
-        active[capture.id] = capture; scheduler.reserve(selected)
+        active[capture.id] = capture
         let pacedAt = now(); if admissionIdle { nextAdmission = max(nextAdmission, pacedAt) }
         nextAdmission = max(nextAdmission + 1 / Double(rate), pacedAt - 1); admissionIdle = false
         guard let prepared = row.progress.prepared, let challenge = prepared["challenge"] as? String,
@@ -459,13 +420,15 @@ public actor MobileClaimsEngine {
         if !result.completed {
             if result.error == "CLAIM_CANCELLED" { cancelled = increment(cancelled); return }
             if result.error == "CLAIM_DNS" { stats[row.policy]?.retryAfter = now() + 2; dirty = true }
-            if ["CLAIM_DNS", "CLAIM_CONTEXT", "CLAIM_TIMEOUT", "CLAIM_BUSY"].contains(result.error) { lastError = result.error; return }
+            if ["CLAIM_DNS", "CLAIM_CONTEXT", "CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_LOCAL_UNAVAILABLE"].contains(result.error) { lastError = result.error; return }
             handleReadFailure(WalletError(result.error), capture.epoch); return
         }
+        let locallyUnavailable = result.error == "CLAIM_LOCAL_UNAVAILABLE"
         guard capture.started, (0...60_000).contains(result.duration), !result.valid || result.validationPassed,
               !result.validationPassed || result.captured, !result.hit || result.valid,
+              !locallyUnavailable || !result.captured && !result.validationPassed && !result.valid && !result.hit,
               result.valid || result.proof.isEmpty else { handleReadFailure(WalletError("CLAIMS_NATIVE_DATA"), capture.epoch); return }
-        stats[row.policy]?.record(result.validationPassed, Double(result.duration) / 1000)
+        if !locallyUnavailable { stats[row.policy]?.record(result.validationPassed, Double(result.duration) / 1000) }
         if result.captured {
             if row.progress.captures != UInt64.max { row.progress.captures += 1 }
             if !row.budget { scheduler.remove(row.key) }
@@ -473,39 +436,69 @@ public actor MobileClaimsEngine {
         if result.validationPassed { valid = increment(valid) } else { invalid = increment(invalid) }
         if result.hit { hits = increment(hits) }
         if lastRpcError == nil { lastError = result.valid ? "" : result.error.isEmpty ? "CLAIM_INVALID_PROOF" : result.error }
-        guard result.hit && fresh && available(row.key), let prepared = row.progress.prepared else { return }
-        retired.insert(row.key); reservations.insert(row.key); scheduler.remove(row.key); cancelCaptures(row.key, except: id)
-        winners.append(Winner(row: row, prepared: prepared, proof: result.proof, epoch: capture.epoch, permit: RpcBroadcastPermit()))
-        launchSubmission()
+        // A completed valid winner may arrive just as catalog freshness expires.
+        // Keep it while identity/lifecycle remain valid; launchSubmission and
+        // the write permit still require a refreshed catalog before any write.
+        guard result.hit && available(row.key),
+              ClaimSubmissionRetry.matchesAvailableBounty(catalog[row.key], captured: row),
+              let prepared = row.progress.prepared else { return }
+        do {
+            // Attach once. Every transport retry reuses these exact immutable
+            // bytes and txid, with no new TLS work or transaction generation.
+            try walletRequire(ClaimSubmissionRetry.canAppendWinner(currentCount: winners.count + (transmitting == nil ? 0 : 1)), "CLAIMS_CAPACITY")
+            let completed = try NativeTransactions.attachClaim(prepared, result.proof)
+            let winner = try Winner(row: row, completed: completed, epoch: capture.epoch, validUntil: catalogAt + 60)
+            retired.insert(row.key); reservations.insert(row.key); scheduler.remove(row.key); cancelCaptures(row.key, except: id)
+            winners.append(winner); launchSubmission()
+        } catch { handleReadFailure(error, capture.epoch) }
     }
     private func launchSubmission() {
-        guard submissionTask == nil, !winners.isEmpty else { return }
-        let winner = winners.removeFirst(); transmitting = winner
+        invalidateQueued()
+        guard submissionTask == nil, fresh, let index = winners.firstIndex(where: { $0.retry.due <= now() }) else { return }
+        let winner = winners.remove(at: index)
+        winner.permit = RpcBroadcastPermit(validUntil: catalogAt + 60)
+        transmitting = winner
         submissionTask = Task { [weak self] in await self?.submit(winner) }
     }
     private func submit(_ winner: Winner) async {
-        var attempted = false
+        var attempted = false, retained = false
         defer {
-            reservations.remove(winner.row.key)
-            if !attempted { retired.remove(winner.row.key); dirty = true }
+            if !retained {
+                reservations.remove(winner.row.key)
+                if !attempted { retired.remove(winner.row.key); dirty = true }
+            }
             transmitting = nil; submissionTask = nil; launchSubmission()
         }
         do {
             try check(winner.epoch)
-            guard fresh && catalog[winner.row.key]?.state == "available" else { return }
-            let completed = try NativeTransactions.attachClaim(winner.prepared, winner.proof)
-            let txid = try PJ.hash(completed["txid"])
+            guard winnerCurrent(winner) else { return }
+            if !fresh { winner.retry.waitForFreshCatalog(now: now()); winners.append(winner); retained = true; return }
+            let txid = winner.retry.txid
             try record(txid, "pending"); attempted = true
             do {
-                let response = try await rpc.broadcast(PJ.string(completed["hex"]), permit: winner.permit)
+                let response = try await rpc.broadcast(winner.retry.hex, permit: winner.permit)
                 guard response["txid"] as? String == txid else { uncertain(txid); return }
                 try record(txid, "submitted"); submitted = increment(submitted)
                 if winner.epoch == epoch && enabled { status = "submitted" }
             } catch let error as RpcFailure {
-                if !error.unknownOutcome && error.code == "RPC_CANCELLED" {
-                    do { try record(txid, "not-sent"); attempted = false } catch { uncertain(txid) }; return
-                }
                 if error.unknownOutcome || error.nodeCode == -27 { uncertain(txid); return }
+                if error.notSent {
+                    do { try record(txid, "not-sent"); attempted = false } catch { uncertain(txid); return }
+                    if winnerCurrent(winner) {
+                        let expired = error.code == "RPC_CANCELLED" && winner.permit.expired
+                        if expired { winner.retry.waitForFreshCatalog(now: now()) }
+                        if expired || winner.retry.retain(after: error, now: now()) {
+                            winners.append(winner); retained = true; status = "retrying"
+                            lastError = error.code; nextDiscovery = 0
+                            return
+                        }
+                    }
+                    if error.code != "RPC_CANCELLED" { handleReadFailure(error, winner.epoch) }
+                    return
+                }
+                // A response without a validated node rejection is not proof
+                // of non-broadcast. Never convert it into a safe retry.
+                guard error.explicitRejection else { uncertain(txid); return }
                 do { try record(txid, "rejected") } catch { uncertain(txid); return }
                 lastError = "CLAIMS_REJECTED"; nextDiscovery = 0
                 lastRpcError = ["code": error.code, "method": "sendrawtransaction", "phase": "response", "stage": "submission", "elapsedMs": 0, "queuedMs": 0, "bytesReceived": 0]
@@ -521,8 +514,9 @@ public actor MobileClaimsEngine {
         acknowledgeStarts()
         let domains: [JSONObject] = stats.keys.sorted().map { key in
             let value = stats[key]!, parts = key.split(separator: ":")
+            let measuredRate = value.rate
             return ["domain": parts.dropLast().joined(separator: ":"), "signatureAlgorithmsMask": Int(parts.last ?? "0") ?? 0,
-                "connections": value.connections, "totalTime": value.totalTime, "rate": value.rate, "completed": value.completed]
+                "connections": value.connections, "totalTime": value.totalTime, "rate": measuredRate, "completed": value.completed]
         }
         return ["enabled": enabled, "requested": enabled, "allowed": allowed,
             "running": enabled && allowed && !closed && !unknownBlocked, "status": status,

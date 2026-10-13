@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { acknowledgePreferences, createPreferenceSaver, preferenceBatch } from '../src/ui/preferences.mjs';
+import { MAX_CONNECTION_LIMIT } from '../src/core/connection-limits.mjs';
 
 const config = () => ({ rpc: { host: 'localhost', port: 48190 }, claims: { enabled: true, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }, autoLockMinutes: 15, feeRate: 1500 });
 const draft = () => ({ settings: {}, claims: {}, send: {} });
@@ -67,6 +68,34 @@ test('connection preferences autosave above 256 through the signed integer bound
       assert.deepEqual(batch, { patch: {}, entries: [] });
       acknowledgePreferences(edits, batch);
       assert.equal(edits.claims[name], raw);
+    }
+  }
+});
+
+test('both connection preferences accept the exact int32 ceiling and never autosave overflow drafts', async () => {
+  assert.equal(MAX_CONNECTION_LIMIT, 2147483647);
+  for (const key of ['maxConnectionsPerSecond', 'maxConcurrent']) {
+    for (const raw of ['2147483647', '2147483647.', '2147483647,']) {
+      const edits = draft(); edits.claims[key] = raw;
+      const batch = preferenceBatch(config(), edits);
+      assert.deepEqual(batch, {
+        patch: { claims: { [key]: 2147483647 } },
+        entries: [{ section: 'claims', key, raw }],
+      });
+      acknowledgePreferences(edits, batch);
+      assert.deepEqual(edits.claims, {});
+    }
+    for (const raw of ['2147483648', '2147483648.', '2147483648,', '3000000000', '3200000000', '3230000000', '9999999999']) {
+      const edits = draft(); edits.claims[key] = raw;
+      assert.deepEqual(preferenceBatch(config(), edits), { patch: {}, entries: [] }, raw);
+      const saver = createPreferenceSaver({
+        snapshot: () => preferenceBatch(config(), edits),
+        save: async () => assert.fail(`overflow ${key} must not reach the service`),
+        saved: () => assert.fail('invalid drafts must not be acknowledged'),
+      });
+      await saver.flush();
+      assert.equal(edits.claims[key], raw);
+      assert.equal(saver.hasPending(), false);
     }
   }
 });

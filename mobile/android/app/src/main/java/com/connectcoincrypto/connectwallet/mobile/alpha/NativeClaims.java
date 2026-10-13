@@ -35,12 +35,14 @@ public final class NativeClaims {
      * validProof:false without proof bytes; target misses remain validProof:true.
      * captured records the raw P2C transcript through CertificateVerify (not
      * a completed TLS handshake). validationPassed is the
-     * known certificate/signature outcome for EMA; validProof additionally
-     * requires an unexpired usable proof. An expired known-valid result retains
+     * known certificate/signature outcome for the hourly performance window;
+     * validProof additionally requires an unexpired validated result. Only target
+     * hits carry encoded proof bytes; valid target misses return an empty proof.
+     * An expired known-valid result retains
      * validationPassed:true but no proof bytes and validProof:false.
      * Completed TCP/TLS failures also return false with durationMs/errorCode.
      * Pre-TCP DNS failures, cancellation and local setup errors throw instead:
-     * they must not be recorded as a certificate-failure EMA sample.
+     * they must not be recorded as a certificate-failure performance sample.
      * challengeHex is the exact32 ClientHello bytes, targetHex is uint256 display.
      */
     public static String captureAndVerify(String domain, String challengeHex, String targetHex,

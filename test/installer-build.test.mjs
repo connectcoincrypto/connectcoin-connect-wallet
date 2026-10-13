@@ -64,10 +64,10 @@ test('Linux and macOS targets preserve platform identity and native helper resou
   // matrix uses an explicit filename arch so all four formats have the same stem.
   assert.equal(build.linux.artifactName, 'ConnectWallet-${version}-Linux-x64.${ext}');
   assert.equal(build.linux.desktop.entry.StartupWMClass, build.appId);
-  assert.deepEqual(build.extraResources, [{ from: 'helpers/bin/connectwallet-claims', to: 'claims-helper' }]);
+  assert.deepEqual(build.extraResources, [{ from: 'helpers/native-bin/connectwallet-claims', to: 'claims-helper' }]);
   assert.equal(build.publish, null);
 });
-test('native plans forbid cross-compilation of Python helpers and reject injected/duplicate flags', () => {
+test('native plans forbid cross-compilation of claims helpers and reject injected/duplicate flags', () => {
   for (const [platform, arch] of [['win32','x64'], ['linux','x64'], ['darwin','x64'], ['darwin','arm64']]) {
     const plan = buildPlan([], { platform, arch });
     assert.equal(plan.platform, platform); assert.equal(plan.arch, arch);

@@ -38,7 +38,7 @@ ClaimResult VerifyParallel(const PublicClaimContext& context,const std::vector<u
     });
     for(auto& worker:workers) worker.join();
     if(invalid_result) throw std::runtime_error("TEST_PARALLEL_VALIDATION");
-    return VerifyProofForTest(context,proof,roots);
+    return CheckVerifierCacheForTest(context,proof,roots);
 }
 ClaimResult CaptureParallel(const PublicClaimContext& context,const std::vector<unsigned char>& roots,uint16_t port,int timeout,int worker_count=VERIFY_WORKERS) {
     if(worker_count<2 || worker_count>100) throw std::runtime_error("TEST_WORKERS");

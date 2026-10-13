@@ -92,7 +92,7 @@ export function createRsaProbe({ resourcesPath, helper, basePath, spawnProcess =
         const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => ENVIRONMENT_NAMES.has(key.toLowerCase())));
         // A stale helper rejects the required-policy suffix before any DNS/TLS.
         // Keep one process and the existing end-to-end deadline; no fallback.
-        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--probe-rsa', '--require-rsa-exponent-64'], {
+        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--probe-rsa', '--require-rsa-exponent-64', ...(runtime.native ? ['--require-native-mbedtls'] : [])], {
           shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' },
         });

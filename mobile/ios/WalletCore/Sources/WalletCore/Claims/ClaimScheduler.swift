@@ -38,6 +38,16 @@ struct ClaimInteger: Comparable, Equatable {
     }
     var floating: Double { words.reversed().reduce(0) { $0 * 4_294_967_296 + Double($1) } }
     static var twiceSpace: ClaimInteger { var value = ClaimInteger(); value.words[8] = 2; return value }
+    /// First forbidden successful capture, cached once per immutable target.
+    /// The fixed-width product is exact (257 + 64 bits fit our 352 bits).
+    var captureStopCount: UInt64 {
+        var low: UInt64 = 0, high = UInt64.max
+        while low < high {
+            let middle = low + (high - low) / 2
+            if multiplied(middle) > .twiceSpace { high = middle } else { low = middle + 1 }
+        }
+        return low // UInt64 saturation is forbidden even for the hardest target.
+    }
 }
 
 final class ClaimProgress {
@@ -61,10 +71,15 @@ struct ClaimCandidate {
     let bounty: JSONObject, key: String, domain: String, policy: String, target: String, block: String
     let height: Int64, mask: Int32, coinbase: Bool, supported: Bool
     let targetPlusOne: ClaimInteger, raw: ClaimInteger
-    var state: String, progress: ClaimProgress
+    let captureStopCount: UInt64, outpointOrder: [UInt8], outputIndex: Int64
+    private(set) var priority: ClaimInteger
+    var state: String
+    var progress: ClaimProgress { didSet { priority = raw.multiplied(progress.factor) } }
     init(_ source: JSONObject, block expectedBlock: String, fee: Int64, factor: UInt64? = nil) throws {
         bounty = try JSON.clone(source)
         key = try PJ.outpoint(source); target = try PJ.hash(source["connection_work_target"])
+        outpointOrder = Array(try WalletCrypto.fromHex(String(key.prefix(64))).reversed())
+        outputIndex = try PJ.integer(source["vout"], 0, 0xffff_ffff)
         block = try PJ.hash(source["block_hash"])
         try walletRequire(block == expectedBlock, "CLAIMS_RPC_DATA")
         height = try PJ.integer(source["block_height"], 0, 9_007_199_254_740_991)
@@ -80,33 +95,61 @@ struct ClaimCandidate {
         supported = roots == 1 && domain.contains(".") && !PJ.matches(domain, "[0-9]+(?:\\.[0-9]+){3}") &&
             ![".localhost", ".local", ".internal"].contains(where: domain.hasSuffix)
         targetPlusOne = try ClaimInteger(hex: target).plusOne()
+        captureStopCount = targetPlusOne.captureStopCount
         let amount = try PJ.money(source, "amount")
         raw = targetPlusOne.multiplied(UInt64(max(0, amount - fee)))
         progress = try ClaimProgress(block: block, policy: policy, factor: factor)
+        priority = raw.multiplied(progress.factor)
     }
-    var priority: ClaimInteger { raw.multiplied(progress.factor) }
-    var budget: Bool { progress.captures < UInt64.max && targetPlusOne.multiplied(progress.captures) <= .twiceSpace }
+    var budget: Bool { progress.captures < captureStopCount }
     static func before(_ a: ClaimCandidate, _ b: ClaimCandidate) -> Bool {
         if a.priority != b.priority { return a.priority > b.priority }
-        let aHash = String(a.key.prefix(64)), bHash = String(b.key.prefix(64))
         // Core uint256 outpoint ordering compares display-order txids backwards.
-        let aBytes = Array(aHash.utf8), bBytes = Array(bHash.utf8)
-        for i in stride(from: 62, through: 0, by: -2) {
-            if aBytes[i] != bBytes[i] { return aBytes[i] < bBytes[i] }
-            if aBytes[i + 1] != bBytes[i + 1] { return aBytes[i + 1] < bBytes[i + 1] }
-        }
-        return ((a.bounty["vout"] as? NSNumber)?.uint64Value ?? 0) < ((b.bounty["vout"] as? NSNumber)?.uint64Value ?? 0)
+        if a.outpointOrder != b.outpointOrder { return a.outpointOrder.lexicographicallyPrecedes(b.outpointOrder) }
+        return a.outputIndex < b.outputIndex
     }
 }
 
-struct ClaimEMA {
-    var connections = 0.1, totalTime = 0.02
+/// Fixed 60 one-minute buckets; no per-attempt allocations or EMA decay. The
+/// permanent five-valid-connections / one-second prior is not a real counter.
+/// The owner actor serializes access, including scheduler reads that age data.
+final class ClaimPerformanceWindow {
+    private var counts = [Int64](repeating: 0, count: 60)
+    private var successes = [Int64](repeating: 0, count: 60)
+    private var seconds = [Double](repeating: 0, count: 60)
+    private var minute: Int64?
+    private let clock: () -> Double
+    private(set) var observations: Int64 = 0, connections: Int64 = 0
+    private(set) var totalTime = 0.0
     var completed: Int64 = 0
     var retryAfter: Double = 0
-    var rate: Double { max(Double.leastNonzeroMagnitude, min(Double.greatestFiniteMagnitude, connections / max(Double.leastNonzeroMagnitude, totalTime))) }
-    mutating func record(_ success: Bool, _ seconds: Double) {
-        connections = 0.999 * connections + 0.001 * (success ? 1 : 0)
-        totalTime = 0.999 * totalTime + 0.001 * seconds
+    init(clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) { self.clock = clock }
+    func advance() {
+        let reading = clock()
+        let measured = reading.isFinite ? Int64((min(9_007_199_254_740_991, max(0, reading)) / 60).rounded(.down)) : minute ?? 0
+        let current = max(minute ?? measured, measured)
+        guard let previous = minute else { minute = current; return }
+        guard previous != current else { return }
+        if current - previous >= 60 {
+            for slot in counts.indices { counts[slot] = 0; successes[slot] = 0; seconds[slot] = 0 }
+        } else {
+            for next in (previous + 1)...current {
+                let slot = Int(next % 60); counts[slot] = 0; successes[slot] = 0; seconds[slot] = 0
+            }
+        }
+        observations = counts.reduce(0, +); connections = successes.reduce(0, +); totalTime = seconds.reduce(0, +)
+        minute = current
+    }
+    var rate: Double {
+        advance()
+        return max(Double.leastNonzeroMagnitude, min(Double.greatestFiniteMagnitude, (5 + Double(connections)) / (1 + totalTime)))
+    }
+    func record(_ success: Bool, _ duration: Double) {
+        guard duration.isFinite && (0...60).contains(duration) else { return }
+        advance(); let slot = Int(minute! % 60)
+        counts[slot] += 1; observations += 1
+        if success { successes[slot] += 1; connections += 1 }
+        seconds[slot] += duration; totalTime += duration
         completed = min(9_007_199_254_740_991, completed + 1)
     }
 }
@@ -115,24 +158,40 @@ struct ClaimEMA {
 /// turns; low-observed-rate recovery probes are bounded to one per minute.
 struct ClaimScheduler {
     struct Entry { let row: ClaimCandidate, score: Double, recovering: Bool, transportDue: Double }
-    struct Selection { let id = UUID(); let row: ClaimCandidate, recovering: Bool, economic: Bool }
+    final class Selection {
+        let id = UUID()
+        let row: ClaimCandidate, recovering: Bool, economic: Bool, serial: UInt64
+        var reserved = false, committed = false
+        init(row: ClaimCandidate, recovering: Bool, economic: Bool, serial: UInt64) {
+            self.row = row; self.recovering = recovering; self.economic = economic; self.serial = serial
+        }
+    }
     var groups: [String: [Int32: [Entry]]] = [:]
+    private var names: [String] = []
+    private var locations: [String: (String, Int32)] = [:]
     var probeDue: [String: Double] = [:]
     var pendingProbes: [String: UUID] = [:]
     private var probeOrder: [String] = []
     private var economic = false
     private var domainAfter = ""
+    private var serial: UInt64 = 0
     static func score(_ raw: ClaimInteger, rate: Double, scale: Double = 1) -> Double {
-        raw.floating / pow(2, 256) * rate / scale
+        guard rate.isFinite && rate > 0 && scale.isFinite && scale > 0 else { return .nan }
+        let expected = raw.floating / pow(2, 256), value = expected * rate / scale
+        return value == .infinity ? min(Double.greatestFiniteMagnitude, expected / scale * rate) : value
     }
     static func worth(_ row: ClaimCandidate, rate: Double) -> Bool { score(row.raw, rate: rate) >= 1000 }
-    mutating func rebuild(_ rows: [ClaimCandidate], stats: [String: ClaimEMA], retired: Set<String>, now: Double) {
+    mutating func rebuild(_ rows: [ClaimCandidate], stats: [String: ClaimPerformanceWindow], retired: Set<String>, now: Double) {
         groups.removeAll(keepingCapacity: true)
+        locations.removeAll(keepingCapacity: true)
         let policies = Set(rows.map(\.policy))
         probeDue = probeDue.filter { policies.contains($0.key) }
         probeOrder.removeAll { probeDue[$0] == nil }
         let eligible = rows.filter { $0.supported && $0.state == "available" && !retired.contains($0.key) && $0.budget && $0.raw > ClaimInteger() }
-        let healthy = Set(eligible.filter { Self.worth($0, rate: stats[$0.policy]?.rate ?? 5) }.map(\.policy))
+        // Read/age each policy only once per refresh, not once per bounty.
+        var rates: [String: Double] = [:]
+        for row in eligible where rates[row.policy] == nil { rates[row.policy] = stats[row.policy]?.rate ?? 5 }
+        let healthy = Set(eligible.filter { Self.worth($0, rate: rates[$0.policy]!) }.map(\.policy))
         var recovering: [String: ClaimCandidate] = [:]
         for row in eligible where !healthy.contains(row.policy) && Self.worth(row, rate: 5) {
             if recovering[row.policy] == nil || ClaimCandidate.before(row, recovering[row.policy]!) { recovering[row.policy] = row }
@@ -141,14 +200,16 @@ struct ClaimScheduler {
         let admittedKeys = Set(admitted.map(\.key))
         for row in admitted { _ = due(row.policy, now: now) }
         for row in eligible {
-            let rate = stats[row.policy]?.rate ?? 5
+            let rate = rates[row.policy]!
             let recovery = !Self.worth(row, rate: rate)
             if recovery && !admittedKeys.contains(row.key) { continue }
             let value = Self.score(row.priority, rate: rate, scale: 1_000_000)
             guard value.isFinite else { continue }
             groups[row.domain, default: [:]][row.mask, default: []].append(
                 Entry(row: row, score: value, recovering: recovery, transportDue: stats[row.policy]?.retryAfter ?? 0))
+            locations[row.key] = (row.domain, row.mask)
         }
+        names = groups.keys.sorted()
         for domain in groups.keys { for mask in groups[domain]!.keys {
             groups[domain]![mask]!.sort { ClaimCandidate.before($0.row, $1.row) }
         } }
@@ -160,39 +221,49 @@ struct ClaimScheduler {
         return now + 60
     }
     mutating func next(now: Double, prepared: Bool) -> Selection? {
-        var leaders: [Entry] = []
-        for domain in groups.keys.sorted() {
+        var reward: Entry?, first: Entry?, after: Entry?
+        for domain in names {
             var best: Entry?
             for mask in groups[domain]!.values {
                 guard let row = mask.first, row.transportDue <= now,
                       !row.recovering || (pendingProbes[row.row.policy] == nil && due(row.row.policy, now: now) <= now) else { continue }
                 if best == nil || row.score > best!.score || row.score == best!.score && ClaimCandidate.before(row.row, best!.row) { best = row }
             }
-            if let best, (best.row.progress.prepared != nil) == prepared { leaders.append(best) }
+            if let best, (best.row.progress.prepared != nil) == prepared {
+                if first == nil { first = best }
+                if after == nil && domain > domainAfter { after = best }
+                if economic && (reward == nil || best.score > reward!.score || best.score == reward!.score && ClaimCandidate.before(best.row, reward!.row)) { reward = best }
+            }
         }
-        let selected: Entry?
-        if economic { selected = leaders.sorted { $0.score == $1.score ? ClaimCandidate.before($0.row, $1.row) : $0.score > $1.score }.first }
-        else { selected = leaders.first { $0.row.domain > domainAfter } ?? leaders.first }
-        return selected.map { Selection(row: $0.row, recovering: $0.recovering, economic: economic) }
+        let selected = economic ? reward : after ?? first
+        return selected.map { Selection(row: $0.row, recovering: $0.recovering, economic: economic, serial: serial) }
     }
-    mutating func reserve(_ selected: Selection) {
+    @discardableResult mutating func reserve(_ selected: Selection) -> Bool {
+        guard !selected.reserved && selected.serial == serial && (!selected.recovering || pendingProbes[selected.row.policy] == nil) else { return false }
+        selected.reserved = true
         if !selected.economic { domainAfter = selected.row.domain }
         economic = !selected.economic
+        serial &+= 1
         if selected.recovering { pendingProbes[selected.row.policy] = selected.id }
+        return true
     }
-    mutating func acknowledge(_ selected: Selection, now: Double) {
+    @discardableResult mutating func acknowledge(_ selected: Selection, now: Double) -> Bool {
+        guard selected.reserved && !selected.committed else { return false }
+        selected.committed = true
         if selected.recovering {
             _ = due(selected.row.policy, now: now)
             probeOrder.removeAll { $0 == selected.row.policy }; probeOrder.append(selected.row.policy)
             probeDue[selected.row.policy] = now + 60
         }
         release(selected)
+        return true
     }
     mutating func release(_ selected: Selection) {
         if selected.recovering && pendingProbes[selected.row.policy] == selected.id { pendingProbes.removeValue(forKey: selected.row.policy) }
     }
     mutating func remove(_ key: String) {
-        for domain in groups.keys { for mask in groups[domain]!.keys { groups[domain]![mask]!.removeAll { $0.row.key == key } } }
+        guard let (domain, mask) = locations.removeValue(forKey: key) else { return }
+        groups[domain]?[mask]?.removeAll { $0.row.key == key }
     }
-    mutating func clear() { groups.removeAll() }
+    mutating func clear() { groups.removeAll(); names.removeAll(); locations.removeAll() }
 }

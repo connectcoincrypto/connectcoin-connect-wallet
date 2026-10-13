@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { validateConnectionOptions } from '../src/core/claim-pool.mjs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -234,5 +235,14 @@ test('config file creation is bounded, atomic, sanitized and rejects malformed U
   } finally {
     assert.ok(path.basename(directory).startsWith('connectwallet-config-test-'));
     await rm(directory, { recursive: true, force: true });
+  }
+});
+test('claims retain their defaults and accept high limits consistently through configuration and helper admission', () => {
+  assert.deepEqual(validateConnectionOptions(), { connectionsPerSecond: 100, concurrency: 100 });
+  for (const value of [257, 400, 800, 1000, 2147483647]) {
+    const config = validateConfig({ claims: { maxConcurrent: value, maxConnectionsPerSecond: value } });
+    assert.equal(config.claims.maxConcurrent, value);
+    assert.equal(config.claims.maxConnectionsPerSecond, value);
+    assert.equal(validateConnectionOptions({ concurrency: value, connectionsPerSecond: value }).concurrency, value);
   }
 });

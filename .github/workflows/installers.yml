@@ -77,7 +77,7 @@ jobs:
         run: npm test
         timeout-minutes: 5
       - name: Build and verify native installers
-        # Builds/tests fresh Python code and its pinned dependencies on each OS;
+        # Builds/tests pinned C++ code and its offline Python reference on each OS;
         # binaries, venvs and signing credentials are never shared between jobs.
         run: npm run dist -- --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
         env:
