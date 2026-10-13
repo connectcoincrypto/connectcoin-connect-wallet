@@ -42,6 +42,24 @@ The detailed behaviors in this section describe the Android reference implementa
 - Mobile-data and background opt-ins default off. Native network policy treats metered/unknown connectivity conservatively. Explicit user Start only; no boot receiver, sticky restart or invisible auto-start. Android background claims use an ongoing service indication with Stop, not permission for additional notifications. System interruption is still possible.
 - Screenshots and screen recording are allowed, including recovery-word screens; keep any captures of recovery words private. Secrets remain native-only, the WebView file/content proxy is blocked, and no remote WebView origin or generic HTTP/cookie/file plugins are exported.
 
+## Adaptive claims discovery (Android and iOS)
+
+The complete, validated 600-block hash window is cached in memory. An unchanged
+tip does not download the list again. New blocks and reorganizations request
+5, then 100, then 600 hashes only as necessary to reconstruct the entire window
+using an overlap that agrees on hash, height and ancestry. A rollback with a
+missing cached tail still requires the complete response. Legacy servers can
+return a full window or explicitly reject `count`, allowing a full-window retry;
+malformed or failed reads never silently bypass validation.
+
+Journal pagination and mempool changes continue even with an unchanged tip.
+Hash refreshes keep their original journal checkpoint and replay changes that
+arrived during the query. A final lightweight tip check guards publication of
+the staged catalog, cursor and window. Bounty streams still load progressively;
+having 600 hashes does not mark 600 bounty streams as read. A cursor reset
+requires a fresh query and new bounty streams; hashes alone are not bounty state.
+The existing per-method quotas, proof checks and claim counters are unchanged.
+
 ## HD discovery reconnection (Android and iOS)
 
 Transient connection/time-out, capacity and rate-limit failures retry only the failed discovery reads, preserving validated progress, original checkpoints and cursors in the same in-memory scan. One shared recovery gate prevents a failed parallel window from producing a burst of retry probes. Backoff increases from 1 to 30 seconds with jitter, honors server cooldowns and stops after eight failed probe rounds; offline waiting does not consume that budget. Existing 16-way concurrency and per-method minute quotas stay unchanged.

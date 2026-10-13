@@ -72,6 +72,32 @@ Tests use controlled clocks, fake RPC/loopback TLS and public cryptographic
 fixtures. They do not benchmark or submit claims against public websites and
 do not establish a throughput guarantee on a phone or VPS.
 
+## Adaptive discovery window
+
+Desktop, Android and iOS retain a privately owned, validated window of up to
+600 block hashes and heights. The window is a discovery cache, not a substitute
+for the bounty journal or proof validation.
+
+- An unchanged tip reuses the window without downloading another hash list.
+  Bounty/mempool changes and every journal page are still processed.
+- A changed tip first requests the latest 5 hashes, then 100, then the full
+  600 if necessary. Normal block arrivals and reorganizations use the same
+  path. A cached overlap must match both hash and height, and overlapping
+  ancestors must agree before the complete window can be reconstructed.
+- Partial results from separate requests are never spliced together. A tip
+  race, rollback or missing overlap cannot silently truncate the active window.
+- Only an explicit invalid-parameters response to the optional `count`
+  parameter permits a legacy full-window retry. Servers that ignore `count`
+  may return a complete, validated window. Malformed responses still fail.
+- Journal reset invalidates the bounty snapshot and forces a fresh window
+  query; cached hashes can only supply a validated reconstruction anchor.
+  A final lightweight tip check protects publication of the staged result.
+
+These changes do not increase RPC quotas, skip block-bounty streams, alter
+claim counters, or change transaction submission/retry rules. Tests use
+controlled RPC fixtures for new blocks, shallow/deep reorganizations, cursor
+reset, pagination, mempool changes and inconsistent responses.
+
 ## Local verification (2026-10-13)
 
 The Windows native helper and unpacked desktop application were built and

@@ -87,6 +87,36 @@ test('unsubscribe accepts opaque bounded IDs and rejects overlong or control-cha
   }
 });
 
+test('recent block count is optional, bounded plain integer data and isolated to its RPC method', () => {
+  assert.deepEqual(validateRpcParams('getrecentblockhashes', {}), {});
+  for (const count of [1, 5, 100, 600]) {
+    const params = { count }, validated = validateRpcParams('getrecentblockhashes', params);
+    params.count = 601;
+    assert.deepEqual(validated, { count }, 'Validation owns its parameter copy.');
+  }
+  for (const count of [0, -1, 601, 1.5, NaN, Infinity, '5', null, undefined, {}, []]) {
+    assert.throws(() => validateRpcParams('getrecentblockhashes', { count }), /Invalid RPC recent-block count/);
+  }
+  let invoked = false;
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { get count() { invoked = true; return 5; } }), /plain data/);
+  assert.equal(invoked, false);
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { count: 5, mnemonic: 'secret' }), /Unexpected/);
+  assert.throws(() => validateRpcParams('getchaintip', { count: 5 }), /Unexpected/);
+});
+
+test('adaptive recent-block counts share the same method quota and cooldown', () => {
+  const client = new RpcClient({ host: '127.0.0.1', port: 1, quota: 1, windowMs: 60000 });
+  assert.equal(client.quotaWait('getrecentblockhashes', { count: 5 }, { reserve: true }), 0);
+  for (const params of [{ count: 100 }, { count: 600 }, {}]) {
+    assert.ok(client.quotaWait('getrecentblockhashes', params) > 0, 'A larger or legacy query cannot bypass pacing.');
+  }
+  assert.deepEqual([...client.history.keys()], ['getrecentblockhashes']);
+  assert.equal(client.quotaWait('getchaintip', {}), 0, 'The final fence uses its own existing RPC method quota.');
+  client.history.clear(); client.cooldowns.set('getrecentblockhashes', performance.now() + 60000);
+  for (const params of [{ count: 5 }, { count: 100 }, {}]) assert.ok(client.quotaWait('getrecentblockhashes', params) > 0);
+  client.close();
+});
+
 test('concurrent requests share one connection; chunk fragmentation is reassembled', async () => {
   const server = await mock((request, socket) => {
     const encoded = line(response(request, { method: request.method }));

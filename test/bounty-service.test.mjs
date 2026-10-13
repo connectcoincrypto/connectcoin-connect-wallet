@@ -8,8 +8,9 @@ import { serializeTransaction, transactionId } from '../src/core/transaction.mjs
 import { deriveAccount } from '../src/core/crypto.mjs';
 
 const hash = index => index.toString(16).padStart(64, '0');
-const tip = height => ({ chain: 'testnet4', genesis_hash: GENESIS.testnet4, height, hash: hash(height + 1), mediantime: 1800000000 });
-const window = height => ({ window: 600, tip: tip(height), blocks: Array.from({ length: Math.min(600, height + 1) }, (_, index) => ({ height: height - index, hash: hash(height - index + 1) })) });
+const blockHash = height => height === 0 ? GENESIS.testnet4 : hash(height + 1);
+const tip = height => ({ chain: 'testnet4', genesis_hash: GENESIS.testnet4, height, hash: blockHash(height), mediantime: 1800000000 });
+const window = height => ({ window: 600, tip: tip(height), blocks: Array.from({ length: Math.min(600, height + 1) }, (_, index) => ({ height: height - index, hash: blockHash(height - index) })) });
 const row = (height = 1, delta = {}) => ({ txid: hash(900), vout: 0, amount: '1000000000', domain: 'example.com', connection_work_target: 'f'.repeat(64), root_certificates_version: 1, signature_algorithms_mask: 7, block_height: height, block_hash: hash(height + 1), coinbase: false, confirmations: 1, status: 'available', spending_txid: null, ...delta });
 const page = (cursor, changes = [], has_more = false, height = 1) => ({ tip: tip(height), changes, next_cursor: cursor, has_more });
 
@@ -18,7 +19,8 @@ function fixture({ height = 1, changes = () => page('c0', [], false, height), wi
   let resets = 0, currentHeight = height;
   const rpc = { async request(method, params = {}, options = {}) {
     calls.push({ method, ...params });
-    if (method === 'getbountychanges') return changes(params, calls);
+    if (method === 'getbountychanges') { const value = changes(params, calls); currentHeight = value.tip.height; return value; }
+    if (method === 'getchaintip') return tip(currentHeight);
     if (method === 'getrecentblockhashes') { const value = windows(calls); currentHeight = value.tip.height; return value; }
     if (method === 'getblockbounties') {
       const values = structuredClone(rows.get(params.block_hash) ?? []).map(value => ({ ...value, confirmations: currentHeight - value.block_height + 1 }));
@@ -38,7 +40,7 @@ test('bounty discovery requests complete streams including empty blocks and publ
   const result = await f.run();
   assert.equal(result.blocks.size, 2);
   assert.equal(result.blocks.get(hash(2)).length, 1);
-  assert.equal(result.blocks.get(hash(1)).length, 0);
+  assert.equal(result.blocks.get(GENESIS.testnet4).length, 0);
   assert.equal(result.cursor, 'c0');
   assert.equal(f.calls[0].method, 'getbountychanges');
 });
@@ -116,7 +118,7 @@ test('all initial journal pages are consumed, including matured and available_ag
     if (calls === 3) return page('c3', [{ sequence: 3, type: 'matured', txid: hash(900), vout: 0 }]);
     return page('c3');
   } });
-  const result = await f.run({ previous: new Map([[hash(2), [row(1, { status: 'immature', coinbase: true })]], [hash(1), []]]), cursor: 'c0' });
+  const result = await f.run({ previous: new Map([[hash(2), [row(1, { status: 'immature', coinbase: true })]], [GENESIS.testnet4, []]]), cursor: 'c0' });
   assert.deepEqual(f.calls.filter(call => call.method === 'getbountychanges').map(call => call.cursor).slice(0, 4), ['c0', 'c1', 'c2', 'c3']);
   assert.equal(result.blocks.get(hash(2))[0].status, 'available');
   assert.equal(result.cursor, 'c3');
@@ -152,11 +154,11 @@ test('new blocks appearing during scan are incorporated before completion', asyn
 });
 
 test('window exits remove queued outpoints even when they have no journal block hash', async () => {
-  const obsolete = row(0, { block_hash: hash(1) });
+  const obsolete = row(0, { block_hash: GENESIS.testnet4 });
   const f = fixture({ height: 600, rows: new Map(), changes: () => page('c1', [], false, 600) });
-  const result = await f.run({ previous: new Map([[hash(1), [obsolete]]]), cursor: 'c0' });
+  const result = await f.run({ previous: new Map([[GENESIS.testnet4, [obsolete]]]), cursor: 'c0' });
   assert.equal(result.blocks.size, 600);
-  assert.equal(result.blocks.has(hash(1)), false);
+  assert.equal(result.blocks.has(GENESIS.testnet4), false);
   assert.ok(f.invalidated.some(value => value.txid === obsolete.txid));
 });
 

@@ -201,21 +201,24 @@ for (const transition of ['lock', 'new epoch', 'new RPC', 'aborted signal']) tes
   assert.equal(calls.length, 0);
 });
 
-test('the shared validated tip is cleared on reconnect, current RPC disconnection and locking', async () => {
+test('the shared validated tip and hash window are cleared on reconnect, current RPC disconnection and locking', async () => {
   const { service } = serviceFixture();
   const clients = [];
   service.clientFactory = () => {
     const client = new EventEmitter(); client.close = () => {};
     clients.push(client); return client;
   };
-  service.connectClient(); assert.equal(service.tip, null);
-  service.tip = tip(600);
-  clients[0].emit('disconnected'); assert.equal(service.tip, null);
-  service.connectClient(); service.tip = tip(601);
+  service.claimWindow = window(600);
+  service.connectClient(); assert.equal(service.tip, null); assert.equal(service.claimWindow, null);
+  service.tip = tip(600); service.claimWindow = window(600);
+  clients[0].emit('disconnected'); assert.equal(service.tip, null); assert.equal(service.claimWindow, null);
+  service.connectClient(); service.tip = tip(601); service.claimWindow = window(601);
   clients[0].emit('disconnected');
   assert.equal(service.tip.height, 601, 'an obsolete connection must not clear a newer connection state');
+  assert.equal(service.claimWindow.tip.height, 601);
   await service.lock();
   assert.equal(service.tip, null);
+  assert.equal(service.claimWindow, null);
 });
 
 for (const stage of ['prepare', 'proof', 'submit']) test(`retirement during ${stage} preserves only work whose TCP attempt already started`, async t => {
@@ -285,10 +288,12 @@ function mockDiscovery(service, { height, reorg = false, event = null, rows = []
   }
   service.rpc.request = async (method, params) => {
     if (method === 'getrecentblockhashes') return structuredClone(snapshot);
+    if (method === 'getchaintip') return structuredClone(snapshot.tip);
     if (method === 'getbountychanges') return { tip: snapshot.tip, next_cursor: 'c1', has_more: false, changes: ++journalCalls === 1 && event ? [event] : [] };
     return previousRequest(method, params);
   };
   service.blockBounties = async blockHash => rows.filter(value => value.block_hash === blockHash);
+  return snapshot;
 }
 
 test('discovery preserves a verified automatic winner reserved while waiting for RPC capacity', async t => {
@@ -415,6 +420,7 @@ test('discovery reports a reorg, not expiry, when a canonical block is replaced 
   snapshot.blocks[1].hash = hash(12000);
   const rpc = { async request(method) {
     if (method === 'getrecentblockhashes') return snapshot;
+    if (method === 'getchaintip') return structuredClone(snapshot.tip);
     if (method === 'getbountychanges') return { tip: snapshot.tip, next_cursor: 'c1', has_more: false, changes: [] };
     throw new Error(`Unexpected request ${method}`);
   } };
@@ -434,15 +440,17 @@ for (const when of ['later scan', 'same scan']) test(`a retired in-flight claim 
   t.after(async () => { gate.resolve(); await service.engine.stop(); });
   service.engine.enqueue([bounty]); service.engine.start(); await until(() => entered);
   const signal = service.engine.controller.signal;
-  mockDiscovery(service, { height: 600 });
+  const snapshot = mockDiscovery(service, { height: 600 });
   const request = service.rpc.request;
-  let reads = 0, replace = false;
+  let fences = 0, replace = false;
   service.rpc.request = async (method, params) => {
-    const value = await request(method, params);
-    if (method === 'getrecentblockhashes' && (++reads >= 2 && when === 'same scan' || replace)) {
-      value.blocks.find(block => block.height === 599).hash = hash(15000);
+    if (replace || method === 'getchaintip' && ++fences === 1 && when === 'same scan') {
+      // Replacing an ancestor also changes the descendant tip: a block hash
+      // cannot identify two conflicting ancestral chains.
+      snapshot.blocks.find(block => block.height === 599).hash = hash(15000);
+      snapshot.blocks[0].hash = snapshot.tip.hash = hash(15001);
     }
-    return value;
+    return request(method, params);
   };
   await service.syncBountiesInternal(service.epoch);
   assert.equal(service.claimBlocks.has(bounty.block_hash), false);

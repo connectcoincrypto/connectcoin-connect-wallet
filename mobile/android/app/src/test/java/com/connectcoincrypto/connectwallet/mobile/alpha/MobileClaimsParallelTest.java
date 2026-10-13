@@ -91,9 +91,13 @@ public class MobileClaimsParallelTest {
             };
         }
         void start() { engine.setAllowed(true); engine.start("fixture"); }
-        void refresh() throws Exception { synchronized (engine) { Field field = MobileClaimsEngine.class.getDeclaredField("nextDiscovery"); field.setAccessible(true); field.setLong(engine, 0); } }
+        void refresh() throws Exception { synchronized (engine) {
+            Field field = MobileClaimsEngine.class.getDeclaredField("nextDiscovery"); field.setAccessible(true); field.setLong(engine, 0);
+            if (holdDiscovery) { Field cache = MobileClaimsEngine.class.getDeclaredField("blockWindow"); cache.setAccessible(true); cache.set(engine, null); }
+        } }
         public CompletableFuture<JSONObject> call(String method, JSONObject params) {
             try {
+                if (method.equals("getchaintip")) return CompletableFuture.completedFuture(tip());
                 if (method.equals("getbountychanges")) return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("next_cursor", "cursor" + pages.incrementAndGet()).put("has_more", false).put("changes", changeEvents));
                 if (method.equals("getrecentblockhashes")) {
                     if (holdDiscovery) { discoveryWaiting = true; return pendingDiscovery; }

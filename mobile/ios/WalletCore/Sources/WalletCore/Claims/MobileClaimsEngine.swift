@@ -6,7 +6,6 @@ import CConnectWallet
 /// automatic startup. The runtime supplies a natively derived reward address.
 public actor MobileClaimsEngine {
     private static let maximum: Int64 = 9_007_199_254_740_991
-    private static let genesis = "30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e"
     private let rpc: MobileRpcClient
     private let receiptURL: URL
     private let network = NWPathMonitor()
@@ -17,6 +16,7 @@ public actor MobileClaimsEngine {
     private var enabled = false, allowed = false, closed = false, healthy = false, unknownBlocked = false
     private var epoch: UInt64 = 0, run: UInt64 = 0, nextCapture: UInt64 = 0
     private var address = "", cursor: String?, tip: JSONObject?
+    private var recentWindow: ClaimRecentWindow?
     private var status = "stopped", lastError = "", lastTxid = "", receiptStatus = ""
     private var lastRpcError: JSONObject?
     private var rate = 100, concurrency = 100
@@ -132,7 +132,7 @@ public actor MobileClaimsEngine {
         attempts = 0; valid = 0; invalid = 0; hits = 0; submitted = 0; unknown = 0; cancelled = 0
         elapsed = 0; recentStarts.removeAll(); activeSince = nil
         blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); catalog.removeAll(); scheduler.clear()
-        cursor = nil; tip = nil; healthy = false; dirty = true; catalogAt = 0
+        cursor = nil; tip = nil; recentWindow = nil; healthy = false; dirty = true; catalogAt = 0
         lastError = ""; lastRpcError = nil; nextDiscovery = 0; nextBlock = 0; nextPreparation = 0; retryAt = 0
         status = "paused"; refreshAllowed()
         if dispatchTask == nil {
@@ -196,11 +196,7 @@ public actor MobileClaimsEngine {
         try record(expected, "submitted"); unknownBlocked = false; lastError = ""; stop(); return state()
     }
     private static func validateTip(_ value: Any?) throws -> JSONObject {
-        let value = try PJ.object(value)
-        try walletRequire(value["chain"] as? String == "main" && value["genesis_hash"] as? String == genesis, "CLAIMS_WRONG_NETWORK")
-        _ = try PJ.hash(value["hash"]); _ = try PJ.integer(value["height"], 0, maximum)
-        _ = try PJ.integer(value["mediantime"], 1, 253_402_300_799)
-        return value
+        try ClaimRecentWindow.Tip(value).json
     }
     private func request(_ method: String, _ params: JSONObject, _ token: UInt64) async throws -> JSONObject {
         try check(token)
@@ -211,9 +207,6 @@ public actor MobileClaimsEngine {
             }
             throw failure
         }
-    }
-    private func validCursor(_ value: Any?) throws -> String {
-        let text = try PJ.string(value); try walletRequire(PJ.matches(text, "[A-Za-z0-9_.-]{1,1024}"), "CLAIMS_RPC_DATA"); return text
     }
     private func launchMaintenance() {
         guard maintenanceTask == nil else { return }
@@ -238,25 +231,7 @@ public actor MobileClaimsEngine {
         catch { handleReadFailure(error, token) }
     }
     private func discover(_ token: UInt64) async throws {
-        var start = cursor
-        if start == nil {
-            let watermark = try await request("getbountychanges", [:], token)
-            _ = try Self.validateTip(watermark["tip"])
-            try walletRequire(try PJ.array(watermark["changes"]).isEmpty && !PJ.bool(watermark["has_more"]), "CLAIMS_RPC_DATA")
-            start = try validCursor(watermark["next_cursor"])
-        }
-        let response = try await request("getrecentblockhashes", [:], token)
-        let snapshot = try Self.validateTip(response["tip"]), height = try PJ.integer(snapshot["height"])
-        let list = try PJ.objects(response["blocks"])
-        try walletRequire(try PJ.integer(response["window"]) == 600 && list.count == min(600, height + 1), "CLAIMS_RPC_DATA")
-        var nextBlocks: [String: Int64] = [:], order: [String] = []
-        for (index, row) in list.enumerated() {
-            let hash = try PJ.hash(row["hash"])
-            try walletRequire(try PJ.integer(row["height"]) == height - Int64(index) && nextBlocks[hash] == nil, "CLAIMS_RPC_DATA")
-            if index == 0 { try walletRequire(hash == snapshot["hash"] as? String, "CLAIMS_RPC_DATA") }
-            nextBlocks[hash] = height - Int64(index); order.append(hash)
-        }
-        try await replay(token, recent: nextBlocks, recentOrder: order, start: start)
+        try await replay(token)
         nextDiscovery = now() + 10
     }
     private func loadBlock(_ hash: String, _ token: UInt64) async throws {
@@ -277,58 +252,25 @@ public actor MobileClaimsEngine {
         try await replay(token, newBlock: hash, staged: staged)
         nextBlock = now() + 1.5
     }
-    private func replay(_ token: UInt64, newBlock: String? = nil, staged: [String: ClaimCandidate] = [:],
-                        recent: [String: Int64]? = nil, recentOrder: [String]? = nil, start: String? = nil) async throws {
+    private func replay(_ token: UInt64, newBlock: String? = nil, staged: [String: ClaimCandidate] = [:]) async throws {
         try check(token)
         let began = now()
-        var next = catalog.filter { recent == nil || recent![$0.value.block] != nil }
-        for (key, source) in staged {
-            var row = source
-            if let previous = next[key] { row.progress = previous.progress }
-            next[key] = row
-        }
-        try walletRequire(next.count <= ClaimSubmissionRetry.maximumCatalogEntries, "CLAIMS_CAPACITY")
-        var nextCursor = start ?? cursor, nextTip = tip, more = true, lastSequence: Int64 = -1
-        for _ in 0..<20 {
-            guard more, let current = nextCursor else { break }
-            let response = try await request("getbountychanges", ["cursor": current], token)
-            nextTip = try Self.validateTip(response["tip"])
-            let events = try PJ.objects(response["changes"])
-            more = try PJ.bool(response["has_more"])
-            let following = try validCursor(response["next_cursor"])
-            try walletRequire(events.count <= 500 && (!more || !events.isEmpty && following != current), "CLAIMS_RPC_DATA")
-            for event in events {
-                let sequence = try PJ.integer(event["sequence"], 0, Self.maximum)
-                try walletRequire(sequence > lastSequence, "CLAIMS_RPC_DATA"); lastSequence = sequence
-                let key = try PJ.outpoint(event), kind = try PJ.string(event["type"])
-                switch kind {
-                case "window_exit": next.removeValue(forKey: key)
-                case "added": _ = try PJ.hash(event["block_hash"]); _ = try PJ.integer(event["block_height"], 0, Self.maximum)
-                case "spent", "pending_spend": _ = try PJ.hash(event["spending_txid"]); next[key]?.state = kind
-                case "available_again", "matured":
-                    if var row = next[key], row.state != "spent", kind == "available_again" || row.state == "immature" {
-                        row.state = try row.coinbase && PJ.integer(nextTip!["height"]) - row.height + 1 < 100 ? "immature" : "available"
-                        next[key] = row
-                    }
-                default: throw WalletError("CLAIMS_RPC_DATA")
-                }
+        let result = try await ClaimDiscoveryReplay.read(known: recentWindow, cursor: cursor, catalog: catalog,
+            loaded: loaded, newBlock: newBlock, staged: staged) { method, params in
+                try await self.request(method, params, token)
             }
-            nextCursor = following
-        }
-        try walletRequire(!more, "CLAIMS_SYNC_BUSY"); try check(token)
-        if let newBlock { try walletRequire(blocks[newBlock] != nil, "CLAIMS_SYNC_BUSY") }
-        let nextBlocks = recent ?? blocks
-        var nextLoaded = loaded.intersection(Set(nextBlocks.keys)); if let newBlock { nextLoaded.insert(newBlock) }
+        try check(token)
+        let next = result.catalog, nextLoaded = result.loaded, nextBlocks = result.window.heights
         var nextProgress = progress
         for row in next.values { nextProgress[row.key] = row.progress }
         let protected = reservations.union(Set(active.values.map { $0.selection.row.key }))
         nextProgress = nextProgress.filter { key, item in protected.contains(key) || nextBlocks[item.block] != nil && (!nextLoaded.contains(item.block) || next[key] != nil) }
         try walletRequire(ClaimSubmissionRetry.validProgressCount(nextProgress.count), "CLAIMS_CAPACITY")
-        blocks = nextBlocks; if let recentOrder { blockOrder = recentOrder }
+        blocks = nextBlocks; blockOrder = result.window.order; recentWindow = result.window
         loaded = nextLoaded; catalog = next; progress = nextProgress
         let policies = Set(nextProgress.values.map(\.policy)); stats = stats.filter { policies.contains($0.key) }
         retired = retired.intersection(Set(progress.keys).union(reservations))
-        cursor = nextCursor; tip = nextTip; healthy = true; catalogAt = began; dirty = true
+        cursor = result.cursor; tip = result.window.tip.json; healthy = true; catalogAt = began; dirty = true
         lastRpcError = nil; lastError = ""; invalidateQueued()
     }
     private func prepare(_ row: ClaimCandidate, _ token: UInt64) async throws {
@@ -372,7 +314,7 @@ public actor MobileClaimsEngine {
             } ?? false
             if !transient {
                 healthy = false; epoch &+= 1; cancelCaptures(); resetAdmission(); acknowledgeStarts(); invalidateQueued()
-                if code == "-32011" {
+                if ["-32011", "-32004"].contains(code) {
                     catalog.removeAll(); blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); scheduler.clear()
                     cursor = nil; tip = nil; catalogAt = 0; dirty = true
                 }

@@ -95,6 +95,15 @@ public class MobileRpcClientTest {
             assertEquals(0, error.elapsedMs); assertEquals(0, error.queuedMs); assertEquals(0, error.bytesReceived);
         }
     }
+    @Test public void recentBlockCountIsOptionalAndStrictlyBoundedInteger() throws Exception {
+        assertEquals(0, MobileRpcClient.validateParams("getrecentblockhashes", new JSONObject()).length());
+        for (int count : new int[] {1, 5, 100, 600}) assertEquals(count,
+            MobileRpcClient.validateParams("getrecentblockhashes", new JSONObject().put("count", count)).getLong("count"));
+        for (Object count : new Object[] {0, -1, 601, Long.MAX_VALUE, "5", 5.0, true, JSONObject.NULL})
+            invalid("getrecentblockhashes", new JSONObject().put("count", count));
+        invalid("getchaintip", new JSONObject().put("count", 5));
+        invalid("getrecentblockhashes", new JSONObject().put("count", 5).put("unexpected", 1));
+    }
     private static void diagnostic(MobileRpcClient.RpcFailure failure, String method, String phase) {
         assertEquals(method, failure.method); assertEquals(phase, failure.phase);
         assertTrue(failure.elapsedMs >= 0); assertTrue(failure.queuedMs >= 0); assertTrue(failure.queuedMs <= failure.elapsedMs);

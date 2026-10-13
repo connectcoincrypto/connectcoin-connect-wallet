@@ -85,6 +85,7 @@ function discoveryFixture(rows) {
   let snapshot = { window: 600, tip: tip(601), blocks: Array.from({ length: 600 }, (_, i) => ({ height: 601 - i, hash: hash(602 - i) })) };
   rpc.request = async method => {
     if (method === 'getrecentblockhashes') return structuredClone(snapshot);
+    if (method === 'getchaintip') return structuredClone(snapshot.tip);
     if (method === 'getbountychanges') return { tip: snapshot.tip, next_cursor: 'c1', has_more: false, changes: [] };
     throw new Error('Unexpected mock discovery request');
   };
@@ -113,7 +114,9 @@ test('reorg detection checks every retained active outpoint, not only one active
   await service.syncBountiesInternal(service.epoch);
   assert.equal(service.retiredClaims.size, 2);
   const snapshot = { window: 600, tip: tip(602), blocks: Array.from({ length: 600 }, (_, i) => ({ height: 602 - i, hash: hash(603 - i) })) };
-  snapshot.blocks.find(block => block.height === 599).hash = hash(99000);
+  // A replaced ancestor necessarily replaces every descendant too.
+  for (const block of snapshot.blocks) if (block.height >= 599) block.hash = hash(99000 + block.height);
+  snapshot.tip.hash = snapshot.blocks[0].hash;
   setSnapshot(snapshot);
   await service.syncBountiesInternal(service.epoch);
   for (const value of rows) assert.ok(removals.includes(bountyKey(value)));

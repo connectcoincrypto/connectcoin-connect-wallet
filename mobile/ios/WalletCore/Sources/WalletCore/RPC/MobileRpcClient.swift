@@ -448,7 +448,7 @@ public final class MobileRpcClient: @unchecked Sendable {
     }
     public static func hash(_ value: String) -> Bool { value.range(of: "\\A[0-9a-fA-F]{64}\\z", options: .regularExpression) != nil }
     public static func validateParams(_ method: String, _ params: JSONObject, subscriptions: Bool = false) throws -> JSONObject {
-        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": [],
+        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": ["count"],
             "getaddressbalance": ["address"], "getaddresshistory": ["address", "cursor"],
             "getaddressutxos": ["address", "cursor", "include_pending_spent"], "getaddresschanges": ["addresses", "cursor"],
             "gettransaction": ["txid"], "gettransactions": ["txids"], "getbountychanges": ["cursor"],
@@ -459,8 +459,10 @@ public final class MobileRpcClient: @unchecked Sendable {
         if subscriptions { try walletRequire(["subscribeaddress","subscribetip","getchaintip"].contains(method), "RPC_INVALID") }
         var clean: JSONObject = [:]
         for key in allowed {
-            guard let value = params[key] else { if ["cursor", "include_pending_spent"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
+            guard let value = params[key] else { if ["cursor", "include_pending_spent", "count"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
             switch key {
+            case "count":
+                clean[key] = try JSON.integer(value, min: 1, max: 600)
             case "address":
                 let text = try JSON.string(value); _ = try WalletCrypto.decodeAddress(text); clean[key] = text.lowercased()
             case "addresses":

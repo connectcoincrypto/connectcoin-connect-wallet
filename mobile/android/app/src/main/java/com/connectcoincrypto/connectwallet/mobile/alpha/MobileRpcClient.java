@@ -59,7 +59,7 @@ public final class MobileRpcClient implements AutoCloseable {
     private static final Map<String, Set<String>> PARAMS;
     static {
         Map<String, Set<String>> methods = new HashMap<>();
-        methods.put("getchaintip", keys()); methods.put("getrecentblockhashes", keys());
+        methods.put("getchaintip", keys()); methods.put("getrecentblockhashes", keys("count"));
         methods.put("getaddressbalance", keys("address"));
         methods.put("getaddresshistory", keys("address", "cursor"));
         methods.put("getaddressutxos", keys("address", "cursor", "include_pending_spent"));
@@ -288,11 +288,14 @@ public final class MobileRpcClient implements AutoCloseable {
         try {
             for (String name : allowed) {
                 if (!params.has(name)) {
-                    if (!name.equals("cursor") && !name.equals("include_pending_spent")) throw failure("RPC_INVALID");
+                    if (!name.equals("cursor") && !name.equals("include_pending_spent") && !name.equals("count")) throw failure("RPC_INVALID");
                     continue;
                 }
                 Object value = params.opt(name);
                 switch (name) {
+                    case "count":
+                        if (!(value instanceof Integer || value instanceof Long) || ((Number)value).longValue() < 1 || ((Number)value).longValue() > 600) throw failure("RPC_INVALID");
+                        clean.put(name, ((Number)value).longValue()); break;
                     case "address": clean.put(name, address(value)); break;
                     case "cursor":
                         if (value != JSONObject.NULL && (!(value instanceof String) || !((String) value).matches("[A-Za-z0-9_.-]{1,1024}"))) throw failure("RPC_INVALID");

@@ -67,6 +67,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private final Map<String, PerformanceWindow> domains = new LinkedHashMap<>();
     private final MobileClaimScheduler scheduler = new MobileClaimScheduler();
     private final Map<String, Long> blocks = new LinkedHashMap<>();
+    private MobileClaimBlockWindow blockWindow;
     private final Set<String> loaded = new HashSet<>(), retired = new HashSet<>();
     private String cursor, rewardAddress, currentDomain = "", status = "stopped", lastError = "", lastTxid = "";
     private JSONObject tip, lastRpcError;
@@ -249,7 +250,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private void pauseClock() { if (activeSince != 0) { elapsedBeforePause += Math.max(0, now() - activeSince); activeSince = 0; } }
     private synchronized void check(long epoch) { if (closed || !enabled || !allowed || epoch != generation) throw new Stopped(); }
     private static final class Stopped extends RuntimeException { private static final long serialVersionUID = 1L; }
-    private synchronized void resetCatalog() { catalog.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; }
+    private synchronized void resetCatalog() { resetCatalog(false); }
+    private synchronized void resetCatalog(boolean keepHashAnchor) { catalog.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; if (!keepHashAnchor) blockWindow = null; }
+    private static final class ChainMoved extends Exception { private static final long serialVersionUID = 1L; }
 
     /** Discovery reads may retry independently, but never authorize work from an unboundedly old snapshot. */
     private boolean catalogFresh() { return healthy && now() - catalogValidatedAt < CATALOG_FRESH_MS; }
@@ -295,36 +298,42 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
     static JSONObject validateTip(JSONObject value) throws JSONException {
         require(value != null && "main".equals(value.opt("chain")) && GENESIS.equals(value.opt("genesis_hash")), "CLAIMS_WRONG_NETWORK");
-        hash(value.opt("hash")); integer(value.opt("height"), 0, SAFE_MAX); integer(value.opt("mediantime"), 1, 253402300799L); return copy(value);
-    }
-    private Map<String, Long> recent(JSONObject response) throws Exception {
-        JSONObject state = validateTip(response.optJSONObject("tip")); long height = state.getLong("height");
-        require(integer(response.opt("window"), 600, 600) == 600 && response.opt("blocks") instanceof JSONArray, "CLAIMS_RPC_DATA");
-        JSONArray list = response.getJSONArray("blocks"); require(list.length() == Math.min(600L, height + 1), "CLAIMS_RPC_DATA");
-        Map<String, Long> result = new LinkedHashMap<>();
-        for (int index = 0; index < list.length(); index++) {
-            JSONObject block = list.getJSONObject(index); String id = hash(block.opt("hash"));
-            require(integer(block.opt("height"), 0, SAFE_MAX) == height - index && !result.containsKey(id), "CLAIMS_RPC_DATA");
-            if (index == 0) require(id.equals(state.getString("hash")), "CLAIMS_RPC_DATA"); result.put(id, height - index);
-        }
-        return result;
+        String id = hash(value.opt("hash")); long height = integer(value.opt("height"), 0, SAFE_MAX);
+        require(height != 0 || id.equals(GENESIS), "CLAIMS_RPC_DATA");
+        integer(value.opt("mediantime"), 1, 253402300799L); return copy(value);
     }
     private void discover(long epoch) throws Exception {
-        String startCursor;
-        synchronized (this) { startCursor = cursor; }
-        if (startCursor == null) {
-            JSONObject watermark = request("getbountychanges", new JSONObject(), epoch);
-            validateTip(watermark.optJSONObject("tip"));
-            require(watermark.opt("changes") instanceof JSONArray && watermark.getJSONArray("changes").length() == 0 && Boolean.FALSE.equals(watermark.opt("has_more")), "CLAIMS_RPC_DATA");
-            startCursor = validCursor(watermark.opt("next_cursor"));
+        String originalCursor; MobileClaimBlockWindow known;
+        synchronized (this) { originalCursor = cursor; known = blockWindow; }
+        // A normal tip race usually settles with one extra pass. Retain the
+        // original journal cursor until commit and bound repeated reorgs.
+        for (int pass = 0; pass < 3; pass++) {
+            String startCursor = originalCursor;
+            JSONObject first = request("getbountychanges", startCursor == null ? new JSONObject() : new JSONObject().put("cursor", startCursor), epoch);
+            JSONObject expected = validateTip(first.optJSONObject("tip"));
+            boolean force = startCursor == null;
+            if (startCursor == null) {
+                require(first.opt("changes") instanceof JSONArray && first.getJSONArray("changes").length() == 0 && Boolean.FALSE.equals(first.opt("has_more")), "CLAIMS_RPC_DATA");
+                startCursor = validCursor(first.opt("next_cursor")); first = null;
+            }
+            MobileClaimBlockWindow refreshed = refreshWindow(known, expected, force, epoch);
+            // Publish recent blocks and deltas together. A failed read cannot
+            // make a new tip or partially refreshed catalog visible to workers.
+            try {
+                replay(epoch, null, null, refreshed.blocks(), startCursor, refreshed, first);
+                synchronized (this) { check(epoch); nextDiscovery = now() + 10000; readRecovered("discovery"); }
+                return;
+            } catch (ChainMoved moved) { if (pass == 2) throw moved; known = refreshed; }
         }
-        JSONObject response = request("getrecentblockhashes", new JSONObject(), epoch); Map<String, Long> recent = recent(response);
-        // Publish recent blocks and deltas together. A failed read cannot leave
-        // a new tip or partially refreshed catalog visible to capture workers.
-        replay(epoch, null, null, recent, startCursor);
-        synchronized (this) { check(epoch); nextDiscovery = now() + 10000; readRecovered("discovery"); }
+    }
+    private MobileClaimBlockWindow refreshWindow(MobileClaimBlockWindow known, JSONObject expected, boolean force, long epoch) throws Exception {
+        try { return MobileClaimBlockWindow.refresh(known, expected, force,
+            params -> { check(epoch); return waitFor(rpc.call("getrecentblockhashes", params), epoch); }); }
+        catch (MobileRpcClient.RpcFailure failure) { throw new ReadFailure("getrecentblockhashes", failure); }
     }
     private void loadBlock(String blockHash, long epoch) throws Exception {
+        String originalCursor; MobileClaimBlockWindow known; long blockHeight;
+        synchronized (this) { check(epoch); originalCursor = cursor; known = blockWindow; blockHeight = blocks.get(blockHash); }
         Map<String, Candidate> staged = new LinkedHashMap<>();
         try { waitFor(rpc.stream(blockHash, chunk -> {
             check(epoch);
@@ -341,7 +350,22 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 require(staged.put(row.key, row) == null && staged.size() <= MAX_CATALOG, "CLAIMS_CAPACITY");
             }
         }), epoch); } catch (MobileRpcClient.RpcFailure failure) { throw new ReadFailure("getblockbounties", failure); }
-        replay(epoch, blockHash, staged);
+        // Reuse the completed stream across ordinary new-block races, but
+        // always replay from BEFORE that stream. Advancing the public cursor
+        // separately would lose spends that arrived while the stream ran.
+        JSONObject first = null; Map<String, Long> recent = null;
+        for (int pass = 0; pass < 3; pass++) {
+            boolean canonical = known.blocks().containsKey(blockHash) && known.blocks().get(blockHash) == blockHeight;
+            try {
+                replay(epoch, canonical ? blockHash : null, canonical ? staged : null, recent, originalCursor, known, first);
+                break;
+            } catch (ChainMoved moved) {
+                if (pass == 2) throw moved;
+                first = request("getbountychanges", new JSONObject().put("cursor", originalCursor), epoch);
+                known = refreshWindow(known, validateTip(first.optJSONObject("tip")), false, epoch);
+                recent = known.blocks();
+            }
+        }
         synchronized (this) { check(epoch); nextBlock = now() + 1500; readRecovered("catalog"); }
     }
     /** Private clone plus delta replay; no partially received block is published. */
@@ -349,34 +373,58 @@ public final class MobileClaimsEngine implements AutoCloseable {
         replay(epoch, newBlock, staged, null, null);
     }
     private void replay(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor) throws Exception {
+        MobileClaimBlockWindow known;
+        synchronized (this) { known = recent == null ? blockWindow : null; }
+        replay(epoch, newBlock, staged, recent, startCursor, known, null);
+    }
+    private void replay(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
+                        MobileClaimBlockWindow window, JSONObject first) throws Exception {
         Map<String, Candidate> next = new LinkedHashMap<>(); String nextCursor; JSONObject nextTip;
+        Map<String, Long> canonical; boolean replayAfterFirst;
+        Set<String> dirtyBlocks = new HashSet<>();
         long validatedFrom = now();
         synchronized (this) {
             check(epoch);
-            for (Candidate row : catalog.values()) if (recent == null || recent.containsKey(row.blockHash)) next.put(row.key, row.copy());
+            for (Candidate row : catalog.values()) if ((recent == null || recent.containsKey(row.blockHash)) && !row.blockHash.equals(newBlock)) next.put(row.key, row.copy());
             nextCursor = startCursor == null ? cursor : startCursor; nextTip = tip;
-        }
-        if (staged != null) for (Candidate row : staged.values()) {
-            Candidate existing = next.get(row.key);
-            if (existing != null) row.progress = existing.progress;
-            next.put(row.key, row);
+            canonical = new LinkedHashMap<>(recent == null ? blocks : recent);
+            replayAfterFirst = first != null && window != blockWindow;
+            // A complete stream replaces that block, including rows that have
+            // disappeared. Preserve public accounting for surviving outpoints.
+            if (staged != null) for (Candidate source : staged.values()) {
+                Candidate row = source.copy();
+                Candidate existing = catalog.get(row.key);
+                if (existing != null) row.progress = existing.progress;
+                next.put(row.key, row);
+            }
         }
         require(next.size() <= MAX_CATALOG, "CLAIMS_CAPACITY");
         boolean more = true; long previousSequence = -1;
-        for (int page = 0; more && page < 20; page++) {
-            JSONObject changes = request("getbountychanges", new JSONObject().put("cursor", nextCursor), epoch);
+        for (int page = 0; (more || replayAfterFirst) && page < 20; page++) {
+            JSONObject changes = page == 0 && first != null ? first : request("getbountychanges", new JSONObject().put("cursor", nextCursor), epoch);
+            if (page > 0 || first == null) replayAfterFirst = false;
             nextTip = validateTip(changes.optJSONObject("tip"));
             require(changes.opt("changes") instanceof JSONArray && changes.opt("has_more") instanceof Boolean, "CLAIMS_RPC_DATA");
             JSONArray events = changes.getJSONArray("changes"); require(events.length() <= 500, "CLAIMS_RPC_DATA");
+            for (int index = 0; index < events.length(); index++) if ("resync_required".equals(events.getJSONObject(index).opt("type"))) throw new IllegalArgumentException("CLAIMS_RESYNC");
+            if (window != null && !MobileClaimBlockWindow.sameTip(window.tip(), nextTip)) throw new ChainMoved();
             String following = validCursor(changes.opt("next_cursor")); more = changes.getBoolean("has_more");
-            require(!more || events.length() > 0 && !following.equals(nextCursor), "CLAIMS_RPC_DATA");
+            require((!more || events.length() > 0) && (events.length() == 0 || !following.equals(nextCursor)), "CLAIMS_RPC_DATA");
             for (int index = 0; index < events.length(); index++) {
-                JSONObject event = events.getJSONObject(index); long sequence = integer(event.opt("sequence"), 0, SAFE_MAX);
+                JSONObject event = events.getJSONObject(index);
+                long sequence = integer(event.opt("sequence"), 0, SAFE_MAX);
                 require(sequence > previousSequence, "CLAIMS_RPC_DATA"); previousSequence = sequence;
                 String txid = hash(event.opt("txid")); long vout = integer(event.opt("vout"), 0, 0xffffffffL); String key = txid + ":" + vout;
                 String type = event.optString("type", ""); Candidate row = next.get(key);
                 if (type.equals("window_exit")) next.remove(key);
-                else if (type.equals("added")) { hash(event.opt("block_hash")); integer(event.opt("block_height"), 0, SAFE_MAX); }
+                else if (type.equals("added")) {
+                    String blockHash = hash(event.opt("block_hash")); long height = integer(event.opt("block_height"), 0, SAFE_MAX);
+                    if (row != null) require(row.blockHash.equals(blockHash) && row.height == height, "CLAIMS_RPC_DATA");
+                    if (canonical.containsKey(blockHash)) {
+                        require(canonical.get(blockHash) == height, "CLAIMS_RPC_DATA");
+                        if (row == null) dirtyBlocks.add(blockHash);
+                    }
+                }
                 else if (type.equals("spent") || type.equals("pending_spend")) { hash(event.opt("spending_txid")); if (row != null) row.state = type.equals("spent") ? "spent" : "pending_spend"; }
                 else if (type.equals("available_again") || type.equals("matured")) {
                     if (row != null && !row.state.equals("spent") && (type.equals("available_again") || row.state.equals("immature"))) row.state = row.coinbase && nextTip.getLong("height") - row.height + 1 < 100 ? "immature" : "available";
@@ -384,11 +432,17 @@ public final class MobileClaimsEngine implements AutoCloseable {
             }
             nextCursor = following;
         }
-        require(!more, "CLAIMS_SYNC_BUSY");
+        require(!more && !replayAfterFirst, "CLAIMS_SYNC_BUSY");
+        // Never mark mixed-branch rows fresh. This inexpensive fence replaces
+        // a second full-window transfer and also protects each progressive block.
+        JSONObject finalTip = validateTip(request("getchaintip", new JSONObject(), epoch));
+        if (!MobileClaimBlockWindow.sameTip(nextTip, finalTip) || window != null && !MobileClaimBlockWindow.sameTip(window.tip(), finalTip)) throw new ChainMoved();
         synchronized (this) {
-            check(epoch); if (newBlock != null && !blocks.containsKey(newBlock)) throw new IllegalArgumentException("CLAIMS_SYNC_BUSY");
+            check(epoch);
             Map<String, Long> nextBlocks = recent == null ? blocks : recent;
+            if (newBlock != null && !nextBlocks.containsKey(newBlock)) throw new IllegalArgumentException("CLAIMS_SYNC_BUSY");
             Set<String> nextLoaded = new HashSet<>(loaded); nextLoaded.retainAll(nextBlocks.keySet()); if (newBlock != null) nextLoaded.add(newBlock);
+            nextLoaded.removeAll(dirtyBlocks);
             Map<String, Candidate.Progress> nextProgress = new LinkedHashMap<>(progress);
             for (Candidate row : next.values()) nextProgress.put(row.key, row.progress);
             Set<String> protectedKeys = new HashSet<>(reservations);
@@ -398,6 +452,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             // it: protected old captures/winners can outlive their window.
             require(nextProgress.size() <= MAX_PROGRESS, "CLAIMS_CAPACITY");
             if (recent != null) { blocks.clear(); blocks.putAll(recent); }
+            if (window != null) blockWindow = window;
             loaded.clear(); loaded.addAll(nextLoaded); catalog.clear(); catalog.putAll(next);
             progress.clear(); progress.putAll(nextProgress); scheduleDirty = true;
             if (recent != null) {
@@ -440,6 +495,16 @@ public final class MobileClaimsEngine implements AutoCloseable {
             scope = candidate == null ? "" : candidate.key;
             if (candidate != null) prepare(candidate, epoch);
         } catch (Stopped stopped) { /* An explicit lifecycle cancellation is neutral. */ }
+        catch (ChainMoved moved) {
+            synchronized (this) {
+                if (epoch == generation && enabled) {
+                    // A normal block race is not a new wallet generation and
+                    // must not discard retained, proven-unsent winners.
+                    healthy = false; nextDiscovery = 0; retryAt = now() + 1000; status = "retrying";
+                    cancelCaptures(null, -1); cancelUnsafeQueuedTransmissions(); resetStartSchedule();
+                }
+            }
+        }
         catch (ReadFailure error) {
             synchronized (this) { if (epoch == generation && enabled) { recordRpcError(error.failure, error.method, stage); lastRpcScope = scope; } }
             if (!retryRead(error.failure, epoch)) failed(error.failure, epoch, false);
@@ -461,7 +526,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private void recordRpcError(MobileRpcClient.RpcFailure failure, String fallbackMethod, String stage) {
         try {
             String method = failure.method;
-            if (!java.util.Arrays.asList("getbountychanges", "getrecentblockhashes", "getblockbounties", "gettransaction", "sendrawtransaction").contains(method)) method = fallbackMethod;
+            if (!java.util.Arrays.asList("getchaintip", "getbountychanges", "getrecentblockhashes", "getblockbounties", "gettransaction", "sendrawtransaction").contains(method)) method = fallbackMethod;
             String phase = failure.phase;
             if (phase == null || !phase.matches("[a-z_]{1,32}")) phase = "unknown";
             lastRpcError = new JSONObject().put("code", failure.code).put("method", method).put("phase", phase).put("stage", stage)
@@ -492,7 +557,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             if (epoch != generation || !enabled) return;
             healthy = false; currentDomain = "";
             String code = error instanceof MobileRpcClient.RpcFailure ? ((MobileRpcClient.RpcFailure) error).code : safeCode(error.getMessage());
-            if (code.equals("-32011")) resetCatalog();
+            if (code.equals("-32011") || code.equals("-32004") || code.equals("CLAIMS_RESYNC")) resetCatalog(true);
             if (code.equals("CLAIMS_WRONG_NETWORK") || code.equals("CLAIMS_CAPACITY") || code.equals("CLAIMS_RPC_DATA") || code.equals("CLAIMS_NATIVE_DATA") || code.equals("CLAIMS_RECEIPT_UNAVAILABLE") || error instanceof LinkageError) { enabled = false; pauseClock(); status = "error"; }
             else { status = "retrying"; retryAt = now() + (code.equals("-32029") ? 60000 : 5000); nextDiscovery = 0; }
             lastError = code; generation++; cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts();
