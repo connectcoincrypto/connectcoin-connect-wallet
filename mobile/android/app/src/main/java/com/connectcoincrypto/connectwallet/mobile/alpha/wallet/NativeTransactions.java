@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
@@ -120,15 +121,99 @@ public final class NativeTransactions {
         JSONObject tx = new JSONObject().put("version", version).put("inputs", inputs).put("outputs", outputs).put("locktime", r.integer(4));
         require(r.position == r.data.length && Arrays.equals(serialize(tx, true), r.data), "Noncanonical or trailing transaction bytes."); return tx;
     }
+    private static final class FundingOutput {
+        final int type, mask;
+        final long roots;
+        final String amount, publicKey, domain, target;
+        FundingOutput(JSONObject output) throws Exception {
+            type = output.getInt("type"); amount = output.getString("amount");
+            publicKey = type == 1 ? output.getString("publicKey") : null;
+            domain = type == 2 ? output.getString("domain") : null;
+            target = type == 2 ? output.getString("target") : null;
+            roots = type == 2 ? output.getLong("rootVersion") : 0;
+            mask = type == 2 ? output.getInt("mask") : 0;
+        }
+        JSONObject copy() throws Exception {
+            JSONObject output = new JSONObject().put("type", type).put("amount", amount);
+            if (type == 1) return output.put("publicKey", publicKey);
+            return output.put("domain", domain).put("target", target).put("rootVersion", roots).put("mask", mask);
+        }
+        long retainedBytes() {
+            long characters = amount.length();
+            for (String value : new String[]{publicKey, domain, target}) if (value != null) characters += value.length();
+            return 512 + 2 * characters;
+        }
+    }
     private static final class FundingParent {
-        final JSONObject transaction;
+        final FundingOutput[] outputs;
         final String id;
-        FundingParent(String raw) throws Exception { transaction = parse(raw); id = txid(transaction); }
+        final long retainedBytes;
+        FundingParent(String raw) throws Exception {
+            // Full canonical parsing validates ALL outputs, keys and witnesses.
+            // Discard inputs/witnesses afterwards; cache only private scalars.
+            JSONObject transaction = parse(raw); id = txid(transaction);
+            JSONArray parsed = transaction.getJSONArray("outputs"); outputs = new FundingOutput[parsed.length()];
+            long bytes = 256 + 2L * raw.length();
+            for (int i = 0; i < outputs.length; i++) { outputs[i] = new FundingOutput(parsed.getJSONObject(i)); bytes += outputs[i].retainedBytes(); }
+            retainedBytes = bytes;
+        }
+    }
+    /** Exact-wire public metadata only, never a cache of output/context trust.
+     * Budget charges UTF-16 raw/scalar strings plus conservative entry/output
+     * overhead, not precise VM RSS. Wire/output bounds also remain enforced.
+     * No mutable JSON, inputs, scripts, witness objects or wallet keys retained. */
+    public static final class FundingTransactionCache {
+        private final int maxEntries;
+        private final long maxBytes;
+        private final LinkedHashMap<String, FundingParent> entries = new LinkedHashMap<>(16, .75f, true);
+        private long retainedBytes, generation, parses;
+        public FundingTransactionCache() { this(128, 16L * 1024 * 1024); }
+        public FundingTransactionCache(int maxEntries, long maxBytes) {
+            require(maxEntries >= 1 && maxEntries <= 128 && maxBytes >= 1 && maxBytes <= 16L * 1024 * 1024, "Invalid funding cache bounds.");
+            this.maxEntries = maxEntries; this.maxBytes = maxBytes;
+        }
+        public synchronized int size() { return entries.size(); }
+        public synchronized long retainedBytes() { return retainedBytes; }
+        synchronized long parses() { return parses; }
+        public synchronized void clear() { entries.clear(); retainedBytes = 0; generation++; }
+        private FundingParent validated(String raw, FundingCheck check) throws Exception {
+            check.check();
+            final long observed;
+            synchronized (this) {
+                observed = generation;
+                FundingParent cached = entries.get(raw); if (cached != null) return cached;
+            }
+            FundingParent parent = new FundingParent(raw);
+            // Never call the lifecycle guard under the cache monitor: the
+            // engine may hold its own monitor while clearing this cache.
+            check.check();
+            synchronized (this) {
+                if (observed != generation) throw new java.util.concurrent.CancellationException("Funding cache context changed.");
+                parses++;
+                FundingParent existing = entries.get(raw); if (existing != null) return existing;
+                if (parent.retainedBytes <= maxBytes) {
+                    while (entries.size() >= maxEntries || retainedBytes > maxBytes - parent.retainedBytes) {
+                        String oldest = entries.keySet().iterator().next(); retainedBytes -= entries.remove(oldest).retainedBytes;
+                    }
+                    entries.put(raw, parent); retainedBytes += parent.retainedBytes;
+                }
+            }
+            return parent;
+        }
+        public JSONObject verifyFunding(JSONObject utxo, String expectedKey) throws Exception { return verifyFunding(utxo, expectedKey, () -> {}); }
+        public JSONObject verifyFunding(JSONObject utxo, String expectedKey, FundingCheck check) throws Exception {
+            JSONObject result = checkFundingOutput(utxo, expectedKey, validated(utxo.getString("rawTransaction"), check));
+            check.check(); return result;
+        }
+        public JSONObject prepareClaim(JSONObject bounty, String raw, String reward, int rate, FundingCheck check) throws Exception {
+            JSONObject output = verifyFunding(new JSONObject(bounty.toString()).put("rawTransaction", raw), null, check);
+            JSONObject result = prepareClaimWithFunding(bounty, output, reward, rate); check.check(); return result;
+        }
     }
     private static JSONObject checkFundingOutput(JSONObject utxo, String expectedKey, FundingParent parent) throws Exception {
         require(parent.id.equals(utxo.getString("txid")), "Funding ID does not match the original transaction.");
-        long index = utxo.getLong("vout"); require(index >= 0 && index < parent.transaction.getJSONArray("outputs").length(), "Funding output does not exist.");
-        JSONObject output = parent.transaction.getJSONArray("outputs").getJSONObject((int)index);
+        long index = utxo.getLong("vout"); require(index >= 0 && index < parent.outputs.length, "Funding output does not exist.");
+        JSONObject output = parent.outputs[(int)index].copy();
         require(amount(output.getString("amount")) == amount(utxo.getString("amount")), "Funding amount does not match the original transaction.");
         if (expectedKey != null) require(output.getInt("type") == 1 && output.getString("publicKey").equals(expectedKey), "Funding output is not owned by this key.");
         return output;
@@ -187,6 +272,9 @@ public final class NativeTransactions {
     public static long claimFee(int feeRate) { feeRate(feeRate); return (long)((92 * 4 + 2 + 1 + compact(MAX_PROOF).length + MAX_PROOF + 3) / 4) * feeRate; }
     public static JSONObject prepareClaim(JSONObject bounty, String parentHex, String rewardAddress, int rate) throws Exception {
         JSONObject funded = new JSONObject(bounty.toString()).put("rawTransaction", parentHex), output = verifyFunding(funded, null);
+        return prepareClaimWithFunding(bounty, output, rewardAddress, rate);
+    }
+    private static JSONObject prepareClaimWithFunding(JSONObject bounty, JSONObject output, String rewardAddress, int rate) throws Exception {
         require(output.getInt("type") == 2 && output.getInt("rootVersion") == 1, "Unsupported bounty output.");
         for (String[] keys : new String[][]{{"domain","domain"}, {"connection_work_target","target"}, {"root_certificates_version","rootVersion"}, {"signature_algorithms_mask","mask"}}) require(bounty.has(keys[0]) && bounty.get(keys[0]).toString().equals(output.get(keys[1]).toString()), "Bounty differs from the funding transaction.");
         long fee = claimFee(rate), value = amount(output.getString("amount")); require(fee <= COIN && value > fee, "Bounty is smaller than its safe fee.");
@@ -195,7 +283,7 @@ public final class NativeTransactions {
         JSONObject tx = new JSONObject().put("version", 2).put("locktime", 0).put("inputs", new JSONArray().put(new JSONObject().put("txid", bounty.getString("txid")).put("vout", bounty.getLong("vout")).put("sequence", 0xffffffffL).put("scriptSig", "").put("witness", new JSONArray()))).put("outputs", new JSONArray().put(reward));
         return new JSONObject().put("hex", WalletCrypto.hex(serialize(tx, false))).put("txid", txid(tx)).put("challenge", claimChallenge(tx)).put("bounty", output).put("fee", Long.toString(fee)).put("payout", Long.toString(value - fee));
     }
-    public static JSONObject attachClaim(JSONObject prepared, String proofHex) throws Exception {
+    private static List<byte[]> claimProofMessages(String proofHex, String challenge) throws Exception {
         byte[] proof = bytes(proofHex); require(proof.length > 0 && proof.length <= MAX_PROOF && proof[0] == 2, "Invalid proof version or size.");
         int offset = 1; List<byte[]> messages = new ArrayList<>();
         for (int[] spec : new int[][]{{1,4096},{2,2048},{8,4096},{11,49152},{15,8192}}) {
@@ -203,10 +291,36 @@ public final class NativeTransactions {
             int size = 4 + ((proof[offset+1] & 255) << 16) + ((proof[offset+2] & 255) << 8) + (proof[offset+3] & 255);
             require(size <= spec[1] && size <= proof.length - offset, "Invalid proof framing."); messages.add(Arrays.copyOfRange(proof, offset, offset + size)); offset += size;
         }
-        require(offset == proof.length && messages.get(0).length >= 38 && WalletCrypto.hex(Arrays.copyOfRange(messages.get(0), 6, 38)).equals(prepared.getString("challenge")), "Proof is not bound to this claim.");
-        JSONObject tx = parse(prepared.getString("hex")); require(txid(tx).equals(prepared.getString("txid")) && claimChallenge(tx).equals(prepared.getString("challenge")) && tx.getJSONArray("inputs").length() == 1 && tx.getJSONArray("outputs").length() == 1 && tx.getJSONArray("inputs").getJSONObject(0).getJSONArray("witness").length() == 0, "Claim proposal changed.");
+        require(offset == proof.length && messages.get(0).length >= 38 && WalletCrypto.hex(Arrays.copyOfRange(messages.get(0), 6, 38)).equals(challenge), "Proof is not bound to this claim.");
+        return messages;
+    }
+    /** Receipt identity excludes witness. Another accepted TLS proof may spend
+     * the same input to the exact same payout. Validate its canonical framing
+     * and challenge without replacing the original locally verified bytes.
+     * The node remains responsible for full consensus/TLS proof validation. */
+    public static void validateObservedClaim(String raw, String expectedTxid, String originalHex) throws Exception {
+        validateObservedClaim(raw, expectedTxid, originalHex, null);
+    }
+    public static void validateObservedClaim(String raw, String expectedTxid, String originalHex, String target) throws Exception {
+        JSONObject observed = parse(raw);
+        require(txid(observed).equals(expectedTxid), "Observed claim transaction identity changed.");
+        if (originalHex != null) require(Arrays.equals(serialize(observed, false), serialize(parse(originalHex), false)), "Observed claim input or payout changed.");
+        JSONArray inputs = observed.getJSONArray("inputs"), outputs = observed.getJSONArray("outputs");
+        require(observed.getLong("version") == 2 && observed.getLong("locktime") == 0 && inputs.length() == 1 && outputs.length() == 1, "Invalid observed claim shape.");
+        JSONObject input = inputs.getJSONObject(0);
+        require(input.getString("scriptSig").isEmpty() && input.getLong("sequence") == 0xffffffffL && outputs.getJSONObject(0).getInt("type") == 1, "Invalid observed claim input or payout.");
+        JSONArray witness = input.getJSONArray("witness"); require(witness.length() == 1, "Invalid observed claim witness.");
+        List<byte[]> messages = claimProofMessages(witness.getString(0), claimChallenge(observed));
+        if (target != null) requireClaimWork(messages, target);
+    }
+    private static void requireClaimWork(List<byte[]> messages, String target) throws Exception {
         byte[] work = WalletCrypto.taggedHash("ConnectCoin/P2C/work/v2", concat(messages.subList(0, 4).toArray(new byte[0][])));
-        require(new BigInteger(1, reverse(work)).compareTo(new BigInteger(prepared.getJSONObject("bounty").getString("target"), 16)) <= 0, "Proof does not meet target.");
+        require(new BigInteger(1, reverse(work)).compareTo(new BigInteger(1, fixed(target, 32))) <= 0, "Proof does not meet target.");
+    }
+    public static JSONObject attachClaim(JSONObject prepared, String proofHex) throws Exception {
+        List<byte[]> messages = claimProofMessages(proofHex, prepared.getString("challenge"));
+        JSONObject tx = parse(prepared.getString("hex")); require(txid(tx).equals(prepared.getString("txid")) && claimChallenge(tx).equals(prepared.getString("challenge")) && tx.getJSONArray("inputs").length() == 1 && tx.getJSONArray("outputs").length() == 1 && tx.getJSONArray("inputs").getJSONObject(0).getJSONArray("witness").length() == 0, "Claim proposal changed.");
+        requireClaimWork(messages, prepared.getJSONObject("bounty").getString("target"));
         tx.getJSONArray("inputs").getJSONObject(0).put("witness", new JSONArray().put(proofHex));
         return new JSONObject().put("hex", WalletCrypto.hex(serialize(tx, true))).put("txid", txid(tx)).put("fee", prepared.getString("fee")).put("payout", prepared.getString("payout"));
     }

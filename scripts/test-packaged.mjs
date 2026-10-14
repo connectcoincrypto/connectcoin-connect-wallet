@@ -6,7 +6,8 @@ import { dirname, isAbsolute, normalize, relative, resolve, sep } from 'node:pat
 import { fileURLToPath } from 'node:url';
 import asar from '@electron/asar';
 import { ConnectionPool } from '../src/core/claim-pool.mjs';
-import { pinnedCryptographyVersion, validateHelperSecurity } from './helper-security.mjs';
+import { validateNativeHelperSecurity } from './helper-security.mjs';
+import { validateNativeLicenseManifest } from './native-helper-manifest.mjs';
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const usage = 'Usage: node scripts/test-packaged.mjs --directory=<output root> --platform=win32|darwin|linux --arch=x64|arm64';
@@ -50,7 +51,7 @@ export function packagedLayout({ directory, platform, arch }) {
     executable: resolve(app, ...(platform === 'darwin' ? ['Contents', 'MacOS', 'ConnectWallet'] : [platform === 'win32' ? 'ConnectWallet.exe' : 'connectwallet'])),
     archive: resolve(resources, 'app.asar'),
     helper: resolve(resources, 'claims-helper', platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims'),
-    internal: resolve(resources, 'claims-helper', '_internal'),
+    licenses: resolve(resources, 'claims-helper', 'licenses'),
   };
 }
 
@@ -122,21 +123,17 @@ export async function testPackaged(options) {
     throw new Error('Packaged app name, version or main entry does not match this checkout.');
   }
   for (const path of ['src/main.mjs', 'src/preload.cjs', 'src/ui/index.html', 'src/ui/app.mjs',
-    'src/ui/styles.css', 'src/ui/tokens.css', 'assets/icon.png', 'LICENSE', 'THIRD_PARTY_NOTICES.md']) {
+    'src/ui/styles.css', 'src/ui/tokens.css', 'src/core/connection-limits.mjs',
+    'src/core/claims-helper-policy.mjs', 'assets/icon.png', 'LICENSE', 'THIRD_PARTY_NOTICES.md']) {
     const entry = asar.statFile(layout.archive, normalize(path), false);
     if (!entry || entry.link || entry.unpacked || !Number.isSafeInteger(entry.size) || entry.size <= 0) {
       throw new Error(`Missing or invalid app.asar entry: ${path}`);
     }
   }
 
-  for (const path of ['p2c_roots_v1.pem', 'licenses/LICENSE.connectcoin-p2c-tools', 'licenses/PROVENANCE.md', 'licenses/dependencies/manifest.json']) {
-    await requireFile(appRoot, resolve(layout.internal, path));
-  }
-  const roots = await readFile(resolve(layout.internal, 'p2c_roots_v1.pem'));
-  if (!roots.equals(await readFile(resolve(project, 'helpers/p2c_roots_v1.pem')))) throw new Error('Packaged helper roots differ from this checkout.');
-  const licenses = resolve(layout.internal, 'licenses/dependencies');
-  const manifest = JSON.parse(await readFile(resolve(licenses, 'manifest.json'), 'utf8'));
-  if (!Array.isArray(manifest) || !manifest.length) throw new Error('Missing bundled dependency license manifest.');
+  const licenses = layout.licenses;
+  await requireFile(appRoot, resolve(licenses, 'manifest.json'));
+  const manifest = validateNativeLicenseManifest(JSON.parse(await readFile(resolve(licenses, 'manifest.json'), 'utf8')));
   const seen = new Set();
   for (const entry of manifest) {
     const path = bundledLicensePath(licenses, entry?.file);
@@ -146,19 +143,20 @@ export async function testPackaged(options) {
     if (createHash('sha256').update(await readFile(path)).digest('hex') !== entry.sha256) throw new Error(`Bundled license checksum differs: ${entry.file}`);
   }
 
-  const expectedVersion = pinnedCryptographyVersion(await readFile(resolve(project, 'helpers/requirements.txt'), 'utf8'));
-  const selfTest = spawnSync(layout.helper, ['--self-test'], {
+  // The fixed root bundle is compiled into C++; self-test hashes those bytes.
+  // Do not compare the entire executable: macOS signing legitimately changes it.
+  const selfTest = spawnSync(layout.helper, ['--self-test', '--require-native-mbedtls'], {
     cwd: layout.app, shell: false, windowsHide: true, encoding: 'utf8',
     timeout: 30000, maxBuffer: 8192, input: '',
   });
   if (selfTest.error || selfTest.status !== 0) throw new Error('Packaged Automatic Claims helper failed its self-test.');
-  const security = validateHelperSecurity(selfTest.stdout, expectedVersion);
+  const security = validateNativeHelperSecurity(selfTest.stdout);
   // Only start/shutdown frames: no claim requests, DNS, TLS, RPC or wallet data.
-  const pool = new ConnectionPool({ helper: { command: layout.helper, args: [] } });
+  const pool = new ConnectionPool({ helper: { command: layout.helper, args: [], native: true } });
   try { await pool.start({}); }
   finally { await pool.close(); }
   console.log(`Packaged ConnectWallet ${packagedPackage.version} verified for ${options.platform}/${options.arch}: app.asar, native executables, roots, ${manifest.length} license files and protocol-4 startup/shutdown.`);
-  console.log(`Packaged cryptography ${security.cryptographyVersion}; ${security.opensslVersion}. No GUI was launched.`);
+  console.log(`Packaged native Mbed TLS ${security.mbedtlsVersion}. No GUI was launched.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

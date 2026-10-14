@@ -18,7 +18,7 @@ typedef struct cw_claim_context {
 } cw_claim_context;
 
 typedef struct cw_claim_result {
-    char *proof_hex; /* At most 128 KiB hex plus NUL. Owned; free with cw_claim_result_free. */
+    char *proof_hex; /* NULL without a winning proof; otherwise at most 128 KiB hex plus NUL. Owned; free with cw_claim_result_free. */
     int32_t captured;
     int32_t validation_passed;
     int32_t valid_proof;
@@ -31,13 +31,19 @@ typedef struct cw_claim_result {
  * Every error buffer supplied to these functions must hold at least 32 bytes. */
 int64_t cw_claim_limiter_create(int32_t rate, char *error);
 int32_t cw_claim_limiter_set_rate(int64_t limiter, int32_t rate, char *error);
+int32_t cw_claim_limiter_set_allowed(int64_t limiter, int32_t allowed, char *error);
 int32_t cw_claim_limiter_reset(int64_t limiter, char *error);
 void cw_claim_limiter_destroy(int64_t limiter);
 int64_t cw_claim_cancellation_create(int64_t limiter, char *error);
+int32_t cw_claim_bind_budget(int64_t handle, const char *key, const char *target_hex,
+    const char *successful_connections, char *error);
 void cw_claim_cancel(int64_t handle);
 void cw_claim_cancellation_destroy(int64_t handle);
 int32_t cw_claim_has_started(int64_t handle);
 int64_t cw_claim_started_age_nanos(int64_t handle);
+/* Read before destroying the drained handle. A counted native capture still
+ * consumes budget when later cancellation suppresses its result/proof. */
+int32_t cw_claim_has_captured(int64_t handle);
 
 /* Initialize result to zero before first use, and free once after every call.
  * A return value of 1 means an attempt completed, even if its proof was invalid.

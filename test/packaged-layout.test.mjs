@@ -34,7 +34,7 @@ test('builder layouts stay in the explicitly selected root for every target', ()
     assert.equal(layout.executable, resolve(directory, app, executable));
     assert.equal(layout.archive, resolve(directory, app, resources, 'app.asar'));
     assert.equal(layout.helper, resolve(directory, app, resources, 'claims-helper', platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims'));
-    assert.equal(layout.internal, resolve(directory, app, resources, 'claims-helper/_internal'));
+    assert.equal(layout.licenses, resolve(directory, app, resources, 'claims-helper/licenses'));
     for (const path of Object.values(layout)) assert.ok(!relative(directory, path).startsWith('..'));
   }
   assert.throws(() => packagedLayout({ directory, platform: 'win32', arch: '../../old-output' }), /Usage:/);

@@ -52,6 +52,16 @@ import org.xmlpull.v1.XmlPullParser;
 public final class AlphaSmokeTest {
     private static final String APP_ID = "com.connectcoincrypto.connectwallet.mobile.alpha";
     private static final String PROFILE_KEY = "connectwallet.mobile.alpha.public-profile.v1";
+    // Exact application surface plus the five inherited Capacitor methods.
+    // check-android.mjs verifies this against the native source before CI boots
+    // an emulator; the runtime assertion still checks the real PluginHandle.
+    private static final String[] NATIVE_WALLET_METHODS = {
+        "getState", "getSettings", "saveSettings", "getRecoverySnapshots", "lock", "create", "importRecovery",
+        "importWallet", "exportWallet", "unlock", "changePassword", "viewRecoveryPhrase", "reviewPayment", "reviewP2C",
+        "getPaymentBatch", "dismissPaymentBatch", "queryPublic", "watchAccount", "readPaymentClipboard", "newAddress",
+        "recoverAddresses", "claimsState", "claimsLimits", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission",
+        "addListener", "removeListener", "removeAllListeners", "checkPermissions", "requestPermissions"
+    };
     private Context context;
     private ActivityScenario<MainActivity> scenario;
 
@@ -143,7 +153,7 @@ public final class AlphaSmokeTest {
             "importRecoveryEnabled:Boolean(document.getElementById('import-recovery') && !document.getElementById('import-recovery').disabled)," +
             "importFileEnabled:Boolean(document.getElementById('import-wallet') && !document.getElementById('import-wallet').disabled)})"));
         assertEquals("en", ui.getString("language"));
-        assertEquals("ConnectWallet Alpha", ui.getString("title"));
+        assertEquals("ConnectWallet", ui.getString("title"));
         assertEquals("https://localhost", ui.getString("origin"));
         assertEquals("android", ui.getString("platform"));
         assertTrue(ui.getBoolean("setupVisible")); assertTrue(ui.getBoolean("walletHidden"));
@@ -175,9 +185,7 @@ public final class AlphaSmokeTest {
             // as our application methods. Keep the full exact allowlist;
             // permission methods cannot request undeclared plugin permissions.
             assertEquals(0, bridge.getPlugin("NativeWallet").getPluginAnnotation().permissions().length);
-            assertEquals(new HashSet<>(Arrays.asList("getState", "lock", "create", "importRecovery", "importWallet", "exportWallet", "unlock", "reviewPayment", "reviewP2C",
-                "queryPublic", "watchAccount", "readPaymentClipboard", "newAddress", "recoverAddresses", "claimsState", "claimsLimits", "claimsPolicy", "claimsStart", "claimsStop", "claimsCheckSubmission",
-                "addListener", "removeListener", "removeAllListeners", "checkPermissions", "requestPermissions")), wallet);
+            assertEquals(new HashSet<>(Arrays.asList(NATIVE_WALLET_METHODS)), wallet);
             PluginHandle paymentInput = bridge.getPlugin("NativePaymentInput");
             assertNotNull(paymentInput);
             assertEquals(NativePaymentInputPlugin.class, paymentInput.getInstance().getClass());
@@ -273,8 +281,8 @@ public final class AlphaSmokeTest {
         Configuration portuguese = new Configuration(context.getResources().getConfiguration());
         portuguese.setLocale(Locale.forLanguageTag("pt-BR"));
         Context localized = context.createConfigurationContext(portuguese);
-        assertEquals("ConnectWallet Alpha", localized.getString(R.string.app_name));
-        assertEquals("ConnectWallet Alpha", localized.getString(R.string.title_activity_main));
+        assertEquals("ConnectWallet", localized.getString(R.string.app_name));
+        assertEquals("ConnectWallet", localized.getString(R.string.title_activity_main));
     }
 
     @Test public void paymentLinksResolveOnlyToMainActivityAndNeverToTheInternalScanner() {

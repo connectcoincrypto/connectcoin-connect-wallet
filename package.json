@@ -29,6 +29,7 @@
     "test:ui:recovery": "node scripts/test-ui-recovery.mjs",
     "test:regtest": "node scripts/crypto-regtest.mjs",
     "setup:claims": "node scripts/setup-claims.mjs",
+    "setup:python-reference": "node scripts/setup-python-reference.mjs",
     "build:claims": "node scripts/setup-claims.mjs --build",
     "build:icon": "node scripts/build-icon.mjs",
     "prepack": "node scripts/check-package.mjs",
@@ -70,7 +71,7 @@
     },
     "extraResources": [
       {
-        "from": "helpers/bin/connectwallet-claims",
+        "from": "helpers/native-bin/connectwallet-claims",
         "to": "claims-helper"
       }
     ],

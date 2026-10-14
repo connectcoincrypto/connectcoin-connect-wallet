@@ -19,12 +19,18 @@ public final class NativeClaims {
     public static void setStartRate(long limiter, int rate) { nativeSetStartRate(limiter, rate); }
     /** Clear paused-run timing debt, retaining the rolling actual-start limit. */
     public static void resetStartSchedule(long limiter) { nativeResetStartSchedule(limiter); }
+    /** Atomic pre-TCP gate; already-started captures and rolling history survive. */
+    public static void setStartAllowed(long limiter, boolean allowed) { nativeSetStartAllowed(limiter, allowed); }
+    public static void bindBudget(long handle, String key, String target, String captured) { nativeBindBudget(handle, key, target, captured); }
     public static void destroyStartLimiter(long limiter) { nativeDestroyStartLimiter(limiter); }
     /** Elapsed monotonic nanos since actual connect, or -1 until started.
      * Using an age avoids assuming a shared epoch with System.nanoTime(). */
     public static long startedAgeNanos(long handle) { return nativeStartedAgeNanos(handle); }
     /** Actual TCP-start acknowledgement; query before destroying this handle. */
     public static boolean hasStarted(long handle) { return nativeHasStarted(handle); }
+    /** Completed native capture, including a result withheld on cancellation.
+     * Query after capture returns/throws and before destroying this handle. */
+    public static boolean hasCaptured(long handle) { return nativeHasCaptured(handle); }
     public static void cancel(long handle) { nativeCancel(handle); }
     public static void destroyHandle(long handle) { nativeDestroy(handle); }
 
@@ -35,12 +41,14 @@ public final class NativeClaims {
      * validProof:false without proof bytes; target misses remain validProof:true.
      * captured records the raw P2C transcript through CertificateVerify (not
      * a completed TLS handshake). validationPassed is the
-     * known certificate/signature outcome for EMA; validProof additionally
-     * requires an unexpired usable proof. An expired known-valid result retains
+     * known certificate/signature outcome for the hourly performance window;
+     * validProof additionally requires an unexpired validated result. Only target
+     * hits carry encoded proof bytes; valid target misses return an empty proof.
+     * An expired known-valid result retains
      * validationPassed:true but no proof bytes and validProof:false.
      * Completed TCP/TLS failures also return false with durationMs/errorCode.
      * Pre-TCP DNS failures, cancellation and local setup errors throw instead:
-     * they must not be recorded as a certificate-failure EMA sample.
+     * they must not be recorded as a certificate-failure performance sample.
      * challengeHex is the exact32 ClientHello bytes, targetHex is uint256 display.
      */
     public static String captureAndVerify(String domain, String challengeHex, String targetHex,
@@ -61,9 +69,12 @@ public final class NativeClaims {
     private static native long nativeCreateStartLimiter(int rate);
     private static native void nativeSetStartRate(long limiter, int rate);
     private static native void nativeResetStartSchedule(long limiter);
+    private static native void nativeSetStartAllowed(long limiter, boolean allowed);
+    private static native void nativeBindBudget(long handle, String key, String target, String captured);
     private static native void nativeDestroyStartLimiter(long limiter);
     private static native long nativeStartedAgeNanos(long handle);
     private static native boolean nativeHasStarted(long handle);
+    private static native boolean nativeHasCaptured(long handle);
     private static native void nativeCancel(long handle);
     private static native void nativeDestroy(long handle);
     private static native String nativeCapture(String domain, String challengeHex, String targetHex,

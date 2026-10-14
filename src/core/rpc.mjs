@@ -5,11 +5,11 @@ import { performance } from 'node:perf_hooks';
 import { validateRpcEndpoint } from './config.mjs';
 
 const PARAMS = Object.freeze({
-  getchaintip: [], getrecentblockhashes: [], getblockbounties: ['block_hash'],
+  getchaintip: [], getrecentblockhashes: ['count'], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
   gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
-  subscribebounties: [], subscribeaddress: ['address'], subscribetip: [], unsubscribe: ['subscription_id'],
+  subscribebounties: [], subscribeaddress: ['address', 'changes_only'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
 const PLAIN = value => value !== null && typeof value === 'object' && !Array.isArray(value) && [null, Object.prototype].includes(Object.getPrototypeOf(value));
@@ -27,14 +27,22 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor' && key !== 'include_pending_spent') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only' && key !== 'count') throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (!Object.hasOwn(descriptor, 'value')) throw new Error('RPC parameters must be plain data.');
     const value = descriptor.value;
+    if (key === 'count') {
+      if (!Number.isSafeInteger(value) || value < 1 || value > 600) throw new Error('Invalid RPC recent-block count.');
+      clean[key] = value; continue;
+    }
     if (key === 'include_pending_spent') {
       if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
+      clean[key] = value; continue;
+    }
+    if (key === 'changes_only') {
+      if (typeof value !== 'boolean') throw new Error('Invalid RPC address change option.');
       clean[key] = value; continue;
     }
     if (key === 'addresses') {
@@ -84,6 +92,14 @@ function closedError() {
 }
 function cancelledError() {
   return Object.assign(new Error('RPC request cancelled before transmission.'), { name: 'AbortError', code: 'ABORT_ERR' });
+}
+function unsentError(error) {
+  // failAll can reject transmitted reads and queued requests with the SAME
+  // Error. Never mark that shared instance unsent on behalf of one waiter.
+  // Copy descriptors to preserve structured codes/cause without invoking getters.
+  const original = error instanceof Error ? error : new Error('RPC operation failed before transmission.');
+  return Object.create(Object.getPrototypeOf(original), { ...Object.getOwnPropertyDescriptors(original),
+    notSent: { value: true, writable: true, configurable: true, enumerable: true } });
 }
 function isLocalCancellation(error) {
   return error instanceof Error && error.name === 'AbortError' && error.code === 'ABORT_ERR' && !error.unknownOutcome;
@@ -172,7 +188,7 @@ export class RpcClient extends EventEmitter {
         } catch {
           const error = new Error('RPC server returned an invalid or oversized response.');
           idleFailure(error, 'request');
-          this.failAll(error, socket);
+          this.failAll(error, socket, error, 'protocol');
           socket.destroy();
         }
       });
@@ -191,7 +207,7 @@ export class RpcClient extends EventEmitter {
         // An old socket may close after a new connection has already begun.
         // Reject only requests owned by this socket; never kill the new one.
         const error = new Error('Connection to the RPC server was lost.');
-        this.failAll(error, socket, socketFailure ?? error);
+        this.failAll(error, socket, socketFailure ?? error, 'socket-close');
         this.diagnostic('rpc.disconnected', { stage: 'connect', durationMs: performance.now() - startedAt });
         this.publishDisconnection(socket);
       });
@@ -200,7 +216,7 @@ export class RpcClient extends EventEmitter {
     try { return await connecting; }
     finally { if (this.connecting === connecting) this.connecting = null; }
   }
-  failAll(error, socket = null, diagnosticError = error) {
+  failAll(error, socket = null, diagnosticError = error, failureSource) {
     const affected = request => !socket || request.socket === socket;
     const draining = [...this.streams.values()].find(stream => stream.abandoned && affected(stream));
     if (draining && !isLocalCancellation(error) &&
@@ -208,14 +224,21 @@ export class RpcClient extends EventEmitter {
       // Its consumer already settled as cancellation, but malformed data or a
       // timeout during the bounded drain is still a real transport failure.
       this.diagnostic('rpc.failed', { method: draining.method, stage: 'stream',
-        durationMs: performance.now() - draining.startedAt, error: diagnosticError, unknownOutcome: false });
+        durationMs: performance.now() - draining.startedAt, error: diagnosticError, unknownOutcome: false,
+        sent: Boolean(draining.sent), notSent: false, failureSource });
     }
     for (const [id, request] of this.pending) if (!socket || request.socket === socket) {
-      if (request.diagnostic) request.diagnostic.error ??= diagnosticError;
+      if (request.diagnostic) {
+        request.diagnostic.error ??= diagnosticError;
+        request.diagnostic.failureSource ??= failureSource;
+      }
       clearRequest(request); this.pending.delete(id); request.reject(lossError(request, error));
     }
     for (const [id, stream] of this.streams) if (!socket || stream.socket === socket) {
-      if (stream.diagnostic) stream.diagnostic.error ??= diagnosticError;
+      if (stream.diagnostic) {
+        stream.diagnostic.error ??= diagnosticError;
+        stream.diagnostic.failureSource ??= failureSource;
+      }
       clearRequest(stream); this.streams.delete(id); stream.reject(lossError(stream, error));
     }
     // Queued requests belong to the connection on which they requested a slot.
@@ -234,13 +257,24 @@ export class RpcClient extends EventEmitter {
       // cannot strand an untracked promise when the socket is torn down.
       if (error) {
         if (!PLAIN(message.error) || !Number.isSafeInteger(message.error.code) || typeof message.error.message !== 'string') throw new Error('Invalid RPC error.');
+        const data = message.error.data;
+        const hasRetry = data != null && Object.hasOwn(data, 'retry_after_ms');
+        if (hasRetry && (!Number.isSafeInteger(data.retry_after_ms) || data.retry_after_ms < 0)) throw new Error('Invalid RPC retry delay.');
+        const retry = hasRetry ? data.retry_after_ms : undefined;
+        const cooldown = (key, wait) => this.cooldowns.set(key, Math.max(this.cooldowns.get(key) ?? 0,
+          Math.min(Number.MAX_SAFE_INTEGER, performance.now() + wait)));
         if (message.error.code === -32029) {
-          const retry = message.error.data?.retry_after_ms;
-          const wait = Number.isSafeInteger(retry) && retry > 0 ? Math.min(60000, retry) : this.windowMs;
-          this.cooldowns.set(pending.method, performance.now() + wait);
-        } else if (message.error.code === -32001) this.cooldowns.set('*', performance.now() + 1000);
+          cooldown(pending.method, retry ?? this.windowMs);
+        } else if (message.error.code === -32001) cooldown('*', Math.max(1000, retry ?? 0));
+        else if (message.error.code === -32030) cooldown(pending.method, retry ?? 1000);
         this.pending.delete(message.id); clearRequest(pending);
-        pending.reject(new RpcError('RPC request failed. ' + message.error.message.slice(0, 180), message.error.code, message.error.data));
+        const failure = new RpcError('RPC request failed. ' + message.error.message.slice(0, 180), message.error.code, message.error.data);
+        // Only a matched, well-framed RPC rejection can attest that a broadcast
+        // was not forwarded. This is distinct from notSent (zero socket writes).
+        // A node_code contradicts the pre-dispatch contract; stay conservative.
+        if (pending.method === 'sendrawtransaction' && [-32001, -32029, -32030].includes(failure.code) &&
+            (data == null || PLAIN(data) && !Object.hasOwn(data, 'node_code'))) failure.notForwarded = true;
+        pending.reject(failure);
       } else if (pending.streaming) {
         const streamId = message.result?.stream_id;
         if (!PLAIN(message.result) || typeof streamId !== 'string' || streamId.length < 1 || streamId.length > 128 || this.streams.has(streamId)) throw new Error('Invalid stream identifier.');
@@ -248,7 +282,10 @@ export class RpcClient extends EventEmitter {
         const stream = { ...pending, next: 0, records: 0, bytes: 0, phase: 'snapshot' };
         this.pending.delete(message.id); clearRequest(pending);
         this.streams.set(streamId, stream); this.resetStreamTimer(streamId, stream);
-        stream.deadlineTimer = setTimeout(() => { this.failAll(new Error('Bounty transfer exceeded its total time limit.'), socket); socket.destroy(); }, 180000);
+        stream.deadlineTimer = setTimeout(() => {
+          const failure = new Error('Bounty transfer exceeded its total time limit.');
+          this.failAll(failure, socket, failure, 'stream-deadline'); socket.destroy();
+        }, 180000);
       } else {
         this.pending.delete(message.id); clearRequest(pending); pending.resolve(message.result);
       }
@@ -271,8 +308,12 @@ export class RpcClient extends EventEmitter {
             const data = PLAIN(params.error.data) && Number.isSafeInteger(params.error.data.node_code)
               ? { node_code: params.error.data.node_code } : undefined;
             diagnosticError = new RpcError(failure.message, params.error.code, data);
+            // Explicit, well-framed server invalidations are recoverable. Keep
+            // malformed success markers/counts and all other failures generic.
+            if (params.chunks === stream.next && typeof params.error.message === 'string' &&
+                [-32011, -32001].includes(params.error.code)) failure.code = params.error.code;
           }
-          this.failAll(failure, socket, diagnosticError);
+          this.failAll(failure, socket, diagnosticError, 'stream-incomplete');
           socket.destroy();
         } else {
           this.streams.delete(params.stream_id); clearRequest(stream);
@@ -318,7 +359,10 @@ export class RpcClient extends EventEmitter {
   }
   resetStreamTimer(id, stream) {
     clearTimeout(stream.timer);
-    stream.timer = setTimeout(() => { this.failAll(new Error('Bounty transfer timed out.'), stream.socket); stream.socket.destroy(); }, this.timeoutMs);
+    stream.timer = setTimeout(() => {
+      const failure = new Error('Bounty transfer timed out.');
+      this.failAll(failure, stream.socket, failure, 'stream-timeout'); stream.socket.destroy();
+    }, this.timeoutMs);
   }
   waitForCapacity(socket, signal) {
     // queuedRequests already bounds these waiters. Reserve synchronously when
@@ -377,10 +421,12 @@ export class RpcClient extends EventEmitter {
       if (waitingSignal.aborted) throw cancelledError();
       const wait = this.quotaWait(method, params, { reserve });
       if (!wait) return;
-      await delay(wait, undefined, { signal: waitingSignal });
+      // Node timers overflow above signed 32-bit milliseconds. Sleep only one
+      // bounded slice, then recheck the full monotonic server deadline.
+      await delay(Math.min(wait, 2_147_483_647), undefined, { signal: waitingSignal });
     }
   }
-  async request(method, params = {}, { onChunk, signal } = {}) {
+  async request(method, params = {}, { onChunk, signal, beforeSend } = {}) {
     const startedAt = performance.now(), diagnostic = { stage: 'request', error: null };
     // Never copy caller params, arbitrary method names, or response bodies into diagnostics.
     const metadata = typeof method === 'string' && Object.hasOwn(PARAMS, method) ? { method } : {};
@@ -388,35 +434,60 @@ export class RpcClient extends EventEmitter {
     try {
       const clean = validateRpcParams(method, params);
       if ((method === 'getblockbounties') !== (typeof onChunk === 'function')) throw new Error('Bounty requests require a stream callback; other requests must not use one.');
+      if (beforeSend !== undefined && typeof beforeSend !== 'function') throw new Error('RPC beforeSend must be a synchronous function.');
       const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
       if (waitingSignal.aborted) throw cancelledError();
-      if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
+      if (this.queuedRequests >= 32) throw Object.assign(new Error('Too many queued RPC requests; retry shortly.'), { code: 'RPC_QUEUE_FULL' });
       this.queuedRequests++; queued = true;
       await this.pace(method, clean, { signal: waitingSignal, reserve: false });
       if (waitingSignal.aborted) throw cancelledError();
       diagnostic.stage = 'connect';
       const socket = await waitForConnection(this.connect(), waitingSignal);
       diagnostic.stage = 'request';
+      let id, encoded;
       for (;;) {
         releaseCapacity = await this.waitForCapacity(socket, waitingSignal);
         if (waitingSignal.aborted) throw cancelledError();
         if (this.closed) throw closedError();
         if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
         // A slot wait may outlive a quota window or receive a new server
-        // cooldown. Debit only immediately before transmission, and never
-        // occupy a global slot while waiting on one method's rate limit.
-        if (!this.quotaWait(method, clean, { reserve: true })) break;
+        // cooldown. Check without charging until ALL local write fences pass.
+        // Never occupy a global slot while waiting on one method's rate limit.
+        if (!this.quotaWait(method, clean)) {
+          if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
+          id = ++this.nextId;
+          encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
+          if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
+          // Revalidate the catalog/epoch AFTER every quota/capacity wait.
+          // Rejection owns no pending request, spends no quota and never
+          // tears down sibling I/O. Asynchronous fences are not permitted.
+          if (beforeSend) {
+            const result = beforeSend();
+            if (result && typeof result.then === 'function') {
+              Promise.resolve(result).catch(() => {});
+              throw new Error('RPC beforeSend must be synchronous.');
+            }
+          }
+          // The fence itself may cancel or close the client/socket.
+          if (waitingSignal.aborted) throw cancelledError();
+          if (this.closed) throw closedError();
+          if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
+          // Debit immediately before transmission. There is no await or
+          // caller callback from this point to write, so concurrent requests
+          // cannot oversubscribe quota. A synchronous fence that changes a
+          // cooldown must wait again and revalidate, without spending quota.
+          if (!this.quotaWait(method, clean, { reserve: true })) break;
+        }
         releaseCapacity(); releaseCapacity = undefined;
         await this.pace(method, clean, { signal: waitingSignal, reserve: false });
       }
-      if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
-      const id = ++this.nextId;
-      const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
-      if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
       return await new Promise((resolve, reject) => {
         if (waitingSignal.aborted) { reject(cancelledError()); return; }
         const request = { resolve, reject, method, socket, streaming: typeof onChunk === 'function', onChunk, sent: false, diagnostic, startedAt };
-        request.timer = setTimeout(() => { this.failAll(new Error('RPC request timed out.'), socket); socket.destroy(); }, this.timeoutMs);
+        request.timer = setTimeout(() => {
+          const failure = new Error('RPC request timed out.');
+          this.failAll(failure, socket, failure, 'request-timeout'); socket.destroy();
+        }, this.timeoutMs);
         this.pending.set(id, request);
         // The pending request now owns the same slot until its reply or final
         // stream.end, even if the stream consumer cancels and starts draining.
@@ -427,18 +498,23 @@ export class RpcClient extends EventEmitter {
           // an individual abort must never cause a retry or lose that result.
           request.sent = sent = true;
           socket.write(encoded, error => {
-            if (error) { this.failAll(error, socket); socket.destroy(); }
+            if (error) { this.failAll(error, socket, error, 'socket-write'); socket.destroy(); }
           });
-        } catch (error) { this.failAll(error, socket); socket.destroy(); }
+        } catch (error) { this.failAll(error, socket, error, 'socket-write'); socket.destroy(); }
       });
     } catch (error) {
+      const cause = diagnostic.error ?? this.connectionErrors.get(error) ?? error;
       unknownOutcome = Boolean(error?.unknownOutcome);
       cancelled = error?.name === 'AbortError' && !unknownOutcome;
-      if (cancelled && !sent) error.notSent = true;
-      const details = { ...metadata, stage: diagnostic.stage, durationMs: performance.now() - startedAt, unknownOutcome };
+      // Invocation is not transmission. Connect/queue/buffer/fence failures are
+      // definitely unsent just like cancellation, regardless of Error.name.
+      // Once write starts, even a synchronous write failure remains uncertain.
+      if (!sent && !unknownOutcome) error = unsentError(error);
+      const details = { ...metadata, stage: diagnostic.stage, durationMs: performance.now() - startedAt, unknownOutcome,
+        sent, notSent: !sent && !unknownOutcome,
+        failureSource: diagnostic.failureSource ?? (sent ? 'rpc-reply' : 'pre-write') };
       if (cancelled) this.diagnostic('rpc.cancelled', details);
       else {
-        const cause = diagnostic.error ?? this.connectionErrors.get(error) ?? error;
         // A submitted broadcast still has an unknown outcome when local close
         // interrupts its reply; do not label that case as harmless cancellation.
         this.diagnostic('rpc.failed', { ...details, error: unknownOutcome && cause?.name === 'AbortError' ? error : cause });
@@ -453,6 +529,7 @@ export class RpcClient extends EventEmitter {
   }
   close() {
     this.closed = true; this.abort.abort();
-    this.failAll(closedError()); this.socket?.destroy(); this.socket = null;
+    const failure = closedError();
+    this.failAll(failure, null, failure, 'client-close'); this.socket?.destroy(); this.socket = null;
   }
 }

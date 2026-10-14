@@ -39,7 +39,7 @@ class Backend extends EventEmitter {
       const key = `${kind}:${params.address ?? ''}`;
       if (!this.subscriptions.has(key)) this.subscriptions.set(key, { kind, address: params.address,
         subscription_id: `sub-${this.generation}-${this.subscriptions.size}` });
-      return { ...this.subscriptions.get(key), tip, cursor: 'journal-0' };
+      return { ...this.subscriptions.get(key), tip, cursor: 'journal-0', ...(kind === 'address' ? { changes_only: true } : {}) };
     }
     if (method === 'unsubscribe') {
       const entry = [...this.subscriptions].find(([, value]) => value.subscription_id === params.subscription_id);
@@ -82,7 +82,7 @@ function idleEngine() {
     async stop() { this.stops++; this.enabled = false; },
     async suspend() { this.suspends++; },
     start() { this.enabled = true; }, resume() { this.resumes++; }, clear() {},
-    setOptions() {}, notify() {}, activeKeys() { return []; },
+    setOptions() {}, notify() {}, setCatalogBlocked(value) { this.catalogBlocked = value; }, activeKeys() { return []; },
     hasActive() { return false; }, retainCatalog() {}, enqueue() {}, remove() {}, retire() {},
   };
 }
@@ -162,10 +162,12 @@ test('a reorg push invalidates an in-flight snapshot before it can resume claims
   s.rpc.notice('bounties', { resync_required: true, changes: undefined });
   assert.ok(s.claimRevision > revision);
   assert.equal(s.claimCursor, null);
-  assert.ok(s.engine.suspends > 0);
+  assert.equal(s.engine.suspends, 0, 'A push resync preserves captures rather than stopping the native pool');
+  assert.equal(s.engine.catalogBlocked, true);
   assert.equal(s.engine.resumes, 0);
   gate.resolve(); await cancelled;
   await until(() => s.engine.resumes === 1, 'A fresh validated snapshot must recover after the reorg');
+  assert.equal(s.engine.catalogBlocked, false);
   assert.equal(s.claimCursor, 'journal-0');
 });
 
@@ -307,7 +309,7 @@ test('transient claim startup failures retry without another push or a periodic 
   assert.equal(s.claimsResumePending, true);
   await until(() => s.engine.enabled && s.engine.resumes === 1,
     'Transient startup failure left Automatic Claims idle without a new notification');
-  assert.equal(tipAttempts, 3);
+  assert.equal(tipAttempts, 4, 'Two failed startup reads, one successful startup tip and the final discovery tip fence.');
   assert.equal(notifications, 0);
   assert.equal(s.claimsResumePending, false);
   assert.equal(s.claimCursor, 'journal-0');
@@ -416,6 +418,7 @@ test('disconnect during a held refresh forces another read after reconnect even 
     return result;
   };
   const pending = s.refresh();
+  const cancelled = assert.rejects(pending, { name: 'AbortError', code: 'ABORT_ERR' });
   await until(() => held);
   s.liveUpdates.retryDelay = 5;
   s.liveUpdates.retryMinMs = 5;
@@ -424,7 +427,7 @@ test('disconnect during a held refresh forces another read after reconnect even 
   await until(() => rpc.generation === 2 && rpc.subscriptions.size === s.accounts.length + 2);
   // Complete an old address snapshot only after the reconnect catch-up signal.
   // Its old revision must not acknowledge changes which happened in the gap.
-  gate.resolve(); await pending;
+  gate.resolve(); await cancelled;
   await until(() => s.balance?.confirmed === '1', 'Reconnect catch-up was incorrectly consumed by the stale held refresh');
   assert.equal(s.tip.hash, tip.hash);
 });

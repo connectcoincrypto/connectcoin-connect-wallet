@@ -34,7 +34,7 @@ void CheckEndpointSequenceForTest() {
     for(int i=0;i<1000;++i) changed->Record(false,10);
     for(unsigned mask=2;mask<=7;++mask) {
         auto selected=priority.Select(mask);
-        CapacityExpect(SameEndpoint(selected.endpoint,endpoints[0]) && selected.score!=changed && selected.score->Rate()==5.0,"Every exact signature mask has independent EMA and cursor");
+        CapacityExpect(SameEndpoint(selected.endpoint,endpoints[0]) && selected.score!=changed && selected.score->Rate()==5.0,"Every exact signature mask has independent performance history and cursor");
     }
     EndpointPriority other; other.Refresh(endpoints);
     auto unrelated=other.Select(1);
@@ -42,8 +42,9 @@ void CheckEndpointSequenceForTest() {
     for(unsigned mask:{0U,8U,255U}) CapacityExpect(CapacityError([&] { priority.Select(mask); },"CLAIM_CONTEXT"),"Invalid signature masks rejected");
 
     EndpointPriority weighted; weighted.Refresh(endpoints); weighted.Select(1);
-    const std::array<double,3> rates{20,5,1};
-    for(size_t i=0;i<3;++i) { auto score=weighted.entries[i].masks[0]; score->connections=rates[i]; score->seconds=1; score->credit=0; }
+    const std::array<size_t,3> valid{35,5,1};
+    const std::array<double,3> elapsed{1,1,5};
+    for(size_t i=0;i<3;++i) { auto score=weighted.entries[i].masks[0]; for(size_t j=0;j<valid[i];++j) score->Record(true,elapsed[i]/valid[i]); score->credit=0; }
     weighted.next[0]=0;
     // Specification/Core/desktop smooth weighted round-robin reference vector:
     // 1%/3 exploration +99%*(20,5,1)/26, max-normalized summation, rotating ties.
@@ -69,16 +70,20 @@ void CheckEndpointLearningForTest() {
     for(int i=0;i<10000;++i) { fast->Record(true,0.2); slow->Record(false,0.2); }
     CapacityExpect(slow->Rate()<before && slow->Rate()>0,"Invalid IP decays without a policy floor");
     counts=CountEndpoints(priority,1,20000);
-    CapacityExpect(counts[0]>19700 && counts[1]>=99,"Failing IP retains one-percent uniform exploration share");
-    const double oldConnections=fast->connections, oldSeconds=fast->seconds;
+    const double expectedFast=20000*(0.005+0.99*fast->Rate()/(fast->Rate()+slow->Rate()));
+    CapacityExpect(std::abs(static_cast<double>(counts[0])-expectedFast)<2 && counts[1]>=99,"Hourly evidence weights failing IP without removing exploration");
+    const double oldRate=fast->Rate();
     fast->Record(false,-1); fast->Record(false,std::numeric_limits<double>::quiet_NaN()); fast->Record(false,std::numeric_limits<double>::infinity());
-    CapacityExpect(fast->connections==oldConnections && fast->seconds==oldSeconds,"Malformed observations are neutral");
-    for(int i=0;i<10000;++i) { fast->Record(false,0.2); slow->Record(true,0.2); }
+    CapacityExpect(fast->Rate()==oldRate,"Malformed observations are neutral");
+    // Complete the old hour: previously failing IPs regain the prior, then
+    // learn from fresh outcomes rather than remaining biased forever.
+    auto later=PerformanceTime()+3600;
+    for(int i=0;i<10000;++i) { fast->Record(false,0.2,later); slow->Record(true,0.2,later); }
     counts=CountEndpoints(priority,1,20000);
     CapacityExpect(counts[1]>19700,"Exploration allows a formerly failing IP to recover");
 
-    fast->connections=std::numeric_limits<double>::max(); fast->seconds=std::numeric_limits<double>::denorm_min();
-    slow->connections=std::numeric_limits<double>::max(); slow->seconds=std::numeric_limits<double>::denorm_min();
+    // Equal fresh priors restore balanced selection when both windows expire.
+    fast->Rate(later+3600); slow->Rate(later+3600);
     counts=CountEndpoints(priority,1,2000);
     CapacityExpect(std::abs(static_cast<double>(counts[0])-1000)<2 && std::isfinite(fast->credit) && std::isfinite(slow->credit),"Extreme rates do not overflow scheduling credits");
 }
@@ -144,16 +149,62 @@ void CheckEndpointConcurrentObservationsForTest() {
     try { refreshed=ResolveCached(cache,"parallel.example",std::make_shared<Cancellation>(),Clock::now()+std::chrono::seconds(2),lookup,1).score==first.score; }
     catch(...) { ++failed; }
     gate->release(); for(auto& worker:workers) worker.join();
-    double expectedConnections=0.1, expectedSeconds=0.02;
-    for(int i=0;i<99;++i) { expectedConnections=0.999*expectedConnections+0.001; expectedSeconds=0.999*expectedSeconds+0.0002; }
     CapacityExpect(refreshed && selected.load()==100 && failed.load()==0,"100 concurrent selections retain scores across DNS refresh");
-    CapacityExpect(first.score->connections==expectedConnections && std::abs(first.score->seconds-expectedSeconds)<1e-15,"Concurrent outcomes recorded exactly once; cancellation is neutral");
+    CapacityExpect(std::abs(first.score->Rate()-104.0/20.8)<1e-12,"Concurrent outcomes recorded exactly once; cancellation is neutral");
+}
+void CheckBoundedPerformanceWindowForTest() {
+    auto cache=std::make_shared<EndpointPerformanceCache>(2);
+    auto a=std::make_shared<EndpointScore>(cache), b=std::make_shared<EndpointScore>(cache), c=std::make_shared<EndpointScore>(cache);
+    a->Record(true,0.1,0); a->Record(false,1,0);
+    CapacityExpect(std::abs(a->Rate(0)-6.0/2.1)<1e-12,"Prior applied once to exact hourly totals");
+    b->Record(false,2,1); c->Record(false,3,2);
+    CapacityExpect(cache->Size()==2 && a->Rate(2)==5,"Least recently observed history evicted at hard bound");
+    CapacityExpect(c->Rate(3599)<5 && c->Rate(3600)==5 && cache->Size()==0,"Hour expiration restores prior and releases histories");
+    a->Record(true,0,3660); a->Record(false,-1,3660);
+    CapacityExpect(a->Rate(3660)==6 && a->Rate(0)==6,"Bad duration neutral and clock regression cannot resurrect history");
+}
+void CheckLocalReachabilityForTest() {
+    auto not_started=std::make_shared<Cancellation>();
+    CapacityExpect(CapacityError([&] { LocalUnavailableOutcome(not_started,Clock::now(),true); },"CLAIM_LOCAL_UNAVAILABLE"),"Pre-TCP local failure stays neutral and cannot invent an attempt");
+    auto started=std::make_shared<Cancellation>(); started->started=true;
+    auto outcome=LocalUnavailableOutcome(started,Clock::now()-std::chrono::milliseconds(20),false);
+    CapacityExpect(outcome.error_code=="CLAIM_LOCAL_UNAVAILABLE" && outcome.duration_ms>=20 && !outcome.captured && !outcome.validation_passed && !outcome.valid_proof && !outcome.meets_target && outcome.proof_hex.empty(),"Post-TCP local failure reports a completed failed attempt without usable proof or quality penalty");
+    started->cancel();
+    CapacityExpect(CapacityError([&] { LocalUnavailableOutcome(started,Clock::now(),false); },"CLAIM_CANCELLED"),"Cancellation remains neutral even after local route failure");
+    const auto a=TestEndpoint("8.8.8.8"),b=TestEndpoint("1.1.1.1"),v6=TestEndpoint("2001:4860:4860::8888");
+    auto cache=std::make_shared<DnsCache>();
+    auto lookup=[=](const std::string&) { return std::vector<Endpoint>{a,b,v6}; };
+    auto select=[&] { return ResolveCached(cache,"reach.example",std::make_shared<Cancellation>(),Clock::now()+std::chrono::seconds(2),lookup,1); };
+    auto first=select();
+    ExcludeEndpoint(cache,first,false);
+    for(int i=0;i<20;++i) CapacityExpect(!SameEndpoint(select().endpoint,a),"Route exclusion affects only its numeric endpoint");
+    auto second=select();
+    while(second.endpoint.family!=AF_INET6) second=select();
+    ExcludeEndpoint(cache,second,true);
+    for(int i=0;i<20;++i) CapacityExpect(SameEndpoint(select().endpoint,b),"Unsupported family skipped immediately without disabling other family");
+    CapacityExpect(first.score->Rate()==5 && second.score->Rate()==5,"Local incapability does not bias validation scores");
+    auto remaining=select(); ExcludeEndpoint(cache,remaining,false);
+    CapacityExpect(CapacityError([&] { select(); },"CLAIM_LOCAL_UNAVAILABLE"),"No feasible endpoint is a neutral bounded wait, not unsafe fallback");
+    *first.unavailable=Clock::now()-std::chrono::seconds(1);
+    CapacityExpect(SameEndpoint(select().endpoint,a),"Expired exclusion retries numeric route");
+    cache->reachability->ipv6=Clock::now()-std::chrono::seconds(1);
+    bool saw_v6=false;
+    for(int i=0;i<20;++i) saw_v6=saw_v6 || select().endpoint.family==AF_INET6;
+    CapacityExpect(saw_v6,"Unsupported family is rechecked after expiry");
+#ifdef _WIN32
+    const int unsupported=WSAEAFNOSUPPORT,unreachable=WSAENETUNREACH,exhausted=WSAEADDRNOTAVAIL,refused=WSAECONNREFUSED;
+#else
+    const int unsupported=EAFNOSUPPORT,unreachable=ENETUNREACH,exhausted=EADDRNOTAVAIL,refused=ECONNREFUSED;
+#endif
+    CapacityExpect(CapacityError([&] { SocketFailure(unsupported,true); },"CLAIM_LOCAL_UNAVAILABLE"),"Unsupported socket family classified locally");
+    CapacityExpect(CapacityError([&] { SocketFailure(unreachable,false); },"CLAIM_LOCAL_UNAVAILABLE"),"Conclusive per-IP route failure classified locally");
+    CapacityExpect(CapacityError([&] { SocketFailure(exhausted,false); },"CLAIM_NETWORK") && CapacityError([&] { SocketFailure(refused,false); },"CLAIM_NETWORK"),"Port exhaustion/refusal must not poison endpoint quarantine");
 }
 void CheckKnownValidationFinalizationForTest() {
     auto state=std::make_shared<Cancellation>();
     ClaimResult valid; valid.valid_proof=true; valid.meets_target=true; valid.proof_hex="abcdef";
     auto late=FinalizeKnownCapture(valid,200,state,Clock::now()-std::chrono::seconds(1));
-    CapacityExpect(late.captured && late.validation_passed && !late.valid_proof && !late.meets_target && late.proof_hex.empty() && late.error_code=="CLAIM_TIMEOUT" && late.duration_ms==200,"Known-valid expired result retains EMA observation but cannot expose usable proof");
+    CapacityExpect(late.captured && late.validation_passed && !late.valid_proof && !late.meets_target && late.proof_hex.empty() && late.error_code=="CLAIM_TIMEOUT" && late.duration_ms==200,"Known-valid expired result retains performance observation but cannot expose usable proof");
     auto timely=FinalizeKnownCapture(valid,200,state,Clock::now()+std::chrono::seconds(1));
     CapacityExpect(timely.captured && timely.validation_passed && timely.valid_proof && timely.proof_hex=="abcdef","Unexpired valid result remains usable");
     valid.meets_target=false;
@@ -169,5 +220,5 @@ void CheckKnownValidationFinalizationForTest() {
 }
 } // namespace
 void CheckNativeEndpointPriorityForTest() {
-    CheckEndpointSequenceForTest(); CheckEndpointLearningForTest(); CheckEndpointDnsRefreshForTest(); CheckEndpointConcurrentObservationsForTest(); CheckKnownValidationFinalizationForTest();
+    CheckEndpointSequenceForTest(); CheckEndpointLearningForTest(); CheckEndpointDnsRefreshForTest(); CheckEndpointConcurrentObservationsForTest(); CheckKnownValidationFinalizationForTest(); CheckBoundedPerformanceWindowForTest(); CheckLocalReachabilityForTest();
 }

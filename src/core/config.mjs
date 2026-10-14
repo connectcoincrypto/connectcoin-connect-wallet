@@ -1,3 +1,4 @@
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -56,8 +57,8 @@ export function validateConfig(input, { allowRegtest = false, network } = {}) {
     rpc: validateRpcEndpoint(merged.rpc),
     claims: {
       enabled: boolean(merged.claims.enabled, 'Automatic Claims'),
-      maxConnectionsPerSecond: integer(merged.claims.maxConnectionsPerSecond, 1, 256, 'Connection starts per second'),
-      maxConcurrent: integer(merged.claims.maxConcurrent, 1, 256, 'Simultaneous connections'),
+      maxConnectionsPerSecond: integer(merged.claims.maxConnectionsPerSecond, 1, MAX_CONNECTION_LIMIT, 'Connection starts per second'),
+      maxConcurrent: integer(merged.claims.maxConcurrent, 1, MAX_CONNECTION_LIMIT, 'Simultaneous connections'),
       lookbackBlocks: integer(merged.claims.lookbackBlocks, 1, 600, 'Recent blocks'),
     },
     autoLockMinutes: integer(merged.autoLockMinutes, 0, 60, 'Auto-lock minutes'),
@@ -88,7 +89,14 @@ export async function readConfig(directory, options) {
     handle = await open(join(directory, 'config.json'), 'r');
     if (!(await handle.stat()).isFile()) throw new Error('Configuration must be a regular file.');
     const buffer = Buffer.alloc(16385);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    // A short regular-file read is not necessarily EOF. Read the complete
+    // bounded document before accepting settings or its saved safety stop.
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
     if (bytesRead > 16384) throw new Error('Configuration file is too large.');
     const text = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
     return validateConfig(JSON.parse(text), options);

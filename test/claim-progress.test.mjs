@@ -223,7 +223,7 @@ test('progress allowlists exclude arbitrary reasons, duration labels, nested dat
     paused: false, durationScope: 'run', reason: 'stop', domain: 'private-canary.example', proof: 'private-proof-canary',
     get cancelledOther() { invoked++; return 1; } });
   log.record('claims.progress', { reason: 'private-reason-canary', durationScope: 'private-scope-canary', prepareActive: 5, dnsActive: 3,
-    captureActive: 257, submitActive: 5, operationsStarted: Infinity, operationsFailed: -1, cancelledStop: 1.5,
+    captureActive: 2147483648, submitActive: 5, operationsStarted: Infinity, operationsFailed: -1, cancelledStop: 1.5,
     durationTotalMs: Number.MAX_SAFE_INTEGER + 1, raw: { private: 'canary' } });
   log.record('claims.failed', { reason: 'fatal', error: Object.assign(new Error('private-error-canary'), { unknownOutcome: true }) });
   await log.flush();

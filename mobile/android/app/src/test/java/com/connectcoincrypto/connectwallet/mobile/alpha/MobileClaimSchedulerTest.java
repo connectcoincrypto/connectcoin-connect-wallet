@@ -22,8 +22,18 @@ public class MobileClaimSchedulerTest {
         row.progress.prepared = new JSONObject(); return row;
     }
     private static MobileClaimsEngine.Candidate row(String domain, int mask, int vout, long net) throws Exception { return row(domain, mask, vout, net, 1_000_000); }
-    private static MobileClaimsEngine.Ema rate(double value) { MobileClaimsEngine.Ema stats = new MobileClaimsEngine.Ema(); stats.connections = value; stats.totalTime = 1; return stats; }
-    private static void rebuild(MobileClaimScheduler scheduler, List<MobileClaimsEngine.Candidate> rows, Map<String, MobileClaimsEngine.Ema> stats, long now) { scheduler.rebuild(rows, stats, new HashSet<>(), now); }
+    private static MobileClaimsEngine.PerformanceWindow rate(double value) {
+        MobileClaimsEngine.PerformanceWindow stats = new MobileClaimsEngine.PerformanceWindow(() -> 0);
+        if (value < 5) {
+            double duration = 5 / value - 1;
+            while (duration > 0) { double sample = Math.min(60, duration); stats.record(false, sample); duration -= sample; }
+        } else if (value > 5) {
+            int count = (int)Math.ceil(value); double duration = ((5 + count) / value - 1) / count;
+            for (int index = 0; index < count; index++) stats.record(true, duration);
+        }
+        return stats;
+    }
+    private static void rebuild(MobileClaimScheduler scheduler, List<MobileClaimsEngine.Candidate> rows, Map<String, MobileClaimsEngine.PerformanceWindow> stats, long now) { scheduler.rebuild(rows, stats, new HashSet<>(), now); }
 
     @Test public void fairAndEconomicTurnsAlternateExactlyLikeDesktop() throws Exception {
         MobileClaimScheduler scheduler = new MobileClaimScheduler();
@@ -65,48 +75,52 @@ public class MobileClaimSchedulerTest {
         MobileClaimsEngine.Candidate below = row("a.example", 7, 0, 199, 1_100_000), equal = row("b.example", 7, 1, 200);
         assertFalse(MobileClaimScheduler.worth(below.raw, 5)); assertTrue(MobileClaimScheduler.worth(equal.raw, 5));
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(below, equal), new HashMap<>(), 0);
-        assertSame(equal, scheduler.next(0, true).row); assertEquals(0, scheduler.probeCount());
+        MobileClaimScheduler.Selection probe = scheduler.next(0, true); assertSame(below, probe.row); assertTrue(probe.recovery);
+        scheduler.commit(probe, 0);
+        assertSame(equal, scheduler.next(0, true).row); assertFalse(scheduler.next(0, true).recovery); assertEquals(1, scheduler.probeCount());
     }
     @Test public void exactMasksHaveSeparateRatesAndBothTurnsUseTheSameDomainLeader() throws Exception {
         MobileClaimsEngine.Candidate slower = row("a.example", 1, 0, 1000), fast = row("a.example", 2, 1, 300), other = row("b.example", 7, 2, 200);
-        Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>(); stats.put(slower.policy, rate(1)); stats.put(fast.policy, rate(5));
+        Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>(); stats.put(slower.policy, rate(1)); stats.put(fast.policy, rate(5));
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(slower, fast, other), stats, 0);
         MobileClaimScheduler.Selection fair = scheduler.next(0, true); assertSame(fast, fair.row); scheduler.commit(fair, 0);
         assertSame(fast, scheduler.next(0, true).row);
         stats.put(slower.policy, rate(10)); rebuild(scheduler, List.of(slower, fast, other), stats, 10); assertSame(slower, scheduler.next(10, true).row);
     }
-    @Test public void recoveryWaitsAMinuteAndRepresentativeChangesCannotSpendMoreProbes() throws Exception {
+    @Test public void bootstrapIsThirtyTwoActualStartsThenMinuteRecoveryAcrossRepresentativeChanges() throws Exception {
         MobileClaimsEngine.Candidate first = row("a.example", 7, 0, 200), replacement = row("a.example", 7, 1, 300);
-        Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>(); stats.put(first.policy, rate(0.01));
+        Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>(); stats.put(first.policy, rate(0.01));
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(first), stats, 0);
-        assertNull(scheduler.next(0, true)); assertNull(scheduler.next(59999, true));
-        MobileClaimScheduler.Selection probe = scheduler.next(60000, true); assertTrue(probe.recovery);
+        MobileClaimScheduler.Selection probe = scheduler.next(0, true); assertTrue(probe.recovery);
         // A catalog refresh replaces the representative while the OLD native
         // request is still awaiting its TCP-start acknowledgement.
-        rebuild(scheduler, List.of(replacement), stats, 60000);
-        assertSame(replacement, scheduler.next(60000, true).row);
-        assertTrue(scheduler.commit(probe, 60000));
-        for (int index = 0; index < 100; index++) assertNull(scheduler.next(60001, true));
-        assertNull(scheduler.next(119999, true)); assertSame(replacement, scheduler.next(120000, true).row);
+        rebuild(scheduler, List.of(replacement), stats, 0);
+        assertSame(replacement, scheduler.next(0, true).row);
+        assertTrue(scheduler.commit(probe, 0));
+        for (int index = 1; index < 32; index++) {
+            assertNull(scheduler.next(index * 250L - 1, true));
+            MobileClaimScheduler.Selection next = scheduler.next(index * 250L, true); assertTrue(next.recovery);
+            assertTrue(scheduler.commit(next, index * 250L));
+            rebuild(scheduler, List.of(replacement.copy()), stats, index * 250L);
+        }
+        assertNull(scheduler.next(67749, true)); assertNotNull(scheduler.next(67750, true));
     }
     @Test public void recoveryRequiresNoHealthyBountyForThatExactPolicy() throws Exception {
         MobileClaimsEngine.Candidate excluded = row("a.example", 1, 0, 200), healthy = row("a.example", 1, 1, 200000), otherMask = row("a.example", 2, 2, 200);
-        Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>(); stats.put(excluded.policy, rate(0.01)); stats.put(otherMask.policy, rate(0.01));
+        Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>(); stats.put(excluded.policy, rate(0.01)); stats.put(otherMask.policy, rate(0.01));
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(excluded, healthy, otherMask), stats, 0);
         assertEquals(1, scheduler.probeCount()); assertSame(healthy, scheduler.next(0, true).row);
     }
     @Test public void boundedRecoveryAdmissionCannotTurnEvictionIntoImmediateProbes() throws Exception {
-        List<MobileClaimsEngine.Candidate> rows = new ArrayList<>(); Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>();
+        List<MobileClaimsEngine.Candidate> rows = new ArrayList<>(); Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>();
         for (int i = 0; i < 300; i++) { MobileClaimsEngine.Candidate row = row("domain" + i + ".example", 7, i, 1000); rows.add(row); stats.put(row.policy, rate(0.01)); }
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, rows, stats, 0);
-        assertEquals(256, scheduler.probeCount()); assertNull(scheduler.next(0, true));
-        rebuild(scheduler, rows.subList(44, 300), stats, 60000);
+        assertEquals(256, scheduler.probeCount()); assertTrue(scheduler.commit(scheduler.next(0, true), 0));
+        rebuild(scheduler, rows.subList(44, 300), stats, 1);
         assertEquals(256, scheduler.probeCount());
-        for (int i = 0; i < 256; i++) {
-            MobileClaimScheduler.Selection selection = scheduler.next(60000, true);
-            if (selection == null) break;
-            assertTrue(selection.row.bounty.getInt("vout") < 256); scheduler.commit(selection, 60000);
-        }
+        assertNull(scheduler.next(249, true)); assertNotNull(scheduler.next(250, true));
+        scheduler.clear(); rebuild(scheduler, List.of(rows.get(299)), stats, 2);
+        assertNull(scheduler.next(249, true)); assertNotNull(scheduler.next(250, true));
     }
     @Test public void startAcknowledgementSurvivesRefreshAndDeletionOfItsEntry() throws Exception {
         MobileClaimsEngine.Candidate a = row("a.example", 7, 0, 600), b = row("b.example", 7, 1, 200);
@@ -121,6 +135,37 @@ public class MobileClaimSchedulerTest {
         MobileClaimsEngine.Candidate hard = new MobileClaimsEngine.Candidate(hardData, BLOCK, 10, 1_000_000);
         hard.progress.captures = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.valueOf(2)); assertTrue(hard.budget());
         hard.progress.captures = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE); assertFalse(hard.budget());
+    }
+    @Test public void cachedBudgetMatchesOriginalExactProductAcrossTargetAndCountBoundaries() throws Exception {
+        java.util.Random random = new java.util.Random(921);
+        for (int sample = 0; sample < 400; sample++) {
+            MobileClaimsEngine.Candidate source = row("a.example", 7, sample, 600);
+            BigInteger target = sample < 256 ? BigInteger.ONE.shiftLeft(sample).subtract(BigInteger.ONE) : new BigInteger(256, random);
+            JSONObject data = new JSONObject(source.bounty.toString()).put("connection_work_target", String.format("%064x", target));
+            MobileClaimsEngine.Candidate candidate = new MobileClaimsEngine.Candidate(data, BLOCK, 10, 1_000_000);
+            for (BigInteger count : List.of(BigInteger.ZERO, BigInteger.ONE, candidate.captureStopCount.subtract(BigInteger.ONE), candidate.captureStopCount, BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE))) {
+                candidate.progress.captures = count;
+                boolean expected = count.compareTo(BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)) < 0 && count.multiply(target.add(BigInteger.ONE)).compareTo(BigInteger.ONE.shiftLeft(257)) <= 0;
+                assertEquals("target=" + target + " count=" + count, expected, candidate.budget());
+            }
+        }
+    }
+    @Test public void removingUnpreparedLeaderImmediatelyAdmitsRemainingPreparation() throws Exception {
+        MobileClaimsEngine.Candidate leader = row("a.example", 7, 0, 1000), replacement = row("a.example", 7, 1, 500);
+        leader.progress.prepared = replacement.progress.prepared = null;
+        MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(leader, replacement), new HashMap<>(), 0);
+        assertSame(leader, scheduler.next(0, false).row);
+        scheduler.remove(leader.key);
+        assertSame(replacement, scheduler.next(0, false).row);
+        replacement.progress.prepared = new JSONObject();
+        assertSame(replacement, scheduler.next(0, true).row);
+    }
+    @Test public void cachedPriorityFollowsRestoredProgressFactor() throws Exception {
+        MobileClaimsEngine.Candidate candidate = row("a.example", 7, 0, 600);
+        assertEquals(candidate.raw.multiply(BigInteger.valueOf(1_000_000)), candidate.priority());
+        candidate.progress = new MobileClaimsEngine.Candidate.Progress(1_100_000, BLOCK, candidate.height, candidate.policy, candidate.progress.metadata);
+        assertEquals(candidate.raw.multiply(BigInteger.valueOf(1_100_000)), candidate.priority());
+        assertEquals(candidate.priority(), candidate.copy().priority());
     }
     @Test public void economicConversionUsesTheDesktopWordOrderAndFiniteOverflowRule() {
         BigInteger raw = BigInteger.ONE.shiftLeft(256).multiply(BigInteger.valueOf(200));
@@ -141,14 +186,54 @@ public class MobileClaimSchedulerTest {
     }
     @Test public void recoveryReservationSurvivesRepresentativeChangesAndUnstartedReleaseDoesNotSpendIt() throws Exception {
         MobileClaimsEngine.Candidate first = row("a.example", 7, 0, 200), replacement = row("a.example", 7, 1, 300);
-        Map<String, MobileClaimsEngine.Ema> stats = new HashMap<>(); stats.put(first.policy, rate(0.01));
+        Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>(); stats.put(first.policy, rate(0.01));
         MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(first), stats, 0);
         MobileClaimScheduler.Selection old = scheduler.next(60000, true); assertTrue(scheduler.reserve(old));
         rebuild(scheduler, List.of(replacement), stats, 60001); assertNull(scheduler.next(60001, true));
         scheduler.release(old);
         MobileClaimScheduler.Selection current = scheduler.next(60001, true); assertSame(replacement, current.row); assertTrue(scheduler.reserve(current));
         scheduler.release(old); assertNull("An old worker cannot clear a newer policy reservation", scheduler.next(60002, true));
-        assertTrue(scheduler.acknowledge(current, 65000)); assertNull(scheduler.next(124999, true));
-        assertSame(replacement, scheduler.next(125000, true).row);
+        assertTrue(scheduler.acknowledge(current, 65000)); assertNull(scheduler.next(65249, true));
+        assertSame(replacement, scheduler.next(65250, true).row);
+    }
+
+    @Test public void singleGlobalPreAckProbeDoesNotBlockEconomicAndCancelledStartIsFree() throws Exception {
+        MobileClaimsEngine.Candidate a = row("a.example", 7, 0, 1), b = row("b.example", 1, 1, 1), economic = row("z.example", 7, 2, 200);
+        MobileClaimScheduler scheduler = new MobileClaimScheduler(); rebuild(scheduler, List.of(a, b, economic), new HashMap<>(), 0);
+        MobileClaimScheduler.Selection pending = scheduler.next(0, true); assertTrue(pending.recovery); assertTrue(scheduler.reserve(pending, 0));
+        assertSame(economic, scheduler.next(0, true).row); scheduler.remove(economic.key); assertNull(scheduler.next(10000, true));
+        scheduler.release(pending); MobileClaimScheduler.Selection retry = scheduler.next(10000, true);
+        assertTrue(scheduler.reserve(retry, 10000)); scheduler.release(pending); assertNull(scheduler.next(20000, true));
+        assertTrue(scheduler.acknowledge(retry, 20000)); assertFalse(scheduler.acknowledge(retry, 20000));
+        assertNull(scheduler.next(20249, true)); assertNotNull(scheduler.next(20250, true));
+    }
+
+    @Test public void positiveNetColdTwentyBitPolicyCanLearnButZeroNetCannotProbe() throws Exception {
+        MobileClaimsEngine.Candidate source = row("a.example", 7, 0, 75_000_000);
+        JSONObject data = new JSONObject(source.bounty.toString()).put("connection_work_target", "00000" + "f".repeat(59));
+        MobileClaimsEngine.Candidate cold = new MobileClaimsEngine.Candidate(data, BLOCK, 10, 1_000_000); cold.progress.prepared = new JSONObject();
+        MobileClaimsEngine.Candidate zero = row("b.example", 7, 1, 0), negative = row("c.example", 7, 2, -1);
+        MobileClaimScheduler scheduler = new MobileClaimScheduler(); Map<String, MobileClaimsEngine.PerformanceWindow> stats = new HashMap<>();
+        rebuild(scheduler, List.of(cold, zero, negative), stats, 0);
+        assertFalse(MobileClaimScheduler.worth(cold.raw, 5)); assertTrue(scheduler.next(0, true).recovery);
+        assertTrue(scheduler.commit(scheduler.next(0, true), 0)); assertNull(scheduler.next(249, true));
+        stats.put(cold.policy, rate(20)); rebuild(scheduler, List.of(cold, zero, negative), stats, 1);
+        assertSame(cold, scheduler.next(1, true).row); assertFalse(scheduler.next(1, true).recovery);
+        cold.progress.budgetExhausted = true; rebuild(scheduler, List.of(cold, zero, negative), stats, 2); assertNull(scheduler.next(100000, true));
+    }
+
+    @Test public void relocatedOutpointPreservesBudgetAndFactorButNotPreparedContext() throws Exception {
+        MobileClaimsEngine.Candidate old = row("a.example", 7, 0, 600, 1_100_000);
+        old.progress.captures = BigInteger.valueOf(3); old.progress.budgetExhausted = true;
+        String block = "34".repeat(32);
+        JSONObject data = new JSONObject(old.bounty.toString()).put("block_hash", block).put("block_height", 2);
+        MobileClaimsEngine.Candidate relocated = new MobileClaimsEngine.Candidate(data, block, 10, 1_000_000);
+        relocated.reuse(old.progress);
+        assertEquals(old.key, relocated.key); assertEquals(old.progress.factor, relocated.progress.factor);
+        assertEquals(old.progress.captures, relocated.progress.captures); assertTrue(relocated.progress.budgetExhausted);
+        assertFalse(relocated.budget()); assertNull(relocated.progress.prepared); assertNotSame(old.progress, relocated.progress);
+        assertNotNull(old.progress.prepared); assertEquals(old.priority(), relocated.priority());
+        MobileClaimsEngine.Candidate fake = new MobileClaimsEngine.Candidate(data.put("domain", "evil.example"), block, 10);
+        assertThrows(IllegalArgumentException.class, () -> fake.reuse(old.progress));
     }
 }

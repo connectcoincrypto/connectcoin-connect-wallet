@@ -14,7 +14,7 @@ void Error(char* destination, const char* candidate) noexcept {
     std::string_view code = candidate ? candidate : "";
     bool known = false;
     for (const auto allowed : {"CLAIM_CONTEXT", "CLAIM_MEMORY", "CLAIM_CANCELLED", "CLAIM_TIMEOUT",
-            "CLAIM_BUSY", "CLAIM_NETWORK", "CLAIM_DNS", "CLAIM_TLS", "CLAIM_CERTIFICATE",
+            "CLAIM_BUSY", "CLAIM_BUDGET", "CLAIM_NETWORK", "CLAIM_LOCAL_UNAVAILABLE", "CLAIM_DNS", "CLAIM_TLS", "CLAIM_CERTIFICATE",
             "CLAIM_CRYPTO", "CLAIM_NATIVE"}) {
         if (code == allowed) { known = true; break; }
     }
@@ -47,6 +47,12 @@ extern "C" int64_t cw_claim_limiter_create(int32_t rate, char* error) {
 extern "C" int32_t cw_claim_limiter_set_rate(int64_t limiter, int32_t rate, char* error) {
     return Guard(error, [&] { connectwallet::SetStartRate(limiter, rate); });
 }
+extern "C" int32_t cw_claim_limiter_set_allowed(int64_t limiter, int32_t allowed, char* error) {
+    return Guard(error, [&] {
+        if(allowed!=0 && allowed!=1) throw std::runtime_error("CLAIM_CONTEXT");
+        connectwallet::SetStartAllowed(limiter,allowed!=0);
+    });
+}
 extern "C" int32_t cw_claim_limiter_reset(int64_t limiter, char* error) {
     return Guard(error, [&] { connectwallet::ResetStartSchedule(limiter); });
 }
@@ -57,6 +63,9 @@ extern "C" int64_t cw_claim_cancellation_create(int64_t limiter, char* error) {
     int64_t handle = 0;
     Guard(error, [&] { handle = connectwallet::CreateCancellation(limiter); });
     return handle;
+}
+extern "C" int32_t cw_claim_bind_budget(int64_t handle,const char* key,const char* target,const char* count,char* error) {
+    return Guard(error,[&] { connectwallet::BindClaimBudget(handle,Text(key,128),Text(target,64),Text(count,20)); });
 }
 extern "C" void cw_claim_cancel(int64_t handle) {
     Guard(nullptr, [&] { connectwallet::Cancel(handle); });
@@ -74,6 +83,11 @@ extern "C" int64_t cw_claim_started_age_nanos(int64_t handle) {
     Guard(nullptr, [&] { age = connectwallet::StartedAgeNanos(handle); });
     return age;
 }
+extern "C" int32_t cw_claim_has_captured(int64_t handle) {
+    int32_t captured = 0;
+    Guard(nullptr, [&] { captured = connectwallet::HasCaptured(handle) ? 1 : 0; });
+    return captured;
+}
 extern "C" int32_t cw_claim_capture(const cw_claim_context* input, int32_t timeout,
         int64_t handle, cw_claim_result* output) {
     if (!output) return 0;
@@ -85,10 +99,12 @@ extern "C" int32_t cw_claim_capture(const cw_claim_context* input, int32_t timeo
             Text(input->target_hex, 64), input->roots_version, input->signature_mask, input->validation_time};
         const auto result = connectwallet::CaptureAndVerify(context, timeout, handle);
         if (result.proof_hex.size() > 2 * 64 * 1024) throw std::runtime_error("CLAIM_NATIVE");
-        char* proof = static_cast<char*>(std::malloc(result.proof_hex.size() + 1));
-        if (!proof) throw std::bad_alloc();
-        std::memcpy(proof, result.proof_hex.c_str(), result.proof_hex.size() + 1);
-        output->proof_hex = proof;
+        if (!result.proof_hex.empty()) {
+            char* proof = static_cast<char*>(std::malloc(result.proof_hex.size() + 1));
+            if (!proof) throw std::bad_alloc();
+            std::memcpy(proof, result.proof_hex.c_str(), result.proof_hex.size() + 1);
+            output->proof_hex = proof;
+        }
         output->captured = result.captured;
         output->validation_passed = result.validation_passed;
         output->valid_proof = result.valid_proof;

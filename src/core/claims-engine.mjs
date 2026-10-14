@@ -6,12 +6,16 @@ import { ClaimScheduler } from './claim-scheduler.mjs';
 import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES } from './claim-connection-policy.mjs';
 import { diagnosticError } from './diagnostics.mjs';
 import { claimPriority, selectionPriority, domainPriority, isWorthAttempting, compareClaimPriority, P2CDomainStats, validateAttemptStats,
-  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, isP2CClaimConnectionLimitExceeded, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
+  PRIORITY_FACTOR_SCALE, PRIORITY_FACTOR_MAX, claimConnectionStopCount, MAX_P2C_SUCCESSFUL_CONNECTIONS } from './claim-priority.mjs';
 
 const keyOf = bounty => `${bounty.txid}:${bounty.vout}`;
 const policyOf = job => `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
 const report = (callback, event, details) => { try { Promise.resolve(callback(event, details)).catch(() => {}); } catch { /* Diagnostics never control claims. */ } };
 const DIAGNOSTIC_INTERVAL_MS = 5000, DIAGNOSTIC_SAMPLES_PER_STAGE = 4;
+// Pipeline preparation/IPC without preassigning a long queue at low rates.
+// The helper still spaces actual socket starts; this is not a rate allowance.
+const START_LOOKAHEAD_MS = 100;
+const MAX_PENDING_STARTS = 128;
 const CANCELLATIONS = Object.freeze({ stop: 'cancelledStop', locked: 'cancelledLocked', suspend: 'cancelledSuspend',
   clear: 'cancelledClear', unavailable: 'cancelledUnavailable', 'window-exit': 'cancelledWindowExit',
   'sibling-proof': 'cancelledSiblingProof', fatal: 'cancelledFatal', other: 'cancelledOther' });
@@ -47,7 +51,7 @@ function injectedPool(generateProof) {
   };
 }
 
-/** One persistent worker pool, with a fresh Core-style assignment per TCP start. */
+/** One persistent worker pool, with bounded Core-style connection assignments. */
 export class ClaimsEngine {
   constructor({ prepare, submit, isUnlocked, poolFactory, generateProof, resourcesPath, onState = () => {}, onDiagnostic = () => {},
     options = {}, retryDelayMs = 30000, maxQueue = 20000, randomIndex = randomInt, getNetReward = bounty => BigInt(bounty.amount), getValidationTime } = {}) {
@@ -57,15 +61,17 @@ export class ClaimsEngine {
     this.poolFactory = poolFactory ?? (generateProof ? () => injectedPool(generateProof) : ({ onFailure }) => new ConnectionPool({ resourcesPath, onDiagnostic, onFailure }));
     this.options = validateConnectionOptions(options);
     this.queue = new Map(); this.completed = new Set(); this.factors = new Map(); this.successCounts = new Map();
-    this.proposals = new Map(); this.pendingProofs = new Map(); this.submitting = new Set();
+    this.selectionHistoryHeights = new Map();
+    this.proposals = new Map(); this.pendingProofs = new Map(); this.acceptedProofs = new Map(); this.submitting = new Set();
     this.domainStats = new Map(); this.dns = new Map(); this.live = new Map(); this.connections = new Map();
     this.connectionPolicy = new ClaimConnectionPolicy();
     this.recoveryJobs = new Map();
+    this.pendingStarts = new Set(); this.pendingRecovery = new Map();
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
-    this.waitingPrepare = new Set(); this.waitingDns = new Set();
+    this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
-    this.enabled = false; this.paused = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
-    this.nextStart = 0; this.awaitingStart = false; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
+    this.enabled = false; this.paused = false; this.catalogBlocked = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
+    this.nextStart = 0; this.startIdle = true; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
     this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
     this.diagnosticOperations = new Set(); this.cancellationReasons = new WeakMap();
@@ -85,7 +91,7 @@ export class ClaimsEngine {
   }
   beginOperation(stage, controller) {
     // Only active work is retained: at most 4 preparations, 2 DNS requests,
-    // 256 captures and 4 submissions. No historical IDs or payloads are stored.
+    // configured captures and 4 submissions. No historical IDs or payloads are stored.
     const operation = { stage, controller, started: performance.now() };
     this.diagnosticOperations.add(operation); this.countDiagnostic('operationsStarted');
     return operation;
@@ -152,13 +158,14 @@ export class ClaimsEngine {
     const tracked = Promise.resolve(promise).finally(() => {
       const count = this.live.get(key) - 1; if (count) this.live.set(key, count); else this.live.delete(key);
       this.tasks.delete(tracked);
-      if (job.retired && !this.hasActive(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
+      if (job.retired && !this.hasActive(key) && !this.pendingProofs.has(key) && this.queue.get(key) === job) { this.queue.delete(key); this.scheduler.remove(key); }
       this.notify(); this.kick();
     });
     this.tasks.add(tracked); return tracked;
   }
   eligible(job) { return !job.unavailable && !job.retired && !job.winner && !job.budgetExceeded; }
-  ready(job) { return this.eligible(job) && !job.preparing && !job.waitingPrepare; }
+  ready(job) { return this.eligible(job) && !job.preparing &&
+    !(job.recoveryProbe && this.pendingRecovery.size > 0); }
   drawIndex(length) {
     const value = this.randomIndex(length);
     if (!Number.isSafeInteger(value) || value < 0 || value >= length) throw new Error('Invalid claim random index');
@@ -167,7 +174,16 @@ export class ClaimsEngine {
   updatePriority(job) {
     const net = job.prepared?.payout !== undefined ? BigInt(job.prepared.payout) : this.getNetReward(job.bounty);
     job.rawPriority = claimPriority(job.bounty.connection_work_target, net); job.priority = selectionPriority(job.rawPriority, job.factor);
-    job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+    job.budgetExceeded = this.connectionBudgetExceeded(job, this.successCounts.get(keyOf(job.bounty)) ?? 0n);
+  }
+  connectionBudgetExceeded(job, successes) {
+    const target = job.bounty.connection_work_target;
+    if (job.budgetTarget !== target || job.connectionStopCount === undefined) {
+      job.connectionStopCount = claimConnectionStopCount(target); job.budgetTarget = target;
+    }
+    if (typeof successes === 'number' && Number.isSafeInteger(successes)) successes = BigInt(successes);
+    if (typeof successes !== 'bigint' || successes < 0n) throw new Error('Invalid successful connection count');
+    return successes >= job.connectionStopCount;
   }
   connectionRate(job, cache) {
     const key = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
@@ -179,9 +195,9 @@ export class ClaimsEngine {
     const healthy = new Set(), recovery = new Map();
     for (const candidate of candidates) {
       const { job } = candidate, policy = policyOf(job);
-      if (!this.eligible(job)) continue;
+      if (!this.eligible(job) || job.rawPriority <= 0n) continue;
       if (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates))) healthy.add(policy);
-      else if (isWorthAttempting(job.rawPriority, 5)) {
+      else {
         const previous = recovery.get(policy);
         if (!previous || compareClaimPriority(job, previous.job) < 0) recovery.set(policy, candidate);
       }
@@ -203,7 +219,10 @@ export class ClaimsEngine {
     this.scheduler.rebuild(this.queue);
     this.dirty = false;
   }
-  nextReady(now = Date.now()) { if (this.dirty) this.rebuild(); return this.scheduler.next(now); }
+  nextReady(now = Date.now()) {
+    if (this.dirty) this.rebuild();
+    return this.scheduler.next(now, { allowPreparation: this.preparing.size < 4 });
+  }
   markAssigned(jobOrSelection) { this.scheduler.commit(jobOrSelection); }
   enqueue(bounties) {
     if (!Array.isArray(bounties)) throw new Error('Bounty list required');
@@ -211,24 +230,25 @@ export class ClaimsEngine {
     for (const [key, job] of this.queue) {
       this.updatePriority(job);
       if (this.hasActive(key) || this.pendingProofs.has(key) || job.due > Date.now()) protectedKeys.add(key);
-      else if (this.eligible(job) && (isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)) || isWorthAttempting(job.rawPriority, 5))) candidates.push({ key, job });
+      else if (this.eligible(job) && job.rawPriority > 0n) candidates.push({ key, job });
     }
     let incoming = 0;
     for (const bounty of bounties) {
       if (!validBounty(bounty)) continue;
       const key = keyOf(bounty);
-      if (seen.has(key) || this.completed.has(key) || this.hasActive(key)) continue;
+      if (seen.has(key) || this.completed.has(key) || this.hasActive(key) || this.acceptedProofs.has(key) && !this.pendingProofs.has(key)) continue;
       seen.add(key);
       let factor = this.factors.get(key);
       if (factor === undefined) {
         if (this.factors.size >= 100000) continue;
         factor = PRIORITY_FACTOR_SCALE + this.drawIndex(PRIORITY_FACTOR_MAX - PRIORITY_FACTOR_SCALE + 1); this.factors.set(key, factor);
       }
+      if (Number.isSafeInteger(bounty.block_height) && bounty.block_height >= 0) this.selectionHistoryHeights.set(key, bounty.block_height);
       const proof = this.pendingProofs.get(key);
       const job = { bounty, factor, due: proof?.due ?? 0, failures: proof?.failures ?? 0,
         winner: Boolean(proof), diagnosticId: ++this.nextDiagnosticId, prepared: this.proposals.get(key) };
       this.updatePriority(job);
-      if (!proof && (job.budgetExceeded || (!isWorthAttempting(job.rawPriority, this.connectionRate(job, rates)) && !isWorthAttempting(job.rawPriority, 5)))) continue;
+      if (!proof && (job.budgetExceeded || job.rawPriority <= 0n)) continue;
       candidates.push({ key, job, fresh: true }); incoming++;
     }
     let count = 0;
@@ -241,25 +261,43 @@ export class ClaimsEngine {
       const recovery = this.recoveryCandidates([...candidates, ...[...protectedKeys].map(key => ({ key, job: this.queue.get(key) }))], rates)
         .filter(({ key }) => !protectedKeys.has(key));
       const slots = Math.max(0, this.maxQueue - protectedKeys.size);
-      // Reserve a small bounded part of admission for formerly viable domains;
-      // a full normal queue must not permanently prevent recovery observations.
+      // Reserve a small bounded part of admission for actual measurements;
+      // an unknown domain must not need a profitable prior to get measured.
       const proofSlots = ordinary.filter(({ key }) => this.pendingProofs.has(key)).length;
       const probeSlots = Math.min(recovery.length, MAX_RECOVERY_POLICIES, Math.max(1, Math.floor(this.maxQueue / 10)), Math.max(0, slots - Math.max(proofSlots, Number(ordinary.length > 0))));
       const selected = [...ordinary.slice(0, slots - probeSlots), ...recovery.slice(0, probeSlots)];
       const retained = new Set([...protectedKeys, ...selected.map(item => item.key)]);
-      for (const [key, job] of this.queue) if (!retained.has(key)) { this.queue.delete(key); this.waitingPrepare.delete(job); }
+      for (const key of this.queue.keys()) if (!retained.has(key)) this.queue.delete(key);
       for (const { key, job, fresh } of selected) if (fresh) { job.bounty = structuredClone(job.bounty); this.queue.set(key, job); count++; }
     }
     this.dirty = true; if (count) this.notify(); this.kick(); return count;
   }
-  retainCatalog(rows) {
+  retainCatalog(rows, { oldestHeight = null } = {}) {
+    if (oldestHeight !== null && (!Number.isSafeInteger(oldestHeight) || oldestHeight < 0)) throw new Error('Invalid claim selection history window');
     const keys = new Set(), masks = new Set(), domains = new Set();
-    for (const row of rows) { keys.add(keyOf(row)); masks.add(`${row.domain}:${row.signature_algorithms_mask}`); domains.add(row.domain); }
+    for (const row of rows) {
+      const key = keyOf(row); keys.add(key); masks.add(`${row.domain}:${row.signature_algorithms_mask}`); domains.add(row.domain);
+      if (this.factors.has(key) && Number.isSafeInteger(row.block_height) && row.block_height >= 0) this.selectionHistoryHeights.set(key, row.block_height);
+    }
     for (const key of this.activeKeys()) {
       keys.add(key); const job = this.queue.get(key) ?? [...this.connections.values()].find(item => keyOf(item.job.bounty) === key)?.job;
       if (job) { masks.add(`${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`); domains.add(job.bounty.domain); }
     }
-    for (const map of [this.factors, this.successCounts, this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
+    // Verified work still owns its proposal after leaving the discovery window.
+    for (const [key, job] of this.queue) if (!job.unavailable && this.pendingProofs.has(key)) {
+      keys.add(key); masks.add(policyOf(job)); domains.add(job.bounty.domain);
+    }
+    // Funding can disappear in a reorg and be mined again inside the discovery
+    // horizon. That must not redraw its factor or reset successful captures.
+    // Keep only small selection metadata, bounded by the existing 100k factors;
+    // stale proposals/proofs still follow their separate invalidation rules.
+    const selectionKeys = new Set(keys);
+    for (const [key, height] of this.selectionHistoryHeights) {
+      if (this.factors.has(key) && oldestHeight !== null && height >= oldestHeight) selectionKeys.add(key);
+      else if (!keys.has(key) || !this.factors.has(key)) this.selectionHistoryHeights.delete(key);
+    }
+    for (const map of [this.factors, this.successCounts]) for (const key of map.keys()) if (!selectionKeys.has(key)) map.delete(key);
+    for (const map of [this.proposals, this.pendingProofs]) for (const key of map.keys()) if (!keys.has(key)) map.delete(key);
     for (const key of this.domainStats.keys()) if (!masks.has(key)) this.domainStats.delete(key);
     for (const domain of this.dns.keys()) if (!domains.has(domain)) this.dns.delete(domain);
     for (const domain of this.waitingDns) if (!domains.has(domain)) this.waitingDns.delete(domain);
@@ -267,7 +305,7 @@ export class ClaimsEngine {
   }
   recordAttemptStats(job, snapshot, previousCompleted) {
     // Legacy tooling only. Production observes every protocol-4 validation result.
-    // A truncated snapshot cannot reconstruct an EMA: never silently drop
+    // A truncated snapshot cannot reconstruct an performance history: never silently drop
     // missing observations as the former last-100 window permitted.
     validateAttemptStats(snapshot, Number.MAX_SAFE_INTEGER);
     if (!Number.isSafeInteger(previousCompleted) || previousCompleted < 0 ||
@@ -283,7 +321,7 @@ export class ClaimsEngine {
   remove(txid, vout) {
     const key = `${txid}:${vout}`, job = this.queue.get(key); this.queue.delete(key); this.scheduler.remove(key);
     this.pendingProofs.delete(key);
-    if (job) { job.unavailable = true; this.cancelOperation(job.prepareController, 'unavailable'); this.cancelOperation(job.submitController, 'unavailable'); this.waitingPrepare.delete(job); }
+    if (job) { job.unavailable = true; this.cancelOperation(job.prepareController, 'unavailable'); this.cancelOperation(job.submitController, 'unavailable'); }
     let cancelled = false;
     for (const request of this.connections.values()) if (keyOf(request.job.bounty) === key) { request.job.unavailable = true; this.cancelOperation(request.controller, 'unavailable'); cancelled = true; }
     if (this.compatActiveKey === key && this.compatController && !this.compatController.signal.aborted) { this.compatController.abort(); cancelled = true; }
@@ -293,20 +331,66 @@ export class ClaimsEngine {
     const key = `${txid}:${vout}`, job = this.queue.get(key);
     if (!job || job.retired) return;
     job.retired = true; this.scheduler.remove(key);
-    if (!job.submitting) this.pendingProofs.delete(key);
     // Normal window exit does not cancel captures already on the wire.
     for (const request of this.connections.values()) if (request.job === job && !request.started) this.cancelOperation(request.controller, 'window-exit');
-    if (!this.hasActive(key)) this.queue.delete(key);
+    if (!this.hasActive(key) && !this.pendingProofs.has(key)) this.queue.delete(key);
     this.notify(); this.kick();
   }
+  restoreAvailable(bounty) {
+    const job = this.queue.get(keyOf(bounty));
+    if (!job || job.unavailable || !job.retired) return;
+    // Called only after immutable fields and the replacement catalog pass validation.
+    job.retired = false; job.bounty = structuredClone(bounty); this.dirty = true;
+  }
+  preservePendingWinner(key) {
+    const job = this.queue.get(key), pending = this.pendingProofs.get(key);
+    if (!job?.prepared || !pending || this.acceptedProofs.has(key)) return;
+    // A competing mempool spend is reversible even before our first send.
+    // Transfer the verified winner's existing bounded proposal slot before
+    // removing/cancelling its queue entry; do not credit an unaccepted claim.
+    this.acceptedProofs.set(key, { prepared: job.prepared,
+      pending: { ...pending, counted: pending.counted === true }, factor: job.factor,
+      bounty: structuredClone(job.bounty), txid: job.prepared.txid,
+      invalidated: false, due: Date.now() + 30000 });
+  }
+  reopenAccepted(key, bounty) {
+    const accepted = this.acceptedProofs.get(key);
+    if (!accepted || this.hasActive(key) || this.queue.has(key) || !validBounty(bounty)) return false;
+    // Admission is explicit: completed means an ACK was counted, not that the
+    // transaction is permanently confirmed. A replay spends no TLS attempt.
+    const pending = { ...accepted.pending, counted: accepted.pending.counted === true, due: 0 };
+    const job = { bounty: structuredClone(bounty), prepared: accepted.prepared,
+      factor: accepted.factor, winner: true, due: 0, failures: pending.failures,
+      revalidateClaim: true, diagnosticId: ++this.nextDiagnosticId };
+    this.updatePriority(job); this.queue.set(key, job);
+    this.proposals.set(key, accepted.prepared); this.pendingProofs.set(key, pending);
+    this.dirty = true; this.notify(); this.kick(); return true;
+  }
+  confirmAccepted(key, record) {
+    if (this.acceptedProofs.get(key) !== record) return;
+    // An explicit rejection can race the node/index view: authoritative exact
+    // confirmation is the first acceptance if no earlier ACK was counted.
+    const firstAcceptance = record.pending.counted !== true;
+    record.pending.counted = true;
+    const job = this.queue.get(key), pending = this.pendingProofs.get(key);
+    if (job?.prepared?.txid === record.txid && pending) pending.counted = true;
+    // Catalog invalidation removes queue/pending ownership, but a request
+    // already written still returns its ACK. Its local pending reference must
+    // observe this confirmation too, or both paths credit the first success.
+    for (const active of this.submitting) if (keyOf(active.bounty) === key && active.prepared?.txid === record.txid && active.submissionPending) active.submissionPending.counted = true;
+    this.acceptedProofs.delete(key);
+    this.completed.add(key); if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
+    if (firstAcceptance) { this.countDiagnostic('completed'); this.notify({ completed: this.state.completed + 1, lastClaim: record.txid }); }
+  }
   clear({ preserveSelection = false } = {}) {
+    this.startIdle = true;
     for (const job of this.queue.values()) job.unavailable = true;
-    this.queue.clear(); this.completed.clear();
+    this.queue.clear();
     this.recoveryJobs.clear();
-    this.waitingPrepare.clear(); this.waitingDns.clear();
+    this.waitingDns.clear();
     for (const controller of this.controllers) this.cancelOperation(controller, 'clear');
     this.scheduler.clear({ preserveSelection }); this.dirty = true;
-    if (!preserveSelection) { this.factors.clear(); this.successCounts.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
+    if (!preserveSelection) { this.completed.clear(); this.factors.clear(); this.successCounts.clear(); this.selectionHistoryHeights.clear(); this.proposals.clear(); this.pendingProofs.clear(); this.acceptedProofs.clear(); this.domainStats.clear(); this.connectionPolicy.clear(); }
     // A catalog resync keeps both activity totals. A full context reset must
     // clear both together so the UI never compares counters from different periods.
     this.notify(preserveSelection ? {} : { completed: 0, attempts: 0 });
@@ -335,7 +419,7 @@ export class ClaimsEngine {
     if (!this.enabled) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     if (this.haltReason !== 'fatal') this.haltReason = reason;
     if (this.stopping) return this.stopping;
-    this.generation++; this.awaitingStart = false;
+    this.generation++;
     for (const controller of this.controllers) this.cancelOperation(controller, reason);
     const pool = this.pool; this.pool = null; this.poolReady = null;
     this.notify({ status, domain: null });
@@ -345,8 +429,8 @@ export class ClaimsEngine {
     })();
     this.stopping = pending.finally(() => {
       this.stopping = null; this.dns.clear(); this.scheduler.domainGates.clear();
-      for (const job of this.waitingPrepare) job.waitingPrepare = false;
-      this.waitingPrepare.clear(); this.waitingDns.clear(); this.dirty = true;
+      this.pendingStarts.clear(); this.pendingRecovery.clear(); this.nextStart = 0; this.startIdle = true;
+      this.waitingDns.clear(); this.dirty = true;
       const reason = this.haltReason; this.haltReason = null;
       if (this.diagnosticRun) {
         const event = this.enabled ? 'claims.suspended' : 'claims.stopped';
@@ -362,12 +446,24 @@ export class ClaimsEngine {
     if (wasPaused && this.diagnosticRun) report(this.onDiagnostic, 'claims.resumed', this.diagnosticSnapshot());
     this.kick();
   }
+  setCatalogBlocked(blocked) {
+    this.catalogBlocked = Boolean(blocked);
+    const pool = this.pool, generation = this.generation;
+    const gate = pool?.setAdmissionAllowed?.(!this.catalogBlocked);
+    if (gate) void Promise.resolve(gate).catch(error => {
+      if (this.pool === pool && generation === this.generation && this.enabled && !this.paused) this.fatal(error);
+    });
+    if (this.catalogBlocked) { clearTimeout(this.timer); this.timer = null; }
+    else this.kick();
+  }
   schedule(delay) {
     if (!this.enabled || this.paused || this.stopping || !Number.isFinite(delay)) return;
-    clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; this.kick(); }, Math.max(1, delay)); this.timer.unref?.();
+    // Keep the actual retry deadline on the job. Recheck it after each bounded
+    // timer slice instead of overflowing long server cooldowns into a 1 ms loop.
+    clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; this.kick(); }, Math.min(2_147_483_647, Math.max(1, delay))); this.timer.unref?.();
   }
   kick() {
-    if (!this.enabled || this.paused || this.stopping) return;
+    if (!this.enabled || this.paused || this.catalogBlocked || this.stopping) return;
     if (this.coordinator) { this.wakeRequested = true; return; }
     if (!this.isUnlocked()) { void this.stop('locked'); this.notify({ status: 'locked' }); return; }
     clearTimeout(this.timer); this.timer = null;
@@ -381,7 +477,7 @@ export class ClaimsEngine {
     });
   }
   async pump(generation) {
-    if (!this.enabled || this.paused || generation !== this.generation) return;
+    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
     if (!this.pool) {
       let pool;
       const onFailure = error => queueMicrotask(() => {
@@ -393,20 +489,41 @@ export class ClaimsEngine {
       this.poolReady = pool.start(this.options);
       await this.poolReady;
     } else await this.poolReady;
-    if (!this.enabled || this.paused || generation !== this.generation) return;
+    await this.pool?.setAdmissionAllowed?.(!this.catalogBlocked);
+    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
+    this.refreshDnsReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
-      if (this.awaitingStart || this.connections.size >= this.options.concurrency) {
+      // At least two pending starts let one slow admission be bypassed. The
+      // lookahead is bounded independently of active captures: at 1/s, never
+      // queue hundreds of requests behind the helper's 45-second IPC deadline.
+      // Only the production/helper contract guarantees socket pacing. Legacy
+      // adapters without that gate retain their single-start handshake: pacing
+      // dispatch alone could let delayed starts bunch together above the limit.
+      const pendingLimit = this.pool.pacesStarts ? Math.min(this.options.concurrency, MAX_PENDING_STARTS, Math.max(2,
+        Math.ceil(this.options.connectionsPerSecond * START_LOOKAHEAD_MS / 1000))) : 1;
+      if (this.pendingStarts.size >= pendingLimit || this.connections.size >= this.options.concurrency) {
+        // Cancelled requests can still occupy capacity while their callbacks
+        // drain. They cannot bridge an idle period into the next live run.
+        if (!this.pool.pacesStarts && [...this.connections.values()].every(request => request.controller.signal.aborted)) this.startIdle = true;
         this.schedule(this.nextProofDue() - Date.now()); return;
       }
       const selection = this.nextReady();
-      if (!selection) { this.notify({ status: 'waiting' }); this.schedule(Math.min(this.scheduler.nextDue(), this.nextProofDue()) - Date.now()); return; }
+      if (!selection) {
+        // No runnable or live capture demand: idle time does not earn credit.
+        // Capacity/ACK waits above retain the shared phase instead.
+        if (![...this.connections.values()].some(request => !request.controller.signal.aborted)) this.startIdle = true;
+        const proofDue = this.nextProofDue();
+        this.notify({ status: 'waiting' });
+        this.schedule(Math.min(this.scheduler.nextDue(), proofDue) - Date.now()); return;
+      }
       const [key, job] = selection;
-      if (!this.ready(job)) { this.scheduler.remove(key); continue; }
+      if (!this.ready(job)) {
+        if (this.eligible(job) && this.attemptable(job)) this.scheduler.setReady(key, false);
+        else this.scheduler.remove(key);
+        continue;
+      }
       if (!job.prepared) {
-        if (this.preparing.size >= 4) {
-          job.waitingPrepare = true; this.waitingPrepare.add(job); this.scheduler.setReady(key, false); continue;
-        }
         this.prepareJob(job, generation); continue;
       }
       const dns = this.dns.get(job.bounty.domain);
@@ -419,14 +536,19 @@ export class ClaimsEngine {
       if (!dns.ok) { this.scheduler.setDomainReady(job.bounty.domain, true, { due: dns.expires }); continue; }
       const delay = this.nextStart - performance.now();
       if (delay > 0) { this.schedule(delay); return; }
-      this.dispatch(selection, generation); return; // Wait for real TCP-start ACK, not capture completion.
+      this.dispatch(selection, generation);
     }
   }
   cachePrepared(key, prepared) {
-    if (!this.proposals.has(key) && this.proposals.size >= 256) {
-      const old = [...this.proposals.keys()].find(candidate => !this.hasActive(candidate) && !this.pendingProofs.has(candidate) && !this.queue.get(candidate)?.winner);
+    const retained = new Set([...this.proposals.keys(), ...this.acceptedProofs.keys()]);
+    if (!retained.has(key) && retained.size >= 256) {
+      const old = [...this.proposals.keys()].find(candidate => !this.acceptedProofs.has(candidate) && !this.hasActive(candidate) && !this.pendingProofs.has(candidate) && !this.queue.get(candidate)?.winner);
       if (!old) return false;
-      this.proposals.delete(old); const idle = this.queue.get(old); if (idle) idle.prepared = undefined;
+      this.proposals.delete(old); const idle = this.queue.get(old);
+      if (idle) {
+        idle.prepared = undefined;
+        this.scheduler.refreshPrepared(old);
+      }
     }
     this.proposals.delete(key); this.proposals.set(key, prepared); return true;
   }
@@ -454,9 +576,8 @@ export class ClaimsEngine {
     }).finally(() => {
       this.finishOperation(operation);
       job.preparing = false; job.prepareController = null; this.preparing.delete(job); this.controllers.delete(controller);
-      if (this.queue.get(key) === job && this.ready(job) && this.attemptable(job)) this.scheduler.setReady(key, true, { due: this.jobDue(job) });
+      if (this.queue.get(key) === job && this.eligible(job) && this.attemptable(job)) this.scheduler.setReady(key, this.ready(job), { due: this.jobDue(job) });
       else this.scheduler.remove(key);
-      this.releasePreparationSlot();
     });
     void this.track(job, task);
   }
@@ -485,29 +606,42 @@ export class ClaimsEngine {
     if (observation.captured) {
       this.countDiagnostic('captures');
       const count = this.successCounts.get(key) ?? 0n;
-      // The raw-capture budget is independent of the validated domain EMA. Replies
+      // The raw-capture budget is independent of the validated domain performance history. Replies
       // from parallel workers may arrive out of order, so never add it twice.
       const observed = observation.successfulConnections === undefined
         ? (count < MAX_P2C_SUCCESSFUL_CONNECTIONS ? count + 1n : count)
         : BigInt(observation.successfulConnections);
       this.successCounts.set(key, observed > count ? observed : count);
-      job.budgetExceeded = isP2CClaimConnectionLimitExceeded(job.bounty.connection_work_target, this.successCounts.get(key));
+      job.budgetExceeded = this.connectionBudgetExceeded(job, this.successCounts.get(key));
       if (job.budgetExceeded) this.scheduler.remove(key); // Keep already-running attempts alive.
     }
   }
   observeResult(request, result) {
     if (request.resultObserved) throw new Error('Duplicate connection validation observation');
     request.resultObserved = true;
+    if (Object.hasOwn(result, 'blocked') && (result.blocked !== 'budget' || result.captured ||
+        result.proof !== null || result.verified !== false || result.validationPassed !== null ||
+        (!result.started && result.seconds !== 0))) {
+      throw new Error('Invalid blocked connection observation');
+    }
+    if (Object.hasOwn(result, 'localUnavailable') && (result.localUnavailable !== true ||
+        result.captured || result.proof !== null || result.verified !== false || result.validationPassed === true || result.blocked)) {
+      throw new Error('Invalid local-unavailable connection observation');
+    }
     if (![true, false, null].includes(result.validationPassed) ||
         typeof result.seconds !== 'number' || !Number.isFinite(result.seconds) || result.seconds < 0 || result.seconds > 3600 ||
         (result.validationPassed !== null && !result.started) ||
         (result.validationPassed === true && !result.captured) ||
-        (result.validationPassed === null && result.started && !result.cancelled)) {
+        (result.validationPassed === null && result.started && !result.cancelled &&
+          result.blocked !== 'budget' && result.localUnavailable !== true)) {
       throw new Error('Invalid connection validation observation');
     }
-    // Null means no conclusive observation, e.g. cancellation before validation.
+    // Null means no conclusive observation, e.g. cancellation or a sibling
+    // invalidating admission after the started ACK but before the TCP call.
     // A target miss is still true: work probability already enters rawPriority.
-    if (result.validationPassed === null) return;
+    // Machine-local route/family failures still count as failed started
+    // attempts, but say nothing about a remote domain's proof quality.
+    if (result.validationPassed === null || result.localUnavailable === true) return;
     const { job } = request;
     const domainMask = `${job.bounty.domain}:${job.bounty.signature_algorithms_mask}`;
     const stats = this.domainStats.get(domainMask) ?? new P2CDomainStats(); this.domainStats.set(domainMask, stats);
@@ -517,7 +651,10 @@ export class ClaimsEngine {
     const [key, job] = selection;
     const recoveryProbe = !isWorthAttempting(job.rawPriority, this.connectionRate(job));
     if (recoveryProbe) {
-      if (!job.recoveryProbe || !isWorthAttempting(job.rawPriority, 5)) { this.dirty = true; this.wakeRequested = true; return; }
+      if (!job.recoveryProbe || job.rawPriority <= 0n) { this.dirty = true; this.wakeRequested = true; return; }
+      if (this.pendingRecovery.size > 0) {
+        this.scheduler.setReady(key, false); return;
+      }
       // A delayed TCP-start acknowledgement may belong to a different bounty
       // than the current probe representative. Consult policy state, not the
       // representative's cached deadline, before spending another connection.
@@ -529,9 +666,19 @@ export class ClaimsEngine {
     }
     const controller = new AbortController(), token = ++this.nextToken;
     const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime() } : {}) });
-    const request = { job, controller, token, started: false, observed: false, recoveryProbe };
+    if (recoveryProbe && !this.connectionPolicy.reserveProbe(policyOf(job), token)) {
+      this.refreshRecoveryReadiness(); this.wakeRequested = true; return;
+    }
+    const request = { job, controller, token, generation, policy: policyOf(job), started: false, observed: false, recoveryProbe };
     const operation = this.beginOperation('capture', controller);
-    this.connections.set(token, request); this.controllers.add(controller); this.awaitingStart = true;
+    this.connections.set(token, request); this.controllers.add(controller); this.pendingStarts.add(token);
+    if (recoveryProbe) {
+      this.pendingRecovery.set(request.policy, request); this.refreshRecoveryReadiness();
+    }
+    // Reserve turns in dispatch order, not callback arrival order. A failure
+    // before TCP spends no attempt/performance history/probe cooldown, but cannot rewind turns
+    // already reserved by other concurrent requests.
+    this.scheduler.commit(selection);
     const pool = this.pool;
     let stage = 'proof', operationStarted = performance.now();
     const valid = () => generation === this.generation && this.enabled && !this.paused && this.isUnlocked() && !controller.signal.aborted && !job.unavailable && this.queue.get(key) === job;
@@ -539,20 +686,24 @@ export class ClaimsEngine {
       onStarted: () => {
         if (request.started) throw new Error('Duplicate connection start');
         this.countDiagnostic('attempts');
-        request.started = true; this.scheduler.commit(selection); this.awaitingStart = false;
+        request.started = true;
         if (request.recoveryProbe) {
-          const policy = policyOf(job), due = this.connectionPolicy.probeStarted(policy);
-          job.probeDue = due;
-          const representative = this.recoveryJobs.get(policy);
-          if (representative) {
-            representative.probeDue = due;
-            this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
+          job.probeDue = this.connectionPolicy.probeStarted(request.policy, Date.now(), token);
+        }
+        this.releaseStart(request);
+        // Never add a second JavaScript timer to the production helper's own
+        // high-resolution socket gate. Only legacy/offline adapters need it.
+        if (generation === this.generation) {
+          if (pool.pacesStarts) this.nextStart = 0;
+          else {
+            const now = performance.now();
+            if (this.startIdle) this.nextStart = Math.max(this.nextStart, now);
+            this.nextStart = Math.max(this.nextStart + 1000 / this.options.connectionsPerSecond, now - 1000);
+            // Count late real starts, but cancelled old work must not consume
+            // the pending idle reset belonging to the next live admission.
+            if (!controller.signal.aborted && !job.unavailable && this.queue.get(key) === job) this.startIdle = false;
           }
         }
-        // The native pool gates actual TCP starts with a high-resolution timer.
-        // Avoid a second Windows JS timer (~15 ms on some systems) capping it
-        // near 65/s. Offline/custom adapters may delegate pacing to this fallback.
-        this.nextStart = pool.pacesStarts ? 0 : performance.now() + 1000 / this.options.connectionsPerSecond;
         this.notify({ attempts: this.state.attempts + 1,
           ...(generation === this.generation && this.enabled && !this.paused
             ? { status: 'searching', domain: context.domain, lastError: null } : {}) }); this.kick();
@@ -568,7 +719,8 @@ export class ClaimsEngine {
       if (!result.started) { this.dns.delete(job.bounty.domain); return; }
       if (result.proof && result.verified === true && !job.winner) {
         job.winner = true; this.scheduler.remove(key);
-        this.pendingProofs.set(key, { proof: result.proof, context, due: 0, failures: 0 });
+        this.pendingProofs.set(key, { proof: result.proof, context, due: 0, failures: 0,
+          counted: job.prepared.acceptanceCounted === true });
         for (const sibling of this.connections.values()) if (sibling !== request && sibling.job === job) this.cancelOperation(sibling.controller, 'sibling-proof');
         stage = 'submit';
         if (!valid()) return;
@@ -588,44 +740,58 @@ export class ClaimsEngine {
       }
     }).finally(() => {
       this.finishOperation(operation);
-      if (!request.started) this.awaitingStart = false;
+      this.releaseStart(request);
       this.connections.delete(token); this.controllers.delete(controller);
     });
     void this.track(job, task);
+  }
+  releaseStart(request) {
+    this.pendingStarts.delete(request.token);
+    const policy = request.policy;
+    if (this.pendingRecovery.get(policy) !== request) return;
+    this.pendingRecovery.delete(policy);
+    this.connectionPolicy.releaseProbe(request.token);
+    if (request.generation === this.generation) this.refreshRecoveryReadiness();
+  }
+  refreshRecoveryReadiness() {
+    // At most 256 representatives, updated only on probe admission/ACK/release.
+    // Share the deadline with other policies and replacement representatives.
+    for (const [policy, representative] of this.recoveryJobs) {
+      representative.probeDue = this.connectionPolicy.probeDue(policy);
+      this.scheduler.setReady(keyOf(representative.bounty), this.ready(representative), { due: this.jobDue(representative) });
+    }
   }
   nextProofDue() {
     if (this.submitting.size >= 4) return Infinity; // A completion will wake queued submissions.
     let due = Infinity;
     for (const [key, pending] of this.pendingProofs) {
       const job = this.queue.get(key);
-      if (job && !job.retired && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
+      if (job && !job.unavailable && !job.submitting) due = Math.min(due, pending.due);
     }
     return due;
   }
-  releasePreparationSlot() {
-    for (const job of this.waitingPrepare) {
-      this.waitingPrepare.delete(job); job.waitingPrepare = false;
-      const key = keyOf(job.bounty);
-      if (this.queue.get(key) !== job || !this.ready(job)) continue;
-      if (this.scheduler.setReady(key, true, { due: this.jobDue(job) }) && this.jobDue(job) <= Date.now()) break;
-    }
-  }
-  releaseDnsSlot() {
+  refreshDnsReadiness() {
+    if (this.resolving.size >= 2) return;
+    // Waking a domain does not reserve a resolution slot. Reopen all capacity
+    // waiters so removing a woken candidate cannot strand the others forever.
+    // The pump still enforces two resolutions and each cached DNS deadline.
     for (const domain of this.waitingDns) {
+      if (this.resolving.has(domain)) continue;
       this.waitingDns.delete(domain);
       // Remove a remembered closed gate even if a rebuild excluded all of its
       // candidates. Otherwise a later eligible candidate would stay stuck.
       this.scheduler.domainGates.delete(domain);
-      if (this.scheduler.setDomainReady(domain, true) && this.scheduler.groups.get(domain)?.ready.total) break;
+      this.scheduler.setDomainReady(domain, true);
     }
   }
+  releaseDnsSlot() { this.refreshDnsReadiness(); }
   retrySubmissions(generation) {
     // At most 256 cached proposals. A proof retry never spends a TLS slot or
     // resets the successful-capture budget/challenge.
     for (const [key, pending] of this.pendingProofs) {
       if (this.submitting.size >= 4) return;
       const job = this.queue.get(key);
-      if (!job || job.retired || job.unavailable || job.submitting || pending.due > Date.now()) continue;
+      if (!job || job.unavailable || job.submitting || pending.due > Date.now()) continue;
       const controller = new AbortController(); this.controllers.add(controller);
       const task = this.submitVerified(job, controller, generation).finally(() => this.controllers.delete(controller));
       void this.track(job, task);
@@ -637,30 +803,54 @@ export class ClaimsEngine {
     // proofs queued; completing a submission wakes the coordinator to drain them.
     if (job.submitting || this.submitting.size >= 4 || !pending || generation !== this.generation || !this.enabled || this.paused || controller.signal.aborted ||
         job.unavailable || !this.isUnlocked() || this.queue.get(key) !== job) return;
-    const started = performance.now(); job.submitting = true; job.submitController = controller; this.submitting.add(job);
+    const started = performance.now(); job.submitting = true; job.submitController = controller; job.submissionPending = pending; this.submitting.add(job);
     const operation = this.beginOperation('submit', controller);
     this.notify({ status: 'submitting' });
     try {
       const receipt = await this.submit(job.prepared, pending.proof, { signal: controller.signal });
+      const firstAcceptance = pending.counted !== true;
+      if (receipt?.retainProof) this.acceptedProofs.set(key, { prepared: job.prepared,
+        pending: { ...pending, counted: true }, factor: job.factor,
+        bounty: structuredClone(this.acceptedProofs.get(key)?.bounty ?? job.retainedBounty ?? job.bounty), txid: typeof receipt === 'string' ? receipt : receipt.txid,
+        // A spend/reorg may remove the job while its written request still
+        // awaits an ACK, before any retained owner exists. Do not forget that
+        // evidence on the late ACK. Own pending spends already transfer an
+        // owner with invalidated=false and remain eligible for safe replay.
+        invalidated: this.acceptedProofs.get(key)?.invalidated ?? job.retainedInvalidated ?? Boolean(job.unavailable),
+        due: Date.now() + 30000 });
+      else this.acceptedProofs.delete(key);
       this.completed.add(key); if (this.completed.size > this.maxQueue) this.completed.delete(this.completed.values().next().value);
       this.queue.delete(key); this.proposals.delete(key); this.pendingProofs.delete(key);
-      this.finishOperation(operation, 'completed'); this.countDiagnostic('completed');
+      this.finishOperation(operation, 'completed'); if (firstAcceptance) this.countDiagnostic('completed');
       // durationMs measures this submit operation only, not preparation/capture
       // or queue time. Aggregated progress counts every success, even if sampled.
-      this.sampleDiagnostic('claim.succeeded', { stage: 'submit', claimId: job.diagnosticId, completed: this.state.completed + 1,
+      this.sampleDiagnostic('claim.succeeded', { stage: 'submit', claimId: job.diagnosticId, completed: this.state.completed + Number(firstAcceptance),
         durationMs: Math.round(performance.now() - started), attempts: 1 });
-      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + 1,
+      this.notify({ status: this.enabled ? 'claimed' : 'off', completed: this.state.completed + Number(firstAcceptance),
         ...(this.enabled && generation === this.generation ? { lastError: null } : {}),
         lastClaim: typeof receipt === 'string' ? receipt : receipt?.txid ?? pending.context.txid });
     } catch (error) {
       this.finishOperation(operation, error.name === 'AbortError' && !error.unknownOutcome ? 'cancelled' : 'failed');
       if (error.unknownOutcome || error.helperFatal) { this.fatal(error); return; }
-      if (job.retired || job.unavailable) this.pendingProofs.delete(key);
+      if (isKnownClaimRejection(error)) {
+        // A transient competing mempool spend may remove this queue entry
+        // before available_again. Preserve its verified witness within the
+        // same bounded ownership map used for ACKs, without crediting success.
+        this.acceptedProofs.set(key, { prepared: job.prepared,
+          pending: { ...pending, counted: pending.counted === true }, factor: job.factor,
+          bounty: structuredClone(this.acceptedProofs.get(key)?.bounty ?? job.retainedBounty ?? job.bounty), txid: job.prepared.txid,
+          invalidated: this.acceptedProofs.get(key)?.invalidated ?? job.retainedInvalidated ?? Boolean(job.unavailable),
+          due: Date.now() + 30000 });
+      }
+      if (job.unavailable) this.pendingProofs.delete(key);
       if (error.name !== 'AbortError') {
         this.jobError(job, error, 'submit', true, { durationMs: Math.round(performance.now() - started), attempts: 1 });
+        if (Number.isSafeInteger(error.retryAfterMs) && error.retryAfterMs > 0) {
+          job.due = Math.max(job.due, Math.min(Number.MAX_SAFE_INTEGER, Date.now() + error.retryAfterMs));
+        }
         pending.due = job.due; pending.failures = job.failures;
       }
-    } finally { this.finishOperation(operation); job.submitting = false; job.submitController = null; this.submitting.delete(job); }
+    } finally { this.finishOperation(operation); job.submitting = false; job.submitController = null; job.submissionPending = null; this.submitting.delete(job); }
   }
   pauseWorker(signal) {
     if (signal.aborted) return Promise.resolve();

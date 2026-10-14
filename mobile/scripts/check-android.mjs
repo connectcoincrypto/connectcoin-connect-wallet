@@ -53,6 +53,7 @@ for (const name of ['allowBackup', 'fullBackupContent', 'usesCleartextTraffic'])
 assert.equal(attr(application[0], 'dataExtractionRules'), '@xml/data_extraction_rules');
 assert.equal(attr(application[0], 'icon'), '@mipmap/ic_launcher');
 assert.equal(attr(application[0], 'roundIcon'), '@mipmap/ic_launcher_round');
+assert.equal(attr(application[0], 'label'), '@string/app_name');
 assert.notEqual(attr(application[0], 'debuggable'), 'true');
 for (const component of ['provider', 'receiver', 'activity-alias']) {
   assert.equal(elements(manifest, component).length, 0, `Unexpected ${component} in the native wallet alpha`);
@@ -71,6 +72,7 @@ const activities = elements(manifest, 'activity').filter((item) => !activityRemo
 assert.deepEqual(activities.map((item) => attr(item, 'name')).sort(), ['.MainActivity', '.PaymentQrCaptureActivity']);
 const mainActivity = activities.find((item) => attr(item, 'name') === '.MainActivity');
 const scannerActivity = activities.find((item) => attr(item, 'name') === '.PaymentQrCaptureActivity');
+assert.equal(attr(mainActivity, 'label'), '@string/title_activity_main');
 assert.equal(attr(mainActivity, 'exported'), 'true'); // Launcher and explicit public payment links only.
 assert.equal(attr(mainActivity, 'launchMode'), 'singleTask');
 assert.equal(attr(scannerActivity, 'exported'), 'false');
@@ -125,7 +127,8 @@ for (const transport of ['cloud-backup', 'device-transfer']) {
 await scanXml(res);
 const strings = await xml(path.join(res, 'values/strings.xml'));
 const stringMap = new Map(elements(strings, 'string').map((item) => [item.getAttribute('name'), item.textContent]));
-assert.equal(stringMap.get('app_name'), 'ConnectWallet Alpha');
+assert.equal(stringMap.get('app_name'), 'ConnectWallet');
+assert.equal(stringMap.get('title_activity_main'), 'ConnectWallet');
 assert.equal(stringMap.get('package_name'), appId);
 for (const name of ['ic_launcher', 'ic_launcher_round']) {
   const adaptive = await xml(path.join(res, `mipmap-anydpi-v26/${name}.xml`));
@@ -234,9 +237,18 @@ const claimsExports = await read(path.join(mobile, 'native/jni-exports.map'));
 const exportedMethods = [...claimsExports.matchAll(/Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_(native\w+);/g)].map(x => x[1]).sort();
 const jniSource = await read(path.join(mobile, 'native/src/jni.cpp'));
 const implementedMethods = [...jniSource.matchAll(/Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_(native\w+)\(/g)].map(x => x[1]).sort();
-assert.deepEqual(nativeMethods, ['nativeCancel', 'nativeCapture', 'nativeCreate', 'nativeCreateStartLimiter', 'nativeDestroy', 'nativeDestroyStartLimiter', 'nativeHasStarted', 'nativeProbeRsa', 'nativeResetStartSchedule', 'nativeSetStartRate', 'nativeStartedAgeNanos']);
+assert.deepEqual(nativeMethods, ['nativeBindBudget', 'nativeCancel', 'nativeCapture', 'nativeCreate', 'nativeCreateStartLimiter', 'nativeDestroy', 'nativeDestroyStartLimiter', 'nativeHasCaptured', 'nativeHasStarted', 'nativeProbeRsa', 'nativeResetStartSchedule', 'nativeSetStartAllowed', 'nativeSetStartRate', 'nativeStartedAgeNanos']);
 assert.deepEqual(exportedMethods, nativeMethods, 'Every declared native claims method must be exported by the Android library');
 assert.deepEqual(implementedMethods, nativeMethods, 'JNI implementations must match the exact claims contract');
+assert.match(nativeClaims, /private\s+static\s+native\s+void\s+nativeSetStartAllowed\(long limiter,\s*boolean allowed\);/,
+  'Lifecycle admission accepts only its owning limiter and a boolean');
+assert.match(nativeClaims, /private\s+static\s+native\s+void\s+nativeBindBudget\(long handle,\s*String key,\s*String target,\s*String captured\);/,
+  'Public budget counts remain decimal uint64 strings, not lossy floating-point or signed Java counters');
+assert.match(jniSource, /JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeSetStartAllowed\(JNIEnv\* env,jclass,jlong limiter,jboolean allowed\)/);
+assert.match(jniSource, /connectwallet::SetStartAllowed\(limiter,allowed==JNI_TRUE\)/);
+assert.match(jniSource, /JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeBindBudget\(JNIEnv\* env,jclass,jlong handle,jstring key,jstring target,jstring count\)/);
+assert.match(jniSource, /connectwallet::BindClaimBudget\(handle,Text\(env,key,128\),Text\(env,target,64\),Text\(env,count,20\)\)/,
+  'Budget bridge strings must remain bounded before crossing into native admission');
 assert.doesNotMatch(nativeClaims, /@PluginMethod/, 'The native capture/start acknowledgement must not be exposed to the WebView');
 assert.doesNotMatch(nativeWallet, /FLAG_SECURE/, 'Screen capture must remain available in native dialogs');
 assert.match(nativeWallet, /else showRecoveryPhrase\(call, WalletCrypto\.generateMnemonic\(24\)\)/);
@@ -298,6 +310,14 @@ assert.match(nativeWallet, /new VaultSession\(payload\.getString\("mnemonic"\), 
   'Removing the setup field must not change keys in an existing encrypted wallet');
 const exposed = [...nativeWallet.matchAll(/@PluginMethod\s+public\s+void\s+(\w+)\s*\(/g)].map(x => x[1]).sort();
 assert.deepEqual(exposed, ['changePassword', 'claimsCheckSubmission', 'claimsLimits', 'claimsPolicy', 'claimsStart', 'claimsState', 'claimsStop', 'create', 'dismissPaymentBatch', 'exportWallet', 'getPaymentBatch', 'getRecoverySnapshots', 'getSettings', 'getState', 'importRecovery', 'importWallet', 'lock', 'newAddress', 'queryPublic', 'readPaymentClipboard', 'recoverAddresses', 'reviewP2C', 'reviewPayment', 'saveSettings', 'unlock', 'viewRecoveryPhrase', 'watchAccount'].sort());
+const alphaSmoke = await read(path.join(mobile, 'android/app/src/androidTest/java/com/connectcoincrypto/connectwallet/mobile/alpha/AlphaSmokeTest.java'));
+const smokeWalletMethods = alphaSmoke.match(/private static final String\[\] NATIVE_WALLET_METHODS\s*=\s*\{([^}]+)\}/);
+assert(smokeWalletMethods, 'The emulator must retain an explicit exact native wallet allowlist');
+assert.deepEqual([...smokeWalletMethods[1].matchAll(/"(\w+)"/g)].map(match => match[1]).sort(),
+  [...exposed, 'addListener', 'removeListener', 'removeAllListeners', 'checkPermissions', 'requestPermissions'].sort(),
+  'Keep the exact emulator allowlist in sync with reviewed native APIs and inherited framework methods');
+assert.match(alphaSmoke, /assertEquals\(new HashSet<>\(Arrays\.asList\(NATIVE_WALLET_METHODS\)\), wallet\)/,
+  'The actual runtime bridge must equal the allowlist, not merely contain a subset');
 const recoverySnapshots = nativeWallet.slice(nativeWallet.indexOf('@PluginMethod public void getRecoverySnapshots('), nativeWallet.indexOf('@PluginMethod public void readPaymentClipboard('));
 assert.match(recoverySnapshots, /if \(!empty\(call\)\) return/);
 assert.match(recoverySnapshots, /hdWallet\.recoverySnapshots\(\)/);

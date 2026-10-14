@@ -31,6 +31,7 @@ public actor MobileWalletRuntime {
     private var rpcGeneration: UInt64 = 0
     private var eventHandler: ((String, JSONObject) -> Void)?
     private var recovery: Task<Void, Never>?, inactivity: Task<Void, Never>?
+    private var recoveryRevision: UInt64 = 0
     private var lastInteraction = ProcessInfo.processInfo.systemUptime
     private let funding = try! MobilePaymentFunding()
     private struct Approval {
@@ -83,9 +84,10 @@ public actor MobileWalletRuntime {
             // Security revocation and timer cancellation precede the first await.
             // An older cleanup must never cancel a newer foreground timer/watch.
             let (_, old) = revoke(); inactivity?.cancel(); inactivity = nil
-            await old?.close(); await afterLock?()
-            guard revision == activityRevision && !active else { return }
+            // Claims own native sockets independently of the HD actor. Revoke
+            // their foreground policy before waiting for unrelated HD cleanup.
             await claims.setActive(false)
+            await old?.close(); await afterLock?()
             guard revision == activityRevision && !active else { return }
             await subscriptions?.stop()
             guard revision == activityRevision && !active else { return }
@@ -122,6 +124,12 @@ public actor MobileWalletRuntime {
     }
     private func revoke() -> (UInt64, NativeHdWallet?) {
         paymentPermit?.cancel(); let token = fence.invalidate(); recovery?.cancel(); recovery = nil
+        recoveryRevision &+= 1
+        if var state = publicHd["hd"] as? JSONObject {
+            state["recovering"] = false; state["retryAfterMs"] = 0
+            if state["complete"] as? Bool != true { state["recoveryState"] = "paused" }
+            publicHd["hd"] = state
+        }
         signing?.lock(); signing = nil; update?.close(); update = nil
         let old = hd; hd = nil; approval?.inventory.discard(); approval = nil
         return (token, old)
@@ -273,19 +281,22 @@ public actor MobileWalletRuntime {
         } catch { candidate.close(); throw error }
     }
     private func startRecovery(_ owner: NativeHdWallet, _ token: UInt64) {
-        recovery?.cancel()
+        guard (try? live(token)) != nil, hd === owner else { return }
+        recovery?.cancel(); recoveryRevision &+= 1
+        let revision = recoveryRevision, rpc = self.rpc, fence = self.fence
         recovery = Task { [weak self] in
             guard let self else { return }
             do {
-                try await owner.recover(rpc: self.rpc, progress: { value in Task { await self.acceptHd(value, token) } })
-                await self.acceptHd(owner.snapshot(), token)
-            } catch { await self.acceptHd(owner.snapshot(), token) }
+                try await owner.recover(reader: { try await rpc.call($0, $1) }, ownership: { try fence.check(token) },
+                                        progress: { value in await self.acceptHd(value, token, revision) })
+                await self.acceptHd(owner.snapshot(), token, revision)
+            } catch { await self.acceptHd(owner.snapshot(), token, revision) }
         }
     }
-    private func acceptHd(_ value: JSONObject, _ token: UInt64) async {
-        guard (try? live(token)) != nil else { return }
+    private func acceptHd(_ value: JSONObject, _ token: UInt64, _ revision: UInt64) async {
+        guard revision == recoveryRevision, (try? live(token)) != nil else { return }
         publicHd = value; await refreshSubscriptions()
-        if let state = try? await publicState(), (try? live(token)) != nil { emit("walletStateChanged", state) }
+        if let state = try? await publicState(), revision == recoveryRevision, (try? live(token)) != nil { emit("walletStateChanged", state) }
     }
     private func refreshSubscriptions() async {
         guard active, let id = publicHd["walletId"] as? String, let rows = publicHd["accounts"] as? [JSONObject], !rows.isEmpty else { return }
@@ -327,7 +338,9 @@ public actor MobileWalletRuntime {
             try live(token); publicHd = snapshot; await refreshSubscriptions(); try live(token); return try await publicState()
         case "recoverAddresses":
             guard let hd else { throw WalletError("Unlock the wallet first") }
-            try await hd.requestRecovery(); startRecovery(hd, fence.token()); return try await publicState()
+            let token = fence.token(); try live(token)
+            try await hd.requestRecovery(); try live(token)
+            startRecovery(hd, token); return try await publicState()
         case "queryPublic":
             let method = try params.string("method"), arguments = try params.object("params"), token = fence.token(), rpcToken = rpcGeneration
             try walletRequire(!endpointChanging, "RPC endpoint is changing")
@@ -357,16 +370,17 @@ public actor MobileWalletRuntime {
                 // Revoke old endpoint recovery and every publication token before
                 // awaiting replacement. Public ownership remains watch-only.
                 let token = try await revokeForOperation(), storage = try store()
-                await claims.close(); await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
+                let claimsReplacement = try await claims.closeForReplacement()
+                await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
                 do {
                     let replacement = try await rpc.replaceEndpoint(TcpEndpoint(next.string("rpcHost"), Int(next.integer("rpcPort"))), persist: { [fence] in
                         try fence.commit(token) { try storage.write(.settings, JSON.encode(next)) }
                     })
                     settings = next; rpc = replacement; rpc.setActive(active)
                 } catch {
-                    claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions(); throw error
+                    claims = claimsReplacement.makeEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions(); throw error
                 }
-                claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions()
+                claims = claimsReplacement.makeEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions()
                 emit("walletStateChanged", try await publicState())
             } else { try store().write(.settings, JSON.encode(next)); settings = next }
             settingsError = nil

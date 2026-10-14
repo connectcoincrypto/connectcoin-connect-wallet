@@ -15,7 +15,7 @@ void Error(JNIEnv* env,const char* code) {
     if(env->ExceptionCheck()) return;
     // Never return implementation/path/OS exception strings to the renderer.
     bool known=false;
-    for(auto allowed:{"CLAIM_CONTEXT","CLAIM_MEMORY","CLAIM_CANCELLED","CLAIM_TIMEOUT","CLAIM_BUSY","CLAIM_NETWORK","CLAIM_DNS","CLAIM_TLS","CLAIM_CERTIFICATE","CLAIM_CRYPTO","CLAIM_NATIVE"}) {
+    for(auto allowed:{"CLAIM_CONTEXT","CLAIM_MEMORY","CLAIM_CANCELLED","CLAIM_TIMEOUT","CLAIM_BUSY","CLAIM_BUDGET","CLAIM_NETWORK","CLAIM_LOCAL_UNAVAILABLE","CLAIM_DNS","CLAIM_TLS","CLAIM_CERTIFICATE","CLAIM_CRYPTO","CLAIM_NATIVE"}) {
         if(std::string_view(code)==allowed) { known=true; break; }
     }
     if(!known) code="CLAIM_NATIVE";
@@ -32,6 +32,12 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_connectcoincrypto_connectwallet_mobi
 extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeSetStartRate(JNIEnv* env,jclass,jlong limiter,jint rate) {
     try { connectwallet::SetStartRate(limiter,rate); } catch(const std::runtime_error& error) { Error(env,error.what()); } catch(...) { Error(env,"CLAIM_NATIVE"); }
 }
+extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeSetStartAllowed(JNIEnv* env,jclass,jlong limiter,jboolean allowed) {
+    try { connectwallet::SetStartAllowed(limiter,allowed==JNI_TRUE); } catch(const std::runtime_error& error) { Error(env,error.what()); } catch(...) { Error(env,"CLAIM_NATIVE"); }
+}
+extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeBindBudget(JNIEnv* env,jclass,jlong handle,jstring key,jstring target,jstring count) {
+    try { connectwallet::BindClaimBudget(handle,Text(env,key,128),Text(env,target,64),Text(env,count,20)); } catch(const std::runtime_error& error) { Error(env,error.what()); } catch(...) { Error(env,"CLAIM_NATIVE"); }
+}
 extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeResetStartSchedule(JNIEnv* env,jclass,jlong limiter) {
     try { connectwallet::ResetStartSchedule(limiter); } catch(const std::runtime_error& error) { Error(env,error.what()); } catch(...) { Error(env,"CLAIM_NATIVE"); }
 }
@@ -40,6 +46,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_connectcoincrypto_connectwallet_mobi
 extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeCancel(JNIEnv* env,jclass,jlong handle) { try { connectwallet::Cancel(handle); } catch(...) { Error(env,"CLAIM_NATIVE"); } }
 extern "C" JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeDestroy(JNIEnv* env,jclass,jlong handle) { try { connectwallet::DestroyCancellation(handle); } catch(...) { Error(env,"CLAIM_NATIVE"); } }
 extern "C" JNIEXPORT jboolean JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeHasStarted(JNIEnv* env,jclass,jlong handle) { try { return connectwallet::HasStarted(handle)?JNI_TRUE:JNI_FALSE; } catch(...) { Error(env,"CLAIM_NATIVE"); } return JNI_FALSE; }
+extern "C" JNIEXPORT jboolean JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeHasCaptured(JNIEnv* env,jclass,jlong handle) { try { return connectwallet::HasCaptured(handle)?JNI_TRUE:JNI_FALSE; } catch(...) { Error(env,"CLAIM_NATIVE"); } return JNI_FALSE; }
 extern "C" JNIEXPORT jstring JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeCapture(JNIEnv* env,jclass,jstring domain,jstring challenge,jstring target,jint roots,jint mask,jlong time,jint timeout,jlong handle) {
     try {
         connectwallet::PublicClaimContext context{Text(env,domain,253),Text(env,challenge,64),Text(env,target,64),roots,mask,time};

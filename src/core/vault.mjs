@@ -154,7 +154,7 @@ export async function replaceVault(file, payload, password, { expectedFingerprin
   const suffix = randomBytes(16).toString('hex');
   const backupFile = path.join(backups, `wallet-${new Date().toISOString().replace(/[:.]/g, '-')}-${suffix}.connectwallet.json`);
   const temporary = path.join(directory, `.wallet-${suffix}.tmp`);
-  let temporaryHandle, backupHandle, backupComplete = false, backupCreated = false;
+  let temporaryHandle, backupHandle, backupComplete = false, backupCreated = false, published = false;
   try {
     temporaryHandle = await open(temporary, 'wx', 0o600);
     await temporaryHandle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8');
@@ -177,6 +177,7 @@ export async function replaceVault(file, payload, password, { expectedFingerprin
     if (!current.isFile() || current.isSymbolicLink() || current.size > LIMIT + 4096 || fingerprint(readFileSync(destination)) !== expectedFingerprint) throw new Error('The wallet file changed. Start recovery or replacement again.');
     check();
     renameSync(temporary, destination);
+    published = true;
     if (process.platform !== 'win32') {
       let handle;
       try { handle = openSync(directory, 'r'); fsyncSync(handle); closeSync(handle); handle = undefined; }
@@ -190,7 +191,14 @@ export async function replaceVault(file, payload, password, { expectedFingerprin
   } finally {
     await temporaryHandle?.close().catch(() => {});
     await backupHandle?.close().catch(() => {});
-    await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await unlink(temporary).catch(error => {
+      if (error.code === 'ENOENT') return;
+      if (!published) throw error;
+      // Cleanup can fail after the new encrypted wallet is already installed.
+      // Preserve that outcome so the service revokes the old authorization
+      // and tells the user which password now opens the active wallet.
+      throw Object.assign(new Error('The new wallet was installed, but storage could not complete cleanup. Keep both recovery phrases safe and verify access with the new password. The previous encrypted backup is preserved.', { cause: error }), { walletPublished: true });
+    });
     if (backupCreated && !backupComplete) await unlink(backupFile).catch(() => {});
   }
 }

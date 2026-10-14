@@ -113,12 +113,13 @@ function claimFixture(rpc) {
   const funding = { version: 2, locktime: 0,
     inputs: [{ txid: '99'.repeat(32), vout: 0, sequence: 0xffffffff, scriptSig: '', witness: [] }],
     outputs: [{ type: 2, amount: '1000000000', domain: 'example.com', target: 'f'.repeat(64), rootVersion: 1, mask: 7 }] };
-  const bounty = { txid: transactionId(funding), vout: 0, amount: '1000000000', status: 'available' };
+  const bounty = { txid: transactionId(funding), vout: 0, amount: '1000000000', status: 'available', block_height: 1 };
   const prepared = { ...prepareClaim({ bounty, rawTransaction: serializeTransaction(funding).toString('hex'), rewardAddress: account.address }), epoch: 7, walletGeneration: 0, rpc };
   const hello = Buffer.concat([Buffer.from('010000220303', 'hex'), Buffer.from(prepared.challenge, 'hex')]);
   const proof = Buffer.concat([Buffer.from([2]), hello, ...[2, 8, 11, 15].map(type => Buffer.from([type, 0, 0, 0]))]).toString('hex');
   const service = new WalletService({ directory: '/unused-rpc-cancellation-test' });
   service.rpc = rpc; service.epoch = 7; service.session = { data: {} };
+  service.tip = { height: 1 };
   service.config = { claims: { enabled: true } };
   service.queueSettings = async operation => operation();
   service.applyConfig = async input => { Object.assign(service.config.claims, input.claims); };
@@ -173,9 +174,12 @@ test('STOP during claim broadcast quota releases only its unsent reservation and
   const { client, requests } = await fixture(t, undefined, { windowMs: 180 });
   client.history.set('sendrawtransaction', Array(48).fill(performance.now()));
   const { service, prepared, proof, key } = claimFixture(client);
+  const entered = deferred(), pace = client.pace.bind(client);
+  client.pace = (...args) => { entered.resolve(); return pace(...args); };
   const controller = new AbortController();
   const submission = service.submitAutomaticClaim(prepared, proof, { signal: controller.signal });
   const rejected = assert.rejects(bounded(submission), cancelled);
+  await entered.promise;
   assert.equal(service.reserved.has(key), true);
   service.engine.enabled = false; controller.abort(); await rejected; await delay(220);
   assert.deepEqual(requests, []); assert.equal(service.reserved.has(key), false);
@@ -191,7 +195,7 @@ for (const outcome of ['confirmed', 'disconnected']) test(`STOP after a claim wa
   const result = outcome === 'confirmed' ? submission : assert.rejects(submission, error => error.unknownOutcome === true);
   const { request, socket } = await received.promise;
   service.engine.enabled = false; controller.abort();
-  if (outcome === 'confirmed') { reply(socket, request, { txid: prepared.txid }); assert.deepEqual(await result, { txid: prepared.txid }); }
+  if (outcome === 'confirmed') { reply(socket, request, { txid: prepared.txid }); assert.deepEqual(await result, { txid: prepared.txid, retainProof: true }); }
   else { socket.destroy(); await result; assert.match(service.error, /broadcast was not confirmed/); }
   assert.equal(service.reserved.has(key), true); assert.equal(requests.length, 1);
 });

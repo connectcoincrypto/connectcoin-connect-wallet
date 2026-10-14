@@ -42,7 +42,13 @@ public class MobileClaimsParallelTest {
     private static MobileRpcClient.RpcFailure cancelledRpc(boolean written) {
         try {
             java.lang.reflect.Constructor<MobileRpcClient.RpcFailure> constructor = MobileRpcClient.RpcFailure.class.getDeclaredConstructor(String.class, boolean.class, Integer.class, long.class, boolean.class);
-            constructor.setAccessible(true); return constructor.newInstance("RPC_CANCELLED", written, null, 0L, false);
+            constructor.setAccessible(true);
+            MobileRpcClient.RpcFailure failure = constructor.newInstance("RPC_CANCELLED", written, null, 0L, false);
+            if (!written) {
+                java.lang.reflect.Method beforeWrite = MobileRpcClient.RpcFailure.class.getDeclaredMethod("beforeWrite", String.class);
+                beforeWrite.setAccessible(true); failure = (MobileRpcClient.RpcFailure)beforeWrite.invoke(failure, "sendrawtransaction");
+            }
+            return failure;
         } catch (Exception failure) { throw new AssertionError(failure); }
     }
     private static final class Gate {
@@ -67,6 +73,7 @@ public class MobileClaimsParallelTest {
         volatile int rate = 100;
         long nextNativeStart, lastNativeStart;
         boolean limiterClosed, heldStartsReleased;
+        volatile boolean startsAllowed = true;
         volatile boolean holdDiscovery, discoveryWaiting, hit, validMiss, holdAttach, attachWaiting, holdStart, startWaiting;
         volatile CompletableFuture<JSONObject> broadcastResult;
         volatile boolean broadcastWritten = true, failNotSentReceipt;
@@ -85,15 +92,23 @@ public class MobileClaimsParallelTest {
             };
         }
         void start() { engine.setAllowed(true); engine.start("fixture"); }
-        void refresh() throws Exception { synchronized (engine) { Field field = MobileClaimsEngine.class.getDeclaredField("nextDiscovery"); field.setAccessible(true); field.setLong(engine, 0); } }
+        void refresh() throws Exception { synchronized (engine) {
+            Field field = MobileClaimsEngine.class.getDeclaredField("nextDiscovery"); field.setAccessible(true); field.setLong(engine, 0);
+            if (holdDiscovery) { Field cache = MobileClaimsEngine.class.getDeclaredField("blockWindow"); cache.setAccessible(true); cache.set(engine, null); }
+        } }
         public CompletableFuture<JSONObject> call(String method, JSONObject params) {
             try {
+                if (method.equals("getchaintip")) return CompletableFuture.completedFuture(tip());
                 if (method.equals("getbountychanges")) return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("next_cursor", "cursor" + pages.incrementAndGet()).put("has_more", false).put("changes", changeEvents));
                 if (method.equals("getrecentblockhashes")) {
                     if (holdDiscovery) { discoveryWaiting = true; return pendingDiscovery; }
                     return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("window", 600).put("blocks", new JSONArray().put(new JSONObject().put("height", 0).put("hash", GENESIS))));
                 }
-                if (method.equals("gettransaction")) { parents.incrementAndGet(); return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("transaction", new JSONObject().put("hex", "fixture"))); }
+                if (method.equals("gettransaction")) {
+                    if (CLAIM.equals(params.optString("txid"))) return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("status", "pending")
+                        .put("transaction", new JSONObject().put("txid", CLAIM).put("hex", "fixture-signed")));
+                    parents.incrementAndGet(); return CompletableFuture.completedFuture(new JSONObject().put("tip", tip()).put("transaction", new JSONObject().put("hex", "fixture")));
+                }
                 throw new AssertionError(method);
             } catch (Exception failure) { CompletableFuture<JSONObject> result = new CompletableFuture<>(); result.completeExceptionally(failure); return result; }
         }
@@ -114,6 +129,9 @@ public class MobileClaimsParallelTest {
             }
         }
         public void resetStartSchedule(long limiter) { synchronized (startLimiter) { nextNativeStart = Math.max(nextNativeStart, System.nanoTime()); startLimiter.notifyAll(); } }
+        public void setStartAllowed(long limiter, boolean allowed) {
+            synchronized (startLimiter) { if (!startsAllowed && allowed) nextNativeStart = Math.max(nextNativeStart, System.nanoTime()); startsAllowed = allowed; startLimiter.notifyAll(); }
+        }
         public void destroyStartLimiter(long limiter) { synchronized (startLimiter) { limiterClosed = true; startLimiter.notifyAll(); } }
         public long create(long limiter) {
             assertEquals(1, limiter); long id = serial.incrementAndGet(); Gate gate = new Gate();
@@ -153,6 +171,7 @@ public class MobileClaimsParallelTest {
                 try {
                     while (true) {
                         if (gate.cancelled || limiterClosed) throw new IllegalStateException("CLAIM_CANCELLED");
+                        if (!startsAllowed) { startLimiter.wait(); continue; }
                         if (startWaiters.peekFirst() != handle) { startLimiter.wait(); continue; }
                         long now = System.nanoTime();
                         while (!recentNativeStarts.isEmpty() && now - recentNativeStarts.peekFirst() >= TimeUnit.SECONDS.toNanos(1)) recentNativeStarts.removeFirst();
@@ -189,6 +208,10 @@ public class MobileClaimsParallelTest {
             lastWinnerVout = prepared.getInt("vout");
             if (holdAttach) { attachWaiting = true; assertTrue(attachGate.await(8, TimeUnit.SECONDS)); }
             return new JSONObject().put("txid", CLAIM).put("hex", "fixture-signed");
+        }
+        public void validateObserved(String raw, String expectedTxid, String originalHex, String target) {
+            if (!CLAIM.equals(expectedTxid) || !"fixture-signed".equals(raw)
+                    || originalHex != null && !"fixture-signed".equals(originalHex)) throw new IllegalArgumentException("CLAIMS_RPC_DATA");
         }
         public void close() throws Exception { engine.close(); attachGate.countDown(); releaseHeldStarts(); until(() -> gates.isEmpty()); }
     }
@@ -246,9 +269,10 @@ public class MobileClaimsParallelTest {
             until(() -> "RPC_TIMEOUT".equals(f.engine.snapshot().optString("lastError")));
             assertFalse("Maintenance timeout cannot cancel a financial transmission", f.broadcastResult.isDone());
             assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(0, f.cancellations.get()); assertEquals(1, f.active.get());
-            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(61)); until(() -> f.gates.isEmpty());
-            assertFalse("Even stale-catalog suspension owns only proof handles", f.broadcastResult.isDone());
-            assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(1, f.cancellations.get());
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(61)); until(() -> !f.startsAllowed);
+            assertFalse("Catalog suspension cannot cancel an already written transmission", f.broadcastResult.isDone());
+            assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(0, f.cancellations.get());
+            f.finish(f.startedHandles.get(1)); until(() -> f.gates.isEmpty());
             int previousStarts = f.starts.size(); Thread.sleep(40); assertEquals(previousStarts, f.starts.size());
             f.broadcastResult.complete(new JSONObject().put("txid", CLAIM)); until(() -> f.engine.snapshot().optLong("submitted") == 1);
             assertEquals(List.of(CLAIM + ":pending", CLAIM + ":submitted"), f.receipts); assertEquals(0, f.engine.snapshot().getLong("unknown"));
@@ -267,9 +291,11 @@ public class MobileClaimsParallelTest {
                     java.lang.reflect.Constructor<MobileRpcClient.RpcFailure> constructor = MobileRpcClient.RpcFailure.class.getDeclaredConstructor(String.class, boolean.class, Integer.class, long.class, boolean.class);
                     constructor.setAccessible(true); f.pendingDiscovery.completeExceptionally(constructor.newInstance(code, false, null, 0L, false));
                 }
-                until(() -> code.equals(f.engine.snapshot().optString("lastError"))); until(() -> f.gates.isEmpty());
+                until(() -> code.equals(f.engine.snapshot().optString("lastError")));
+                if (code.equals("-32011")) { assertEquals(0, f.cancellations.get()); f.finish(f.startedHandles.get(1)); }
+                until(() -> f.gates.isEmpty());
                 assertFalse("Only explicit lifecycle shutdown owns financial cancellation", f.broadcastResult.isDone());
-                assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(1, f.cancellations.get());
+                assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(code.equals("-32011") ? 0 : 1, f.cancellations.get());
                 f.broadcastResult.complete(new JSONObject().put("txid", CLAIM)); until(() -> f.engine.snapshot().optLong("submitted") == 1);
                 assertEquals(List.of(CLAIM + ":pending", CLAIM + ":submitted"), f.receipts); assertEquals(0, f.engine.snapshot().getLong("unknown"));
                 assertEquals(1, f.broadcasts.get());
@@ -311,15 +337,39 @@ public class MobileClaimsParallelTest {
             assertEquals(1, f.broadcasts.get()); assertEquals(List.of(CLAIM + ":pending", CLAIM + ":submitted"), f.receipts);
         }
     }
-    @Test public void stopWhileQuotaQueuedRecordsNotSentAndAllowsTheOutpointAgain() throws Exception {
+    @Test public void winnerBehindWrittenSubmissionSurvivesCatalogExpiryBeforeItsOwnEnqueue() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.rows.put(bounty(1)); f.engine.configureLimits(100, 1); f.hit = true;
+            f.broadcastResult = new CompletableFuture<>(); f.start();
+            until(() -> f.starts.size() == 1); f.finish(f.startedHandles.get(0)); until(() -> f.broadcasts.get() == 1);
+            until(() -> f.starts.size() == 2); f.finish(f.startedHandles.get(1)); until(() -> f.gates.isEmpty());
+            f.holdDiscovery = true; f.refresh(); until(() -> f.discoveryWaiting);
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(61));
+            f.broadcastResult.complete(new JSONObject().put("txid", CLAIM));
+            until(() -> f.engine.snapshot().optLong("submitted") == 1);
+            Thread.sleep(100); assertEquals(1, f.broadcasts.get()); assertEquals(2, f.starts.size());
+            assertEquals(List.of(CLAIM + ":pending", CLAIM + ":submitted"), f.receipts);
+            f.broadcastResult = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(2)); f.holdDiscovery = false;
+            f.pendingDiscovery.complete(new JSONObject().put("tip", tip()).put("window", 600)
+                .put("blocks", new JSONArray().put(new JSONObject().put("height", 0).put("hash", GENESIS))));
+            until(() -> f.engine.snapshot().optLong("submitted") == 2);
+            assertEquals(2, f.broadcasts.get()); assertEquals(2, f.starts.size());
+            assertEquals(2, f.engine.snapshot().getLong("valid")); assertEquals(2, f.engine.snapshot().getLong("targetHits"));
+        }
+    }
+    @Test public void stopWhileQuotaQueuedPreservesAndResumesTheExactSignedWinner() throws Exception {
         try (Fixture f = new Fixture()) {
             f.engine.configureLimits(100, 1); f.hit = true; f.queueBroadcast(); f.start();
             until(() -> f.starts.size() == 1); f.finish(f.startedHandles.get(0)); until(() -> f.broadcasts.get() == 1);
-            f.engine.stop(); until(() -> f.receipts.contains(CLAIM + ":not-sent")); until(() -> f.engine.snapshot().optInt("eligible") == 1);
+            f.engine.stop(); until(() -> f.receipts.contains(CLAIM + ":not-sent"));
+            until(() -> { synchronized (f.engine) { try { Field saved = MobileClaimsEngine.class.getDeclaredField("savedWinners"); saved.setAccessible(true); return ((Map<?,?>)saved.get(f.engine)).size() == 1; } catch (Exception e) { throw new AssertionError(e); } } });
+            assertEquals(0, f.engine.snapshot().optInt("eligible")); assertFalse(f.engine.canChangeEndpoint());
             assertEquals(List.of(CLAIM + ":pending", CLAIM + ":not-sent"), f.receipts); assertEquals("stopped", f.engine.snapshot().getString("status"));
             assertEquals("", f.engine.snapshot().getString("lastError")); assertEquals(0, f.engine.snapshot().getLong("unknown"));
-            f.hit = false; f.validMiss = true; f.start(); until(() -> f.starts.size() == 2);
-            assertEquals(1, f.broadcasts.get()); assertTrue(f.engine.snapshot().isNull("lastRpcError"));
+            f.hit = false; f.validMiss = true; f.broadcastResult = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(2)); f.start(); until(() -> f.broadcasts.get() == 2);
+            assertEquals(1, f.starts.size()); assertTrue(f.engine.snapshot().isNull("lastRpcError"));
         }
     }
     @Test public void stopAfterQuotaReleasedAndWriteStartedStillRecordsUnknown() throws Exception {
@@ -336,10 +386,21 @@ public class MobileClaimsParallelTest {
             f.rows.put(bounty(1)); f.engine.configureLimits(100, 1); f.hit = true; f.queueBroadcast(); f.start();
             until(() -> f.starts.size() == 1); f.finish(f.startedHandles.get(0)); until(() -> f.broadcasts.get() == 1);
             f.hit = false; f.holdDiscovery = true; f.refresh(); until(() -> f.discoveryWaiting);
-            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(61)); until(() -> f.receipts.contains(CLAIM + ":not-sent")); until(() -> f.gates.isEmpty());
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(61)); until(() -> f.receipts.contains(CLAIM + ":not-sent"));
+            for (long handle : new ArrayList<>(f.startedHandles)) f.finish(handle);
+            until(() -> f.active.get() == 0);
             assertEquals(1, f.queuedCancellations.get()); assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(0, f.engine.snapshot().getLong("submitted"));
             assertEquals(List.of(CLAIM + ":pending", CLAIM + ":not-sent"), f.receipts); assertEquals(1, f.broadcasts.get());
-            until(() -> f.engine.snapshot().optInt("eligible") == 2);
+            until(() -> f.engine.snapshot().optInt("eligible") == 1);
+            // Only the other bounty remains eligible for TLS. Refreshing the
+            // catalog reuses the retained winner rather than hunting a new one.
+            f.broadcastResult = CompletableFuture.completedFuture(new JSONObject().put("txid", CLAIM));
+            f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(2)); f.holdDiscovery = false;
+            f.pendingDiscovery.complete(new JSONObject().put("tip", tip()).put("window", 600)
+                .put("blocks", new JSONArray().put(new JSONObject().put("height", 0).put("hash", GENESIS))));
+            until(() -> f.engine.snapshot().optLong("submitted") == 1);
+            assertEquals(2, f.broadcasts.get()); assertEquals(1, f.engine.snapshot().getLong("targetHits"));
+            assertEquals(List.of(CLAIM + ":pending", CLAIM + ":not-sent", CLAIM + ":pending", CLAIM + ":submitted"), f.receipts);
         }
     }
     @Test public void spentOrExitedOutpointCancelsOnlyUnwrittenQuotaJobDuringAtomicReplay() throws Exception {
@@ -350,6 +411,23 @@ public class MobileClaimsParallelTest {
             f.changeEvents = new JSONArray().put(change); f.refresh(); until(() -> f.receipts.contains(CLAIM + ":not-sent"));
             assertEquals(1, f.queuedCancellations.get()); assertEquals(0, f.engine.snapshot().getLong("unknown")); assertEquals(1, f.broadcasts.get());
             assertEquals(1, f.engine.snapshot().getInt("eligible"));
+        }
+    }
+    @Test public void canonicalBlockReplacementCancelsQueuedWinnerEvenIfOutpointRemainsAvailable() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.engine.configureLimits(100, 1); f.hit = true; f.queueBroadcast(); f.start();
+            until(() -> f.starts.size() == 1); f.finish(f.startedHandles.get(0)); until(() -> f.broadcasts.get() == 1);
+            f.hit = false;
+            synchronized (f.engine) {
+                Field field = MobileClaimsEngine.class.getDeclaredField("catalog"); field.setAccessible(true);
+                @SuppressWarnings("unchecked") Map<String, MobileClaimsEngine.Candidate> catalog = (Map<String, MobileClaimsEngine.Candidate>)field.get(f.engine);
+                String replacement = "34".repeat(32);
+                MobileClaimsEngine.Candidate moved = new MobileClaimsEngine.Candidate(bounty(0).put("block_hash", replacement), replacement, 10);
+                catalog.put(moved.key, moved);
+            }
+            until(() -> f.receipts.contains(CLAIM + ":not-sent"));
+            assertEquals(1, f.queuedCancellations.get()); assertEquals(1, f.broadcasts.get());
+            assertEquals(0, f.engine.snapshot().getLong("unknown"));
         }
     }
     @Test public void invalidCatalogCancelsUnwrittenClaimButReceiptFailureRemainsConservative() throws Exception {
@@ -370,16 +448,17 @@ public class MobileClaimsParallelTest {
         assertSame(first.progress.prepared, second.progress.prepared); assertFalse(second.budget());
         second.progress.captures = java.math.BigInteger.ONE; assertTrue(first.budget());
     }
-    @Test public void pauseBeforeTransmissionReleasesQueuedWinnersForTheSameSession() throws Exception {
+    @Test public void pauseBeforeTransmissionPreservesQueuedProofsForTheSameSession() throws Exception {
         try (Fixture f = new Fixture()) {
             f.rows.put(bounty(1)); f.engine.configureLimits(100, 1); f.hit = true; f.holdAttach = true; f.start();
             until(() -> f.starts.size() == 1); f.finish(f.startedHandles.get(0)); until(() -> f.attachWaiting);
             until(() -> f.starts.size() == 2); f.finish(f.startedHandles.get(1)); until(() -> f.gates.isEmpty());
             assertEquals(0, f.engine.snapshot().getInt("eligible"));
             f.engine.setAllowed(false); f.holdAttach = false; f.attachGate.countDown();
-            until(() -> f.engine.snapshot().optInt("eligible") == 2);
+            until(() -> f.engine.snapshot().optInt("retainedSubmissions") == 2);
             assertTrue(f.engine.snapshot().getBoolean("enabled")); assertEquals(0, f.broadcasts.get()); assertTrue(f.receipts.isEmpty());
-            f.engine.setAllowed(true); until(() -> f.starts.size() == 3);
+            f.engine.setAllowed(true); until(() -> f.broadcasts.get() == 2);
+            assertEquals("Resume uses both existing proofs, not new TLS captures", 2, f.starts.size());
         }
     }
     @Test public void delayedTcpAcknowledgementsDoNotBlockBoundedParallelAdmissionOrBurstOnRelease() throws Exception {
@@ -400,7 +479,7 @@ public class MobileClaimsParallelTest {
         }
     }
     @Test public void localPreTcpFailuresBeforeOrAfterAnInflightSuccessDoNotPauseThePolicy() throws Exception {
-        for (String code : new String[]{"CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_CONTEXT"}) for (boolean failureFirst : new boolean[]{true, false}) {
+        for (String code : new String[]{"CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_CONTEXT", "CLAIM_LOCAL_UNAVAILABLE"}) for (boolean failureFirst : new boolean[]{true, false}) {
             try (Fixture f = new Fixture()) {
                 f.rows = new JSONArray().put(bounty(0).put("connection_work_target", "0000" + "ff".repeat(30)));
                 f.preStartFailures.put(1L, code); f.validMiss = true; f.engine.configureLimits(100, 2); f.start();
@@ -422,7 +501,7 @@ public class MobileClaimsParallelTest {
         }
     }
     @Test public void dnsKeepsItsTwoSecondCooldownEvenWhenOtherPreTcpFailuresAndSuccessArriveLater() throws Exception {
-        for (String code : new String[]{"CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_CONTEXT"}) {
+        for (String code : new String[]{"CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_CONTEXT", "CLAIM_LOCAL_UNAVAILABLE"}) {
             try (Fixture f = new Fixture()) {
                 f.rows = new JSONArray().put(bounty(0).put("connection_work_target", "0000" + "ff".repeat(30)));
                 f.preStartFailures.put(1L, "CLAIM_DNS"); f.preStartFailures.put(2L, code);
@@ -431,10 +510,10 @@ public class MobileClaimsParallelTest {
                 f.finish(1); until(() -> "CLAIM_DNS".equals(f.engine.snapshot().optString("lastError")));
                 Field domains = MobileClaimsEngine.class.getDeclaredField("domains"); domains.setAccessible(true);
                 final long cooldown;
-                synchronized (f.engine) { cooldown = ((MobileClaimsEngine.Ema)((Map<?, ?>)domains.get(f.engine)).get("example.com:7")).retryAfter; }
+                synchronized (f.engine) { cooldown = ((MobileClaimsEngine.PerformanceWindow)((Map<?, ?>)domains.get(f.engine)).get("example.com:7")).retryAfter; }
                 f.finish(2); until(() -> f.gates.size() == 1); f.finish(3); until(() -> f.gates.isEmpty());
                 assertEquals(1, f.engine.snapshot().getLong("valid")); assertEquals(0, f.engine.snapshot().getLong("invalid"));
-                synchronized (f.engine) { assertEquals("Local failures must neither extend nor clear the DNS delay", cooldown, ((MobileClaimsEngine.Ema)((Map<?, ?>)domains.get(f.engine)).get("example.com:7")).retryAfter); }
+                synchronized (f.engine) { assertEquals("Local failures must neither extend nor clear the DNS delay", cooldown, ((MobileClaimsEngine.PerformanceWindow)((Map<?, ?>)domains.get(f.engine)).get("example.com:7")).retryAfter); }
                 f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(1)); Thread.sleep(30);
                 assertEquals(1, f.starts.size());
                 f.clockOffsetNanos.addAndGet(TimeUnit.SECONDS.toNanos(1)); until(() -> f.active.get() == 3);

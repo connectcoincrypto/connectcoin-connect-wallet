@@ -249,6 +249,66 @@ test('catalog resync preserves successful budget, factor and fixed public propos
   assert.equal(engine.proposals.has(key(bounty)), false);
 });
 
+test('a temporarily orphaned funding output cannot reset its capture budget when mined again inside the lookback', async t => {
+  const { engine } = fixture(t);
+  const bounty = { ...row(), block_height: 100 };
+  engine.enqueue([bounty]);
+  const factor = engine.factors.get(key(bounty));
+  engine.successCounts.set(key(bounty), 3n);
+  engine.proposals.set(key(bounty), { oldEpoch: true });
+  engine.remove(bounty.txid, bounty.vout);
+  engine.retainCatalog([], { oldestHeight: 0 });
+  assert.equal(engine.successCounts.get(key(bounty)), 3n, 'A missing/reorged block is not permission to restart successful captures.');
+  assert.equal(engine.factors.get(key(bounty)), factor);
+  assert.equal(engine.proposals.has(key(bounty)), false, 'Old contexts and proofs are not preserved by selection history.');
+  engine.enqueue([{ ...bounty, block_height: 101 }]);
+  assert.equal(engine.queue.has(key(bounty)), false, 'The prior exhausted budget still excludes fresh captures.');
+  assert.equal(engine.successCounts.get(key(bounty)), 3n);
+});
+
+test('orphan selection history survives Stop/Start and resync, expires by height, and clears with its counters', async t => {
+  const { engine } = fixture(t);
+  const bounty = { ...row(), block_height: 100 };
+  engine.enqueue([bounty]); engine.successCounts.set(key(bounty), 3n);
+  const factor = engine.factors.get(key(bounty));
+  engine.remove(bounty.txid, bounty.vout);
+  engine.retainCatalog([], { oldestHeight: 100 });
+  await engine.stop(); engine.kick = () => {}; engine.start();
+  engine.clear({ preserveSelection: true });
+  assert.equal(engine.successCounts.get(key(bounty)), 3n);
+  assert.equal(engine.factors.get(key(bounty)), factor);
+  assert.equal(engine.selectionHistoryHeights.get(key(bounty)), 100);
+  engine.retainCatalog([], { oldestHeight: 101 });
+  assert.equal(engine.factors.has(key(bounty)), false);
+  assert.equal(engine.successCounts.has(key(bounty)), false);
+  assert.equal(engine.selectionHistoryHeights.has(key(bounty)), false);
+  engine.enqueue([{ ...bounty, block_height: 700 }]);
+  assert.equal(engine.queue.has(key(bounty)), true, 'Normal lookback expiration ends the bounded selection lifetime.');
+  engine.clear();
+  assert.equal(engine.selectionHistoryHeights.size, 0);
+  assert.equal(engine.factors.size, 0); assert.equal(engine.successCounts.size, 0);
+});
+
+test('orphan selection metadata shares the existing factor capacity without evicting old budgets', async t => {
+  const { engine } = fixture(t);
+  const bounty = { ...row(), block_height: 100 };
+  engine.enqueue([bounty]); engine.successCounts.set(key(bounty), 3n);
+  const factor = engine.factors.get(key(bounty));
+  for (let id = 2; id <= 100000; id++) {
+    engine.factors.set(`${hash(id)}:0`, 1n);
+    engine.selectionHistoryHeights.set(`${hash(id)}:0`, 100);
+  }
+  engine.remove(bounty.txid, bounty.vout); engine.retainCatalog([], { oldestHeight: 100 });
+  const next = { ...row(100001), block_height: 101 };
+  engine.enqueue([next]);
+  assert.equal(engine.queue.has(key(next)), false);
+  assert.equal(engine.selectionHistoryHeights.size, 100000); assert.equal(engine.factors.size, 100000);
+  assert.equal(engine.successCounts.get(key(bounty)), 3n); assert.equal(engine.factors.get(key(bounty)), factor);
+  engine.retainCatalog([], { oldestHeight: 101 }); engine.enqueue([next]);
+  assert.equal(engine.queue.has(key(next)), true);
+  assert.equal(engine.selectionHistoryHeights.size, 1); assert.equal(engine.factors.size, 1);
+});
+
 test('a recoverably rejected proof retries the same transaction after 2E cutoff without new TLS', async t => {
   const submitted = [];
   const { engine, attempts } = fixture(t, {
@@ -395,7 +455,7 @@ test('a verified pending proof retains the only queue slot after resync even bey
   assert.equal(submitted[1].proof, submitted[0].proof);
 });
 
-test('a high-value candidate parked for preparation keeps its admission slot over a lower-value newcomer', async t => {
+test('a high-value candidate waiting for preparation keeps its admission slot over a lower-value newcomer', async t => {
   let pendingPrepares = 0;
   const { engine, attempts } = fixture(t, {
     maxQueue: 5, options: { connectionsPerSecond: 256, concurrency: 1 },
@@ -403,14 +463,16 @@ test('a high-value candidate parked for preparation keeps its admission slot ove
   });
   const bounties = ['alpha', 'beta', 'delta', 'epsilon', 'gamma'].map((domain, index) => row(index + 1, `${domain}.example`));
   engine.enqueue(bounties); engine.start();
-  await until(() => pendingPrepares === 4 && engine.waitingPrepare.size === 1);
-  const parked = [...engine.waitingPrepare][0], factor = parked.factor;
+  await until(() => pendingPrepares === 4);
+  const parked = [...engine.queue.values()].find(job => !job.preparing), factor = parked.factor;
   assert.equal(engine.hasActive(key(parked.bounty)), false, 'the parked candidate has not consumed a preparation slot');
   const low = { ...row(99, 'low.example'), amount: '1000000' };
   assert.equal(engine.enqueue([low]), 0);
   assert.equal(engine.queue.size, 5);
   assert.strictEqual(engine.queue.get(key(parked.bounty)), parked);
-  assert.equal(parked.factor, factor); assert.equal(engine.waitingPrepare.has(parked), true);
+  assert.equal(parked.factor, factor); assert.equal(parked.preparing, undefined);
+  assert.equal(engine.nextReady(), undefined, 'full preparation capacity keeps the queued candidate indexed but unavailable');
+  assert.strictEqual(engine.scheduler.next(Date.now(), { allowPreparation: true })[1], parked);
   assert.equal(engine.queue.has(key(low)), false); assert.equal(attempts.length, 0);
 });
 
@@ -441,4 +503,51 @@ test('releasing a DNS slot skips a removed parked domain and wakes the next vali
   assert.equal(attempts.length, 0, 'DNS-only decisions consume no TCP attempt');
   assert.equal(engine.scheduler.domainAfter, null);
   assert.equal(engine.preferReward, false);
+});
+
+test('started local route failures count without degrading remote proof quality', async t => {
+  const bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 1, concurrency: 1 } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ localUnavailable: true, message: 'Local network route is unavailable' });
+  await until(() => engine.diagnosticSnapshot().operationsFailed === 1);
+  assert.equal(engine.state.attempts, 1); assert.equal(engine.domainStats.size, 0);
+  assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
+});
+
+for (const gate of [{ blocked: 'budget' }, { localUnavailable: true }]) {
+  test(`post-ACK gate invalidation adds no proof, budget or domain sample ${JSON.stringify(gate)}`, async t => {
+    const bounty = row();
+    const { engine, attempts, submissions } = fixture(t, { options: { connectionsPerSecond: 1, concurrency: 1 } });
+    engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+    const token = [...engine.connections.keys()][0];
+    attempts[0].finish({ validationPassed: null, successfulConnections: '0', ...gate });
+    await until(() => !engine.connections.has(token));
+    assert.equal(engine.state.attempts, attempts.length); assert.equal(engine.domainStats.size, 0);
+    assert.equal(engine.successCounts.get(key(bounty)) ?? 0n, 0n);
+    assert.equal(engine.pendingProofs.size, 0); assert.equal(submissions.length, 0);
+    if (gate.blocked) assert.equal(engine.queue.get(key(bounty)).budgetExceeded, true);
+  });
+}
+
+test('retired verified proofs keep identical retries, while reorg invalidation still discards them', async t => {
+  const submitted = [], bounty = row();
+  const { engine, attempts } = fixture(t, { options: { connectionsPerSecond: 256, concurrency: 1 }, retryDelayMs: 300000,
+    submit: async (prepared, proof) => {
+      submitted.push({ prepared, proof });
+      throw Object.assign(new Error('Quota before sending.'), { code: -32029 });
+    } });
+  engine.enqueue([bounty]); engine.start(); await until(() => attempts.length === 1);
+  attempts[0].finish({ captured: true, validationPassed: true, proof: '020100', verified: true });
+  await until(() => submitted.length === 1 && !engine.hasActive(key(bounty)));
+  engine.retire(bounty.txid, bounty.vout); engine.retainCatalog([]);
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(engine.queue.size, 1);
+  const pending = engine.pendingProofs.get(key(bounty)); pending.due = 0; engine.kick();
+  await until(() => submitted.length === 2 && !engine.hasActive(key(bounty)));
+  assert.equal(engine.pendingProofs.size, 1); assert.equal(attempts.length, 1);
+  assert.strictEqual(submitted[0].prepared, submitted[1].prepared); assert.equal(submitted[0].proof, submitted[1].proof);
+  engine.remove(bounty.txid, bounty.vout);
+  assert.equal(engine.pendingProofs.size, 0); assert.equal(engine.queue.size, 0);
+  engine.kick(); await tick();
+  assert.equal(submitted.length, 2); assert.equal(engine.snapshot().completed, 0);
 });

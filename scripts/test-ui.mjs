@@ -44,7 +44,7 @@ const serve = socket => {
       }
       let result;
       if (method === 'getchaintip') result = tip;
-      else if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) result = { subscription_id: `${method}:${params.address ?? ''}`, tip, cursor: 'ui-empty-journal' };
+      else if (['subscribetip', 'subscribebounties', 'subscribeaddress'].includes(method)) result = { subscription_id: `${method}:${params.address ?? ''}`, tip, cursor: 'ui-empty-journal', ...(method === 'subscribeaddress' ? { changes_only: true } : {}) };
       else if (method === 'unsubscribe') result = { removed: true };
       else if (method === 'getaddressbalance') result = { tip, address: params.address, unit: 'connects', confirmed: '0', available_confirmed: '0', pending_delta: '0', immature: '0' };
       else if (['getaddresshistory', 'getaddressutxos'].includes(method)) result = { tip, address: params.address, unit: 'connects', items: [], next_cursor: null };
@@ -1541,7 +1541,9 @@ try {
   assert.equal(await page.locator('#claims-concurrent').inputValue(), '77');
   assert.equal(await page.locator('#claims-lookback').inputValue(), '345');
   await page.locator('#claims-rate').fill('');
-  await page.locator('#claims-concurrent').fill('999');
+  // 999 is allowed by the native helper. Keep this draft above int32 max so
+  // navigation cannot legitimately persist it under the expanded limits.
+  await page.locator('#claims-concurrent').fill('2147483648');
   await page.locator('#claims-lookback').fill('0');
   await page.locator('[data-view="overview"]').first().click();
   const invalidClaims = (await page.evaluate(() => window.connectwallet.invoke('getState'))).config.claims;

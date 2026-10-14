@@ -26,6 +26,31 @@ final class WalletCustodyTests: XCTestCase {
         try store.saveVault(WalletVault.parse(DesktopCryptoVectors.envelope))
         return try XCTUnwrap(store.read(.vault,maxBytes:WalletVault.maxFileBytes))
     }
+    func testBackgroundRevokesClaimsBeforeWaitingForHdCleanup() async throws {
+        let folder = directory(); defer { try? FileManager.default.removeItem(at:folder) }
+        let runtime = MobileWalletRuntime(directory:folder), pause = ActivityTransitionPause()
+        await runtime.setActive(true)
+        _ = try await runtime.perform("claimsLimits",["connectionsPerSecondLimit":19,"concurrency":7])
+        let background = Task { await runtime.setActive(false,afterLock:{ await pause.hold() }) }
+        await pause.waitUntilHeld()
+        // The runtime is already inactive while old HD cleanup is suspended.
+        // Claims must observe that revocation now, not only when it completes.
+        // This foreground-only operation proves the actor's policy without
+        // starting claims, opening RPC, or depending on the host network.
+        do {
+            _ = try await runtime.perform("claimsLimits",["connectionsPerSecondLimit":100,"concurrency":100])
+            XCTFail("Claims still considered the app foreground during HD cleanup")
+        } catch { XCTAssertEqual((error as? WalletError)?.message,"Open the app to change claims limits.") }
+        let suspended = try await runtime.perform("claimsState").object("state")
+        XCTAssertEqual(suspended["connectionsPerSecondLimit"] as? Int,19)
+        XCTAssertEqual(suspended["concurrency"] as? Int,7)
+        XCTAssertEqual(suspended["attempts"] as? Int64,0)
+        XCTAssertEqual(suspended["submitted"] as? Int64,0)
+        await pause.release(); await background.value
+        await runtime.setActive(true)
+        _ = try await runtime.perform("claimsLimits",["connectionsPerSecondLimit":23,"concurrency":9])
+        await runtime.setActive(false)
+    }
     func testOlderBackgroundCleanupCannotDisableNewForegroundPolicyAndTimer() async throws {
         let folder = directory(); defer { try? FileManager.default.removeItem(at:folder) }
         let runtime = MobileWalletRuntime(directory:folder), pause = ActivityTransitionPause()

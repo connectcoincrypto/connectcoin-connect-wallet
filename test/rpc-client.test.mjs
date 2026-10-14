@@ -39,6 +39,29 @@ async function bounded(promise) {
   finally { clearTimeout(timer); }
 }
 
+test('only well-framed explicit stream invalidations preserve recoverable server codes', async () => {
+  for (const [ending, expectedCode] of [
+    [{ complete: false, chunks: 0, error: { code: -32011, message: 'Block aged out' } }, -32011],
+    [{ complete: false, chunks: 0, error: { code: -32001, message: 'Index not ready' } }, -32001],
+    [{ complete: false, chunks: 0, error: { code: -32002, message: 'Backend failed' } }, undefined],
+    [{ complete: false, chunks: 1, error: { code: -32011, message: 'Wrong chunk count' } }, undefined],
+    [{ complete: true, chunks: 0, error: { code: -32011, message: 'Missing stream state' } }, undefined],
+    [{ complete: false, chunks: 0, error: { code: -32011, message: {} } }, undefined],
+  ]) {
+    const server = await mock((request, socket) => {
+      socket.write(line(response(request, { stream_id: 'recoverability-test' })) +
+        line(note('stream.end', { stream_id: 'recoverability-test', ...ending })));
+    });
+    try {
+      await assert.rejects(bounded(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} })), error => {
+        assert.match(error.message, /Bounty stream was incomplete/);
+        assert.equal(error.code, expectedCode);
+        return true;
+      });
+    } finally { await server.close(); }
+  }
+});
+
 test('method/parameter allowlist cannot leak secrets or invoke getters', () => {
   for (const method of ['getblocktemplate', 'stop', '__proto__', 'constructor']) assert.throws(() => validateRpcParams(method, {}), /not allowed/);
   assert.throws(() => validateRpcParams('getchaintip', { mnemonic: 'secret' }), /Unexpected/);
@@ -62,6 +85,36 @@ test('unsubscribe accepts opaque bounded IDs and rejects overlong or control-cha
   for (const subscription_id of ['', 'x'.repeat(101), 'bad\u0000id', 'bad\nID', 'bad\u007fID']) {
     assert.throws(() => validateRpcParams('unsubscribe', { subscription_id }), /Invalid RPC subscription ID/);
   }
+});
+
+test('recent block count is optional, bounded plain integer data and isolated to its RPC method', () => {
+  assert.deepEqual(validateRpcParams('getrecentblockhashes', {}), {});
+  for (const count of [1, 5, 100, 600]) {
+    const params = { count }, validated = validateRpcParams('getrecentblockhashes', params);
+    params.count = 601;
+    assert.deepEqual(validated, { count }, 'Validation owns its parameter copy.');
+  }
+  for (const count of [0, -1, 601, 1.5, NaN, Infinity, '5', null, undefined, {}, []]) {
+    assert.throws(() => validateRpcParams('getrecentblockhashes', { count }), /Invalid RPC recent-block count/);
+  }
+  let invoked = false;
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { get count() { invoked = true; return 5; } }), /plain data/);
+  assert.equal(invoked, false);
+  assert.throws(() => validateRpcParams('getrecentblockhashes', { count: 5, mnemonic: 'secret' }), /Unexpected/);
+  assert.throws(() => validateRpcParams('getchaintip', { count: 5 }), /Unexpected/);
+});
+
+test('adaptive recent-block counts share the same method quota and cooldown', () => {
+  const client = new RpcClient({ host: '127.0.0.1', port: 1, quota: 1, windowMs: 60000 });
+  assert.equal(client.quotaWait('getrecentblockhashes', { count: 5 }, { reserve: true }), 0);
+  for (const params of [{ count: 100 }, { count: 600 }, {}]) {
+    assert.ok(client.quotaWait('getrecentblockhashes', params) > 0, 'A larger or legacy query cannot bypass pacing.');
+  }
+  assert.deepEqual([...client.history.keys()], ['getrecentblockhashes']);
+  assert.equal(client.quotaWait('getchaintip', {}), 0, 'The final fence uses its own existing RPC method quota.');
+  client.history.clear(); client.cooldowns.set('getrecentblockhashes', performance.now() + 60000);
+  for (const params of [{ count: 5 }, { count: 100 }, {}]) assert.ok(client.quotaWait('getrecentblockhashes', params) > 0);
+  client.close();
 });
 
 test('concurrent requests share one connection; chunk fragmentation is reassembled', async () => {
@@ -137,7 +190,8 @@ test('incomplete stream diagnostics preserve numeric server classifications with
   try {
     await assert.rejects(server.client.request('getblockbounties', { block_hash: hash }, { onChunk() {} }), error => {
       assert.equal(error.message, 'Bounty stream was incomplete; nothing from this block was applied.');
-      assert.equal(error.code, undefined);
+      assert.equal(error.code, -32001);
+      assert.equal(error.data, undefined);
       return true;
     });
     const failures = events.filter(item => item.event === 'rpc.failed');
@@ -386,7 +440,7 @@ test('diagnostics record RPC error metadata without request params or endpoint d
     const failures = events.filter(item => item.event === 'rpc.failed');
     assert.deepEqual(failures.map(item => item.details.method), params.map(([method]) => method));
     for (const { details } of failures) {
-      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'method', 'stage', 'unknownOutcome']);
+      assert.deepEqual(Object.keys(details).sort(), ['durationMs', 'error', 'failureSource', 'method', 'notSent', 'sent', 'stage', 'unknownOutcome']);
       assert.equal(details.stage, 'request');
       assert.equal(details.unknownOutcome, false);
       assert.ok(details.durationMs >= 0);

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 import { validateAttemptStats } from './claim-priority.mjs';
 
 const BASE = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -27,8 +28,8 @@ export function validateClaimOptions(options = {}) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new Error('Invalid claim options');
   if (Object.keys(options).some((key) => !Object.hasOwn(DEFAULT_CLAIM_OPTIONS, key))) throw new Error('Unknown claim option');
   const result = { ...DEFAULT_CLAIM_OPTIONS, ...options };
-  integer(result.connectionsPerSecond, 1, 256, 'connections per second');
-  integer(result.concurrency, 1, 256, 'simultaneous connections');
+  integer(result.connectionsPerSecond, 1, MAX_CONNECTION_LIMIT, 'connections per second');
+  integer(result.concurrency, 1, MAX_CONNECTION_LIMIT, 'simultaneous connections');
   integer(result.overallTimeout, 1, 600, 'claim timeout');
   integer(result.maxAttempts, 1, 100000, 'claim attempts');
   return Object.freeze(result);
@@ -58,10 +59,9 @@ function report(callback, event, details) {
 /** Resources must be outside ASAR. An absent helper is explicit, never silently downloaded. */
 export function getClaimsHelper({ basePath = BASE, resourcesPath } = {}) {
   const executable = process.platform === 'win32' ? 'connectwallet-claims.exe' : 'connectwallet-claims';
-  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/bin/connectwallet-claims', executable)].filter(Boolean);
-  for (const command of candidates) if (existsSync(command)) return { command, args: [], packaged: true };
-  const command = resolve(basePath, '.claims-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-  if (existsSync(command)) return { command, args: ['-I', resolve(basePath, 'helpers/claims_bridge.py')], packaged: false };
+  const candidates = [resourcesPath && resolve(resourcesPath, 'claims-helper', executable), resolve(basePath, 'helpers/native-bin/connectwallet-claims', executable)].filter(Boolean);
+  for (const command of candidates) if (existsSync(command)) return { command, args: [], packaged: true, native: true };
+  // Python is an explicitly injected differential-test reference, not a fallback.
   return null;
 }
 
@@ -136,7 +136,7 @@ export function createProofRunner({ helper, basePath = BASE, resourcesPath, spaw
         // or any application-private environment into the network-facing helper.
         // Older helpers reject this unknown suffix before reading input or
         // opening sockets; never retry without the required RSA policy.
-        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--require-rsa-exponent-64'], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
+        child = spawnProcess(runtime.command, [...(runtime.args ?? []), '--require-rsa-exponent-64', ...(runtime.native ? ['--require-native-mbedtls'] : [])], { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...environment, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1' } });
         child.once('error', (error) => finish(new Error(`Claims helper could not start: ${error.message}`)));
         child.stdout.on('data', (chunk) => {
           if (failure || settled) return;

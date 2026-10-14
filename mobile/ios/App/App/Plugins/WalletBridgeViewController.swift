@@ -83,15 +83,23 @@ final class WalletBridgeViewController: CAPBridgeViewController {
         guard !checkedIsolation, ProcessInfo.processInfo.arguments.contains("--wallet-ui-smoke") else { return }
         checkedIsolation = true
         Task { @MainActor [weak self] in
-            guard let self, let webView = self.webView else { return }
+            guard let self else { return }
+            guard let webView = self.webView else {
+                self.showIsolationResult("Native isolation failed (WebView unavailable)"); return
+            }
             let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("wallet-scheme-test-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: fixture) }
             do {
-                for _ in 0..<200 {
-                    if !webView.isLoading, webView.url?.scheme == "capacitor", webView.url?.host == "localhost" { break }
-                    try await Task.sleep(nanoseconds: 50_000_000)
+                // The first WebKit process on a fresh CI Simulator can start
+                // slowly. Wait for the packaged page before the one-shot probe;
+                // do not silently abandon the marker while startup is pending.
+                let deadline = ProcessInfo.processInfo.systemUptime + 60
+                while webView.isLoading || webView.url?.scheme != "capacitor" || webView.url?.host != "localhost" {
+                    guard ProcessInfo.processInfo.systemUptime < deadline else {
+                        self.showIsolationResult("Native isolation failed (startup timeout)"); return
+                    }
+                    try await Task.sleep(nanoseconds: 200_000_000)
                 }
-                guard !webView.isLoading, webView.url?.scheme == "capacitor", webView.url?.host == "localhost" else { return }
                 try Data("public disposable scheme fixture".utf8).write(to: fixture)
                 let text = "capacitor://localhost/_capacitor_file_" + fixture.path
                 let result = try await webView.callAsyncJavaScript("for (const pluginId of ['CAPHttpPlugin','CAPCookiesPlugin','CAPWebViewPlugin']) window.webkit.messageHandlers.bridge.postMessage({type:'message',pluginId,methodName:'unavailableSecurityProbe',callbackId:'security-probe',options:{}}); await new Promise(resolve => setTimeout(resolve, 50)); if (prompt(JSON.stringify({type:'CapacitorCookies.get',url:'https://example.com'})) !== null) return false; try { const response = await fetch(url); if (!response.ok) return true; return (await response.text()) !== 'public disposable scheme fixture'; } catch { return true; }",
@@ -99,13 +107,16 @@ final class WalletBridgeViewController: CAPBridgeViewController {
                 let pluginsBlocked = self.bridge?.plugin(withName: "CapacitorHttp") is WalletDisabledHttp &&
                     self.bridge?.plugin(withName: "CapacitorCookies") is WalletDisabledCookies &&
                     self.bridge?.plugin(withName: "WebView") is WalletBundledWebView
-                let label = UILabel(); label.text = (result as? Bool == true && pluginsBlocked && (self.scriptGuard?.rejected ?? 0) >= 3) ? "Native isolation verified" : "Native isolation failed"
-                label.accessibilityIdentifier = "wallet-native-security-check"
-                label.font = .systemFont(ofSize: 10); label.textColor = .secondaryLabel
-                label.translatesAutoresizingMaskIntoConstraints = false; self.view.addSubview(label)
-                NSLayoutConstraint.activate([label.bottomAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.bottomAnchor), label.centerXAnchor.constraint(equalTo: self.view.centerXAnchor)])
-            } catch { /* Test fails if its success accessibility marker is absent. */ }
+                self.showIsolationResult((result as? Bool == true && pluginsBlocked && (self.scriptGuard?.rejected ?? 0) >= 3) ? "Native isolation verified" : "Native isolation failed")
+            } catch { self.showIsolationResult("Native isolation failed (probe error)") }
         }
+    }
+    private func showIsolationResult(_ message: String) {
+        let label = UILabel(); label.text = message
+        label.accessibilityIdentifier = "wallet-native-security-check"
+        label.font = .systemFont(ofSize: 10); label.textColor = .secondaryLabel
+        label.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(label)
+        NSLayoutConstraint.activate([label.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor), label.centerXAnchor.constraint(equalTo: view.centerXAnchor)])
     }
     #endif
 }

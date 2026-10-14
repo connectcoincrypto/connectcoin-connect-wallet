@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { acknowledgePreferences, createPreferenceSaver, preferenceBatch } from '../src/ui/preferences.mjs';
+import { MAX_CONNECTION_LIMIT } from '../src/core/connection-limits.mjs';
 
 const config = () => ({ rpc: { host: 'localhost', port: 48190 }, claims: { enabled: true, maxConnectionsPerSecond: 100, maxConcurrent: 100, lookbackBlocks: 600 }, autoLockMinutes: 15, feeRate: 1500 });
 const draft = () => ({ settings: {}, claims: {}, send: {} });
@@ -19,7 +20,7 @@ test('autosave allows only valid preferences and keeps RPC edits atomic until le
   }
   edits.settings.host = '::1';
   assert.deepEqual(preferenceBatch(config(), edits, { rpcReady: true }).patch.rpc, { host: '::1', port: 12345 });
-  for (const invalid of ['', ' ', '-1', '1.5', '1e2', '257', 'Infinity']) {
+  for (const invalid of ['', ' ', '-1', '1.5', '1e2', '2147483648', 'Infinity']) {
     edits.claims.maxConnectionsPerSecond = invalid;
     assert.equal(preferenceBatch(config(), edits).patch.claims, undefined);
   }
@@ -38,7 +39,7 @@ test('trailing separators save integer preferences without changing raw acknowle
     acknowledgePreferences(edits, batch);
     assert.deepEqual(edits, { claims: {}, settings: {}, send: {} });
   }
-  for (const value of ['257.', '1.5', '1.5.', '1..', '.', '1e2.', '0.']) {
+  for (const value of ['2147483648.', '1.5', '1.5.', '1..', '.', '1e2.', '0.']) {
     const edits = draft(); edits.claims.maxConcurrent = value;
     assert.deepEqual(preferenceBatch(config(), edits).patch, {});
   }
@@ -50,6 +51,34 @@ test('trailing separators save integer preferences without changing raw acknowle
   assert.deepEqual(preferenceBatch(config(), same), { patch: {}, entries: [] });
   const host = draft(); host.settings = { host: '123.', port: '12345.' };
   assert.deepEqual(preferenceBatch(config(), host, { rpcReady: true }).patch, {}, 'a hostname must not be interpreted as a numeric input');
+});
+
+test('both connection preferences accept the exact int32 ceiling and never autosave overflow drafts', async () => {
+  assert.equal(MAX_CONNECTION_LIMIT, 2147483647);
+  for (const key of ['maxConnectionsPerSecond', 'maxConcurrent']) {
+    for (const raw of ['2147483647', '2147483647.', '2147483647,']) {
+      const edits = draft(); edits.claims[key] = raw;
+      const batch = preferenceBatch(config(), edits);
+      assert.deepEqual(batch, {
+        patch: { claims: { [key]: 2147483647 } },
+        entries: [{ section: 'claims', key, raw }],
+      });
+      acknowledgePreferences(edits, batch);
+      assert.deepEqual(edits.claims, {});
+    }
+    for (const raw of ['2147483648', '2147483648.', '2147483648,', '3000000000', '3200000000', '3230000000', '9999999999']) {
+      const edits = draft(); edits.claims[key] = raw;
+      assert.deepEqual(preferenceBatch(config(), edits), { patch: {}, entries: [] }, raw);
+      const saver = createPreferenceSaver({
+        snapshot: () => preferenceBatch(config(), edits),
+        save: async () => assert.fail(`overflow ${key} must not reach the service`),
+        saved: () => assert.fail('invalid drafts must not be acknowledged'),
+      });
+      await saver.flush();
+      assert.equal(edits.claims[key], raw);
+      assert.equal(saver.hasPending(), false);
+    }
+  }
 });
 
 test('auto-lock autosave accepts disabled and optional minute values while retaining invalid drafts', () => {

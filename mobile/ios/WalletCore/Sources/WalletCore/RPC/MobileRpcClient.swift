@@ -6,6 +6,11 @@ import CConnectWallet
 public struct RpcFailure: Error, LocalizedError {
     public let code: String
     public var unknownOutcome = false
+    /// Set only by the transport while it knows no write was started. A parsed
+    /// server response or unknownOutcome=false alone never establishes this.
+    public var notSent = false
+    /// Parsed gateway rejection before node submission, distinct from no socket write.
+    public var notForwarded = false
     public var nodeCode: Int?
     public var retryAfterMs = 0
     public var explicitRejection = false
@@ -22,11 +27,19 @@ public struct RpcFailure: Error, LocalizedError {
 public final class RpcBroadcastPermit: @unchecked Sendable {
     private let mutex = NSLock()
     private var valid = true
-    public init() {}
+    private let validUntil: Double?
+    private let now: () -> Double
+    public init(validUntil: Double? = nil, now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+        self.validUntil = validUntil; self.now = now
+    }
     public func cancel() { mutex.lock(); valid = false; mutex.unlock() }
-    public var isValid: Bool { mutex.lock(); defer { mutex.unlock() }; return valid }
+    private var current: Bool { valid && (validUntil.map { now() < $0 } ?? true) }
+    public var isValid: Bool { mutex.lock(); defer { mutex.unlock() }; return current }
+    /// Expiry is distinguishable from explicit lifecycle revocation. Only the
+    /// former may preserve an unsent claim while its catalog is refreshed.
+    public var expired: Bool { mutex.lock(); defer { mutex.unlock() }; return valid && (validUntil.map { now() >= $0 } ?? false) }
     fileprivate func perform(_ action: () -> Void) -> Bool {
-        mutex.lock(); defer { mutex.unlock() }; guard valid else { return false }; action(); return true
+        mutex.lock(); defer { mutex.unlock() }; guard current else { return false }; action(); return true
     }
 }
 
@@ -240,7 +253,10 @@ public final class MobileRpcClient: @unchecked Sendable {
         let id = UUID().uuidString
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler(operation: {
-            try Task.checkCancellation()
+            if Task.isCancelled {
+                var failure = RpcFailure("RPC_CANCELLED"); failure.notSent = method == "sendrawtransaction"
+                throw failure
+            }
             return try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     do {
@@ -251,7 +267,12 @@ public final class MobileRpcClient: @unchecked Sendable {
                         guard permit?.isValid != false else { throw RpcFailure("RPC_CANCELLED") }
                         self.jobs[id] = Job(id, method, clean, permit) { continuation.resume(with: $0) }
                         self.order.append(id); self.pump()
-                    } catch { continuation.resume(throwing: error) }
+                    } catch {
+                        if var failure = (error as? RpcFailure) ?? (error as? WalletError).flatMap({ $0.message.hasPrefix("RPC_") ? RpcFailure($0.message) : nil }) {
+                            failure.notSent = method == "sendrawtransaction"
+                            continuation.resume(throwing: failure)
+                        } else { continuation.resume(throwing: error) }
+                    }
                 }
             }
         }, onCancel: { cancellation.cancel(); self.queue.async { self.cancel(id) } })
@@ -260,6 +281,7 @@ public final class MobileRpcClient: @unchecked Sendable {
         guard let job = jobs[id] else { return }
         var failure = RpcFailure("RPC_CANCELLED")
         failure.unknownOutcome = job.method == "sendrawtransaction" && job.written
+        failure.notSent = job.method == "sendrawtransaction" && !job.written
         job.completion?(.failure(failure)); job.completion = nil
         retainedStreamBytes -= job.retainedBytes; job.retainedBytes = 0; job.chunks = []
         if !job.written { remove(job); pump() }
@@ -354,10 +376,15 @@ public final class MobileRpcClient: @unchecked Sendable {
                 var error = RpcFailure(String(try remote.integer("code", min: Int64(Int32.min), max: Int64(Int32.max))))
                 if let details = remote["data"] as? JSONObject {
                     if let node = try? details.integer("node_code"), [-22, -25, -26, -27, -8].contains(node) { error.nodeCode = Int(node) }
-                    if let delay = try? details.integer("retry_after_ms", min: 0) { error.retryAfterMs = Int(min(60_000, delay)) }
+                    if details.has("retry_after_ms") { error.retryAfterMs = Int(try details.integer("retry_after_ms", min: 0, max: 9_007_199_254_740_991)) }
                 }
                 error.explicitRejection = error.code == "-32020" && error.nodeCode != nil
-                error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection
+                // These codes are emitted before node dispatch. An ambiguous
+                // -32002 or caller-supplied metadata never proves non-submission.
+                let validData = !remote.has("data") || remote["data"] is NSNull || remote["data"] is JSONObject
+                error.notForwarded = job.method == "sendrawtransaction" && validData && ["-32001", "-32029", "-32030"].contains(error.code) &&
+                    !((remote["data"] as? JSONObject)?.has("node_code") ?? false)
+                error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection && !error.notForwarded
                 if error.code == "-32029" { cooldowns[job.method] = now() + max(window, Double(error.retryAfterMs) / 1000) }
                 finish(job, .failure(error)); return
             }
@@ -402,7 +429,13 @@ public final class MobileRpcClient: @unchecked Sendable {
         jobs.removeValue(forKey: job.id); order.removeAll { $0 == job.id }
     }
     private func finish(_ job: Job, _ result: Result<JSONObject, Error>) {
-        remove(job); let completion = job.completion; job.completion = nil; completion?(result)
+        var outcome = result
+        if case .failure(let error) = result,
+           var failure = (error as? RpcFailure) ?? (error as? WalletError).flatMap({ $0.message.hasPrefix("RPC_") ? RpcFailure($0.message) : nil }) {
+            failure.notSent = job.method == "sendrawtransaction" && !job.written
+            outcome = .failure(failure)
+        }
+        remove(job); let completion = job.completion; job.completion = nil; completion?(outcome)
     }
     private func failWire(_ code: String) {
         epoch &+= 1; wire?.cancel(); wire = nil; ready = false; connectStarted = nil; buffer.removeAll(keepingCapacity: false)
@@ -422,7 +455,7 @@ public final class MobileRpcClient: @unchecked Sendable {
     }
     public static func hash(_ value: String) -> Bool { value.range(of: "\\A[0-9a-fA-F]{64}\\z", options: .regularExpression) != nil }
     public static func validateParams(_ method: String, _ params: JSONObject, subscriptions: Bool = false) throws -> JSONObject {
-        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": [],
+        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": ["count"],
             "getaddressbalance": ["address"], "getaddresshistory": ["address", "cursor"],
             "getaddressutxos": ["address", "cursor", "include_pending_spent"], "getaddresschanges": ["addresses", "cursor"],
             "gettransaction": ["txid"], "gettransactions": ["txids"], "getbountychanges": ["cursor"],
@@ -433,8 +466,10 @@ public final class MobileRpcClient: @unchecked Sendable {
         if subscriptions { try walletRequire(["subscribeaddress","subscribetip","getchaintip"].contains(method), "RPC_INVALID") }
         var clean: JSONObject = [:]
         for key in allowed {
-            guard let value = params[key] else { if ["cursor", "include_pending_spent"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
+            guard let value = params[key] else { if ["cursor", "include_pending_spent", "count"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
             switch key {
+            case "count":
+                clean[key] = try JSON.integer(value, min: 1, max: 600)
             case "address":
                 let text = try JSON.string(value); _ = try WalletCrypto.decodeAddress(text); clean[key] = text.lowercased()
             case "addresses":

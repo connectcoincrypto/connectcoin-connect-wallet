@@ -293,6 +293,7 @@ Require ($badging -match ("(?m)^package: name='" + [regex]::Escape($config.appId
 Require ($badging -match ("(?m)^minSdkVersion:'" + $minSdk + "'")) 'APK minSdk differs.'
 Require ($badging -match ("(?m)^targetSdkVersion:'" + $targetSdk + "'")) 'APK targetSdk differs.'
 Require ($badging -match ("(?m)^application-label:'" + [regex]::Escape($config.appName) + "'")) 'APK English application label differs.'
+Require ($badging -match ("(?m)^launchable-activity: name='" + [regex]::Escape($config.appId + '.MainActivity') + "'\s+label='" + [regex]::Escape($config.appName) + "'")) 'APK launcher label differs.'
 Require ($badging -match '(?m)^locales:(.*)$') 'Missing APK locales.'
 $locales = @([regex]::Matches($Matches[1], "'([^']*)'") | ForEach-Object { $_.Groups[1].Value })
 Require (@($locales | Where-Object { $_ -notmatch '^(?:|--_--|en(?:[-_].*)?)$' }).Count -eq 0) 'Unexpected non-English packaged locale.'
@@ -340,7 +341,7 @@ try {
         if ($centralDirectory -ge 16) { Require ([Text.Encoding]::ASCII.GetString($apkBytes, $centralDirectory - 16, 16) -ne 'APK Sig Block 42') 'Release APK unexpectedly contains an APK signing block.' }
     }
     $bundledConfig = [Text.Encoding]::UTF8.GetString((Entry-Bytes $archive 'assets/capacitor.config.json')) | ConvertFrom-Json
-    Require ($bundledConfig.appId -eq $config.appId -and $bundledConfig.android.webContentsDebuggingEnabled -eq $false -and $bundledConfig.android.allowMixedContent -eq $false) 'Bundled Capacitor identity/debugging policy differs.'
+    Require ($bundledConfig.appId -eq $config.appId -and $bundledConfig.appName -eq $config.appName -and $bundledConfig.android.webContentsDebuggingEnabled -eq $false -and $bundledConfig.android.allowMixedContent -eq $false) 'Bundled Capacitor identity/name/debugging policy differs.'
     Require ($bundledConfig.android.minWebViewVersion -eq $config.android.minWebViewVersion -and $bundledConfig.server.androidScheme -eq 'https' -and $bundledConfig.server.errorPath -eq $config.server.errorPath -and !$bundledConfig.server.url -and !$bundledConfig.server.allowNavigation) 'Bundled WebView policy differs.'
     foreach ($density in @('mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi')) {
         foreach ($icon in @('ic_launcher', 'ic_launcher_round', 'ic_launcher_foreground')) {
@@ -391,7 +392,7 @@ $allowedRoots = @((Join-Path $mobileRoot '.tools'), (Join-Path $mobileRoot 'dist
 Require (@($allowedRoots | Where-Object { $reportFile.StartsWith($_ + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) 'Write reports only inside ignored mobile/.tools or mobile/dist.'
 Require (!(Test-Path -LiteralPath $reportFile)) 'Use a new report filename; old validation reports are not overwritten.'
 $report = [ordered]@{ verifiedAtUtc = [DateTime]::UtcNow.ToString('o'); status = 'verified'; variant = $Variant; apk = $apk; sha256 = $sha256
-    appId = $config.appId; versionName = $versionName; versionCode = [int]$versionCode; minSdk = [int]$minSdk; targetSdk = [int]$targetSdk
+    appId = $config.appId; appName = $config.appName; versionName = $versionName; versionCode = [int]$versionCode; minSdk = [int]$minSdk; targetSdk = [int]$targetSdk
     platformPermissions = $manifestResult.PlatformPermissions; internalSignaturePermission = $manifestResult.InternalSignaturePermission; locales = $locales
     verifiedWebAssets = $assetCount; verifiedLauncherBitmaps = $iconCount; signatureVerified = ($Variant -eq 'debug'); installableTestArtifact = ($Variant -eq 'debug')
     distribution = $(if ($Variant -eq 'debug') { 'Debug-signed alpha test only; not a production release.' } else { 'UNSIGNED RELEASE: NOT INSTALLABLE. Signing/distribution was not requested.' })

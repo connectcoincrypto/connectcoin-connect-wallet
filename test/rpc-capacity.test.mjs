@@ -50,7 +50,8 @@ test('FIFO capacity gate holds at 12 on one socket, retains 32-request bound, an
   for (const args of specification) jobs.push(observed(f.client.request(...args)));
   await until(() => f.requests.length === 12);
   assert.equal(f.client.pending.size, 12); assert.equal(f.client.capacityWaiters.length, 20);
-  await assert.rejects(f.client.request('getchaintip'), /Too many queued/);
+  await assert.rejects(f.client.request('getchaintip'), error =>
+    error.code === 'RPC_QUEUE_FULL' && error.notSent === true && !error.unknownOutcome && /Too many queued/.test(error.message));
   await sleep(15); assert.equal(f.requests.length, 12);
   let replies = 0;
   while (replies < 32) {
