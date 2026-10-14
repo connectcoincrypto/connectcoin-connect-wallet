@@ -123,14 +123,88 @@ public enum NativeTransactions {
         let tx: JSONObject = try ["version": version, "inputs": inputs, "outputs": outputs, "locktime": reader.integer(4)]
         try PJ.require(reader.position == reader.data.count && serialize(tx, true) == Data(reader.data), "Noncanonical or trailing transaction bytes."); return tx
     }
+    private struct FundingOutput {
+        let type: Int64, amount: String, publicKey: String?, domain: String?, target: String?, roots: Int64, mask: Int64
+        init(_ output: JSONObject) throws {
+            type = try PJ.integer(output["type"]); amount = try PJ.string(output["amount"])
+            publicKey = type == 1 ? try PJ.string(output["publicKey"]) : nil
+            domain = type == 2 ? try PJ.string(output["domain"]) : nil
+            target = type == 2 ? try PJ.string(output["target"]) : nil
+            roots = type == 2 ? try PJ.integer(output["rootVersion"]) : 0
+            mask = type == 2 ? try PJ.integer(output["mask"]) : 0
+        }
+        var json: JSONObject {
+            var output: JSONObject = ["type": type, "amount": amount]
+            if type == 1 { output["publicKey"] = publicKey! }
+            else { output["domain"] = domain!; output["target"] = target!; output["rootVersion"] = roots; output["mask"] = mask }
+            return output
+        }
+        var retainedBytes: Int { 512 + 2 * ([amount, publicKey, domain, target].compactMap { $0 }.reduce(0) { $0 + $1.utf16.count }) }
+    }
     private struct FundingParent {
-        let transaction: JSONObject, id: String
-        init(_ raw: String) throws { transaction = try parse(raw); id = try txid(transaction) }
+        let outputs: [FundingOutput], id: String, retainedBytes: Int
+        init(_ raw: String) throws {
+            // The original complete parse authenticates every sibling and
+            // witness before retaining only private immutable output scalars.
+            let transaction = try parse(raw); id = try txid(transaction)
+            outputs = try PJ.objects(transaction["outputs"]).map { try FundingOutput($0) }
+            retainedBytes = 256 + 2 * raw.utf16.count + outputs.reduce(0) { $0 + $1.retainedBytes }
+        }
+    }
+    /// Exact wire bytes, not txid, identify a validated parent. The conservative
+    /// budget charges UTF-16 strings and entry/output overhead (not exact RSS).
+    /// Inputs, witness objects, mutable JSON and wallet secrets are not retained.
+    public final class FundingTransactionCache {
+        private let maxEntries: Int, maxBytes: Int
+        private let lock = NSLock()
+        private var entries: [String: FundingParent] = [:], order: [String] = []
+        private var bytes = 0, generation: UInt64 = 0, parseCount = 0
+        public init() { maxEntries = 128; maxBytes = 16 * 1024 * 1024 }
+        public init(maxEntries: Int, maxBytes: Int) throws {
+            try PJ.require((1...128).contains(maxEntries) && (1...(16 * 1024 * 1024)).contains(maxBytes), "Invalid funding cache bounds.")
+            self.maxEntries = maxEntries; self.maxBytes = maxBytes
+        }
+        public var size: Int { lock.lock(); defer { lock.unlock() }; return entries.count }
+        public var retainedBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+        var parses: Int { lock.lock(); defer { lock.unlock() }; return parseCount }
+        public func clear() { lock.lock(); defer { lock.unlock() }; entries.removeAll(); order.removeAll(); bytes = 0; generation &+= 1 }
+        private func validated(_ raw: String, check: () throws -> Void) throws -> FundingParent {
+            try check()
+            lock.lock(); let observed = generation
+            if let existing = entries[raw] {
+                order.removeAll { $0 == raw }; order.append(raw); lock.unlock(); return existing
+            }
+            lock.unlock()
+            let parent = try FundingParent(raw)
+            // No lifecycle callback under the cache lock. clear() fences an
+            // in-flight miss even when its caller's cancellation is delayed.
+            try check()
+            lock.lock(); defer { lock.unlock() }
+            guard observed == generation else { throw CancellationError() }
+            parseCount += 1
+            if let existing = entries[raw] { order.removeAll { $0 == raw }; order.append(raw); return existing }
+            if parent.retainedBytes <= maxBytes {
+                while entries.count >= maxEntries || bytes > maxBytes - parent.retainedBytes {
+                    let oldest = order.removeFirst(); bytes -= entries.removeValue(forKey: oldest)!.retainedBytes
+                }
+                entries[raw] = parent; order.append(raw); bytes += parent.retainedBytes
+            }
+            return parent
+        }
+        public func verifyFunding(_ utxo: JSONObject, _ expectedKey: String?, check: () throws -> Void = {}) throws -> JSONObject {
+            let parent = try validated(PJ.string(utxo["rawTransaction"]), check: check)
+            let output = try checkFundingOutput(utxo, expectedKey, parent); try check(); return output
+        }
+        public func prepareClaim(_ bounty: JSONObject, _ raw: String, _ reward: String, _ rate: Int, check: () throws -> Void = {}) throws -> JSONObject {
+            var funded = bounty; funded["rawTransaction"] = raw
+            let output = try verifyFunding(funded, nil, check: check)
+            let result = try prepareClaimWithFunding(bounty, output, reward, rate); try check(); return result
+        }
     }
     private static func checkFundingOutput(_ utxo: JSONObject, _ expectedKey: String?, _ parent: FundingParent) throws -> JSONObject {
         try PJ.require(parent.id == PJ.string(utxo["txid"]), "Funding ID does not match the original transaction.")
-        let index = try PJ.integer(utxo["vout"]), outputs = try PJ.objects(parent.transaction["outputs"])
-        try PJ.require(index < outputs.count, "Funding output does not exist."); let output = outputs[Int(index)]
+        let index = try PJ.integer(utxo["vout"])
+        try PJ.require(index >= 0 && index < parent.outputs.count, "Funding output does not exist."); let output = parent.outputs[Int(index)].json
         try PJ.require(PJ.money(output, "amount") == PJ.money(utxo, "amount"), "Funding amount does not match the original transaction.")
         if let expectedKey { try PJ.require(PJ.integer(output["type"]) == 1 && PJ.string(output["publicKey"]) == expectedKey, "Funding output is not owned by this key.") }; return output
     }
@@ -162,6 +236,9 @@ public enum NativeTransactions {
     public static func claimFee(_ rate: Int) throws -> Int64 { try feeRate(rate); return try Int64((92 * 4 + 2 + 1 + compact(MAX_PROOF).count + MAX_PROOF + 3) / 4) * Int64(rate) }
     public static func prepareClaim(_ bounty: JSONObject, _ parentHex: String, _ rewardAddress: String, _ rate: Int) throws -> JSONObject {
         var funded = bounty; funded["rawTransaction"] = parentHex; let output = try verifyFunding(funded, nil)
+        return try prepareClaimWithFunding(bounty, output, rewardAddress, rate)
+    }
+    private static func prepareClaimWithFunding(_ bounty: JSONObject, _ output: JSONObject, _ rewardAddress: String, _ rate: Int) throws -> JSONObject {
         try PJ.require(PJ.integer(output["type"]) == 2 && PJ.integer(output["rootVersion"]) == 1, "Unsupported bounty output.")
         for pair in [("domain", "domain"), ("connection_work_target", "target")] {
             try PJ.require(PJ.string(bounty[pair.0]) == PJ.string(output[pair.1]), "Bounty differs from the funding transaction.")
@@ -178,7 +255,7 @@ public enum NativeTransactions {
         let tx: JSONObject = ["version": 2, "locktime": 0, "inputs": [input], "outputs": [reward]]
         return try ["hex": WalletCrypto.hex(serialize(tx, false)), "txid": txid(tx), "challenge": claimChallenge(tx), "bounty": output, "fee": String(fee), "payout": String(value - fee)]
     }
-    public static func attachClaim(_ prepared: JSONObject, _ proofHex: String) throws -> JSONObject {
+    private static func claimProofMessages(_ proofHex: String, challenge: String) throws -> [Data] {
         let proof = [UInt8](try bytes(proofHex)); try PJ.require(!proof.isEmpty && proof.count <= MAX_PROOF && proof[0] == 2, "Invalid proof version or size.")
         var offset = 1, messages = [Data]()
         for (type, maximum) in [(1, 4096), (2, 2048), (8, 4096), (11, 49152), (15, 8192)] {
@@ -187,12 +264,41 @@ public enum NativeTransactions {
             try PJ.require(size <= maximum && size <= proof.count - offset, "Invalid proof framing.")
             messages.append(Data(proof[offset..<(offset + size)])); offset += size
         }
-        try PJ.require(offset == proof.count && messages[0].count >= 38 && WalletCrypto.hex(messages[0].subdata(in: 6..<38)) == PJ.string(prepared["challenge"]), "Proof is not bound to this claim.")
+        try PJ.require(offset == proof.count && messages[0].count >= 38 && WalletCrypto.hex(messages[0].subdata(in: 6..<38)) == challenge, "Proof is not bound to this claim.")
+        return messages
+    }
+    private static func validateClaimWork(_ messages: [Data], target: String) throws {
+        let work = try WalletCrypto.taggedHash("ConnectCoin/P2C/work/v2", messages.prefix(4).reduce(Data(), +))
+        let maximum = try fixed(target, 32)
+        try PJ.require(!maximum.lexicographicallyPrecedes(reverse(work)), "Proof does not meet target.")
+    }
+    /// A txid commits to the complete input/payout transaction, not its witness.
+    /// Another claimer may submit the same transaction with a different valid
+    /// TLS proof. Recognizing that node-observed acceptance must not replace our
+    /// immutable replay bytes. The node remains the consensus/proof verifier;
+    /// this verifies canonical shape, payout identity, proof binding and the
+    /// captured bounty's work target whenever the retained record has it.
+    public static func validateObservedClaim(_ raw: String, expectedTxid: String, originalHex: String? = nil, target: String? = nil) throws -> JSONObject {
+        let tx = try parse(raw), inputs = try PJ.objects(tx["inputs"]), outputs = try PJ.objects(tx["outputs"])
+        try PJ.require(txid(tx) == expectedTxid, "Observed claim transaction identity changed.")
+        try PJ.require(PJ.integer(tx["version"]) == 2 && PJ.integer(tx["locktime"]) == 0 &&
+            inputs.count == 1 && outputs.count == 1, "Invalid observed claim shape.")
+        let witness = try PJ.array(inputs[0]["witness"])
+        try PJ.require(PJ.string(inputs[0]["scriptSig"]).isEmpty && PJ.integer(inputs[0]["sequence"]) == 0xffff_ffff &&
+            witness.count == 1 && PJ.integer(outputs[0]["type"]) == 1, "Invalid observed claim input or payout.")
+        if let originalHex {
+            let original = try parse(originalHex)
+            try PJ.require(serialize(original, false) == serialize(tx, false), "Observed claim input or payout changed.")
+        }
+        let messages = try claimProofMessages(PJ.string(witness[0]), challenge: claimChallenge(tx))
+        if let target { try validateClaimWork(messages, target: target) }
+        return tx
+    }
+    public static func attachClaim(_ prepared: JSONObject, _ proofHex: String) throws -> JSONObject {
+        let messages = try claimProofMessages(proofHex, challenge: PJ.string(prepared["challenge"]))
         var tx = try parse(PJ.string(prepared["hex"])); var inputs = try PJ.objects(tx["inputs"]); let outputs = try PJ.objects(tx["outputs"])
         try PJ.require(txid(tx) == PJ.string(prepared["txid"]) && claimChallenge(tx) == PJ.string(prepared["challenge"]) && inputs.count == 1 && outputs.count == 1 && PJ.array(inputs[0]["witness"]).isEmpty, "Claim proposal changed.")
-        let work = try WalletCrypto.taggedHash("ConnectCoin/P2C/work/v2", messages.prefix(4).reduce(Data(), +))
-        let target = try fixed(PJ.string(PJ.object(prepared["bounty"])["target"]), 32)
-        try PJ.require(!target.lexicographicallyPrecedes(reverse(work)), "Proof does not meet target.")
+        try validateClaimWork(messages, target: PJ.string(PJ.object(prepared["bounty"])["target"]))
         inputs[0]["witness"] = [proofHex]; tx["inputs"] = inputs
         return try ["hex": WalletCrypto.hex(serialize(tx, true)), "txid": txid(tx), "fee": PJ.string(prepared["fee"]), "payout": PJ.string(prepared["payout"])]
     }

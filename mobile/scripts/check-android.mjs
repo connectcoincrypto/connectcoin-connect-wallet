@@ -237,9 +237,18 @@ const claimsExports = await read(path.join(mobile, 'native/jni-exports.map'));
 const exportedMethods = [...claimsExports.matchAll(/Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_(native\w+);/g)].map(x => x[1]).sort();
 const jniSource = await read(path.join(mobile, 'native/src/jni.cpp'));
 const implementedMethods = [...jniSource.matchAll(/Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_(native\w+)\(/g)].map(x => x[1]).sort();
-assert.deepEqual(nativeMethods, ['nativeCancel', 'nativeCapture', 'nativeCreate', 'nativeCreateStartLimiter', 'nativeDestroy', 'nativeDestroyStartLimiter', 'nativeHasStarted', 'nativeProbeRsa', 'nativeResetStartSchedule', 'nativeSetStartRate', 'nativeStartedAgeNanos']);
+assert.deepEqual(nativeMethods, ['nativeBindBudget', 'nativeCancel', 'nativeCapture', 'nativeCreate', 'nativeCreateStartLimiter', 'nativeDestroy', 'nativeDestroyStartLimiter', 'nativeHasCaptured', 'nativeHasStarted', 'nativeProbeRsa', 'nativeResetStartSchedule', 'nativeSetStartAllowed', 'nativeSetStartRate', 'nativeStartedAgeNanos']);
 assert.deepEqual(exportedMethods, nativeMethods, 'Every declared native claims method must be exported by the Android library');
 assert.deepEqual(implementedMethods, nativeMethods, 'JNI implementations must match the exact claims contract');
+assert.match(nativeClaims, /private\s+static\s+native\s+void\s+nativeSetStartAllowed\(long limiter,\s*boolean allowed\);/,
+  'Lifecycle admission accepts only its owning limiter and a boolean');
+assert.match(nativeClaims, /private\s+static\s+native\s+void\s+nativeBindBudget\(long handle,\s*String key,\s*String target,\s*String captured\);/,
+  'Public budget counts remain decimal uint64 strings, not lossy floating-point or signed Java counters');
+assert.match(jniSource, /JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeSetStartAllowed\(JNIEnv\* env,jclass,jlong limiter,jboolean allowed\)/);
+assert.match(jniSource, /connectwallet::SetStartAllowed\(limiter,allowed==JNI_TRUE\)/);
+assert.match(jniSource, /JNIEXPORT void JNICALL Java_com_connectcoincrypto_connectwallet_mobile_alpha_NativeClaims_nativeBindBudget\(JNIEnv\* env,jclass,jlong handle,jstring key,jstring target,jstring count\)/);
+assert.match(jniSource, /connectwallet::BindClaimBudget\(handle,Text\(env,key,128\),Text\(env,target,64\),Text\(env,count,20\)\)/,
+  'Budget bridge strings must remain bounded before crossing into native admission');
 assert.doesNotMatch(nativeClaims, /@PluginMethod/, 'The native capture/start acknowledgement must not be exposed to the WebView');
 assert.doesNotMatch(nativeWallet, /FLAG_SECURE/, 'Screen capture must remain available in native dialogs');
 assert.match(nativeWallet, /else showRecoveryPhrase\(call, WalletCrypto\.generateMnemonic\(24\)\)/);

@@ -113,6 +113,130 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(clock[0], 131.0)
 
 
+class AdmissionTests(unittest.TestCase):
+    def test_pause_keeps_started_capture_and_pending_cancellation_is_neutral(self):
+        entered, release, waiter = threading.Event(), threading.Event(), threading.Event()
+        with Fixture() as h:
+            h.resolve_domain()
+            original = h.service._before_start
+            def before_start(job):
+                if job.identifier == 4: waiter.set()
+                return original(job)
+            h.service._before_start = before_start
+            def capture(*args, **kwargs):
+                result = fake_capture(*args, **kwargs)
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return result
+            h.capture.side_effect = capture
+            try:
+                h.attempt(2)
+                self.assertTrue(entered.wait(5))
+                h.service.command({"type": "admission", "id": 3, "allowed": False})
+                h.attempt(4)
+                self.assertTrue(waiter.wait(5))
+                h.service.command({"type": "cancel", "id": 4})
+                result = h.wait("attempt", 4)
+                self.assertFalse(result["started"])
+                self.assertIsNone(result["validationPassed"])
+                release.set()
+                result = h.wait("attempt", 2)
+                self.assertTrue(result["validationPassed"])
+                self.assertEqual(result["successfulConnections"], "1")
+                h.capture.side_effect = fake_capture
+                h.service.command({"type": "admission", "id": 5, "allowed": True})
+                h.attempt(6)
+                self.assertEqual(h.wait("attempt", 6)["successfulConnections"], "2")
+            finally:
+                release.set()
+
+    def test_pause_during_started_ack_never_connects_or_adds_a_validation_sample(self):
+        entered, release = threading.Event(), threading.Event()
+        with Fixture() as h:
+            h.resolve_domain()
+            emit = h.service.emit_callback
+            def held_emit(frame):
+                if frame["type"] == "started":
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                emit(frame)
+            h.service.emit_callback = held_emit
+            command = None
+            try:
+                h.attempt(2)
+                self.assertTrue(entered.wait(5))
+                command = threading.Thread(target=lambda: h.service.command({"type": "admission", "id": 3, "allowed": False}))
+                command.start()
+                with h.service.condition:
+                    self.assertTrue(h.service.condition.wait_for(lambda: not h.service.admission_allowed, 5))
+                release.set()
+                result = h.wait("attempt", 2)
+                self.assertTrue(result["started"])
+                self.assertTrue(result["cancelled"])
+                self.assertFalse(result["captured"])
+                self.assertIsNone(result["validationPassed"])
+                self.assertEqual(result["successfulConnections"], "0")
+                h.verify.assert_not_called()
+            finally:
+                release.set()
+                if command is not None: command.join(5)
+
+    def test_budget_exhausted_during_started_ack_never_connects_or_advances_phase(self):
+        entered, release = threading.Event(), threading.Event()
+        with Fixture() as h:
+            h.resolve_domain()
+            emit = h.service.emit_callback
+            def held_emit(frame):
+                if frame["type"] == "started" and frame["id"] == 2:
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                emit(frame)
+            h.service.emit_callback = held_emit
+            try:
+                h.attempt(2)
+                self.assertTrue(entered.wait(5))
+                deadline = h.service.next_connection
+                # The same bounty can be updated while IPC owns the start
+                # report. A maximum target has exhausted its budget at three
+                # captures; no additional TCP turn may follow this old ACK.
+                h.attempt(3, successes="3")
+                release.set()
+                result = h.wait("attempt", 2)
+                self.assertTrue(result["started"])
+                self.assertFalse(result["cancelled"])
+                self.assertFalse(result["captured"])
+                self.assertEqual(result["blocked"], "budget")
+                self.assertIsNone(result["validationPassed"])
+                self.assertEqual(result["successfulConnections"], "3")
+                queued = h.wait("attempt", 3)
+                self.assertFalse(queued["started"])
+                self.assertEqual(queued["blocked"], "budget")
+                self.assertEqual(h.service.next_connection, deadline)
+                h.verify.assert_not_called()
+            finally:
+                release.set()
+
+    def test_admission_commands_validate_identity_boolean_and_ack_before_resume(self):
+        with Fixture() as h:
+            h.resolve_domain()
+            for allowed in (None, 0, 1, "true"):
+                with self.assertRaises(ValueError):
+                    h.service.command({"type": "admission", "id": 2, "allowed": allowed})
+            h.service.command({"type": "admission", "id": 2, "allowed": False})
+            with self.assertRaises(ValueError):
+                h.service.command({"type": "admission", "id": 2, "allowed": True})
+            emit = h.service.emit_callback
+            def fail_resume(frame):
+                if frame["type"] == "admission" and frame["allowed"]:
+                    self.assertFalse(h.service.admission_allowed)
+                    raise ValueError("Controlled resume output failure")
+                emit(frame)
+            h.service.emit_callback = fail_resume
+            with self.assertRaisesRegex(ValueError, "Controlled"):
+                h.service.command({"type": "admission", "id": 3, "allowed": True})
+            self.assertFalse(h.service.admission_allowed)
+
+
 class PacingClock:
     """Deterministic local waits; no socket or real sleeping is involved."""
     def __init__(self, quantum=0.0):
@@ -426,7 +550,7 @@ class ServiceTests(unittest.TestCase):
         stream = io.BytesIO(b"".join(json.dumps(frame).encode() + b"\n" for frame in payload))
         self.assertEqual(service.run_service(stream, frames.append, claims_bridge.parse_context, HELPERS / "p2c_roots_v1.pem"), 0)
         self.assertEqual(frames, [{"type": "ready", "protocol": 4, "roots": 1,
-                                   "security": {"rsaPublicExponentMaxBits": 64}}])
+                                   "security": {"rsaPublicExponentMaxBits": 64, "admissionGate": 1}}])
 
     def test_earlier_protocols_are_rejected_before_creating_service(self):
         for protocol in (1, 2, 3, True, "4"):

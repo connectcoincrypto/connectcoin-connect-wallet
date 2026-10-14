@@ -275,7 +275,7 @@ test('RPC endpoint edits clear old discovery state and resume saved claims on th
   assert.notStrictEqual(s.claimWindow, oldWindow);
   assert.equal(s.rpc.calls.filter(method => method === 'getrecentblockhashes').length, 1,
     'The replacement endpoint must establish its own full hash window even when its tip matches.');
-  assert.ok(cleared.mock.callCount() > 0);
+  assert.equal(cleared.mock.callCount(), 0, 'An endpoint edit preserves verified proofs and counters; only unverified proposals are invalidated.');
   assert.ok(s.rpc.calls.includes('getblockbounties'));
   assert.equal(s.engine.enabled, true);
   assert.equal(s.config.claims.enabled, true);
@@ -412,7 +412,7 @@ for (const transition of ['after reply', 'before reply', 'closing']) test(`an un
   assert.equal(reopened.rpc.calls.includes('getblockbounties'), false);
 });
 
-for (const queuedEnable of [false, true]) test(`an unknown broadcast while claim settings drain cannot restart workers${queuedEnable ? ' through an earlier queued enable' : ''}`, async t => {
+for (const endpoint of [false, true]) for (const queuedEnable of [false, true]) test(`an unknown broadcast while ${endpoint ? 'endpoint' : 'claim'} settings drain cannot restart workers${queuedEnable ? ' through an earlier queued enable' : ''}`, async t => {
   const f = await fixture(t, { config: { claims: { enabled: true, lookbackBlocks: 1 } } });
   const s = f.service;
   await unlock(s);
@@ -430,7 +430,8 @@ for (const queuedEnable of [false, true]) test(`an unknown broadcast while claim
   const stop = s.engine.stop.bind(s.engine);
   t.mock.method(s.engine, 'stop', (...args) => { const pending = stop(...args); draining.resolve(); return pending; });
   const starts = t.mock.method(s.engine, 'start');
-  const changing = s.saveConfig({ claims: { maxConcurrent: 3 } });
+  const oldRpc = s.rpc;
+  const changing = s.saveConfig({ claims: { maxConcurrent: 3 }, ...(endpoint ? { rpc: { host: 'replacement.invalid', port: 18001 } } : {}) });
   await draining.promise;
   const enabling = queuedEnable ? s.setClaims({ enabled: true }) : null;
   response.reject(Object.assign(new Error('Isolated broadcast response lost during settings change.'), { unknownOutcome: true }));
@@ -445,6 +446,11 @@ for (const queuedEnable of [false, true]) test(`an unknown broadcast while claim
   const saved = await readConfig(f.directory);
   assert.equal(saved.claims.enabled, false);
   assert.equal(saved.claims.maxConcurrent, 3);
+  if (endpoint) {
+    assert.notEqual(s.rpc, oldRpc);
+    assert.equal(s.rpc.options.host, saved.rpc.host);
+    assert.equal(s.rpc.options.port, saved.rpc.port);
+  }
   await s.refresh();
   assert.equal(s.engine.enabled, false, 'an ordinary refresh must not dismiss required broadcast review');
   await s.setClaims({ enabled: true });

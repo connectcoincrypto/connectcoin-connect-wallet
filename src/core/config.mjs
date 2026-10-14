@@ -1,8 +1,8 @@
+import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
-import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
 
 export const GENESIS = Object.freeze({
   main: '30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e',
@@ -89,7 +89,14 @@ export async function readConfig(directory, options) {
     handle = await open(join(directory, 'config.json'), 'r');
     if (!(await handle.stat()).isFile()) throw new Error('Configuration must be a regular file.');
     const buffer = Buffer.alloc(16385);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    // A short regular-file read is not necessarily EOF. Read the complete
+    // bounded document before accepting settings or its saved safety stop.
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
     if (bytesRead > 16384) throw new Error('Configuration file is too large.');
     const text = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
     return validateConfig(JSON.parse(text), options);

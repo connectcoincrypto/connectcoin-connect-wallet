@@ -175,6 +175,57 @@ final class HdRetryCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.progress.last?.state, "scanning")
     }
 
+    func testNetworkLossDuringInFlightReadWaitsButRevokedOwnerNeverRetries() async throws {
+        for code in ["RPC_UNAVAILABLE", "RPC_CANCELLED"] {
+            for revokeOwner in [false, true] {
+                let fixture = HdRetryFixture(), sleeper = HdRetryManualSleeper(), reader = HdRetryControlledReader()
+                var environment = fixture.environment(); environment.sleep = sleeper.sleep
+                let coordinator = HdRetryCoordinator(environment: environment, check: fixture.check, progress: { fixture.report($0) })
+                let params: JSONObject = ["address": "retained-address", "cursor": "retained.cursor"]
+                let operation = Task {
+                    try await coordinator.call("getaddresshistory", params) { method, value in
+                        _ = fixture.record(method, value)
+                        return try await reader.read(method, value)
+                    }
+                }
+                defer { operation.cancel(); sleeper.stop(); reader.stop() }
+                try await eventually { reader.count == 1 }
+                // The read was already in flight when connectivity disappeared.
+                // Explicit lifecycle revocation is a separate ownership decision.
+                fixture.offline(until: 10_000)
+                if revokeOwner { fixture.revoke() }
+                reader.finish(0, .failure(RpcFailure(code)))
+                if revokeOwner {
+                    do { _ = try await operation.value; XCTFail("Revoked HD ownership entered network retry") }
+                    catch is CancellationError { }
+                    XCTAssertEqual(reader.count, 1); XCTAssertTrue(sleeper.delays.isEmpty)
+                    XCTAssertFalse(fixture.progress.contains { $0.state == "waiting-network" || $0.state == "retrying" })
+                    continue
+                }
+                try await eventually { sleeper.count == 1 }
+                XCTAssertEqual(fixture.progress.last?.state, "waiting-network")
+                XCTAssertEqual(fixture.progress.last?.retryAttempt, 0)
+                fixture.advance(5_000); sleeper.wakeAll()
+                try await eventually { sleeper.count == 1 }
+                XCTAssertEqual(reader.count, 1, "Being offline must not consume RPC calls or retry rounds")
+                XCTAssertEqual(fixture.progress.map(\.retryAttempt).max(), 0)
+                fixture.advance(10_000); sleeper.wakeAll()
+                try await eventually { reader.count == 2 }
+                reader.finish(1, .success(["next_cursor": "next.cursor", "items": []]))
+                let result = try await operation.value
+                XCTAssertEqual(result["next_cursor"] as? String, "next.cursor")
+                XCTAssertEqual(fixture.requests.map(\.atMs), [0, 10_000])
+                for request in fixture.requests {
+                    XCTAssertEqual(request.method, "getaddresshistory")
+                    XCTAssertEqual(try JSON.encode(request.params), try JSON.encode(params))
+                }
+                XCTAssertEqual(fixture.progress.map(\.retryAttempt).max(), 1)
+                XCTAssertEqual(fixture.progress.last?.state, "scanning")
+                XCTAssertEqual(fixture.progress.last?.retryAttempt, 0)
+            }
+        }
+    }
+
     func testPermanentFailuresAndUnknownOutcomesNeverRetry() async throws {
         for (code, expected) in [("-32011", "HD_RESCAN_REQUIRED"), ("RPC_PROTOCOL", "HD_INVALID_RESPONSE"),
                                  ("-32602", "HD_RPC_REJECTED"), ("untrusted server text", "HD_RPC_REJECTED")] {

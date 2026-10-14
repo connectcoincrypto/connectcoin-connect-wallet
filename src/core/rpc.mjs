@@ -257,13 +257,24 @@ export class RpcClient extends EventEmitter {
       // cannot strand an untracked promise when the socket is torn down.
       if (error) {
         if (!PLAIN(message.error) || !Number.isSafeInteger(message.error.code) || typeof message.error.message !== 'string') throw new Error('Invalid RPC error.');
+        const data = message.error.data;
+        const hasRetry = data != null && Object.hasOwn(data, 'retry_after_ms');
+        if (hasRetry && (!Number.isSafeInteger(data.retry_after_ms) || data.retry_after_ms < 0)) throw new Error('Invalid RPC retry delay.');
+        const retry = hasRetry ? data.retry_after_ms : undefined;
+        const cooldown = (key, wait) => this.cooldowns.set(key, Math.max(this.cooldowns.get(key) ?? 0,
+          Math.min(Number.MAX_SAFE_INTEGER, performance.now() + wait)));
         if (message.error.code === -32029) {
-          const retry = message.error.data?.retry_after_ms;
-          const wait = Number.isSafeInteger(retry) && retry > 0 ? Math.min(60000, retry) : this.windowMs;
-          this.cooldowns.set(pending.method, performance.now() + wait);
-        } else if (message.error.code === -32001) this.cooldowns.set('*', performance.now() + 1000);
+          cooldown(pending.method, retry ?? this.windowMs);
+        } else if (message.error.code === -32001) cooldown('*', Math.max(1000, retry ?? 0));
+        else if (message.error.code === -32030) cooldown(pending.method, retry ?? 1000);
         this.pending.delete(message.id); clearRequest(pending);
-        pending.reject(new RpcError('RPC request failed. ' + message.error.message.slice(0, 180), message.error.code, message.error.data));
+        const failure = new RpcError('RPC request failed. ' + message.error.message.slice(0, 180), message.error.code, message.error.data);
+        // Only a matched, well-framed RPC rejection can attest that a broadcast
+        // was not forwarded. This is distinct from notSent (zero socket writes).
+        // A node_code contradicts the pre-dispatch contract; stay conservative.
+        if (pending.method === 'sendrawtransaction' && [-32001, -32029, -32030].includes(failure.code) &&
+            (data == null || PLAIN(data) && !Object.hasOwn(data, 'node_code'))) failure.notForwarded = true;
+        pending.reject(failure);
       } else if (pending.streaming) {
         const streamId = message.result?.stream_id;
         if (!PLAIN(message.result) || typeof streamId !== 'string' || streamId.length < 1 || streamId.length > 128 || this.streams.has(streamId)) throw new Error('Invalid stream identifier.');
@@ -410,7 +421,9 @@ export class RpcClient extends EventEmitter {
       if (waitingSignal.aborted) throw cancelledError();
       const wait = this.quotaWait(method, params, { reserve });
       if (!wait) return;
-      await delay(wait, undefined, { signal: waitingSignal });
+      // Node timers overflow above signed 32-bit milliseconds. Sleep only one
+      // bounded slice, then recheck the full monotonic server deadline.
+      await delay(Math.min(wait, 2_147_483_647), undefined, { signal: waitingSignal });
     }
   }
   async request(method, params = {}, { onChunk, signal, beforeSend } = {}) {
@@ -424,39 +437,49 @@ export class RpcClient extends EventEmitter {
       if (beforeSend !== undefined && typeof beforeSend !== 'function') throw new Error('RPC beforeSend must be a synchronous function.');
       const waitingSignal = signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal;
       if (waitingSignal.aborted) throw cancelledError();
-      if (this.queuedRequests >= 32) throw new Error('Too many queued RPC requests; retry shortly.');
+      if (this.queuedRequests >= 32) throw Object.assign(new Error('Too many queued RPC requests; retry shortly.'), { code: 'RPC_QUEUE_FULL' });
       this.queuedRequests++; queued = true;
       await this.pace(method, clean, { signal: waitingSignal, reserve: false });
       if (waitingSignal.aborted) throw cancelledError();
       diagnostic.stage = 'connect';
       const socket = await waitForConnection(this.connect(), waitingSignal);
       diagnostic.stage = 'request';
+      let id, encoded;
       for (;;) {
         releaseCapacity = await this.waitForCapacity(socket, waitingSignal);
         if (waitingSignal.aborted) throw cancelledError();
         if (this.closed) throw closedError();
         if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
         // A slot wait may outlive a quota window or receive a new server
-        // cooldown. Debit only immediately before transmission, and never
-        // occupy a global slot while waiting on one method's rate limit.
-        if (!this.quotaWait(method, clean, { reserve: true })) break;
+        // cooldown. Check without charging until ALL local write fences pass.
+        // Never occupy a global slot while waiting on one method's rate limit.
+        if (!this.quotaWait(method, clean)) {
+          if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
+          id = ++this.nextId;
+          encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
+          if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
+          // Revalidate the catalog/epoch AFTER every quota/capacity wait.
+          // Rejection owns no pending request, spends no quota and never
+          // tears down sibling I/O. Asynchronous fences are not permitted.
+          if (beforeSend) {
+            const result = beforeSend();
+            if (result && typeof result.then === 'function') {
+              Promise.resolve(result).catch(() => {});
+              throw new Error('RPC beforeSend must be synchronous.');
+            }
+          }
+          // The fence itself may cancel or close the client/socket.
+          if (waitingSignal.aborted) throw cancelledError();
+          if (this.closed) throw closedError();
+          if (socket.destroyed || this.socket !== socket) throw new Error('RPC connection is closed.');
+          // Debit immediately before transmission. There is no await or
+          // caller callback from this point to write, so concurrent requests
+          // cannot oversubscribe quota. A synchronous fence that changes a
+          // cooldown must wait again and revalidate, without spending quota.
+          if (!this.quotaWait(method, clean, { reserve: true })) break;
+        }
         releaseCapacity(); releaseCapacity = undefined;
         await this.pace(method, clean, { signal: waitingSignal, reserve: false });
-      }
-      if (this.nextId >= Number.MAX_SAFE_INTEGER) throw new Error('RPC request identifier space exhausted. Reopen the wallet.');
-      const id = ++this.nextId;
-      const encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params: clean }) + '\n';
-      if (Buffer.byteLength(encoded) > 900000 || socket.writableLength + Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('RPC request exceeds the wallet output buffer limit.');
-      if (waitingSignal.aborted) throw cancelledError();
-      // Revalidate a caller's catalog/epoch gate AFTER every quota/capacity wait.
-      // No await may occur between this synchronous fence and the actual write.
-      // Rejection here owns no pending request and never tears down sibling I/O.
-      if (beforeSend) {
-        const result = beforeSend();
-        if (result && typeof result.then === 'function') {
-          Promise.resolve(result).catch(() => {});
-          throw new Error('RPC beforeSend must be synchronous.');
-        }
       }
       return await new Promise((resolve, reject) => {
         if (waitingSignal.aborted) { reject(cancelledError()); return; }

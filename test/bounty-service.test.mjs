@@ -217,7 +217,7 @@ test('real discovery of thousands of mostly spent bounties publishes bounded sna
     await service.syncBounties();
     assert.equal(service.claimOutpoints.size, 3000);
     assert.equal(service.engine.queue.size, 30);
-    assert.equal(notifications, 3, 'initial pool suspension, reset and thirty new queue entries; no notifications for 2,970 absent spent entries');
+    assert.equal(notifications, 1, 'thirty new queue entries publish once; catalog reset no longer suspends/restarts the pool');
     assert.equal(snapshots, 1, 'snapshot construction is coalesced before serialization');
     assert.equal(timers.size, 1);
     flush();
@@ -226,7 +226,7 @@ test('real discovery of thousands of mostly spent bounties publishes bounded sna
     assert.equal(states.at(-1).claims.scanning, false);
     const reads = f.calls.filter(call => call.method === 'getblockbounties').length;
     for (let i = 0; i < 20; i++) await service.syncBounties();
-    assert.equal(notifications, 3, 'repeated cached scans neither remove absent entries nor re-enqueue unchanged entries');
+    assert.equal(notifications, 1, 'repeated cached scans neither remove absent entries nor re-enqueue unchanged entries');
     assert.equal(service.engine.queue.size, 30);
     assert.equal(f.calls.filter(call => call.method === 'getblockbounties').length, reads);
     assert.equal(snapshots, 2);
@@ -308,10 +308,37 @@ test('an explicit consensus rejection does not masquerade as an unknown broadcas
   assert.equal(service.reserved.has(`${bounty.txid}:0`), false);
 });
 
+test('a safe claim retry is pinned to the first verified witness bytes, not merely the same txid', async () => {
+  const { service, bounty } = serviceFixture();
+  const prepared = await service.prepareAutomaticClaim(bounty), proof = structuralProof(prepared), payloads = [];
+  service.rpc.request = async (method, params) => {
+    assert.equal(method, 'sendrawtransaction'); payloads.push(params.transaction_hex);
+    if (payloads.length === 1) throw Object.assign(new Error('Busy'), { code: -32030, notForwarded: true });
+    return { txid: prepared.txid };
+  };
+  await assert.rejects(service.submitAutomaticClaim(prepared, proof), { code: -32030 });
+  // This second structurally valid witness still binds the same prepared txid,
+  // but is not the verified winner saved before the first RPC request.
+  const changedProof = Buffer.concat([
+    Buffer.from('02010000220303', 'hex'), Buffer.from(prepared.challenge, 'hex'),
+    Buffer.from([2, 0, 0, 1, 0]), ...[8, 11, 15].map(type => Buffer.from([type, 0, 0, 0])),
+  ]).toString('hex');
+  await assert.rejects(service.submitAutomaticClaim(prepared, changedProof), /retained claim transaction or proof was changed/);
+  assert.equal(payloads.length, 1);
+  assert.equal(service.engine.enabled, true); assert.equal(service.claimsReviewRequired, false);
+  await service.submitAutomaticClaim(prepared, proof);
+  assert.equal(payloads.length, 2); assert.equal(payloads[0], payloads[1]);
+});
+
 test('unrecognized or uncertain node rejection replies keep reservations and stop claims', async () => {
   const errors = [
     ...[-27, -99, undefined, '-26'].map(node_code => ({ code: -32020, data: { node_code } })),
     { code: -32020, data: { node_code: -26 }, unknownOutcome: true },
+    // A code on an arbitrary error is not proof of a validated RPC response.
+    ...[-32001, -32029, -32030, -32002].map(code => ({ code })),
+    { code: -32030, notForwarded: true, unknownOutcome: true },
+    { code: -32030, notForwarded: true, helperFatal: true },
+    { code: -32002, notForwarded: true },
   ];
   for (const fields of errors) {
     const { service, bounty } = serviceFixture();

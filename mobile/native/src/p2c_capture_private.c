@@ -8,7 +8,7 @@
 #include <p2c_capture_private.h>
 #include <ssl_misc.h>
 #include <mbedtls/version.h>
-#ifdef CLAIMER_NETWORK_TESTING
+#ifdef CONNECTWALLET_NATIVE_TESTS
 #include <mbedtls/psa_util.h>
 #endif
 #include <string.h>
@@ -108,9 +108,10 @@ int connectcoin_p2c_fetch_certificate(mbedtls_ssl_context* ssl)
     if (ret != 0) return ret;
     ret = capture_certificate_structure(ssl, body, body + length);
     if (ret != 0) return ret;
-    ret = mbedtls_ssl_add_hs_msg_to_checksum(ssl, MBEDTLS_SSL_HS_CERTIFICATE,
-                                           body, length);
-    if (ret != 0) return ret;
+    /* Abbreviated capture stops after fetching CertificateVerify. Its TLS
+     * transcript checksum is never consumed; the independent proof verifier
+     * hashes/authenticates the owned transcript. Completed RSA probes retain
+     * the original Mbed TLS certificate handler and its checksum. */
     mbedtls_ssl_handshake_set_state(ssl, MBEDTLS_SSL_CERTIFICATE_VERIFY);
     return 0;
 }
@@ -122,7 +123,41 @@ int connectcoin_p2c_fetch_certificate_verify(mbedtls_ssl_context* ssl)
     return mbedtls_ssl_tls13_fetch_handshake_msg(ssl, MBEDTLS_SSL_HS_CERTIFICATE_VERIFY,
                                                &body, &length);
 }
-#ifdef CLAIMER_NETWORK_TESTING
+#ifdef CONNECTWALLET_NATIVE_TESTS
+static int bytes_are_zero(const void* bytes,size_t length)
+{
+    const unsigned char* p=(const unsigned char*)bytes;
+    size_t i;
+    for(i=0;i<length;++i) if(p[i]!=0) return 0;
+    return 1;
+}
+int connectcoin_p2c_test_tls_reset_clean(const mbedtls_ssl_context* ssl)
+{
+    const mbedtls_ssl_handshake_params* handshake;
+    if(ssl->p_bio!=NULL || ssl->f_send!=NULL || ssl->f_recv!=NULL ||
+       mbedtls_ssl_get_hostname_pointer(ssl)!=NULL) return 0;
+    if(ssl->conf==NULL) return ssl->in_buf==NULL && ssl->out_buf==NULL && ssl->handshake==NULL;
+    if(ssl->state!=MBEDTLS_SSL_HELLO_REQUEST || ssl->session!=NULL ||
+       ssl->session_in!=NULL || ssl->session_out!=NULL || ssl->in_left!=0 || ssl->out_left!=0 ||
+       ssl->transform_in!=NULL || ssl->transform_out!=NULL || ssl->transform_application!=NULL ||
+       ssl->handshake==NULL || ssl->session_negotiate==NULL) return 0;
+    handshake=ssl->handshake;
+    return handshake->resume==0 && handshake->transform_handshake==NULL &&
+        mbedtls_svc_key_id_is_null(handshake->xxdh_psa_privkey) && handshake->xxdh_psa_peerkey_len==0 &&
+        handshake->sent_extensions==0 && handshake->received_extensions==0 &&
+        bytes_are_zero(handshake->randbytes,sizeof(handshake->randbytes)) &&
+        bytes_are_zero(handshake->xxdh_psa_peerkey,sizeof(handshake->xxdh_psa_peerkey)) &&
+        bytes_are_zero(&handshake->tls13_master_secrets,sizeof(handshake->tls13_master_secrets)) &&
+        bytes_are_zero(&handshake->tls13_hs_secrets,sizeof(handshake->tls13_hs_secrets)) &&
+        ssl->session_negotiate->peer_cert==NULL && ssl->session_negotiate->ticket==NULL &&
+        bytes_are_zero(&ssl->session_negotiate->app_secrets,sizeof(ssl->session_negotiate->app_secrets));
+}
+static int forbidden_abbreviated_checksum(mbedtls_ssl_context* ssl,
+                                         const unsigned char* message,size_t length)
+{
+    (void)ssl; (void)message; (void)length;
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+}
 int connectcoin_p2c_test_certificate(const unsigned char* message, size_t length,
                                    int abbreviated, uint32_t sent_extensions,
                                    uint32_t* received_extensions, int* peer_present)
@@ -156,6 +191,7 @@ int connectcoin_p2c_test_certificate(const unsigned char* message, size_t length
     ssl.in_hslen = length;
     ssl.keep_current_message = 1;
     ssl.handshake->sent_extensions = sent_extensions;
+    if (abbreviated) ssl.handshake->update_checksum = forbidden_abbreviated_checksum;
     mbedtls_ssl_handshake_set_state(&ssl, MBEDTLS_SSL_SERVER_CERTIFICATE);
     ret = abbreviated ? connectcoin_p2c_fetch_certificate(&ssl)
                       : mbedtls_ssl_tls13_process_certificate(&ssl);

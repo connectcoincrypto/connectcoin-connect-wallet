@@ -82,7 +82,7 @@ function idleEngine() {
     async stop() { this.stops++; this.enabled = false; },
     async suspend() { this.suspends++; },
     start() { this.enabled = true; }, resume() { this.resumes++; }, clear() {},
-    setOptions() {}, notify() {}, activeKeys() { return []; },
+    setOptions() {}, notify() {}, setCatalogBlocked(value) { this.catalogBlocked = value; }, activeKeys() { return []; },
     hasActive() { return false; }, retainCatalog() {}, enqueue() {}, remove() {}, retire() {},
   };
 }
@@ -162,10 +162,12 @@ test('a reorg push invalidates an in-flight snapshot before it can resume claims
   s.rpc.notice('bounties', { resync_required: true, changes: undefined });
   assert.ok(s.claimRevision > revision);
   assert.equal(s.claimCursor, null);
-  assert.ok(s.engine.suspends > 0);
+  assert.equal(s.engine.suspends, 0, 'A push resync preserves captures rather than stopping the native pool');
+  assert.equal(s.engine.catalogBlocked, true);
   assert.equal(s.engine.resumes, 0);
   gate.resolve(); await cancelled;
   await until(() => s.engine.resumes === 1, 'A fresh validated snapshot must recover after the reorg');
+  assert.equal(s.engine.catalogBlocked, false);
   assert.equal(s.claimCursor, 'journal-0');
 });
 

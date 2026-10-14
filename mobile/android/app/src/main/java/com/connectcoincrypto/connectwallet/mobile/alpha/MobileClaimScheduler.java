@@ -19,13 +19,16 @@ import java.util.TreeSet;
  */
 final class MobileClaimScheduler {
     static final int FACTOR_SCALE = 1_000_000, FACTOR_MAX = 1_100_000, MIN_RETURN = 1000, MAX_PROBES = 256;
-    static final long PROBE_INTERVAL_MS = 60000;
+    static final long PROBE_INTERVAL_MS = 60000, BOOTSTRAP_INTERVAL_MS = 250;
+    static final int BOOTSTRAP_STARTS = 32;
     private static final double SPACE = Math.scalb(1.0, 256);
     private static final BigInteger WORD = BigInteger.valueOf(0xffffffffL);
     private final Map<String, Entry> entries = new HashMap<>();
     private final TreeMap<String, Group> groups = new TreeMap<>();
-    private final LinkedHashMap<String, Long> probes = new LinkedHashMap<>();
-    private final Map<String, Selection> pendingProbes = new HashMap<>();
+    private final LinkedHashMap<String, Probe> probes = new LinkedHashMap<>();
+    private Selection pendingProbe;
+    private long nextGlobalProbe;
+    private static final class Probe { int starts; long nextDue; }
     private boolean preferReward;
     private String domainAfter;
     private long serial;
@@ -47,9 +50,10 @@ final class MobileClaimScheduler {
     static final class Selection {
         final MobileClaimsEngine.Candidate row;
         final boolean economic, recovery;
-        final long serial;
+        final long serial, selectedAt;
+        final Probe probe;
         boolean reserved, committed;
-        Selection(Entry entry, boolean economic, long serial) { row = entry.row; recovery = entry.recovery; this.economic = economic; this.serial = serial; }
+        Selection(Entry entry, boolean economic, long serial, long now, Probe probe) { row = entry.row; recovery = entry.recovery; this.economic = economic; this.serial = serial; selectedAt = now; this.probe = probe; }
     }
     static double score(BigInteger priority, double rate, int scale) {
         if (priority.signum() < 0 || priority.bitLength() > 352 || !Double.isFinite(rate) || rate <= 0 || scale <= 0) return Double.NaN;
@@ -73,26 +77,24 @@ final class MobileClaimScheduler {
     void rebuild(Iterable<MobileClaimsEngine.Candidate> rows, Map<String, MobileClaimsEngine.PerformanceWindow> stats, Set<String> retired, long now) {
         entries.clear(); groups.clear();
         List<MobileClaimsEngine.Candidate> candidates = new ArrayList<>();
-        Set<String> policies = new HashSet<>(), healthy = new HashSet<>();
+        Set<String> healthy = new HashSet<>();
         Map<String, MobileClaimsEngine.Candidate> recovery = new HashMap<>();
         Map<String, Double> rates = new HashMap<>();
         for (MobileClaimsEngine.Candidate row : rows) {
-            policies.add(row.policy);
             if (!eligible(row, retired)) continue;
             candidates.add(row); double rate = rates.computeIfAbsent(row.policy, unused -> rate(row, stats));
             if (worth(row.raw, rate)) healthy.add(row.policy);
-            else if (worth(row.raw, 5)) {
+            else {
                 MobileClaimsEngine.Candidate previous = recovery.get(row.policy);
                 if (previous == null || compare(row, previous) < 0) recovery.put(row.policy, row);
             }
         }
-        probes.keySet().retainAll(policies);
         List<MobileClaimsEngine.Candidate> representatives = new ArrayList<>();
         for (Map.Entry<String, MobileClaimsEngine.Candidate> item : recovery.entrySet()) if (!healthy.contains(item.getKey())) representatives.add(item.getValue());
         representatives.sort(MobileClaimScheduler::compare);
         Set<String> admitted = new HashSet<>();
         for (int index = 0; index < Math.min(MAX_PROBES, representatives.size()); index++) {
-            MobileClaimsEngine.Candidate row = representatives.get(index); admitted.add(row.key); probeDue(row.policy, now);
+            MobileClaimsEngine.Candidate row = representatives.get(index); admitted.add(row.key); probeState(row.policy);
         }
         for (MobileClaimsEngine.Candidate row : candidates) {
             double rate = rates.get(row.policy); boolean recovering = !worth(row.raw, rate);
@@ -108,20 +110,26 @@ final class MobileClaimScheduler {
     static double rate(MobileClaimsEngine.Candidate row, Map<String, MobileClaimsEngine.PerformanceWindow> stats) {
         MobileClaimsEngine.PerformanceWindow value = stats.get(row.policy); return value == null ? 5 : value.rate();
     }
-    private long probeDue(String policy, long now) {
-        Long due = probes.get(policy);
-        if (due == null) {
-            if (probes.size() >= MAX_PROBES) { Iterator<String> oldest = probes.keySet().iterator(); oldest.next(); oldest.remove(); }
-            due = now + PROBE_INTERVAL_MS; probes.put(policy, due);
+    private Probe probeState(String policy) {
+        Probe state = probes.get(policy);
+        if (state == null) {
+            if (probes.size() >= MAX_PROBES) {
+                Iterator<String> oldest = probes.keySet().iterator();
+                while (oldest.hasNext()) { String key = oldest.next(); if (pendingProbe == null || !key.equals(pendingProbe.row.policy)) { oldest.remove(); break; } }
+            }
+            state = new Probe(); probes.put(policy, state);
         }
-        return due;
+        return state;
+    }
+    private boolean probeReady(String policy, long now) {
+        return pendingProbe == null && now >= nextGlobalProbe && now >= probeState(policy).nextDue;
     }
     private Entry leader(Group group, long now) {
         Entry best = null;
         for (TreeSet<Entry> mask : group.masks.values()) {
             if (mask.isEmpty()) continue;
             Entry row = mask.first();
-            if (row.transportDue > now || row.recovery && (pendingProbes.containsKey(row.row.policy) || probeDue(row.row.policy, now) > now)) continue;
+            if (row.transportDue > now || row.recovery && !probeReady(row.row.policy, now)) continue;
             if (best == null || row.score > best.score || row.score == best.score && compareEntries(row, best) < 0) best = row;
         }
         return best;
@@ -141,16 +149,18 @@ final class MobileClaimScheduler {
             }
         }
         if (!preferReward) best = after != null ? after : first;
-        return best == null ? null : new Selection(best, preferReward, serial);
+        return best == null ? null : new Selection(best, preferReward, serial, now, best.recovery ? probeState(best.row.policy) : null);
     }
     /** Dispatch reserves the fair/economic turn before another DNS worker can
      * select. Recovery reservations belong to the policy across catalog edits. */
-    boolean reserve(Selection selection) {
-        if (selection == null || selection.reserved || selection.serial != serial || selection.recovery && pendingProbes.containsKey(selection.row.policy)) return false;
+    boolean reserve(Selection selection) { return reserve(selection, selection == null ? 0 : selection.selectedAt); }
+    boolean reserve(Selection selection, long now) {
+        if (selection == null || selection.reserved || selection.serial != serial || selection.recovery &&
+            (pendingProbe != null || now < nextGlobalProbe || now < selection.probe.nextDue)) return false;
         selection.reserved = true;
         if (!selection.economic) domainAfter = selection.row.domain;
         preferReward = !selection.economic; serial++;
-        if (selection.recovery) pendingProbes.put(selection.row.policy, selection);
+        if (selection.recovery) pendingProbe = selection;
         return true;
     }
     /** Only an actual TCP event spends a recovery probe. Ack order does not
@@ -159,13 +169,19 @@ final class MobileClaimScheduler {
         if (selection == null || !selection.reserved || selection.committed) return false;
         selection.committed = true;
         if (selection.recovery) {
-            probeDue(selection.row.policy, now); probes.remove(selection.row.policy); probes.put(selection.row.policy, now + PROBE_INTERVAL_MS);
+            Probe state = selection.probe;
+            state.starts = Math.min(BOOTSTRAP_STARTS, state.starts + 1);
+            state.nextDue = Math.max(state.nextDue, now + (state.starts < BOOTSTRAP_STARTS ? BOOTSTRAP_INTERVAL_MS : PROBE_INTERVAL_MS));
+            // No accumulated credit: catalog churn and delayed acknowledgements
+            // cannot reset the single global four-starts/second probe gate.
+            nextGlobalProbe = Math.max(nextGlobalProbe, now + BOOTSTRAP_INTERVAL_MS);
+            if (probes.get(selection.row.policy) == state) { probes.remove(selection.row.policy); probes.put(selection.row.policy, state); }
         }
         release(selection);
         return true;
     }
-    void release(Selection selection) { if (selection != null && selection.recovery) pendingProbes.remove(selection.row.policy, selection); }
-    boolean commit(Selection selection, long now) { return reserve(selection) && acknowledge(selection, now); }
+    void release(Selection selection) { if (pendingProbe == selection) pendingProbe = null; }
+    boolean commit(Selection selection, long now) { return reserve(selection, now) && acknowledge(selection, now); }
     void remove(String key) {
         Entry entry = entries.remove(key);
         if (entry != null) entry.group.masks.get(entry.row.mask).remove(entry);

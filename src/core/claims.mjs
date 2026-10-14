@@ -3,8 +3,8 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { validateAttemptStats } from './claim-priority.mjs';
 import { MAX_CONNECTION_LIMIT } from './connection-limits.mjs';
+import { validateAttemptStats } from './claim-priority.mjs';
 
 const BASE = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONTEXT_KEYS = ['domain', 'txid', 'input_index', 'connection_work_target', 'root_certificates_version', 'signature_algorithms_mask', 'validation_time'];

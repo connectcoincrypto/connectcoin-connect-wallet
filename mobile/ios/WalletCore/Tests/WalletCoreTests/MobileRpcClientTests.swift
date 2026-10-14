@@ -7,6 +7,19 @@ private final class RpcTestClock: @unchecked Sendable {
     func advance(_ by: TimeInterval) { mutex.lock(); time += by; mutex.unlock() }
 }
 
+/// On an already-ready wire, admission and pump see a live permit. It expires
+/// only at perform(), the last atomic check immediately before socket write.
+private final class RpcWriteFenceClock: @unchecked Sendable {
+    private let mutex = NSLock()
+    private var calls = 0
+    func now() -> TimeInterval {
+        mutex.lock(); defer { mutex.unlock() }
+        calls += 1
+        return calls < 3 ? 0 : 1
+    }
+    var readings: Int { mutex.lock(); defer { mutex.unlock() }; return calls }
+}
+
 private final class SubscriptionEvents: @unchecked Sendable {
     private let mutex = NSLock(); private var values: [JSONObject] = []
     func append(_ value: JSONObject) { mutex.lock(); values.append(value); mutex.unlock() }
@@ -230,6 +243,46 @@ final class MobileRpcClientTests: XCTestCase {
         catch let failure as RpcFailure { XCTAssertTrue(failure.unknownOutcome); XCTAssertFalse(failure.notSent) }
         XCTAssertEqual(wire.sent.count,1)
     }
+    func testFinalWriteFenceRevocationsDoNotConsumeQuotaButActualBroadcastsDo() async throws {
+        let clock = RpcTestClock(), wire = RpcTestWire(), hash = fixtureHash
+        wire.respond = { request in request["method"] as? String == "sendrawtransaction" ? ["txid": hash] : [:] }
+        let rpc = MobileRpcClient(factory: { wire }, now: clock.now)
+        defer { rpc.close() }; rpc.setActive(true)
+        // Keep connection setup out of the permit clock: each revoked request
+        // reaches the final write fence, rather than failing at initial admission.
+        _ = try await rpc.call("getchaintip")
+        let hex = String(repeating: "00", count: 10)
+        for _ in 0..<48 {
+            let fence = RpcWriteFenceClock(), permit = RpcBroadcastPermit(validUntil: 1, now: fence.now)
+            do { _ = try await rpc.broadcast(hex, permit: permit); XCTFail("Expired permit wrote a broadcast") }
+            catch let failure as RpcFailure {
+                XCTAssertEqual(failure.code, "RPC_CANCELLED")
+                XCTAssertTrue(failure.notSent); XCTAssertFalse(failure.unknownOutcome)
+            }
+            XCTAssertEqual(fence.readings, 3, "The expiration must occur at perform(), after both earlier checks")
+        }
+        XCTAssertEqual(wire.sent.count, 1, "None of the 48 revoked broadcasts reached the wire")
+        func broadcasts() -> [JSONObject] { wire.sent.filter { $0["method"] as? String == "sendrawtransaction" } }
+        for count in 1...48 {
+            let pending = Task { try await rpc.broadcast(hex, permit: RpcBroadcastPermit()) }
+            try await eventually { broadcasts().count == count }
+            let response = try await pending.value
+            XCTAssertEqual(response["txid"] as? String, hash)
+        }
+        // These are genuine writes and therefore exhaust the unchanged quota.
+        let limited = Task { try await rpc.broadcast(hex, permit: RpcBroadcastPermit()) }
+        defer { limited.cancel() }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(broadcasts().count, 48)
+        clock.advance(59.999)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(broadcasts().count, 48)
+        clock.advance(0.002)
+        try await eventually { broadcasts().count == 49 }
+        let response = try await limited.value
+        XCTAssertEqual(response["txid"] as? String, hash)
+        XCTAssertTrue(broadcasts().allSatisfy { ($0["params"] as? JSONObject)?["transaction_hex"] as? String == hex })
+    }
     func testSixPerMinuteParentsQuotaSurvivesEndpointReplacementAndFailedPersist() async throws {
         let clock = RpcTestClock(), firstWire = RpcTestWire(); firstWire.respond = { _ in [:] }
         let original = MobileRpcClient(factory:{firstWire},now:clock.now); defer { original.close() }; original.setActive(true)
@@ -268,8 +321,59 @@ final class MobileRpcClientTests: XCTestCase {
         let broadcast = Task { try await client.broadcast(String(repeating:"00",count:10)) }
         try await eventually { wire.sent.count == 50 }; wire.reject(wire.sent[49],code:-32029)
         do { _ = try await broadcast.value; XCTFail("Rejected send succeeded") }
-        catch let failure as RpcFailure { XCTAssertEqual(failure.code,"-32029"); XCTAssertTrue(failure.unknownOutcome); XCTAssertFalse(failure.notSent) }
+        catch let failure as RpcFailure { XCTAssertEqual(failure.code,"-32029"); XCTAssertFalse(failure.unknownOutcome); XCTAssertFalse(failure.notSent); XCTAssertTrue(failure.notForwarded) }
         clock.advance(120); try await Task.sleep(nanoseconds:20_000_000); XCTAssertEqual(wire.sent.count,50)
+    }
+    func testGatewayRefusalsProveNonSubmissionButNotAbsenceOfSocketWrite() async throws {
+        for code in [-32001, -32029, -32030] {
+            let wire = RpcTestWire(), rpc = MobileRpcClient(factory: { wire }); defer { rpc.close() }; rpc.setActive(true)
+            let waiting = Task { try await rpc.broadcast(String(repeating: "00", count: 10)) }
+            try await eventually { wire.sent.count == 1 }
+            wire.emit(try JSON.encode(["jsonrpc": "2.0", "id": wire.sent[0]["id"]!,
+                "error": ["code": code, "message": "gateway rejection", "data": ["retry_after_ms": 120_000]]]) + Data([10]))
+            do { _ = try await waiting.value; XCTFail("Rejected request succeeded") }
+            catch let failure as RpcFailure {
+                XCTAssertEqual(failure.code, String(code)); XCTAssertTrue(failure.notForwarded)
+                XCTAssertFalse(failure.notSent); XCTAssertFalse(failure.unknownOutcome); XCTAssertFalse(failure.explicitRejection)
+                XCTAssertNil(failure.nodeCode); XCTAssertEqual(failure.retryAfterMs, 120_000)
+            }
+            XCTAssertEqual(wire.sent.count, 1)
+        }
+    }
+    func testAmbiguousOrContradictoryRepliesCannotClaimNonSubmission() async throws {
+        let responses: [JSONObject] = [
+            ["code": -32002, "data": ["notForwarded": true, "notSent": true]],
+            ["code": -32030, "data": ["node_code": -27]],
+            ["code": -32029, "data": ["node_code": "invalid"]],
+            ["code": -32001, "data": [Any]()],
+            ["code": -32030, "data": true],
+        ]
+        for remote in responses {
+            let wire = RpcTestWire(), rpc = MobileRpcClient(factory: { wire }); defer { rpc.close() }; rpc.setActive(true)
+            let waiting = Task { try await rpc.broadcast(String(repeating: "00", count: 10)) }
+            try await eventually { wire.sent.count == 1 }
+            wire.emit(try JSON.encode(["jsonrpc": "2.0", "id": wire.sent[0]["id"]!, "error": remote]) + Data([10]))
+            do { _ = try await waiting.value; XCTFail("Rejected request succeeded") }
+            catch let failure as RpcFailure {
+                XCTAssertTrue(failure.unknownOutcome); XCTAssertFalse(failure.notSent); XCTAssertFalse(failure.notForwarded)
+            }
+            XCTAssertEqual(wire.sent.count, 1)
+        }
+    }
+    func testInvalidRefusalCooldownRemainsAmbiguousAfterWrite() async throws {
+        let delays: [Any] = ["invalid", -1, 9_007_199_254_740_992, true, NSNull()]
+        for delay in delays {
+            let wire = RpcTestWire(), rpc = MobileRpcClient(factory: { wire }); defer { rpc.close() }; rpc.setActive(true)
+            let waiting = Task { try await rpc.broadcast(String(repeating: "00", count: 10)) }
+            try await eventually { wire.sent.count == 1 }
+            wire.emit(try JSON.encode(["jsonrpc": "2.0", "id": wire.sent[0]["id"]!,
+                "error": ["code": -32030, "data": ["retry_after_ms": delay]]]) + Data([10]))
+            do { _ = try await waiting.value; XCTFail("Malformed response succeeded") }
+            catch let failure as RpcFailure {
+                XCTAssertEqual(failure.code, "RPC_PROTOCOL"); XCTAssertTrue(failure.unknownOutcome)
+                XCTAssertFalse(failure.notSent); XCTAssertFalse(failure.notForwarded)
+            }
+        }
     }
     func testFreshnessDeadlineIsCheckedAtWriteAndDistinguishedFromLifecycleStop() async throws {
         let clock = RpcTestClock(), wire = RpcTestWire(); wire.autoReady = false
@@ -294,6 +398,89 @@ final class MobileRpcClientTests: XCTestCase {
             XCTAssertEqual(failure.code, "RPC_TIMEOUT"); XCTAssertTrue(failure.notSent); XCTAssertFalse(failure.unknownOutcome)
         }
         XCTAssertTrue(wire.sent.isEmpty)
+    }
+    func testGettransactionBackendFailureIsReadOnlyButSameCodeAfterBroadcastStaysUnknown() async throws {
+        let wire = RpcTestWire(), rpc = MobileRpcClient(factory: { wire })
+        defer { rpc.close() }; rpc.setActive(true)
+        let params: JSONObject = ["txid": fixtureHash]
+        let reading = Task { try await rpc.call("gettransaction", params) }
+        try await eventually { wire.sent.count == 1 }
+        wire.reject(wire.sent[0], code: -32002)
+        do { _ = try await reading.value; XCTFail("Unavailable parent transaction unexpectedly succeeded") }
+        catch let failure as RpcFailure {
+            XCTAssertEqual(failure.code, "-32002")
+            XCTAssertFalse(failure.unknownOutcome); XCTAssertFalse(failure.explicitRejection)
+            XCTAssertFalse(failure.notSent); XCTAssertFalse(failure.notForwarded)
+        }
+        let retried = Task { try await rpc.call("gettransaction", params) }
+        try await eventually { wire.sent.count == 2 }
+        XCTAssertEqual(try JSON.encode(wire.sent[0]["params"] as! JSONObject), try JSON.encode(wire.sent[1]["params"] as! JSONObject))
+        wire.reply(wire.sent[1], result: ["recovered": true])
+        let response = try await retried.value
+        XCTAssertEqual(response["recovered"] as? Bool, true)
+
+        // Read recoverability is not evidence that a financial write was rejected.
+        let broadcast = Task { try await rpc.broadcast(String(repeating: "00", count: 10)) }
+        try await eventually { wire.sent.count == 3 }
+        wire.reject(wire.sent[2], code: -32002)
+        do { _ = try await broadcast.value; XCTFail("Ambiguous broadcast unexpectedly succeeded") }
+        catch let failure as RpcFailure {
+            XCTAssertEqual(failure.code, "-32002"); XCTAssertTrue(failure.unknownOutcome)
+            XCTAssertFalse(failure.notSent); XCTAssertFalse(failure.notForwarded)
+            var pending = ClaimSubmissionRetry(hex: String(repeating: "00", count: 10), txid: fixtureHash)
+            XCTAssertFalse(pending.retain(after: failure, now: 0))
+        }
+        XCTAssertEqual(wire.sent.count, 3)
+    }
+    func testStreamTimeoutDiscardsPartialChunksAndReconnectStillRequiresCompleteEnd() async throws {
+        let clock = RpcTestClock(), wire = RpcTestWire()
+        let rpc = MobileRpcClient(factory: { wire }, now: clock.now)
+        defer { rpc.close() }; rpc.setActive(true)
+        func chunk(_ stream: String, _ sequence: Int, _ items: JSONObject) throws {
+            wire.emit(try JSON.encode(["jsonrpc": "2.0", "method": "stream.chunk",
+                "params": ["stream_id": stream, "sequence": sequence, "items": items]]) + Data([10]))
+        }
+        func snapshot(_ stream: String) throws {
+            try chunk(stream, 0, ["type": "snapshot", "tip": [:], "block_hash": fixtureHash,
+                "unit": "connects", "live": true, "cursor": "snapshot.cursor"])
+        }
+        let timedOut = Task { try await rpc.streamBounties(fixtureHash) }
+        try await eventually { wire.sent.count == 1 }
+        wire.reply(wire.sent[0], result: ["stream_id": "interrupted"])
+        try snapshot("interrupted")
+        try chunk("interrupted", 1, ["type": "bounties", "tip": [:], "items": [["partial": true]]])
+        // A completed sibling read is a queue barrier: the preceding stream
+        // chunks have actually been parsed and buffered before the deadline.
+        let barrier = Task { try await rpc.call("getchaintip") }
+        try await eventually { wire.sent.count == 2 }
+        wire.reply(wire.sent[1], result: [:]); _ = try await barrier.value
+        clock.advance(121)
+        do { _ = try await timedOut.value; XCTFail("An unfinished stream published partial chunks") }
+        catch let failure as RpcFailure {
+            XCTAssertEqual(failure.code, "RPC_TIMEOUT")
+            XCTAssertFalse(failure.unknownOutcome); XCTAssertFalse(failure.notSent)
+        }
+        for complete in [false, true] {
+            let stream = complete ? "complete" : "incomplete"
+            let pending = Task { try await rpc.streamBounties(fixtureHash) }
+            let expected = complete ? 4 : 3
+            try await eventually { wire.sent.count == expected }
+            wire.reply(wire.sent[expected - 1], result: ["stream_id": stream])
+            try snapshot(stream)
+            try chunk(stream, 1, ["type": "state", "tip": [:], "cursor": "final.cursor"])
+            wire.emit(try JSON.encode(["jsonrpc": "2.0", "method": "stream.end",
+                "params": ["stream_id": stream, "complete": complete, "chunks": 2]]) + Data([10]))
+            do {
+                let result = try await pending.value
+                XCTAssertTrue(complete); XCTAssertEqual(result.count, 2)
+                XCTAssertEqual(result.compactMap { $0["type"] as? String }, ["snapshot", "state"])
+            } catch let failure as RpcFailure {
+                XCTAssertFalse(complete); XCTAssertEqual(failure.code, "RPC_PROTOCOL")
+                XCTAssertFalse(failure.unknownOutcome)
+            }
+        }
+        XCTAssertEqual(wire.sent.count, 4)
+        XCTAssertEqual(wire.sent.filter { $0["method"] as? String == "getblockbounties" }.count, 3)
     }
     func testExplicitNodeRejectionIsNotAnUnsentTransportFailure() async throws {
         let wire = RpcTestWire(), rpc = MobileRpcClient(factory: { wire }); defer { rpc.close() }; rpc.setActive(true)

@@ -5,7 +5,7 @@ import { pinnedCryptographyVersion, validateHelperSecurity } from '../scripts/he
 const current = () => ({ type: 'ready', protocol: 4, roots: 1, security: {
   cryptographyVersion: '50.0.1', minimumCryptographyVersion: '50.0.1',
   opensslVersion: 'OpenSSL 4.0.2 11 Aug 2026',
-  rsaPublicExponentMaxBits: 64,
+  rsaPublicExponentMaxBits: 64, admissionGate: 1,
 } });
 
 test('packaging reads one exact provider pin on Windows and Unix', () => {

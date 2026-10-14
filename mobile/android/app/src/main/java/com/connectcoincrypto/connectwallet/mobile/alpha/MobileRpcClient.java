@@ -94,6 +94,8 @@ public final class MobileRpcClient implements AutoCloseable {
         public final boolean unknownOutcome;
         /** Positive transport evidence: this request never attempted a write. */
         public final boolean notSent;
+        /** A validated gateway response proves it rejected the request before node submission. */
+        public final boolean notForwarded;
         public final Integer nodeCode;
         public final long retryAfterMs;
         /** Safe operation metadata only: never includes an endpoint, parameters or response content. */
@@ -116,20 +118,27 @@ public final class MobileRpcClient implements AutoCloseable {
         }
         private RpcFailure(String code, boolean unknownOutcome, Integer nodeCode, long retryAfterMs, boolean explicitRejection,
             String method, String phase, long elapsedMs, long queuedMs, long bytesReceived, boolean transportLoss, boolean networkSuspended, boolean notSent) {
+            this(code, unknownOutcome, nodeCode, retryAfterMs, explicitRejection, method, phase, elapsedMs, queuedMs, bytesReceived,
+                transportLoss, networkSuspended, notSent, false);
+        }
+        private RpcFailure(String code, boolean unknownOutcome, Integer nodeCode, long retryAfterMs, boolean explicitRejection,
+            String method, String phase, long elapsedMs, long queuedMs, long bytesReceived, boolean transportLoss, boolean networkSuspended, boolean notSent, boolean notForwarded) {
             super(unknownOutcome ? "Broadcast outcome is unknown. Check its transaction ID before retrying." : message(code));
             this.code = code; this.unknownOutcome = unknownOutcome; this.nodeCode = nodeCode;
             this.retryAfterMs = retryAfterMs; this.explicitRejection = explicitRejection;
             this.method = method; this.phase = phase; this.elapsedMs = elapsedMs; this.queuedMs = queuedMs; this.bytesReceived = bytesReceived;
             this.transportLoss = transportLoss; this.networkSuspended = networkSuspended;
             this.notSent = notSent && !unknownOutcome && !explicitRejection;
+            this.notForwarded = notForwarded && !unknownOutcome && !explicitRejection && nodeCode == null &&
+                Arrays.asList("-32001", "-32029", "-32030").contains(code);
         }
         RpcFailure recoveryHint(boolean lost, boolean suspended) {
             return new RpcFailure(code, unknownOutcome, nodeCode, retryAfterMs, explicitRejection, method, phase,
-                elapsedMs, queuedMs, bytesReceived, lost, suspended, notSent);
+                elapsedMs, queuedMs, bytesReceived, lost, suspended, notSent, notForwarded);
         }
         private RpcFailure beforeWrite(String method) {
             return new RpcFailure(code, unknownOutcome, nodeCode, retryAfterMs, explicitRejection, method, phase,
-                elapsedMs, queuedMs, bytesReceived, transportLoss, networkSuspended, "sendrawtransaction".equals(method));
+                elapsedMs, queuedMs, bytesReceived, transportLoss, networkSuspended, "sendrawtransaction".equals(method), notForwarded);
         }
     }
     public interface ChunkConsumer { void accept(JSONObject chunk) throws Exception; }
@@ -179,7 +188,11 @@ public final class MobileRpcClient implements AutoCloseable {
         ArrayList<Job> cancelled = null;
         synchronized (this) {
             if (closed) return; active = enabled; networkSuspended = !enabled && networkUnavailable;
-            if (!enabled) { generation++; cancelled = new ArrayList<>(jobs); workers.getQueue().clear(); detachConnection(); }
+            if (!enabled) {
+                generation++; cancelled = new ArrayList<>(jobs);
+                for (Job job : cancelled) job.cancelForLifecycle(networkUnavailable);
+                workers.getQueue().clear(); detachConnection();
+            }
         }
         // A concurrent resume must not have its newly queued jobs cancelled.
         if (cancelled != null) for (Job job : cancelled) job.finish(null, failure("RPC_CANCELLED").recoveryHint(false, networkUnavailable), true);
@@ -187,7 +200,11 @@ public final class MobileRpcClient implements AutoCloseable {
     synchronized boolean isActive() { return active && !closed; }
     public void cancelAll() {
         ArrayList<Job> cancelled;
-        synchronized (this) { generation++; cancelled = new ArrayList<>(jobs); workers.getQueue().clear(); detachConnection(); }
+        synchronized (this) {
+            generation++; cancelled = new ArrayList<>(jobs);
+            for (Job job : cancelled) job.cancelForLifecycle(false);
+            workers.getQueue().clear(); detachConnection();
+        }
         for (Job job : cancelled) job.finish(null, failure("RPC_CANCELLED"), true);
     }
     /** Cancel only this client's operation, atomically before any request bytes may be written. */
@@ -196,7 +213,7 @@ public final class MobileRpcClient implements AutoCloseable {
         synchronized (this) {
             for (Job job : jobs) if (job.future == future) {
                 if (job.done.get() || job.writeAttempted || job.preWriteCancelled) return false;
-                job.preWriteCancelled = true; cancelled = job; break;
+                job.preWriteCancelled = true; job.cancelForLifecycle(false); cancelled = job; break;
             }
         }
         if (cancelled == null) return false;
@@ -415,7 +432,7 @@ public final class MobileRpcClient implements AutoCloseable {
                     // Once TCP connects, readiness belongs to the connection,
                     // not to the first request. Its individual cancellation
                     // must not leave a connected Socket marked unconnected.
-                    if (lost || closed || !active || generation != owner.epoch) throw failure("RPC_CANCELLED").recoveryHint(false, !closed && !active && networkSuspended);
+                    if (lost || closed || !active || generation != owner.epoch) throw owner.cancellation();
                     connected = true;
                 }
                 Thread reader = new Thread(this::read, "connectwallet-native-tcp-reader");
@@ -503,7 +520,10 @@ public final class MobileRpcClient implements AutoCloseable {
         // Cancellation completes with RpcFailure, preserving unknownOutcome
         // rather than hiding an in-flight broadcast behind CancellationException.
         final CompletableFuture<JSONObject> future = new CompletableFuture<JSONObject>() {
-            @Override public boolean cancel(boolean mayInterruptIfRunning) { return finish(null, failure("RPC_CANCELLED")); }
+            @Override public boolean cancel(boolean mayInterruptIfRunning) {
+                synchronized (MobileRpcClient.this) { cancelForLifecycle(false); }
+                return finish(null, failure("RPC_CANCELLED"));
+            }
         };
         volatile Connection connection;
         final ArrayBlockingQueue<Inbound> inbox = new ArrayBlockingQueue<>(MAX_BUFFERED_FRAMES);
@@ -514,16 +534,25 @@ public final class MobileRpcClient implements AutoCloseable {
         long deadlineSerial, quotaStarted = -1, quotaElapsed, queueStarted = -1, queueElapsed;
         volatile long bytesReceived;
         volatile String phase = "queue";
-        boolean writeAttempted;
+        boolean writeAttempted, cancelledByNetwork, terminalCancellation;
         Job(String method, JSONObject params, String id, long epoch, ChunkConsumer consumer, Object writeGuard, Runnable beforeWrite) {
             this.method = method; this.params = params; this.id = id; this.epoch = epoch; this.consumer = consumer;
             this.writeGuard = writeGuard; this.beforeWrite = beforeWrite;
             timeoutMs = consumer == null ? requestTimeoutMs : streamTimeoutMs;
         }
         MobileRpcClient owner() { return MobileRpcClient.this; }
+        /** Under the client monitor, before closing sockets or publishing any
+         * cancellation. The cause belongs to this job, not a resumed epoch. */
+        void cancelForLifecycle(boolean networkUnavailable) {
+            if (networkUnavailable) cancelledByNetwork = true;
+            else terminalCancellation = true;
+        }
+        RpcFailure cancellation() {
+            return failure("RPC_CANCELLED").recoveryHint(false, !closed && cancelledByNetwork && !terminalCancellation);
+        }
         void check() throws RpcFailure {
             synchronized (MobileRpcClient.this) {
-                if (done.get() || preWriteCancelled || closed || !active || generation != epoch) throw failure("RPC_CANCELLED").recoveryHint(false, !closed && !active && networkSuspended);
+                if (done.get() || preWriteCancelled || closed || !active || generation != epoch) throw cancellation();
                 if (activeElapsed() >= timeoutMs) throw failure("RPC_TIMEOUT");
             }
         }
@@ -588,12 +617,19 @@ public final class MobileRpcClient implements AutoCloseable {
                   synchronized (writeGuard == null ? MobileRpcClient.this : writeGuard) {
                     synchronized (MobileRpcClient.this) {
                         check(); if (wire.lost || connection != wire) throw failure("RPC_UNAVAILABLE");
-                        long wait = quotaWait(this, true);
+                        long wait = quotaWait(this, false);
                         if (wait > 0) { parkForQuota(wait); return; }
                         if (beforeWrite != null) {
                             try { beforeWrite.run(); }
                             catch (RuntimeException obsolete) { throw failure("RPC_CANCELLED"); }
                         }
+                        // A stale owner fence (or reentrant lifecycle change)
+                        // has not sent anything and must not consume RPC quota.
+                        // Keep the final check/debit atomic with write admission;
+                        // once admitted, even a failed write stays charged.
+                        check(); if (wire.lost || connection != wire) throw failure("RPC_UNAVAILABLE");
+                        wait = quotaWait(this, true);
+                        if (wait > 0) { parkForQuota(wait); return; }
                         phase = "write"; wire.replies.put(id, this); writeAttempted = true;
                     }
                   }
@@ -684,7 +720,7 @@ public final class MobileRpcClient implements AutoCloseable {
                 }
                 if (!tombstone) {
                     if (!done.compareAndSet(false, true)) return false;
-                    if (closed || !active || epoch != generation) { result = null; error = failure("RPC_CANCELLED"); }
+                    if (closed || !active || epoch != generation) { result = null; error = cancellation(); }
                     if (error != null) error = detailed(error);
                     if (error != null && error.code.equals("-32029")) cooldowns.put(method, cooldownAfter(Math.max(quotaWindowMs, error.retryAfterMs)));
                     if (deadline != null) deadline.cancel(false); if (quotaWake != null) quotaWake.cancel(false);
@@ -702,9 +738,9 @@ public final class MobileRpcClient implements AutoCloseable {
         RpcFailure detailed(RpcFailure error) {
             long elapsed = Math.max(0, nowMs() - started);
             long queued = Math.max(0, Math.min(elapsed, queueElapsed + (queueStarted < 0 ? 0 : nowMs() - queueStarted)));
-            return new RpcFailure(error.code, error.unknownOutcome || method.equals("sendrawtransaction") && writeAttempted && !error.explicitRejection,
+            return new RpcFailure(error.code, error.unknownOutcome || method.equals("sendrawtransaction") && writeAttempted && !error.explicitRejection && !error.notForwarded,
                 error.nodeCode, error.retryAfterMs, error.explicitRejection, method, phase, elapsed, queued, bytesReceived,
-                error.transportLoss, error.networkSuspended, !writeAttempted && method.equals("sendrawtransaction"));
+                error.transportLoss, error.networkSuspended, !writeAttempted && method.equals("sendrawtransaction"), error.notForwarded && method.equals("sendrawtransaction"));
         }
     }
     private static boolean integerEquals(Object value, long expected) {
@@ -769,7 +805,12 @@ public final class MobileRpcClient implements AutoCloseable {
                     retry = ((Number) delay).longValue();
                 }
             }
-            throw new RpcFailure(code, false, nodeCode, retry, code.equals("-32020") && nodeCode != null);
+            // Only these gateway codes guarantee rejection before dispatch to
+            // sendrawtransaction. -32002 and arbitrary response metadata do not.
+            boolean validData = !remote.has("data") || remote.isNull("data") || data != null;
+            boolean notForwarded = Arrays.asList("-32001", "-32029", "-32030").contains(code) && validData && (data == null || !data.has("node_code"));
+            throw new RpcFailure(code, false, nodeCode, retry, code.equals("-32020") && nodeCode != null,
+                "", "", 0, 0, 0, false, false, false, notForwarded);
         }
         Object result = response.opt("result");
         if (!(result instanceof JSONObject)) throw failure("RPC_PROTOCOL");

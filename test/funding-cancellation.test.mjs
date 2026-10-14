@@ -33,7 +33,7 @@ function serviceFixture(t, rpc) {
     inputs: [{ txid: '99'.repeat(32), vout: 0, sequence: 0xffffffff, scriptSig: '', witness: [] }],
     outputs: [{ type: 2, amount: '1000000000', domain: 'example.com', target: 'f'.repeat(64), rootVersion: 1, mask: 7 }] };
   const raw = serializeTransaction(transaction).toString('hex');
-  const bounty = { txid: transactionId(transaction), vout: 0, amount: '1000000000', status: 'available' };
+  const bounty = { txid: transactionId(transaction), vout: 0, amount: '1000000000', status: 'available', block_height: 1 };
   const service = new WalletService({ directory: '/unused-funding-cancellation-test' });
   service.config = { ...structuredClone(DEFAULT_CONFIG), network: 'testnet4' };
   service.epoch = 7; service.session = { data: {} }; service.rpc = rpc;

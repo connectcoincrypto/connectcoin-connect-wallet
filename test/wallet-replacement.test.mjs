@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { WalletService } from '../src/core/wallet-service.mjs';
 import { decryptVault, encryptVault, replaceVault, unlockVault, vaultFingerprint } from '../src/core/vault.mjs';
@@ -303,4 +304,78 @@ test('service invalidates replacement authorization after a post-publication dur
   await s.unlock({ password: NEW_PASSWORD });
   assert.equal(s.session.data.name, 'Recovered wallet');
   assert.equal((await backups(s)).length, 1);
+});
+
+test('replacement cleanup failure after rename still reports the published wallet and preserves its backup', async t => {
+  const s = await fixture(t), expectedFingerprint = await vaultFingerprint(s.vaultFile);
+  const realRename = fs.renameSync, realUnlink = fsPromises.unlink;
+  let published = false, cleanupFailures = 0;
+  const rename = t.mock.method(fs, 'renameSync', (...args) => {
+    const result = realRename(...args); published = true; return result;
+  });
+  const unlink = t.mock.method(fsPromises, 'unlink', async path => {
+    if (published && dirname(path) === s.directory && basename(path).startsWith('.wallet-')) {
+      cleanupFailures++;
+      throw Object.assign(new Error('Injected post-publication cleanup failure'), { code: 'EIO' });
+    }
+    return realUnlink(path);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(replaceVault(s.vaultFile, OLD_DATA, NEW_PASSWORD, { expectedFingerprint }),
+      error => error.walletPublished === true && /new wallet was installed/i.test(error.message));
+  } finally { rename.mock.restore(); unlink.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(published, true); assert.equal(cleanupFailures, 1);
+  assert.deepEqual(await unlockVault(s.vaultFile, NEW_PASSWORD), OLD_DATA);
+  const files = await backups(s); assert.equal(files.length, 1);
+  assert.deepEqual(await readFile(join(s.directory, 'wallet-backups', files[0])), originalBytes);
+});
+
+test('service revokes replacement authorization when post-rename cleanup fails instead of treating recovery as aborted', async t => {
+  const s = await fixture(t);
+  const { replacementId } = await s.beginWalletReplacement({ mode: 'recover' });
+  const generation = s.walletGeneration, realRename = fs.renameSync, realUnlink = fsPromises.unlink;
+  let published = false;
+  const rename = t.mock.method(fs, 'renameSync', (...args) => {
+    const result = realRename(...args); published = true; return result;
+  });
+  const unlink = t.mock.method(fsPromises, 'unlink', async path => {
+    if (published && dirname(path) === s.directory && basename(path).startsWith('.wallet-')) {
+      throw Object.assign(new Error('Injected post-publication cleanup failure'), { code: 'EACCES' });
+    }
+    return realUnlink(path);
+  });
+  syncBuiltinESMExports();
+  try { await assert.rejects(s.restoreWallet(input(replacementId)), error => error.walletPublished === true); }
+  finally { rename.mock.restore(); unlink.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(s.walletGeneration, generation + 1);
+  assert.equal(s.getState().phase, 'locked'); assert.equal(s.getState().replacementActive, false);
+  assert.equal(s.getState().setupActive, false); assert.match(s.getState().error, /new password/);
+  await assert.rejects(s.restoreWallet(input(replacementId)), /expired/);
+  await s.unlock({ password: NEW_PASSWORD });
+  assert.equal(s.session.data.name, 'Recovered wallet');
+  const files = await backups(s); assert.equal(files.length, 1);
+  assert.deepEqual(await readFile(join(s.directory, 'wallet-backups', files[0])), originalBytes);
+});
+
+test('replacement cleanup failure before rename does not claim that the new wallet was installed', async t => {
+  const s = await fixture(t), expectedFingerprint = await vaultFingerprint(s.vaultFile);
+  const realUnlink = fsPromises.unlink;
+  let checks = 0;
+  const unlink = t.mock.method(fsPromises, 'unlink', async path => {
+    if (dirname(path) === s.directory && basename(path).startsWith('.wallet-')) {
+      throw Object.assign(new Error('Injected pre-publication cleanup failure'), { code: 'EACCES' });
+    }
+    return realUnlink(path);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(replaceVault(s.vaultFile, OLD_DATA, NEW_PASSWORD, {
+      expectedFingerprint, check() { if (++checks === 4) throw new Error('Cancelled before publication'); },
+    }), error => error.code === 'EACCES' && error.walletPublished !== true);
+  } finally { unlink.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(checks, 4); await unchanged(s);
+  assert.deepEqual(await unlockVault(s.vaultFile, OLD_PASSWORD), OLD_DATA);
+  const files = await backups(s); assert.equal(files.length, 1);
+  assert.deepEqual(await readFile(join(s.directory, 'wallet-backups', files[0])), originalBytes);
 });

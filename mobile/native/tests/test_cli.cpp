@@ -13,6 +13,10 @@
 #include <algorithm>
 using namespace connectwallet;
 #include "parallel_verification.inc"
+namespace {
+int64_t verification_cancel_handle=0;
+void CancelDuringVerification(const void*) { Cancel(verification_cancel_handle); }
+}
 std::vector<unsigned char> Read(const char* path,size_t limit) {
     std::ifstream file(path,std::ios::binary);
     if(!file) throw std::runtime_error("TEST_FILE");
@@ -32,6 +36,11 @@ int main(int argc,char** argv) {
             result=VerifyParallel(context,Read(argv[8],65536),roots);
         } else if(std::string(argv[1])=="verify-prepared") {
             result=CheckPreparedVerificationForTest(context,Read(argv[8],65536),roots);
+        } else if(std::string(argv[1])=="verify-cache") {
+            result=CheckVerifierCacheForTest(context,Read(argv[8],65536),roots);
+        } else if(std::string(argv[1])=="capture-reuse") {
+            int port=std::stoi(argv[8]); if(port<1 || port>65535) throw std::runtime_error("TEST_PORT");
+            result=CheckTlsCaptureSequenceForTest(context,static_cast<uint16_t>(port),roots);
         } else if(std::string(argv[1])=="capture-parallel") {
             int port=std::stoi(argv[8]); if(port<1 || port>65535) throw std::runtime_error("TEST_PORT");
             result=CaptureParallel(context,roots,static_cast<uint16_t>(port),argc>=10?std::stoi(argv[9]):5000,argc==11?std::stoi(argv[10]):8);
@@ -45,17 +54,29 @@ int main(int argc,char** argv) {
             DestroyCancellation(handle); if(canceller.joinable()) canceller.join();
             if(NativeWorkStatsForTest().proof_serializations) throw std::runtime_error("TEST_PROBE_SERIALIZED_PROOF");
             std::cout<<status<<'\n'; return 0;
-        } else if(std::string(argv[1])=="capture") {
+        } else if(std::string(argv[1])=="capture" || std::string(argv[1])=="capture-cancel-verify") {
             int port=std::stoi(argv[8]); if(port<1 || port>65535) throw std::runtime_error("TEST_PORT");
             auto handle=CreateCancellation();
-            if(HasStarted(handle)) throw std::runtime_error("TEST_UNSTARTED_HANDLE");
+            BindClaimBudget(handle,"1:a:0",context.target_hex,"0");
+            if(HasStarted(handle) || HasCaptured(handle)) throw std::runtime_error("TEST_UNSTARTED_HANDLE");
+            const bool verification_cancel=std::string(argv[1])=="capture-cancel-verify";
+            if(verification_cancel) { verification_cancel_handle=handle; SetVerificationObserverForTest(CancelDuringVerification); }
             std::thread canceller;
             if(argc==11) canceller=std::thread([handle,delay=std::stoi(argv[10])] { std::this_thread::sleep_for(std::chrono::milliseconds(delay)); Cancel(handle); });
             try { result=CaptureLoopbackForTest(context,argc>=10?std::stoi(argv[9]):5000,handle,static_cast<uint16_t>(port),roots); }
-            catch(...) { DestroyCancellation(handle); if(canceller.joinable()) canceller.join(); throw; }
+            catch(...) {
+                SetVerificationObserverForTest(nullptr);
+                const bool retained=HasCaptured(handle) && ClaimBudgetCountForTest(handle)==1;
+                DestroyCancellation(handle); if(canceller.joinable()) canceller.join();
+                if(verification_cancel && !retained) throw std::runtime_error("TEST_CANCELLED_CAPTURE_BUDGET");
+                throw;
+            }
+            SetVerificationObserverForTest(nullptr);
+            if(verification_cancel) throw std::runtime_error("TEST_CAPTURE_NOT_CANCELLED");
             bool started=HasStarted(handle);
+            if(ClaimBudgetCountForTest(handle)!=(result.captured?1u:0u) || HasCaptured(handle)!=result.captured) throw std::runtime_error("TEST_CAPTURE_BUDGET_COUNT");
             DestroyCancellation(handle); if(canceller.joinable()) canceller.join();
-            if(!started || HasStarted(handle)) throw std::runtime_error("TEST_TCP_START_ACK");
+            if(!started || HasStarted(handle) || HasCaptured(handle)) throw std::runtime_error("TEST_TCP_START_ACK");
         } else throw std::runtime_error("TEST_MODE");
         const auto stats=NativeWorkStatsForTest();
         std::cout<<"{\"captured\":"<<(result.captured?"true":"false")<<",\"validationPassed\":"<<(result.validation_passed?"true":"false")<<",\"validProof\":"<<(result.valid_proof?"true":"false")<<",\"meetsTarget\":"<<(result.meets_target?"true":"false")<<",\"durationMs\":"<<result.duration_ms<<",\"proof\":\""<<result.proof_hex<<"\",\"errorCode\":\""<<result.error_code<<"\",\"testWork\":{\"contextBuilds\":"<<stats.context_builds<<",\"contextHits\":"<<stats.context_hits<<",\"contextHexDecodes\":"<<stats.context_hex_decodes<<",\"timeChecks\":"<<stats.time_checks<<",\"proofSerializations\":"<<stats.proof_serializations<<",\"serializedBytes\":"<<stats.serialized_bytes<<"}}\n";

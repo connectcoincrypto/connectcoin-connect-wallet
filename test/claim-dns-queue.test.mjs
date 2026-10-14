@@ -30,16 +30,17 @@ function fixture(t) {
     attempt(context, callbacks) {
       return new Promise(resolve => {
         const request = { context, settled: false };
-        request.finish = () => {
+        request.finish = (changes = {}) => {
           if (request.settled) return;
-          request.settled = true; callbacks.signal.removeEventListener('abort', request.finish);
+          request.settled = true; callbacks.signal.removeEventListener('abort', abort);
           const result = { started: true, captured: false, cancelled: true, validationPassed: null,
-            seconds: 0.01, proof: null, verified: false };
+            seconds: 0.01, proof: null, verified: false, ...changes };
           callbacks.onCapture(result); callbacks.onResult(result); resolve(result);
         };
+        const abort = () => request.finish();
         requests.push(request); callbacks.onStarted();
         if (callbacks.signal.aborted) request.finish();
-        else callbacks.signal.addEventListener('abort', request.finish, { once: true });
+        else callbacks.signal.addEventListener('abort', abort, { once: true });
       });
     },
   };
@@ -86,6 +87,76 @@ for (const invalidation of ['remove', 'retire']) {
     assert.ok(rows.every(bounty => !engine.successCounts.has(keyOf(bounty))));
   });
 }
+
+for (const outcome of ['success', 'failure']) {
+  test(`DNS ${outcome} after budget exhaustion and periodic rebuild does not strand a new bounty`, async t => {
+    const f = fixture(t), { engine } = f;
+    const exhausted = { ...row(0), connection_work_target: 'f'.repeat(64) };
+    const replacement = { ...exhausted, vout: 1 };
+    const invalidCapture = { captured: true, cancelled: false, validationPassed: false };
+    engine.enqueue([exhausted]); engine.start(); await settle();
+    f.pending.get(exhausted.domain)(); await settle();
+    assert.equal(f.requests.length, 2);
+    // Keep each capture younger than the native watchdog while the first DNS
+    // cache expires. Only completed raw captures consume the exact budget.
+    t.mock.timers.tick(30000);
+    f.requests[0].finish(invalidCapture); f.requests[1].finish(invalidCapture); await settle();
+    assert.equal(engine.successCounts.get(keyOf(exhausted)), 2n);
+    t.mock.timers.tick(29000);
+    f.requests[2].finish(); f.requests[3].finish(); await settle();
+    t.mock.timers.tick(2000);
+    f.requests[4].finish(); await settle();
+    assert.equal(f.resolutions.length, 2);
+    assert.equal(engine.resolving.size, 1, 'DNS renewal is outstanding while another capture is active');
+    f.requests[5].finish(invalidCapture); await settle();
+    assert.equal(engine.successCounts.get(keyOf(exhausted)), 3n);
+    assert.equal(engine.queue.get(keyOf(exhausted)).budgetExceeded, true);
+    t.mock.timers.tick(5000); await settle(); // Use the real periodic rebuild.
+    assert.equal(engine.scheduler.groups.size, 0);
+    assert.deepEqual(engine.scheduler.domainGates.get(exhausted.domain), { ready: false, due: 0 });
+    const dnsCompletedAt = Date.now();
+    f.pending.get(exhausted.domain)(outcome === 'failure' ? new Error('Controlled DNS renewal failure') : undefined);
+    await settle();
+    assert.equal(engine.resolving.size, 0);
+    assert.equal(engine.scheduler.groups.size, 0, 'DNS does not reopen exhausted work');
+    assert.deepEqual(engine.scheduler.domainGates.get(exhausted.domain),
+      { ready: true, due: outcome === 'failure' ? dnsCompletedAt + 2000 : 0 });
+    engine.enqueue([replacement]); await settle();
+    if (outcome === 'failure') {
+      assert.equal(f.requests.length, 6);
+      t.mock.timers.tick(1999); await settle();
+      assert.equal(f.resolutions.length, 2, 'failed resolution retains its two-second retry');
+      assert.equal(f.requests.length, 6);
+      t.mock.timers.tick(1); await settle();
+      assert.equal(f.resolutions.length, 3);
+      f.pending.get(exhausted.domain)(); await settle();
+    }
+    assert.equal(f.requests.length, 8, 'the new bounty fills both slots without stop/start');
+    assert.equal(engine.connections.size, 2);
+    assert.equal(engine.resolving.size, 0);
+    assert.equal(engine.state.attempts, 8);
+    assert.equal(engine.successCounts.get(keyOf(exhausted)), 3n, 'old capture budget is unchanged');
+    assert.equal(engine.successCounts.has(keyOf(replacement)), false, 'new starts are not fabricated captures');
+    assert.equal(engine.completed.size, 0);
+    assert.equal(engine.domainStats.get(`${exhausted.domain}:6`).completed, 3);
+  });
+}
+
+test('a late DNS completion after full domain removal cannot leave a scheduler gate or revive work', async t => {
+  const f = fixture(t), { engine } = f, bounty = row(0);
+  engine.enqueue([bounty]); engine.start(); await settle();
+  assert.equal(engine.resolving.size, 1);
+  engine.remove(bounty.txid, bounty.vout);
+  t.mock.timers.tick(5000); await settle();
+  assert.equal(engine.queue.size, 0);
+  assert.equal(engine.scheduler.groups.size, 0);
+  assert.equal(engine.scheduler.domainGates.size, 0);
+  f.pending.get(bounty.domain)(); await settle();
+  assert.equal(engine.resolving.size, 0);
+  assert.equal(engine.scheduler.domainGates.size, 0);
+  assert.equal(f.requests.length, 0);
+  assert.equal(engine.state.attempts, 0);
+});
 
 test('reopening DNS capacity preserves failed-resolution retry deadlines and cancellation', async t => {
   const f = fixture(t), { engine } = f, rows = [row(0), row(1), row(2)];

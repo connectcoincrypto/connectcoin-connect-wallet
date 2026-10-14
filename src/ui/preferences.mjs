@@ -1,5 +1,5 @@
-import { numericInputValue } from './numeric-value.mjs';
 import { MAX_CONNECTION_LIMIT } from '../core/connection-limits.mjs';
+import { numericInputValue } from './numeric-value.mjs';
 
 const numeric = value => Number(numericInputValue(value));
 const integer = (value, min, max) => /^\d+$/.test(String(numericInputValue(value))) && Number.isSafeInteger(numeric(value)) && numeric(value) >= min && numeric(value) <= max;

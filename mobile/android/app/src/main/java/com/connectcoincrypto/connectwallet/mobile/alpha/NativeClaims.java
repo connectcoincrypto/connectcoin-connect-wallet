@@ -19,12 +19,18 @@ public final class NativeClaims {
     public static void setStartRate(long limiter, int rate) { nativeSetStartRate(limiter, rate); }
     /** Clear paused-run timing debt, retaining the rolling actual-start limit. */
     public static void resetStartSchedule(long limiter) { nativeResetStartSchedule(limiter); }
+    /** Atomic pre-TCP gate; already-started captures and rolling history survive. */
+    public static void setStartAllowed(long limiter, boolean allowed) { nativeSetStartAllowed(limiter, allowed); }
+    public static void bindBudget(long handle, String key, String target, String captured) { nativeBindBudget(handle, key, target, captured); }
     public static void destroyStartLimiter(long limiter) { nativeDestroyStartLimiter(limiter); }
     /** Elapsed monotonic nanos since actual connect, or -1 until started.
      * Using an age avoids assuming a shared epoch with System.nanoTime(). */
     public static long startedAgeNanos(long handle) { return nativeStartedAgeNanos(handle); }
     /** Actual TCP-start acknowledgement; query before destroying this handle. */
     public static boolean hasStarted(long handle) { return nativeHasStarted(handle); }
+    /** Completed native capture, including a result withheld on cancellation.
+     * Query after capture returns/throws and before destroying this handle. */
+    public static boolean hasCaptured(long handle) { return nativeHasCaptured(handle); }
     public static void cancel(long handle) { nativeCancel(handle); }
     public static void destroyHandle(long handle) { nativeDestroy(handle); }
 
@@ -63,9 +69,12 @@ public final class NativeClaims {
     private static native long nativeCreateStartLimiter(int rate);
     private static native void nativeSetStartRate(long limiter, int rate);
     private static native void nativeResetStartSchedule(long limiter);
+    private static native void nativeSetStartAllowed(long limiter, boolean allowed);
+    private static native void nativeBindBudget(long handle, String key, String target, String captured);
     private static native void nativeDestroyStartLimiter(long limiter);
     private static native long nativeStartedAgeNanos(long handle);
     private static native boolean nativeHasStarted(long handle);
+    private static native boolean nativeHasCaptured(long handle);
     private static native void nativeCancel(long handle);
     private static native void nativeDestroy(long handle);
     private static native String nativeCapture(String domain, String challengeHex, String targetHex,

@@ -21,14 +21,23 @@ struct ClaimResult {
 void InitializeCrypto();
 int64_t CreateStartLimiter(int rate);
 void SetStartRate(int64_t limiter,int rate);
+// Lifecycle/catalog admission fence. Already-started captures are unaffected.
+void SetStartAllowed(int64_t limiter,bool allowed);
 // Rebase overdue pacing after cancelling a paused/stopped run, without clearing
 // actual-start history or moving a still-future deadline earlier.
 void ResetStartSchedule(int64_t limiter);
 void DestroyStartLimiter(int64_t limiter);
 int64_t CreateCancellation(int64_t limiter=0);
+// Bind before capture. Siblings share a bounded limiter-owned budget keyed by
+// run + ':' + outpoint; imported decimal uint64 counts can only increase it.
+void BindClaimBudget(int64_t handle,const std::string& key,const std::string& target,const std::string& successful_connections);
 // True only once this handle's capture has reached the actual TCP connect call.
 // Unknown/destroyed handles return false; the owner queries before destruction.
 bool HasStarted(int64_t handle);
+// Completed capture observation, independent of usable proof/validation. It
+// survives cancellation so the owner can import its budget before destruction.
+// Unknown/destroyed handles return false; query after the capture call ends.
+bool HasCaptured(int64_t handle);
 // Monotonic nanoseconds captured immediately before connect; zero if unstarted.
 // Native diagnostics only; the Java bridge uses age to avoid epoch assumptions.
 int64_t StartedAtNanos(int64_t handle);
@@ -45,6 +54,7 @@ struct NativeWorkStats {
     size_t context_builds{}, context_hits{}, context_hex_decodes{}, time_checks{}, proof_serializations{}, serialized_bytes{};
 };
 NativeWorkStats NativeWorkStatsForTest();
+uint64_t ClaimBudgetCountForTest(int64_t handle);
 ClaimResult CheckPreparedVerificationForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
 void SetVerificationObserverForTest(void (*observer)(const void*));
 // Test-only APIs cannot be compiled into an Android library. No production call
@@ -52,6 +62,7 @@ void SetVerificationObserverForTest(void (*observer)(const void*));
 ClaimResult VerifyProofForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
 ClaimResult CheckVerifierCacheForTest(const PublicClaimContext&, std::span<const unsigned char> proof, std::span<const unsigned char> roots);
 ClaimResult CaptureLoopbackForTest(const PublicClaimContext&, int timeout_ms, int64_t handle, uint16_t port, std::span<const unsigned char> roots);
+ClaimResult CheckTlsCaptureSequenceForTest(const PublicClaimContext&, uint16_t port, std::span<const unsigned char> roots);
 std::string ProbeRsaLoopbackForTest(const std::string& domain, int64_t validation_time, int timeout_ms, int64_t handle, uint16_t port, std::span<const unsigned char> roots);
 #endif
 bool IsPublicAddress(std::string_view address);

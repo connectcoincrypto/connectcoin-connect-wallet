@@ -309,6 +309,51 @@ public class MobileRpcClientTest {
         }
     }
 
+    @Test public void gatewayRefusalsAreProvenNotForwardedWithoutPretendingNoSocketWrite() throws Exception {
+        for (int code : new int[] { -32001, -32029, -32030 }) {
+            try (Server server = new Server((request, socket) -> bytes(new JSONObject().put("jsonrpc", "2.0").put("id", request.get("id"))
+                .put("error", new JSONObject().put("code", code).put("message", "untrusted private text")
+                    .put("data", new JSONObject().put("retry_after_ms", 120000)))));
+                 MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(client.broadcast(HEX), Integer.toString(code));
+                assertFalse(failure.unknownOutcome); assertFalse(failure.notSent); assertTrue(failure.notForwarded);
+                assertFalse(failure.explicitRejection); assertNull(failure.nodeCode); assertEquals(120000, failure.retryAfterMs);
+                diagnostic(failure, "sendrawtransaction", "parse"); assertTrue(failure.bytesReceived > 0);
+                assertFalse(failure.getMessage().contains("private")); assertEquals(1, server.requests.get());
+                assertTrue(failure.recoveryHint(false, false).notForwarded);
+            }
+        }
+    }
+
+    @Test public void ambiguousOrContradictoryGatewayRepliesCannotClaimNonSubmission() throws Exception {
+        JSONObject[] errors = {
+            new JSONObject().put("code", -32002).put("data", new JSONObject().put("notForwarded", true).put("notSent", true)),
+            new JSONObject().put("code", -32030).put("data", new JSONObject().put("node_code", -27)),
+            new JSONObject().put("code", -32029).put("data", new JSONObject().put("node_code", "invalid")),
+            new JSONObject().put("code", -32001).put("data", new JSONArray()),
+            new JSONObject().put("code", -32030).put("data", true),
+        };
+        for (JSONObject remote : errors) {
+            try (Server server = new Server((request, socket) -> bytes(new JSONObject().put("jsonrpc", "2.0").put("id", request.get("id")).put("error", remote)));
+                 MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(client.broadcast(HEX), remote.get("code").toString());
+                assertTrue(failure.unknownOutcome); assertFalse(failure.notSent); assertFalse(failure.notForwarded);
+                assertEquals(1, server.requests.get());
+            }
+        }
+    }
+
+    @Test public void refusalWithInvalidCooldownOrMismatchedIdStaysAmbiguous() throws Exception {
+        for (boolean mismatched : new boolean[] { false, true }) {
+            try (Server server = new Server((request, socket) -> bytes(new JSONObject().put("jsonrpc", "2.0").put("id", mismatched ? "wrong-id" : request.get("id"))
+                .put("error", new JSONObject().put("code", -32030).put("data", new JSONObject().put("retry_after_ms", "invalid")))));
+                 MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(client.broadcast(HEX), "RPC_PROTOCOL");
+                assertTrue(failure.unknownOutcome); assertFalse(failure.notSent); assertFalse(failure.notForwarded);
+            }
+        }
+    }
+
     @Test public void cancellationAfterWritePreservesUnknownOutcomeAndDrainsReplyOnSharedSocket() throws Exception {
         CountDownLatch written = new CountDownLatch(1), release = new CountDownLatch(1);
         try (Server server = new Server((request, socket) -> { written.countDown(); release.await(3, TimeUnit.SECONDS); return response(request, new JSONObject().put("txid", HASH)); });
@@ -362,6 +407,56 @@ public class MobileRpcClientTest {
             assertFalse(tip.isDone()); assertTrue(client.cancelBeforeWrite(tip));
             diagnostic(error(tip, "RPC_CANCELLED"), "getchaintip", "quota"); assertEquals(54, server.requests.get());
             assertEquals(2, server.connections.get());
+        }
+    }
+
+    @Test public void rejectedFinalWriteGuardsNeverSpendQuotaButRealWritesStillDo() throws Exception {
+        Object owner = new Object(); AtomicInteger guards = new AtomicInteger();
+        try (Server server = new Server((request, socket) -> response(request, new JSONObject().put("txid", HASH)));
+             MobileRpcClient client = server.client(3000)) {
+            for (int i = 0; i < 48; i++) {
+                MobileRpcClient.RpcFailure cancelled = error(client.broadcast(HEX, owner, () -> {
+                    assertTrue(Thread.holdsLock(owner)); guards.incrementAndGet(); throw new IllegalStateException("Synthetic stale claim");
+                }), "RPC_CANCELLED");
+                assertTrue(cancelled.notSent); assertFalse(cancelled.unknownOutcome);
+            }
+            assertEquals(48, guards.get()); assertEquals(0, server.requests.get());
+            for (int i = 0; i < 48; i++) assertEquals(HASH, await(client.broadcast(HEX)).getString("txid"));
+            assertEquals(48, server.requests.get());
+            CompletableFuture<JSONObject> waiting = client.broadcast(HEX);
+            assertThrows(java.util.concurrent.TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS));
+            assertTrue(client.cancelBeforeWrite(waiting)); diagnostic(error(waiting, "RPC_CANCELLED"), "sendrawtransaction", "quota");
+            assertEquals(48, server.requests.get());
+        }
+    }
+
+    @Test public void lifecycleCancellationInsideFinalGuardCannotDebitOrWrite() throws Exception {
+        try (Server server = new Server((request, socket) -> response(request, new JSONObject().put("txid", HASH)));
+             MobileRpcClient client = server.client(3000)) {
+            MobileRpcClient.RpcFailure cancelled = error(client.broadcast(HEX, new Object(), () -> client.setActive(false)), "RPC_CANCELLED");
+            assertTrue(cancelled.notSent); assertFalse(cancelled.unknownOutcome); assertEquals(0, server.requests.get());
+            client.setActive(true);
+            for (int i = 0; i < 48; i++) assertEquals(HASH, await(client.broadcast(HEX)).getString("txid"));
+            assertEquals(48, server.requests.get());
+        }
+    }
+
+    @Test public void actualWrittenRequestsStayChargedAfterEofOrGatewayRefusal() throws Exception {
+        for (boolean eof : new boolean[] { false, true }) {
+            AtomicInteger replies = new AtomicInteger();
+            try (Server server = new Server((request, socket) -> {
+                if (replies.getAndIncrement() == 0) return eof ? null : bytes(new JSONObject().put("jsonrpc", "2.0").put("id", request.get("id"))
+                    .put("error", new JSONObject().put("code", -32030)));
+                return response(request, new JSONObject().put("txid", HASH));
+            }); MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(client.broadcast(HEX), eof ? "RPC_PROTOCOL" : "-32030");
+                assertEquals(eof, failure.unknownOutcome); assertEquals(!eof, failure.notForwarded); assertFalse(failure.notSent);
+                for (int i = 0; i < 47; i++) assertEquals(HASH, await(client.broadcast(HEX)).getString("txid"));
+                CompletableFuture<JSONObject> waiting = client.broadcast(HEX);
+                assertThrows(java.util.concurrent.TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS));
+                assertTrue(client.cancelBeforeWrite(waiting)); diagnostic(error(waiting, "RPC_CANCELLED"), "sendrawtransaction", "quota");
+                assertEquals(48, server.requests.get());
+            }
         }
     }
 
@@ -446,14 +541,14 @@ public class MobileRpcClientTest {
         }
     }
 
-    @Test public void remoteRateRejectionIsNotRetriedAndRetainsBroadcastUncertainty() throws Exception {
+    @Test public void remoteRateRejectionIsNotRetriedAndPreservesProvenNonSubmission() throws Exception {
         for (boolean broadcast : new boolean[] { false, true }) {
             try (Server server = new Server((request, socket) -> bytes(new JSONObject().put("jsonrpc", "2.0").put("id", request.get("id"))
                     .put("error", new JSONObject().put("code", -32029).put("message", "rate limited").put("data", new JSONObject().put("retry_after_ms", 400)))));
                  MobileRpcClient client = server.client(1000, 400)) {
                 MobileRpcClient.RpcFailure failed = error(broadcast ? client.broadcast(HEX) : client.call("getchaintip", new JSONObject()), "-32029");
                 diagnostic(failed, broadcast ? "sendrawtransaction" : "getchaintip", "parse");
-                assertEquals(broadcast, failed.unknownOutcome); assertEquals(400, failed.retryAfterMs);
+                assertFalse(failed.unknownOutcome); assertFalse(failed.notSent); assertEquals(broadcast, failed.notForwarded); assertEquals(400, failed.retryAfterMs);
                 assertEquals(1, server.requests.get());
                 CompletableFuture<JSONObject> next = broadcast ? client.broadcast(HEX) : client.call("getchaintip", new JSONObject());
                 assertFalse(next.isDone()); assertTrue(client.cancelBeforeWrite(next));
@@ -556,6 +651,108 @@ public class MobileRpcClientTest {
                 MobileRpcClient.RpcFailure failure = error(broadcast ? client.broadcast(HEX) : client.call("getaddresshistory", params()), "RPC_PROTOCOL");
                 assertTrue(failure.transportLoss); assertEquals(broadcast, failure.unknownOutcome);
                 assertEquals(!broadcast, HdRecoveryReader.retryable(failure)); assertEquals(1, server.requests.get());
+            }
+        }
+    }
+
+    @Test public void networkPauseKeepsTrustedReadReasonButWrittenBroadcastStaysUnknown() throws Exception {
+        for (boolean broadcast : new boolean[] { false, true }) {
+            CountDownLatch written = new CountDownLatch(1), release = new CountDownLatch(1);
+            try (Server server = new Server((request, socket) -> { written.countDown(); release.await(3, TimeUnit.SECONDS); return null; });
+                 MobileRpcClient client = server.client(3000)) {
+                CompletableFuture<JSONObject> pending = broadcast ? client.broadcast(HEX) : client.call("getaddresshistory", params());
+                assertTrue(written.await(2, TimeUnit.SECONDS)); client.setActive(false, true);
+                MobileRpcClient.RpcFailure failure = error(pending, "RPC_CANCELLED");
+                assertTrue(failure.networkSuspended); assertEquals(broadcast, failure.unknownOutcome);
+                assertFalse(failure.notSent); assertEquals(!broadcast, HdRecoveryReader.retryable(failure));
+                client.setActive(true); assertEquals(1, server.requests.get()); // Transport itself never retransmits.
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test public void realNetworkPauseResumesOneHdReadWithSameCursorWithoutLateEpochPollution() throws Exception {
+        CountDownLatch firstWritten = new CountDownLatch(1), releaseOld = new CountDownLatch(1), oldReleased = new CountDownLatch(1);
+        CountDownLatch retryWritten = new CountDownLatch(1), releaseRetry = new CountDownLatch(1), waitingNetwork = new CountDownLatch(1), completed = new CountDownLatch(1);
+        AtomicInteger sequence = new AtomicInteger(), completions = new AtomicInteger();
+        List<String> cursors = Collections.synchronizedList(new ArrayList<>()), states = Collections.synchronizedList(new ArrayList<>());
+        try (Server server = new Server((request, socket) -> {
+            cursors.add(request.getJSONObject("params").getString("cursor"));
+            if (sequence.incrementAndGet() == 1) { firstWritten.countDown(); releaseOld.await(4, TimeUnit.SECONDS); oldReleased.countDown(); }
+            else { retryWritten.countDown(); releaseRetry.await(4, TimeUnit.SECONDS); }
+            JSONObject tip = new JSONObject().put("chain", "main").put("genesis_hash", com.connectcoincrypto.connectwallet.mobile.alpha.wallet.NativePaymentChecks.GENESIS)
+                .put("height", 123).put("hash", HASH).put("mediantime", 1800000000);
+            return response(request, new JSONObject().put("address", ADDRESS).put("tip", tip).put("unit", "connects")
+                .put("live", true).put("items", new JSONArray()).put("next_cursor", JSONObject.NULL));
+        }); MobileRpcClient client = server.client(4000);
+             HdRecoveryReader recovery = new HdRecoveryReader(client::call, () -> {}, client::isActive, (state, delay, attempt, code) -> {
+                 states.add(state); if (state.equals("waiting-network")) waitingNetwork.countDown();
+             })) {
+            CompletableFuture<JSONObject> logical = recovery.read("getaddresshistory", params().put("cursor", "original.cursor"));
+            logical.whenComplete((result, failure) -> { completions.incrementAndGet(); completed.countDown(); });
+            assertTrue(firstWritten.await(2, TimeUnit.SECONDS)); client.setActive(false, true);
+            assertTrue(waitingNetwork.await(2, TimeUnit.SECONDS)); assertFalse(logical.isDone()); assertEquals(0, completions.get());
+            client.setActive(true); recovery.wake(); assertTrue(retryWritten.await(3, TimeUnit.SECONDS));
+            releaseOld.countDown(); assertTrue(oldReleased.await(2, TimeUnit.SECONDS));
+            assertFalse("Old connection completion cannot finish the new logical read", logical.isDone()); assertTrue(client.isActive());
+            releaseRetry.countDown(); assertTrue(await(logical).isNull("next_cursor")); assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertEquals(List.of("original.cursor", "original.cursor"), cursors); assertEquals(2, server.requests.get());
+            assertEquals(1, completions.get()); assertTrue(states.contains("waiting-network"));
+        } finally { releaseOld.countDown(); releaseRetry.countDown(); }
+    }
+
+    @Test public void explicitLifecycleCancellationRemainsFinalForHdReads() throws Exception {
+        for (String mode : List.of("inactive", "cancelAll", "future", "close", "replace")) {
+            CountDownLatch written = new CountDownLatch(1), release = new CountDownLatch(1);
+            try (Server server = new Server((request, socket) -> { written.countDown(); release.await(3, TimeUnit.SECONDS); return null; });
+                 MobileRpcClient client = server.client(3000)) {
+                CompletableFuture<JSONObject> pending = client.call("getaddresshistory", params());
+                assertTrue(written.await(2, TimeUnit.SECONDS));
+                if (mode.equals("inactive")) client.setActive(false);
+                else if (mode.equals("cancelAll")) client.cancelAll();
+                else if (mode.equals("future")) assertTrue(pending.cancel(false));
+                else if (mode.equals("close")) client.close();
+                else try (MobileRpcClient replacement = client.prepareReplacement(new MobileRpcClient.TcpEndpoint("next.example.com", server.listener.getLocalPort()))) {
+                    client.replaceWith(replacement, () -> {});
+                }
+                MobileRpcClient.RpcFailure failure = error(pending, "RPC_CANCELLED");
+                assertFalse(mode, failure.networkSuspended); assertFalse(mode, HdRecoveryReader.retryable(failure));
+                assertFalse(mode, failure.unknownOutcome); assertEquals(1, server.requests.get());
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test public void terminalCancellationOverridesEarlierJobNetworkMarker() throws Exception {
+        for (String mode : List.of("inactive", "cancelAll", "future", "close")) {
+            CountDownLatch written = new CountDownLatch(1), release = new CountDownLatch(1);
+            try (Server server = new Server((request, socket) -> { written.countDown(); release.await(3, TimeUnit.SECONDS); return null; });
+                 MobileRpcClient client = server.client(3000)) {
+                CompletableFuture<JSONObject> pending = client.call("getaddresshistory", params()); assertTrue(written.await(2, TimeUnit.SECONDS));
+                // Deterministically exercise the interval after network cause
+                // capture but before its asynchronous completion is published.
+                java.lang.reflect.Field jobs = MobileRpcClient.class.getDeclaredField("jobs"); jobs.setAccessible(true);
+                synchronized (client) {
+                    Object job = ((java.util.Set<?>)jobs.get(client)).iterator().next();
+                    java.lang.reflect.Method mark = job.getClass().getDeclaredMethod("cancelForLifecycle", boolean.class); mark.setAccessible(true); mark.invoke(job, true);
+                    if (mode.equals("inactive")) client.setActive(false);
+                    else if (mode.equals("cancelAll")) client.cancelAll();
+                    else if (mode.equals("future")) assertTrue(pending.cancel(false));
+                    else client.close();
+                }
+                MobileRpcClient.RpcFailure failure = error(pending, "RPC_CANCELLED");
+                assertFalse(mode, failure.networkSuspended); assertFalse(mode, HdRecoveryReader.retryable(failure));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test public void interruptedStreamEofIsDistinguishedFromExplicitIncompleteOrMalformedEnd() throws Exception {
+        for (String mode : List.of("eof", "incomplete", "sequence")) {
+            try (Server server = new Server((request, socket) -> {
+                if (!mode.equals("eof")) return stream(request, !mode.equals("incomplete"), mode.equals("sequence") ? 9 : 1).getBytes(StandardCharsets.UTF_8);
+                socket.getOutputStream().write(response(request, new JSONObject().put("stream_id", "fixture"))); socket.getOutputStream().flush();
+                return null;
+            }); MobileRpcClient client = server.client(3000)) {
+                MobileRpcClient.RpcFailure failure = error(client.streamBounties(HASH, unused -> {}), mode.equals("sequence") ? "RPC_PROTOCOL" : "RPC_STREAM_INCOMPLETE");
+                assertEquals(mode.equals("eof"), failure.transportLoss); assertFalse(failure.unknownOutcome); assertEquals(1, server.requests.get());
             }
         }
     }

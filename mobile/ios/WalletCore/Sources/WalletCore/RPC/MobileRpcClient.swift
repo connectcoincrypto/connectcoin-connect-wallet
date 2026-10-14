@@ -9,6 +9,8 @@ public struct RpcFailure: Error, LocalizedError {
     /// Set only by the transport while it knows no write was started. A parsed
     /// server response or unknownOutcome=false alone never establishes this.
     public var notSent = false
+    /// Parsed gateway rejection before node submission, distinct from no socket write.
+    public var notForwarded = false
     public var nodeCode: Int?
     public var retryAfterMs = 0
     public var explicitRejection = false
@@ -374,10 +376,15 @@ public final class MobileRpcClient: @unchecked Sendable {
                 var error = RpcFailure(String(try remote.integer("code", min: Int64(Int32.min), max: Int64(Int32.max))))
                 if let details = remote["data"] as? JSONObject {
                     if let node = try? details.integer("node_code"), [-22, -25, -26, -27, -8].contains(node) { error.nodeCode = Int(node) }
-                    if let delay = try? details.integer("retry_after_ms", min: 0, max: 9_007_199_254_740_991) { error.retryAfterMs = Int(delay) }
+                    if details.has("retry_after_ms") { error.retryAfterMs = Int(try details.integer("retry_after_ms", min: 0, max: 9_007_199_254_740_991)) }
                 }
                 error.explicitRejection = error.code == "-32020" && error.nodeCode != nil
-                error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection
+                // These codes are emitted before node dispatch. An ambiguous
+                // -32002 or caller-supplied metadata never proves non-submission.
+                let validData = !remote.has("data") || remote["data"] is NSNull || remote["data"] is JSONObject
+                error.notForwarded = job.method == "sendrawtransaction" && validData && ["-32001", "-32029", "-32030"].contains(error.code) &&
+                    !((remote["data"] as? JSONObject)?.has("node_code") ?? false)
+                error.unknownOutcome = job.method == "sendrawtransaction" && !error.explicitRejection && !error.notForwarded
                 if error.code == "-32029" { cooldowns[job.method] = now() + max(window, Double(error.retryAfterMs) / 1000) }
                 finish(job, .failure(error)); return
             }

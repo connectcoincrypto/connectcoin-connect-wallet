@@ -437,22 +437,19 @@ test('WalletService commits the full cache with its cursor and reuses it across 
   assert.equal(source.count('getbountychanges'), 6);
 });
 
-test('WalletService drains and clears reset work before starting a blocked adaptive hash request', async t => {
+test('WalletService gates reset work without draining the pool before a blocked adaptive hash request', async t => {
   const { service, source } = walletFixture(t);
   await service.syncBountiesInternal(service.epoch);
   const { claimWindow, claimBlocks, claimCursor } = service;
   source.current = makeWindow(701);
   const trace = [];
-  let resetEntered, drain, hashEntered, failHash;
-  const resetting = new Promise(resolve => { resetEntered = resolve; });
-  const draining = new Promise(resolve => { drain = resolve; });
+  let hashEntered, failHash;
   const hashing = new Promise(resolve => { hashEntered = resolve; });
   const blockedHash = new Promise(resolve => { failHash = resolve; });
-  t.after(() => { drain(); failHash(); });
-  service.engine.suspend = async () => {
-    service.engine.paused = true; trace.push('suspend'); resetEntered(); await draining;
-  };
-  service.engine.clear = () => { trace.push('clear'); };
+  t.after(() => { failHash(); service.releaseClaimCatalog(); });
+  service.engine.suspend = async () => { assert.fail('Resync must not stop existing captures'); };
+  service.engine.clear = () => { assert.fail('Resync must not discard the old queue/proofs'); };
+  service.engine.setCatalogBlocked = value => { service.engine.catalogBlocked = value; trace.push(value ? 'block' : 'release'); };
   let reset = false;
   source.hook = async (method, count, params) => {
     if (method === 'getbountychanges' && !reset) {
@@ -468,17 +465,14 @@ test('WalletService drains and clears reset work before starting a blocked adapt
   };
   const pending = service.syncBountiesInternal(service.epoch);
   const rejected = assert.rejects(pending, error => error.code === 'RPC_TIMEOUT');
-  await resetting;
-  assert.deepEqual(trace, ['suspend']);
-  assert.equal(source.count('getrecentblockhashes'), 1, 'Do not request another hash list while old workers drain.');
-  drain(); await hashing;
-  assert.deepEqual(trace, ['suspend', 'clear', 'hash-query']);
-  assert.equal(service.engine.paused, true, 'The old catalog cannot authorize work throughout the hash wait.');
+  await hashing;
+  assert.deepEqual(trace, ['block', 'hash-query']);
+  assert.equal(service.engine.catalogBlocked, true, 'The old catalog cannot authorize new work throughout the hash wait.');
   assert.strictEqual(service.claimWindow, claimWindow); assert.strictEqual(service.claimBlocks, claimBlocks);
   assert.equal(service.claimCursor, claimCursor, 'The reset watermark cannot become a committed cursor.');
   failHash(); await rejected;
   assert.equal(service.engine.resumes, 1, 'A failed reset must not resume workers.');
-  assert.equal(service.engine.paused, true);
+  assert.equal(service.engine.catalogBlocked, true);
 });
 
 for (const stage of ['stream', 'final tip']) test(`WalletService leaves its committed cache and cursor untouched after ${stage} failure`, async t => {

@@ -52,8 +52,10 @@ struct ClaimInteger: Comparable, Equatable {
 
 final class ClaimProgress {
     let factor: UInt64, block: String, policy: String
+    var identity: ClaimCandidate.Identity?
     var prepared: JSONObject?
     var captures: UInt64 = 0
+    var budgetExhausted = false
     init(block: String, policy: String, factor: UInt64? = nil) throws {
         self.block = block; self.policy = policy
         if let factor {
@@ -65,15 +67,84 @@ final class ClaimProgress {
         while random >= (UInt64(1) << 32) / 100_001 * 100_001
         self.factor = 1_000_000 + random % 100_001
     }
+
+    /// Publish bounded accounting for both the canonical window and outputs
+    /// whose funding block was just displaced. Their transaction may be mined
+    /// again after a later stream/reset; losing this entry between those reads
+    /// would reset the capture budget, priority factor and receipt history.
+    /// This is metadata only: no orphaned preparation or proof is resurrected.
+    static func reconcile(previous: [String: ClaimProgress], catalog: [String: ClaimCandidate],
+                          window: ClaimRecentWindow, loaded: Set<String>, protected: Set<String>) throws -> [String: ClaimProgress] {
+        var next = previous
+        for row in catalog.values { next[row.key] = row.progress }
+        let heights = window.heights, oldest = window.blocks.last!.height
+        for (key, item) in next where !protected.contains(key) {
+            if heights[item.block] != nil {
+                if loaded.contains(item.block), catalog[key] == nil { next.removeValue(forKey: key) }
+            } else if let identity = item.identity, identity.height >= oldest {
+                // A rollback can leave the former height above today's tip.
+                // It has not aged out; the same fixed total bound still applies.
+                if item.prepared != nil {
+                    let light = try ClaimProgress(block: item.block, policy: item.policy, factor: item.factor)
+                    light.identity = identity; light.captures = item.captures; light.budgetExhausted = item.budgetExhausted
+                    next[key] = light
+                }
+            } else { next.removeValue(forKey: key) }
+        }
+        try walletRequire(ClaimSubmissionRetry.validProgressCount(next.count), "CLAIMS_CAPACITY")
+        // A relocated stream copies accounting before its asynchronous journal
+        // and final fence. Old handles may drain while those reads await. Only
+        // at publication, merge that newer accounting into the staged copy;
+        // it has not admitted work, so these totals share the same prefix.
+        // Validate all identities before touching any of the staged objects.
+        for row in catalog.values {
+            if let current = previous[row.key], current !== row.progress {
+                try walletRequire(current.identity?.sameOutput(as: row.identity) == true, "CLAIMS_RPC_DATA")
+            }
+        }
+        for row in catalog.values {
+            if let current = previous[row.key], current !== row.progress {
+                row.progress.captures = max(row.progress.captures, current.captures)
+                row.progress.budgetExhausted = row.progress.budgetExhausted || current.budgetExhausted
+            }
+        }
+        return next
+    }
+
+    /// Called once when the native handle drains, independently of whether
+    /// its result can still be used by this lifecycle. The native budget may
+    /// already include a capture which cancellation hid from the result.
+    /// A reorg may have copied accounting into a new Progress while it ran;
+    /// update that existing same-output copy too, never resurrect an entry.
+    static func recordNativeCapture(_ captured: ClaimCandidate, hasCaptured: Bool, current: ClaimProgress?) {
+        guard hasCaptured else { return }
+        let original = captured.progress
+        if original.captures != UInt64.max { original.captures += 1 }
+        if let current, current !== original, let identity = current.identity,
+           identity.sameOutput(as: captured.identity), current.captures != UInt64.max {
+            current.captures += 1
+        }
+    }
 }
 
 struct ClaimCandidate {
+    /// Status/confirmations change; the funding output and its chain location do not.
+    struct Identity: Equatable {
+        let key: String, block: String, domain: String, target: String
+        let height: Int64, amount: Int64, roots: Int64, mask: Int32, coinbase: Bool
+        func sameOutput(as other: Identity) -> Bool {
+            key == other.key && domain == other.domain && target == other.target && amount == other.amount &&
+                roots == other.roots && mask == other.mask && coinbase == other.coinbase
+        }
+    }
+    let identity: Identity
     let bounty: JSONObject, key: String, domain: String, policy: String, target: String, block: String
     let height: Int64, mask: Int32, coinbase: Bool, supported: Bool
     let targetPlusOne: ClaimInteger, raw: ClaimInteger
     let captureStopCount: UInt64, outpointOrder: [UInt8], outputIndex: Int64
     private(set) var priority: ClaimInteger
     var state: String
+    var spendingTxid: String?
     var progress: ClaimProgress { didSet { priority = raw.multiplied(progress.factor) } }
     init(_ source: JSONObject, block expectedBlock: String, fee: Int64, factor: UInt64? = nil) throws {
         bounty = try JSON.clone(source)
@@ -92,16 +163,36 @@ struct ClaimCandidate {
         policy = domain + ":" + String(mask)
         state = try PJ.string(source["status"])
         try walletRequire(["available", "immature", "pending_spend", "spent"].contains(state), "CLAIMS_RPC_DATA")
+        if let spender = source["spending_txid"], !(spender is NSNull) { spendingTxid = try PJ.hash(spender) }
         supported = roots == 1 && domain.contains(".") && !PJ.matches(domain, "[0-9]+(?:\\.[0-9]+){3}") &&
             ![".localhost", ".local", ".internal"].contains(where: domain.hasSuffix)
         targetPlusOne = try ClaimInteger(hex: target).plusOne()
         captureStopCount = targetPlusOne.captureStopCount
         let amount = try PJ.money(source, "amount")
+        identity = Identity(key: key, block: block, domain: domain, target: target,
+            height: height, amount: amount, roots: roots, mask: mask, coinbase: coinbase)
         raw = targetPlusOne.multiplied(UInt64(max(0, amount - fee)))
         progress = try ClaimProgress(block: block, policy: policy, factor: factor)
         priority = raw.multiplied(progress.factor)
+        progress.identity = identity
     }
-    var budget: Bool { progress.captures < captureStopCount }
+    var budget: Bool { !progress.budgetExhausted && progress.captures < captureStopCount }
+    mutating func reuse(_ previous: ClaimProgress) throws {
+        guard let old = previous.identity else { throw WalletError("CLAIMS_RPC_DATA") }
+        try walletRequire(old.sameOutput(as: identity), "CLAIMS_RPC_DATA")
+        if old.block == block {
+            try walletRequire(old.height == height, "CLAIMS_RPC_DATA")
+            progress = previous
+        } else {
+            // The same transaction may be mined again after a reorg. Its old
+            // proposal/proof cannot survive relocation; its exact budget and
+            // priority factor must not reset merely because the block moved.
+            let relocated = try ClaimProgress(block: block, policy: policy, factor: previous.factor)
+            relocated.identity = identity; relocated.captures = previous.captures
+            relocated.budgetExhausted = previous.budgetExhausted
+            progress = relocated
+        }
+    }
     static func before(_ a: ClaimCandidate, _ b: ClaimCandidate) -> Bool {
         if a.priority != b.priority { return a.priority > b.priority }
         // Core uint256 outpoint ordering compares display-order txids backwards.
@@ -155,22 +246,28 @@ final class ClaimPerformanceWindow {
 }
 
 /// A cached leader for each domain/mask. Fair domain turns alternate with EV
-/// turns; low-observed-rate recovery probes are bounded to one per minute.
+/// turns. Positive-reward policies get up to 32 calibration starts, then one
+/// probe/minute; all probes share a no-credit four-starts/second global gate.
 struct ClaimScheduler {
+    final class Probe { var starts = 0; var nextDue = 0.0 }
     struct Entry { let row: ClaimCandidate, score: Double, recovering: Bool, transportDue: Double }
     final class Selection {
         let id = UUID()
         let row: ClaimCandidate, recovering: Bool, economic: Bool, serial: UInt64
+        let selectedAt: Double, probe: Probe?
         var reserved = false, committed = false
-        init(row: ClaimCandidate, recovering: Bool, economic: Bool, serial: UInt64) {
+        init(row: ClaimCandidate, recovering: Bool, economic: Bool, serial: UInt64, now: Double, probe: Probe?) {
             self.row = row; self.recovering = recovering; self.economic = economic; self.serial = serial
+            selectedAt = now; self.probe = probe
         }
     }
     var groups: [String: [Int32: [Entry]]] = [:]
     private var names: [String] = []
     private var locations: [String: (String, Int32)] = [:]
-    var probeDue: [String: Double] = [:]
-    var pendingProbes: [String: UUID] = [:]
+    private var probes: [String: Probe] = [:]
+    private var pendingProbe: Selection?
+    private var nextGlobalProbe = 0.0
+    var probeCount: Int { probes.count }
     private var probeOrder: [String] = []
     private var economic = false
     private var domainAfter = ""
@@ -184,21 +281,18 @@ struct ClaimScheduler {
     mutating func rebuild(_ rows: [ClaimCandidate], stats: [String: ClaimPerformanceWindow], retired: Set<String>, now: Double) {
         groups.removeAll(keepingCapacity: true)
         locations.removeAll(keepingCapacity: true)
-        let policies = Set(rows.map(\.policy))
-        probeDue = probeDue.filter { policies.contains($0.key) }
-        probeOrder.removeAll { probeDue[$0] == nil }
         let eligible = rows.filter { $0.supported && $0.state == "available" && !retired.contains($0.key) && $0.budget && $0.raw > ClaimInteger() }
         // Read/age each policy only once per refresh, not once per bounty.
         var rates: [String: Double] = [:]
         for row in eligible where rates[row.policy] == nil { rates[row.policy] = stats[row.policy]?.rate ?? 5 }
         let healthy = Set(eligible.filter { Self.worth($0, rate: rates[$0.policy]!) }.map(\.policy))
         var recovering: [String: ClaimCandidate] = [:]
-        for row in eligible where !healthy.contains(row.policy) && Self.worth(row, rate: 5) {
+        for row in eligible where !healthy.contains(row.policy) {
             if recovering[row.policy] == nil || ClaimCandidate.before(row, recovering[row.policy]!) { recovering[row.policy] = row }
         }
         let admitted = recovering.values.sorted(by: ClaimCandidate.before).prefix(256)
         let admittedKeys = Set(admitted.map(\.key))
-        for row in admitted { _ = due(row.policy, now: now) }
+        for row in admitted { _ = probeState(row.policy) }
         for row in eligible {
             let rate = rates[row.policy]!
             let recovery = !Self.worth(row, rate: rate)
@@ -214,11 +308,16 @@ struct ClaimScheduler {
             groups[domain]![mask]!.sort { ClaimCandidate.before($0.row, $1.row) }
         } }
     }
-    private mutating func due(_ policy: String, now: Double) -> Double {
-        if let value = probeDue[policy] { return value }
-        if probeOrder.count >= 256 { probeDue.removeValue(forKey: probeOrder.removeFirst()) }
-        probeOrder.append(policy); probeDue[policy] = now + 60
-        return now + 60
+    private mutating func probeState(_ policy: String) -> Probe {
+        if let value = probes[policy] { return value }
+        if probeOrder.count >= 256, let oldest = probeOrder.firstIndex(where: { $0 != pendingProbe?.row.policy }) {
+            probes.removeValue(forKey: probeOrder.remove(at: oldest))
+        }
+        let value = Probe(); probeOrder.append(policy); probes[policy] = value
+        return value
+    }
+    private mutating func probeReady(_ policy: String, now: Double) -> Bool {
+        pendingProbe == nil && now >= nextGlobalProbe && now >= probeState(policy).nextDue
     }
     mutating func next(now: Double, prepared: Bool) -> Selection? {
         var reward: Entry?, first: Entry?, after: Entry?
@@ -226,7 +325,7 @@ struct ClaimScheduler {
             var best: Entry?
             for mask in groups[domain]!.values {
                 guard let row = mask.first, row.transportDue <= now,
-                      !row.recovering || (pendingProbes[row.row.policy] == nil && due(row.row.policy, now: now) <= now) else { continue }
+                      !row.recovering || probeReady(row.row.policy, now: now) else { continue }
                 if best == nil || row.score > best!.score || row.score == best!.score && ClaimCandidate.before(row.row, best!.row) { best = row }
             }
             if let best, (best.row.progress.prepared != nil) == prepared {
@@ -236,30 +335,38 @@ struct ClaimScheduler {
             }
         }
         let selected = economic ? reward : after ?? first
-        return selected.map { Selection(row: $0.row, recovering: $0.recovering, economic: economic, serial: serial) }
+        guard let selected else { return nil }
+        return Selection(row: selected.row, recovering: selected.recovering, economic: economic, serial: serial,
+                         now: now, probe: selected.recovering ? probeState(selected.row.policy) : nil)
     }
-    @discardableResult mutating func reserve(_ selected: Selection) -> Bool {
-        guard !selected.reserved && selected.serial == serial && (!selected.recovering || pendingProbes[selected.row.policy] == nil) else { return false }
+    @discardableResult mutating func reserve(_ selected: Selection, now: Double? = nil) -> Bool {
+        let time = now ?? selected.selectedAt
+        guard !selected.reserved && selected.serial == serial && (!selected.recovering ||
+            (pendingProbe == nil && time >= nextGlobalProbe && time >= selected.probe!.nextDue)) else { return false }
         selected.reserved = true
         if !selected.economic { domainAfter = selected.row.domain }
         economic = !selected.economic
         serial &+= 1
-        if selected.recovering { pendingProbes[selected.row.policy] = selected.id }
+        if selected.recovering { pendingProbe = selected }
         return true
     }
     @discardableResult mutating func acknowledge(_ selected: Selection, now: Double) -> Bool {
         guard selected.reserved && !selected.committed else { return false }
         selected.committed = true
         if selected.recovering {
-            _ = due(selected.row.policy, now: now)
-            probeOrder.removeAll { $0 == selected.row.policy }; probeOrder.append(selected.row.policy)
-            probeDue[selected.row.policy] = now + 60
+            let probe = selected.probe!
+            probe.starts = min(32, probe.starts + 1)
+            probe.nextDue = max(probe.nextDue, now + (probe.starts < 32 ? 0.25 : 60))
+            nextGlobalProbe = max(nextGlobalProbe, now + 0.25)
+            if probes[selected.row.policy] === probe {
+                probeOrder.removeAll { $0 == selected.row.policy }; probeOrder.append(selected.row.policy)
+            }
         }
         release(selected)
         return true
     }
     mutating func release(_ selected: Selection) {
-        if selected.recovering && pendingProbes[selected.row.policy] == selected.id { pendingProbes.removeValue(forKey: selected.row.policy) }
+        if pendingProbe === selected { pendingProbe = nil }
     }
     mutating func remove(_ key: String) {
         guard let (domain, mask) = locations.removeValue(forKey: key) else { return }

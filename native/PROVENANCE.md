@@ -1,7 +1,7 @@
 # Native helper provenance
 
 Imported into ConnectWallet from the MIT-licensed connectcoin-claimer native
-helper at `f97fe7f5b8078957ca514f72133a5b0b6db2f829`. The cryptographic and network
+helper at `7ce30c45fe962f41f3d4fa3887bb423c680a2d2c`. The cryptographic and network
 implementation is retained; wallet-specific changes integrate build/packaging,
 require offline fixture registration during desktop builds, expose the actual
 embedded root-bundle hash, and mark local route/family exclusions separately
@@ -24,8 +24,13 @@ adapted from MIT-licensed ConnectCoin Core at commit
 
 The transport and service adapters replace Core's node-specific dependencies.
 Worker-local certificate/root parsing state avoids a shared verification lock.
-The single-message certificate parsing cache also owns immutable metadata tied
-to its exact DER: all supplied RSA exponents are checked before publication,
+The bounded worker-local certificate parsing LRU owns up to four exact TLS
+Certificate messages and immutable metadata tied to their DER. It retains at
+most 65,536 bytes of message/DER storage and a separate conservative 262,144-byte
+charge for parsed structures/key allocations per worker (not measured RSS).
+Larger inputs still undergo all validation without being retained. Parse or
+admission failures cannot evict a previously valid entry. All supplied RSA
+exponents are checked before publication,
 leaf KU/EKU is decoded once, and all supplied validity dates are converted to
 Unix bounds once. Each proof still checks its new block-median validation time
 against every supplied certificate's bounds and enforces the leaf usage result.
@@ -47,6 +52,25 @@ Moved-from contexts cannot be reused. Captured proofs own immutable
 bytes/context/parsed spans so the ordinary service can reuse one parse and its
 hashes through authentication.
 No ephemeral key, TLS nonce, shared secret or CV result is reused.
+Each worker reuses only its TLS configuration and record-buffer allocations.
+After every capture, including failures and cancellation, the complete provider
+session reset clears handshake/session/transform state. RNG, BIO and hostname
+bindings are detached before the storage becomes idle; reset failure discards
+the context. Signature masks and the challenge are rebound per attempt. This
+does not enable session resumption, share state across workers, or cache any
+dynamic proof result. Offline tests exercise mixed domains/masks, fresh key
+shares, interrupted captures, reset failure and subsequent successful recovery.
+
+The TCP start gate uses a FIFO wait queue with one deadline-owning head instead
+of periodic polling by every queued worker. Cancellation is published and wakes
+the waiter before acquiring its socket mutex; budget/reachability invalidations
+and shutdown also wake affected jobs. Start acknowledgement still precedes TCP,
+and the original configurable pacing phase and one-second catch-up bound remain.
+A failed acknowledgement closes admission before a successor can start. Capture
+and validation counters retain their separate, per-job immutable observations.
+Terminal acknowledgements retire the job and its admission/budget reservations
+before becoming visible to the controller. Identity-guarded cleanup prevents
+double retirement, including queued cancellation and output failures.
 The existing Python helper remains in `helpers/` as a differential reference,
 not a runtime dependency or automatic fallback.
 
@@ -126,8 +150,11 @@ TLS-owned DER chain is omitted: the caller immediately parses the same exact
 message through the owned certificate cache, and every proof still undergoes
 the full chain, hostname, time, usage, signature-mask, CertificateVerify and
 target checks. No untrusted parsed input becomes an authentication result.
-The complete-handshake path keeps the original Mbed TLS handler. Offline
-differential tests compare old/new admission for ECDSA/RSA, malformed lengths,
+The complete-handshake path keeps the original Mbed TLS handler. Abbreviated
+captures omit the unused TLS-owned Certificate transcript checksum;
+the owned proof parser still hashes the exact transcript for full chain and
+CertificateVerify authentication. The completed-handshake checksum is unchanged.
+Offline differential tests compare old/new admission for ECDSA/RSA, malformed lengths,
 DER/count limits, empty chains, unknown/forbidden/unsolicited/duplicate
 extensions and per-entry masks; loopback tests cover fragmented certificates,
 fresh repeated captures, cache reuse and both native/Python proof verification.

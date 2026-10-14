@@ -2640,7 +2640,7 @@ for (const enabled of [true, false]) {
     await waitReady(page);
     await expect(page.locator('#wallet-panel')).toBeHidden();
     await expect(page.locator('#background-claims')).toBeVisible();
-    await expect(page.locator('#background-claims-status')).toContainText(enabled ? 'claiming' : 'error');
+    await expect(page.locator('#background-claims-status')).toContainText(enabled ? 'Claiming' : 'Error');
     await expect(page.locator('#stop-background-claims')).toBeEnabled();
     await page.locator('#stop-background-claims').click();
     await expect(page.locator('#background-claims')).toBeHidden();
@@ -3165,7 +3165,7 @@ test('native-owned receive works with bounded RPC errors and conservative saved 
   await expect(page.locator('#background')).not.toBeChecked();
   await page.locator('#mobile-data').check();
   await page.locator('#background').check();
-  await expect(page.locator('#claims-status')).toContainText('stopped');
+  await expect(page.locator('#claims-status')).toContainText('Stopped');
   expect(await page.evaluate(() => window.testNative.calls.some(call => call.method === 'claimsStart'))).toBe(false);
   await expect(page.locator('#global-error')).toBeEmpty();
   await page.screenshot({ path: 'test-results/mobile-claims.png', fullPage: true });
@@ -3687,7 +3687,7 @@ test('polling preserves draft limits and saving while claims run does not restar
   await page.locator('#stop-claims').click();
   await page.evaluate(() => window.testNative.releaseResponses());
   await expect(page.locator('#claims-limits-status')).toContainText('Saved ceilings: 25/second · 15 simultaneous');
-  await expect(page.locator('#claims-status')).toContainText('stopped');
+  await expect(page.locator('#claims-status')).toContainText('Stopped');
   expect(await page.evaluate(() => window.testNative.calls.some(call => call.method === 'claimsStart'))).toBe(false);
 });
 
@@ -3734,6 +3734,60 @@ test('unknown saved limits and browser preview cannot apply phantom defaults', a
   await expect(page.locator('#claims-rate-limit')).toBeDisabled();
   await page.locator('#claims-limits-form').dispatchEvent('submit');
   expect(await page.evaluate(() => window.testNative.calls.some(call => ['claimsStart', 'claimsLimits'].includes(call.method)))).toBe(false);
+});
+
+for (const platform of ['android', 'ios']) test(`${platform} explains economic waiting without inventing attempts or eligibility`, async ({ page }) => {
+  await openNativeWallet(page, { platform, claims: { enabled: true, requested: true, running: true, allowed: true,
+    policyStatus: 'allowed', status: 'waiting', waitingReason: 'economic-floor', available: 200, eligible: 0,
+    economicFiltered: 200, attempts: 0, valid: 0, invalid: 0, targetHits: 0, submitted: 0, unknown: 0 } });
+  await page.getByRole('button', { name: 'Claims', exact: true }).click();
+  await expect(page.locator('#claims-status')).toContainText('Below the economic floor');
+  await expect(page.locator('#claims-available')).toHaveText('200');
+  await expect(page.locator('#claims-eligible')).toHaveText('0');
+  await expect(page.locator('#claims-economicFiltered')).toHaveText('200');
+  await expect(page.locator('#claims-attempts')).toHaveText('0'); await expect(page.locator('#claims-valid')).toHaveText('0');
+  await expect(page.locator('#stop-claims')).toBeEnabled();
+  await page.setViewportSize({ width: 320, height: 568 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(await page.evaluate(() => window.testNative.calls.some(call => ['claimsStart', 'sendrawtransaction'].includes(call.method)))).toBe(false);
+});
+
+for (const platform of ['android', 'ios']) test(`${platform} shows aged proof submission without a stale availability-wait message`, async ({ page }) => {
+  await openNativeWallet(page, { platform, claims: { enabled: true, requested: true, running: true, allowed: true,
+    policyStatus: 'allowed', status: 'submitting', awaitingAvailability: 2,
+    attempts: 18, valid: 14, invalid: 4, targetHits: 3, submitted: 1, unknown: 0, activeConnections: 0 } });
+  await page.getByRole('button', { name: 'Claims', exact: true }).click();
+  await expect(page.locator('#claims-status')).toHaveText('Allowed · Submitting');
+  await expect(page.locator('#claims-discovery')).toBeEmpty();
+  await expect(page.locator('body')).not.toContainText('Waiting for current bounty availability');
+  await expect(page.locator('body')).not.toContainText('not queued for submission');
+  for (const [key, value] of Object.entries({ attempts: 18, valid: 14, invalid: 4, targetHits: 3, submitted: 1, unknown: 0, activeConnections: 0 })) {
+    await expect(page.locator('#claims-' + key)).toHaveText(String(value));
+  }
+  await expect(page.locator('#stop-claims')).toBeEnabled();
+  await expect(page.locator('#start-claims')).toBeDisabled();
+  await page.setViewportSize({ width: 320, height: 568 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(await page.evaluate(() => window.testNative.calls.some(call => ['claimsStart', 'sendrawtransaction', 'claimsCheckSubmission', 'reviewPayment'].includes(call.method)))).toBe(false);
+  // Native still owns broadcast and counters; the renderer cannot infer a
+  // successful submission simply from a preserved proof or expired window.
+  await page.evaluate(() => Object.assign(window.testNative.claims, { status: 'submitted', submitted: 2 }));
+  await expect(page.locator('#claims-status')).toHaveText('Allowed · Submitted');
+  await expect(page.locator('#claims-discovery')).toBeEmpty();
+  await expect(page.locator('#claims-attempts')).toHaveText('18');
+  await expect(page.locator('#claims-submitted')).toHaveText('2');
+});
+
+test('background proof submission keeps Stop available without unlocking or stale availability text', async ({ page }) => {
+  await fakeNative(page, { exists: true, locked: true, accountAddress: null,
+    claims: { enabled: true, requested: true, allowed: true, policyStatus: 'allowed', status: 'submitting', awaitingAvailability: 1 } });
+  await page.goto('/'); await waitReady(page);
+  await expect(page.locator('#background-claims-status')).toHaveText('Allowed · Submitting');
+  await page.locator('#stop-background-claims').click();
+  await expect(page.locator('#background-claims')).toBeHidden();
+  await expect(page.locator('#wallet-panel')).toBeHidden();
+  expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'claimsStop').length)).toBe(1);
+  expect(await page.evaluate(() => window.testNative.calls.some(call => ['claimsStart', 'sendrawtransaction', 'unlock', 'reviewPayment'].includes(call.method)))).toBe(false);
 });
 
 test('payment request fields, long links and QR fit the smallest supported viewport', async ({ page }) => {

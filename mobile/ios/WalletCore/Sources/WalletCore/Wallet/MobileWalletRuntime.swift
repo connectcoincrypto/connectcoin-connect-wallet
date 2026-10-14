@@ -84,9 +84,10 @@ public actor MobileWalletRuntime {
             // Security revocation and timer cancellation precede the first await.
             // An older cleanup must never cancel a newer foreground timer/watch.
             let (_, old) = revoke(); inactivity?.cancel(); inactivity = nil
-            await old?.close(); await afterLock?()
-            guard revision == activityRevision && !active else { return }
+            // Claims own native sockets independently of the HD actor. Revoke
+            // their foreground policy before waiting for unrelated HD cleanup.
             await claims.setActive(false)
+            await old?.close(); await afterLock?()
             guard revision == activityRevision && !active else { return }
             await subscriptions?.stop()
             guard revision == activityRevision && !active else { return }
@@ -369,16 +370,17 @@ public actor MobileWalletRuntime {
                 // Revoke old endpoint recovery and every publication token before
                 // awaiting replacement. Public ownership remains watch-only.
                 let token = try await revokeForOperation(), storage = try store()
-                await claims.close(); await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
+                let claimsReplacement = try await claims.closeForReplacement()
+                await subscriptions?.stop(); subscriptions = nil; rpcGeneration &+= 1
                 do {
                     let replacement = try await rpc.replaceEndpoint(TcpEndpoint(next.string("rpcHost"), Int(next.integer("rpcPort"))), persist: { [fence] in
                         try fence.commit(token) { try storage.write(.settings, JSON.encode(next)) }
                     })
                     settings = next; rpc = replacement; rpc.setActive(active)
                 } catch {
-                    claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions(); throw error
+                    claims = claimsReplacement.makeEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions(); throw error
                 }
-                claims = MobileClaimsEngine(rpc: rpc, receiptURL:claimsReceiptURL); await claims.setActive(active); await refreshSubscriptions()
+                claims = claimsReplacement.makeEngine(rpc: rpc); await claims.setActive(active); await refreshSubscriptions()
                 emit("walletStateChanged", try await publicState())
             } else { try store().write(.settings, JSON.encode(next)); settings = next }
             settingsError = nil

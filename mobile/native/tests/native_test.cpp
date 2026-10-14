@@ -11,6 +11,8 @@ namespace connectwallet { void CheckNativeEndpointPriorityForTest(); }
 namespace connectwallet { void CheckNativeStartLimiterForTest(); }
 namespace connectwallet { bool CheckNativeRootStoreForTest(); }
 namespace connectwallet { void CheckNativePreparedContextForTest(); }
+namespace connectwallet { void CheckNativeTlsReuseForTest(); }
+namespace connectwallet { void CheckNativeAdmissionGuardsForTest(); }
 void Expect(bool value,const char* message) { if(!value) throw std::runtime_error(message); }
 int main() {
     try {
@@ -41,7 +43,9 @@ int main() {
         CheckNativeCapacityForTest();
         CheckNativeEndpointPriorityForTest();
         CheckNativeStartLimiterForTest();
+        CheckNativeAdmissionGuardsForTest();
         CheckNativePreparedContextForTest();
+        CheckNativeTlsReuseForTest();
         std::cout<<"Offline public P2C smoke passed\n"; return 0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

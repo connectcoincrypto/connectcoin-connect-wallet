@@ -86,4 +86,59 @@ public class NativeTransactionsTest {
         JSONObject duplicate = NativeTransactions.parse(parent); duplicate.getJSONArray("inputs").put(duplicate.getJSONArray("inputs").getJSONObject(0));
         assertThrows(IllegalArgumentException.class, () -> NativeTransactions.serialize(duplicate, true));
     }
+    @Test public void observedClaimAcceptsAnotherBoundWitnessWithoutChangingOriginalBytes() throws Exception {
+        JSONObject f = fixture();
+        JSONObject prepared = NativeTransactions.prepareClaim(f.getJSONObject("bounty"), f.getString("bountyHex"), f.getString("rewardAddress"), 1500);
+        String proof = f.getString("proof");
+        // Framing-only fixtures: changing CertificateVerify does not change the
+        // stripped transaction ID. Full TLS validity remains the node's job.
+        String alternateProof = proof.substring(0, proof.length() - 8) + "0f000001aa";
+        JSONObject original = NativeTransactions.attachClaim(prepared, proof), alternate = NativeTransactions.attachClaim(prepared, alternateProof);
+        String originalHex = original.getString("hex"), alternateHex = alternate.getString("hex"), txid = original.getString("txid");
+        assertNotEquals(originalHex, alternateHex); assertEquals(txid, alternate.getString("txid"));
+        NativeTransactions.validateObservedClaim(originalHex, txid, originalHex);
+        NativeTransactions.validateObservedClaim(alternateHex, txid, originalHex);
+        NativeTransactions.validateObservedClaim(alternateHex, txid, null);
+        NativeTransactions.validateObservedClaim(alternateHex, txid, originalHex, "ff".repeat(32));
+        assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(alternateHex, txid, originalHex, "00".repeat(32)));
+        assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(alternateHex, txid, originalHex, "ff"));
+        assertEquals(f.getJSONObject("attached").getString("hex"), originalHex);
+        assertEquals(f.getJSONObject("claim").getString("hex"), prepared.getString("hex"));
+    }
+    @Test public void observedSameIdNeverBypassesProofFramingChallengeOrWitnessChecks() throws Exception {
+        JSONObject f = fixture(); String originalHex = f.getJSONObject("attached").getString("hex"), txid = f.getJSONObject("attached").getString("txid");
+        String proof = f.getString("proof"); byte[] wrongChallenge = WalletCrypto.fromHex(proof); wrongChallenge[7] ^= 1;
+        for (String invalid : new String[] {"00" + proof.substring(2), WalletCrypto.hex(wrongChallenge), proof + "00", proof.substring(0, proof.length() - 2),
+                proof.substring(0, proof.length() - 8) + "0e000000", proof.substring(0, proof.length() - 8) + "0f002001" + "00".repeat(8193)}) {
+            JSONObject observed = NativeTransactions.parse(originalHex);
+            observed.getJSONArray("inputs").getJSONObject(0).put("witness", new JSONArray().put(invalid));
+            String raw = WalletCrypto.hex(NativeTransactions.serialize(observed, true));
+            assertEquals(txid, NativeTransactions.txid(observed));
+            assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(raw, txid, originalHex));
+        }
+        for (JSONArray invalid : new JSONArray[] {new JSONArray(), new JSONArray().put(proof).put(proof)}) {
+            JSONObject observed = NativeTransactions.parse(originalHex); observed.getJSONArray("inputs").getJSONObject(0).put("witness", invalid);
+            String raw = WalletCrypto.hex(NativeTransactions.serialize(observed, true)); assertEquals(txid, NativeTransactions.txid(observed));
+            assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(raw, txid, originalHex));
+        }
+    }
+    @Test public void observedClaimRejectsDifferentBaseMalformedWireAndPaymentTransactions() throws Exception {
+        JSONObject f = fixture(); String original = f.getJSONObject("attached").getString("hex"), txid = f.getJSONObject("attached").getString("txid");
+        for (String field : new String[] {"version", "locktime", "vout", "sequence", "scriptSig", "amount", "publicKey"}) {
+            JSONObject changed = NativeTransactions.parse(original);
+            JSONObject input = changed.getJSONArray("inputs").getJSONObject(0), output = changed.getJSONArray("outputs").getJSONObject(0);
+            if (field.equals("version")) changed.put(field, 1); else if (field.equals("locktime")) changed.put(field, 1);
+            else if (field.equals("vout")) input.put(field, 99); else if (field.equals("sequence")) input.put(field, 0xfffffffdL);
+            else if (field.equals("scriptSig")) input.put(field, "00"); else if (field.equals("amount")) output.put(field, "100000");
+            else output.put(field, f.getString("publicKey"));
+            String raw = WalletCrypto.hex(NativeTransactions.serialize(changed, true)), changedId = NativeTransactions.txid(changed);
+            assertNotEquals(field, txid, changedId);
+            assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(raw, txid, original));
+            assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(raw, changedId, original));
+        }
+        for (String raw : new String[] {original + "00", original.substring(0, original.length() - 2), f.getJSONObject("payment").getString("hex")})
+            assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(raw, txid, original));
+        String payment = f.getJSONObject("payment").getString("hex"), paymentId = f.getJSONObject("payment").getString("txid");
+        assertThrows(IllegalArgumentException.class, () -> NativeTransactions.validateObservedClaim(payment, paymentId, null));
+    }
 }

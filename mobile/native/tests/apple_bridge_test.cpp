@@ -11,10 +11,25 @@ int main() {
     assert(limiter != 0 && error[0] == '\0');
     assert(cw_claim_limiter_set_rate(limiter, 3, error) == 1);
     assert(cw_claim_limiter_reset(limiter, error) == 1);
+    assert(cw_claim_limiter_set_allowed(limiter, 0, error) == 1);
+    assert(cw_claim_limiter_set_allowed(limiter, 2, error) == 0);
+    assert(std::strcmp(error, "CLAIM_CONTEXT") == 0);
+    assert(cw_claim_limiter_set_allowed(limiter, 1, error) == 1);
     const auto handle = cw_claim_cancellation_create(limiter, error);
     assert(handle != 0 && error[0] == '\0');
     assert(cw_claim_has_started(handle) == 0);
     assert(cw_claim_started_age_nanos(handle) == -1);
+    assert(cw_claim_has_captured(handle) == 0);
+    const char* target="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    assert(cw_claim_bind_budget(handle,"1:a:0",target,"18446744073709551616",error)==0);
+    assert(std::strcmp(error,"CLAIM_CONTEXT")==0);
+    assert(cw_claim_bind_budget(handle,"1:a:0",target,"3",error)==1);
+    cw_claim_context budget_context{"example.com","0000000000000000000000000000000000000000000000000000000000000000",target,1,7,1700000000};
+    cw_claim_result blocked{};
+    assert(cw_claim_capture(&budget_context,100,handle,&blocked)==0);
+    assert(std::strcmp(blocked.error_code,"CLAIM_BUDGET")==0 && !blocked.captured && !cw_claim_has_started(handle));
+    assert(cw_claim_has_captured(handle) == 0);
+    cw_claim_result_free(&blocked);
     cw_claim_result result{};
     assert(cw_claim_capture(nullptr, 100, handle, &result) == 0);
     assert(result.proof_hex == nullptr);
@@ -29,6 +44,7 @@ int main() {
     cw_claim_cancellation_destroy(handle);
     assert(cw_claim_has_started(handle) == 0);
     assert(cw_claim_started_age_nanos(handle) == -1);
+    assert(cw_claim_has_captured(handle) == 0);
     cw_claim_limiter_destroy(limiter);
     return 0;
 }

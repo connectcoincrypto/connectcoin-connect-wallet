@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ClaimsEngine } from '../src/core/claims-engine.mjs';
-import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES } from '../src/core/claim-connection-policy.mjs';
+import { ClaimConnectionPolicy, MAX_RECOVERY_POLICIES, BOOTSTRAP_PROBE_COUNT } from '../src/core/claim-connection-policy.mjs';
 import { P2CDomainStats } from '../src/core/claim-priority.mjs';
 
 const hash = id => id.toString(16).padStart(64, '0');
@@ -85,10 +85,14 @@ test('repeated TCP failures replenish all global slots without introducing a dom
 });
 
 function failedStats() { const stats = new P2CDomainStats(); for (let i = 0; i < 10; i++) stats.record(false, 10); return stats; }
+function bootstrapFinished(engine, policy) {
+  for (let i = 0; i < BOOTSTRAP_PROBE_COUNT; i++) engine.connectionPolicy.probeStarted(policy);
+}
 
-test('below-floor domain gets at most one recovery TCP start per minute without resetting EMA', async t => {
+test('after calibration a below-floor domain gets one recovery start per minute without resetting its window', async t => {
   const { engine, attempts } = fixture(t);
   const stats = failedStats(); engine.domainStats.set('alpha.example:7', stats);
+  bootstrapFinished(engine, 'alpha.example:7');
   const bounties = Array.from({ length: 20 }, (_, i) => row(i + 1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) }));
   engine.enqueue(bounties); engine.start(); await settle();
   assert.equal(engine.queue.size, 1); assert.equal(attempts.length, 0);
@@ -96,15 +100,15 @@ test('below-floor domain gets at most one recovery TCP start per minute without 
   t.mock.timers.tick(1); await settle(); assert.equal(attempts.length, 1);
   assert.equal(engine.domainStats.get('alpha.example:7'), stats); assert.equal(stats.completed, 10);
   attempts[0].finish({ message: 'TLS connection timed out' }); await settle();
-  const nextDue = engine.connectionPolicy.probes.get('alpha.example:7');
+  const nextDue = engine.connectionPolicy.probeDue('alpha.example:7');
   await engine.suspend(); engine.clear({ preserveSelection: true }); engine.enqueue(bounties); engine.retainCatalog(bounties); engine.resume();
   t.mock.timers.tick(59999); await settle(); assert.equal(attempts.length, 1);
-  assert.equal(engine.connectionPolicy.probes.get('alpha.example:7'), nextDue);
+  assert.equal(engine.connectionPolicy.probeDue('alpha.example:7'), nextDue);
   t.mock.timers.tick(1); await settle(); assert.equal(attempts.length, 2);
   assert.equal(stats.completed, 11);
 });
 
-test('recovery never admits intrinsically below-floor candidates and admission remains bounded', async t => {
+test('sampling admission is bounded and prioritizes higher-return candidates without evicting normal work', async t => {
   const { engine } = fixture(t, { maxQueue: 10 });
   for (let i = 0; i < 20; i++) engine.domainStats.set(`d${i}.example:7`, failedStats());
   const unhealthy = Array.from({ length: 20 }, (_, i) => row(i + 1, `d${i}.example`, { amount: '1000', connection_work_target: 'f'.repeat(64) }));
@@ -116,7 +120,7 @@ test('recovery never admits intrinsically below-floor candidates and admission r
   const policy = new ClaimConnectionPolicy();
   for (let i = 0; i < MAX_RECOVERY_POLICIES + 50; i++) policy.probeStarted(`p${i}:7`, 0);
   assert.equal(policy.probes.size, MAX_RECOVERY_POLICIES);
-  assert.equal(policy.probeDue('p0:7', 10000), 70000, 'evicted policies wait before probing again');
+  assert.equal(policy.probeDue('p0:7', 0), 250, 'evicted policies still share the global sampling deadline');
 });
 
 test('full reset clears recovery history after connections drain', async t => {
@@ -164,6 +168,7 @@ test('replacing the probe bounty before its TCP acknowledgement cannot spend a s
     } };
   const { engine } = fixture(t, { poolFactory: () => pool });
   engine.domainStats.set('alpha.example:7', failedStats());
+  bootstrapFinished(engine, 'alpha.example:7');
   const first = row(1, 'alpha.example', { amount: '1000', connection_work_target: 'f'.repeat(64) });
   const replacement = row(2, 'alpha.example', { amount: '1100', connection_work_target: 'f'.repeat(64) });
   engine.enqueue([first]); engine.start(); await settle();

@@ -119,13 +119,14 @@ test('failed domain history survives catalog refresh and admits only a delayed r
   }
   const stats = engine.domainStats.get('failed.example:7'), rate = stats.connectionRate();
   assert.equal(isWorthAttempting(job.rawPriority, rate), false);
+  for (let i = 0; i < 32; i++) engine.connectionPolicy.probeStarted('failed.example:7');
   engine.rebuild();
   for (let i = 0; i < 4; i++) assert.equal(take(engine), key(fresh));
   engine.retainCatalog([failed, fresh]);
   engine.enqueue([failed, fresh]);
   assert.strictEqual(engine.domainStats.get('failed.example:7'), stats);
   assert.equal(stats.connectionRate(), rate);
-  const due = engine.connectionPolicy.probes.get('failed.example:7');
+  const due = engine.connectionPolicy.probeDue('failed.example:7');
   assert.ok(due >= Date.now() + 59000);
   for (let i = 0; i < 4; i++) assert.equal(take(engine, due - 1), key(fresh), 'the failed policy stays gated before the probe deadline');
   assert.equal(take(engine, due), key(failed), 'one representative becomes eligible for a recovery observation after one minute');
@@ -184,11 +185,15 @@ test('bounded random factor can reverse close expected values but never a gap gr
   assert.deepEqual(draws, [100001, 100001, 100001]);
 });
 
-test('maximum factor cannot admit a bounty below the unrandomized profitability floor', t => {
+test('maximum factor cannot turn a below-floor sampling candidate into normal economic work', t => {
   const { engine } = fixture(t, { randomIndex: length => length - 1 });
   const low = bounty(1, '199', 0, { domain: 'alpha.example' });
   const equal = bounty(2, '200', 0, { domain: 'zeta.example' });
   engine.enqueue([low, equal]);
+  engine.rebuild();
+  assert.equal(engine.queue.get(key(low)).recoveryProbe, true);
+  assert.equal(engine.queue.get(key(equal)).recoveryProbe, false);
+  engine.scheduler.setReady(key(low), false);
   assert.equal(take(engine), key(equal));
   assert.equal(take(engine), key(equal));
 });
@@ -392,11 +397,11 @@ test('injected factor draws must be bounded integer indexes', t => {
   }
 });
 
-test('an authenticated fixed payout below the raw floor never reaches TLS or consumes a scheduling turn', async t => {
+test('an authenticated nonpositive payout never reaches TLS or consumes a sampling turn', async t => {
   let prepares = 0, proofs = 0;
   const { engine } = fixture(t, { randomIndex: length => length - 1,
-    prepare: async item => { prepares++; return { item, context: context(item), payout: '199' }; },
-    generateProof: async () => { proofs++; throw new Error('Must not start below the raw floor'); },
+    prepare: async item => { prepares++; return { item, context: context(item), payout: '0' }; },
+    generateProof: async () => { proofs++; throw new Error('Must not sample a nonpositive payout'); },
   });
   const item = bounty(1, '1000'); engine.enqueue([item]); engine.start();
   await until(() => prepares === 1 && !engine.running);
@@ -475,21 +480,22 @@ test('verified funding policy replaces discovery policy before TLS and is resele
   assert.deepEqual(draws, [100001, 100001]);
 });
 
-test('authenticated harder target cannot start TLS based on easier untrusted discovery economics', async t => {
-  let proofs = 0, prepares = 0;
+test('authenticated harder target is sampled with its verified difficulty, not the discovery economics', async t => {
+  let proofs = 0, prepares = 0, capturedContext;
   const { engine } = fixture(t, {
     prepare: async item => {
       prepares++;
       const actual = { ...item, connection_work_target: hash((1n << 192n) - 1n) };
       return { item: actual, bounty: actual, payout: item.amount, context: context(actual) };
     },
-    generateProof: async () => { proofs++; return '020100'; },
+    generateProof: async verified => { proofs++; capturedContext = verified; return '020100'; },
   });
   const entry = bounty(1); engine.enqueue([entry]); engine.start();
   await until(() => prepares === 1 && !engine.running);
-  assert.equal(proofs, 0);
-  assert.equal(engine.queue.get(key(entry)).bounty.connection_work_target, hash((1n << 192n) - 1n));
-  assert.equal(engine.preferReward, false);
+  assert.equal(proofs, 1);
+  assert.equal(capturedContext.connection_work_target, hash((1n << 192n) - 1n));
+  assert.equal(engine.connectionPolicy.probes.get(`${entry.domain}:7`)?.started, 1,
+    'the harder target consumed a bounded sampling ACK');
 });
 
 for (const wrong of [{ txid: hash(9) }, { vout: 1 }]) test(`a prepared outpoint mismatch ${Object.keys(wrong)[0]} cannot consume or submit the queued bounty`, async t => {

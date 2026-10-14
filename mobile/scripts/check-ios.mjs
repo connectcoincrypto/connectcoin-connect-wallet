@@ -63,6 +63,20 @@ assert.equal(icon.readUInt32BE(16), 1024); assert.equal(icon.readUInt32BE(20), 1
 assert.equal(icon[25], 2, 'iOS icon must be RGB without an alpha channel.');
 assert.ok(!icon.includes(Buffer.from('tRNS')), 'iOS icon must not include PNG transparency.');
 assert.match(packageManifest, /linkedLibrary\("connectwallet_native"\)/);
+const [claimsHeader, claimsBridge, claimsEngine] = await Promise.all([
+  read('native/include/apple_claims.h'), read('native/src/apple_claims.cpp'),
+  read('ios/WalletCore/Sources/WalletCore/Claims/MobileClaimsEngine.swift'),
+]);
+assert.match(claimsHeader, /int32_t cw_claim_limiter_set_allowed\(int64_t limiter, int32_t allowed, char \*error\);/,
+  'Lifecycle admission must use the bounded owning-limiter C ABI');
+assert.match(claimsHeader, /int32_t cw_claim_bind_budget\(int64_t handle, const char \*key, const char \*target_hex,\s*const char \*successful_connections, char \*error\);/,
+  'Budget import must retain a decimal uint64 count rather than truncate it to a signed bridge integer');
+assert.match(claimsBridge, /if\(allowed!=0 && allowed!=1\) throw std::runtime_error\("CLAIM_CONTEXT"\)/);
+assert.match(claimsBridge, /connectwallet::SetStartAllowed\(limiter,allowed!=0\)/);
+assert.match(claimsBridge, /connectwallet::BindClaimBudget\(handle,Text\(key,128\),Text\(target,64\),Text\(count,20\)\)/,
+  'C budget bridge must bound every public string');
+assert.match(claimsEngine, /cw_claim_limiter_set_allowed\(limiter, allow \? 1 : 0, &error\)/);
+assert.match(claimsEngine, /cw_claim_bind_budget\(handle, key, target, count, &error\)/);
 const privacy = await read('ios/App/App/PrivacyInfo.xcprivacy');
 for (const reason of ['CA92.1', '35F9.1', 'C617.1', '3B52.1']) assert.ok(privacy.includes(`<string>${reason}</string>`));
 console.log('iOS host, plugin registration, pinned dependencies and packaging policy checks passed.');

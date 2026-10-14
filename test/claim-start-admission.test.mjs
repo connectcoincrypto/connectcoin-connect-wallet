@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { ClaimsEngine } from '../src/core/claims-engine.mjs';
 import { P2CDomainStats } from '../src/core/claim-priority.mjs';
+import { BOOTSTRAP_PROBE_COUNT } from '../src/core/claim-connection-policy.mjs';
 
 const hash = value => value.toString(16).padStart(64, '0');
 const key = bounty => `${bounty.txid}:${bounty.vout}`;
@@ -145,10 +146,14 @@ function failedStats() {
   for (let i = 0; i < 10; i++) stats.record(false, 10);
   return stats;
 }
+function bootstrapFinished(engine, policy) {
+  for (let i = 0; i < BOOTSTRAP_PROBE_COUNT; i++) engine.connectionPolicy.probeStarted(policy);
+}
 
 test('one pending recovery probe owns its policy across representative replacement and elapsed minutes', async t => {
   const f = fixture(t, { concurrency: 3 });
   f.engine.domainStats.set('alpha.example:7', failedStats());
+  bootstrapFinished(f.engine, 'alpha.example:7');
   const first = row(1, 'alpha.example', '1000'), replacement = row(2, 'alpha.example', '1100');
   f.ready([first]); f.engine.start(); await settle();
   assert.equal(f.requests.length, 0);
@@ -295,6 +300,7 @@ test('restart after draining stop can fill fresh slots without retaining old pen
 test('recovery restart releases an unstarted probe but preserves cooldown after a real start', async t => {
   const f = fixture(t, { concurrency: 3 });
   f.engine.domainStats.set('alpha.example:7', failedStats());
+  bootstrapFinished(f.engine, 'alpha.example:7');
   f.ready([row(1, 'alpha.example', '1000')]); f.engine.start(); await settle();
   t.mock.timers.tick(60000); await settle(); assert.equal(f.requests.length, 1);
   await f.engine.stop();

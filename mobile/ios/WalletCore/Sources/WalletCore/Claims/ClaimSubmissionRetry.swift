@@ -29,13 +29,31 @@ struct ClaimSubmissionRetry {
     static func matchesAvailableBounty(_ current: ClaimCandidate?, captured: ClaimCandidate) -> Bool {
         guard let current else { return false }
         return current.supported && current.state == "available" &&
-            current.key == captured.key && current.block == captured.block
+            current.identity == captured.identity
+    }
+
+    /// A published spend outranks an older retained copy. Absence from both
+    /// maps is invalidation, never permission to resurrect the captured row.
+    static func retainAvailableBounty(catalog: ClaimCandidate?, retained: ClaimCandidate?, captured: ClaimCandidate) -> ClaimCandidate? {
+        let current = catalog ?? retained
+        return matchesAvailableBounty(current, captured: captured) ? current : nil
+    }
+
+    /// A normal window exit is a discovery limit, not a consensus expiry.
+    /// Retained work keeps its last locally validated identity/state; it does
+    /// not claim fresh UTXO evidence. Core validates UTXO/proof at broadcast.
+    /// Global snapshot freshness and every known local invalidation still win.
+    static func canSubmitPreserved(catalog: ClaimCandidate?, retained: ClaimCandidate?, captured: ClaimCandidate,
+                                   normallyAged: Bool, coherent: Bool) -> Bool {
+        coherent && (catalog != nil || normallyAged) &&
+            matchesAvailableBounty(catalog ?? retained, captured: captured)
     }
 
     mutating func retain(after failure: RpcFailure, now: Double) -> Bool {
-        guard failure.notSent, !failure.unknownOutcome, !failure.explicitRejection,
+        let unsent = failure.notSent && ["RPC_UNAVAILABLE", "RPC_TIMEOUT", "RPC_BUSY"].contains(failure.code)
+        let notForwarded = failure.notForwarded && ["-32001", "-32029", "-32030"].contains(failure.code)
+        guard unsent || notForwarded, !failure.unknownOutcome, !failure.explicitRejection,
               failure.nodeCode == nil,
-              ["RPC_UNAVAILABLE", "RPC_TIMEOUT", "RPC_BUSY"].contains(failure.code),
               now.isFinite else { return false }
         failures = min(31, failures + 1)
         let backoff = min(30, pow(2, Double(min(5, failures - 1))))

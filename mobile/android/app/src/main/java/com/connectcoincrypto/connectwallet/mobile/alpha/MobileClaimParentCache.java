@@ -26,4 +26,5 @@ final class MobileClaimParentCache {
     }
     int size() { return entries.size(); }
     int characters() { return characters; }
+    void clear() { entries.clear(); characters = 0; }
 }

@@ -5,7 +5,7 @@ import { NATIVE_LICENSE_FILES, NATIVE_ROOT_SHA256, validateNativeLicenseManifest
 import { releaseNotes } from '../scripts/publish-release.mjs';
 
 const report = () => ({ type: 'ready', protocol: 4, roots: 1, security: {
-  provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64, rootsSha256: NATIVE_ROOT_SHA256,
+  provider: 'mbedtls', mbedtlsVersion: '3.6.7', rsaPublicExponentMaxBits: 64, admissionGate: 1, rootsSha256: NATIVE_ROOT_SHA256,
 } });
 test('native runtime disclosure does not rewrite previously published Python releases', () => {
   for (const version of ['1.0.0', '1.0.9', '1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', '1.1.5']) assert.match(releaseNotes(version, '1', 'a'.repeat(40)), /helper and Python runtime are bundled/);
@@ -14,7 +14,7 @@ test('native runtime disclosure does not rewrite previously published Python rel
 test('desktop packaging accepts only the pinned native provider and actual embedded root bytes', () => {
   const valid = report();
   assert.deepEqual(validateNativeHelperSecurity(JSON.stringify(valid)), valid.security);
-  for (const [key, value] of [['provider', 'python'], ['mbedtlsVersion', '3.6.6'], ['rsaPublicExponentMaxBits', 65], ['rootsSha256', '0'.repeat(64)]]) {
+  for (const [key, value] of [['provider', 'python'], ['mbedtlsVersion', '3.6.6'], ['rsaPublicExponentMaxBits', 65], ['admissionGate', undefined], ['admissionGate', true], ['admissionGate', 0], ['rootsSha256', '0'.repeat(64)]]) {
     const bad = report(); bad.security[key] = value;
     assert.throws(() => validateNativeHelperSecurity(JSON.stringify(bad)), /pinned C\+\+/);
   }

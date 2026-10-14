@@ -36,6 +36,10 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private static final String GENESIS = "30a3a7543f593b6343873a16aeb61005dce0fe3f4169ab34039316b2a9bb373e";
     private static final long SAFE_MAX = 9007199254740991L;
     private static final int FEE_RATE = 1500, MAX_CATALOG = 10000, MAX_DOMAINS = 512;
+    // The default journal can hold 10,000 events in 100-event pages. Leave
+    // room for the fence replay without allowing an unbounded maintenance
+    // pass. Smaller pages or continuous growth fall back to a coherent reset.
+    private static final int MAX_REPLAY_PAGES = 128;
     // Admission pauses at MAX_CONCURRENCY reservations; captures already in
     // flight can still produce another MAX_CONCURRENCY verified winners.
     private static final int MAX_RETAINED_WINNERS = 2 * MAX_CONCURRENCY;
@@ -61,9 +65,18 @@ public final class MobileClaimsEngine implements AutoCloseable {
     // Admission stops at 100 reservations; up to 100 already-running captures
     // may still win. Keep every such proof without an unbounded retry queue.
     private final Map<String, Winner> pendingWinners = new LinkedHashMap<>();
+    // Public signed bytes only. An RPC ACK is not chain confirmation; paused
+    // proven-unsent work also survives without occupying a submission slot.
+    private final Map<String, Winner> savedWinners = new LinkedHashMap<>();
     private final Map<String, Candidate> catalog = new LinkedHashMap<>();
+    // Only already-dispatched captures and verified winners may outlive the
+    // discovery window. These rows are NEVER scheduler candidates.
+    private final Map<String, Retained> retained = new LinkedHashMap<>();
+    private final Set<String> resyncBlocks = new HashSet<>();
+    private boolean catalogGate, resyncSnapshotPending, replayPending;
     private final Map<String, Candidate.Progress> progress = new LinkedHashMap<>();
     private final MobileClaimParentCache parents = new MobileClaimParentCache(128, 8 * 1024 * 1024);
+    private final NativeTransactions.FundingTransactionCache fundingValidation = new NativeTransactions.FundingTransactionCache();
     private final Map<String, PerformanceWindow> domains = new LinkedHashMap<>();
     private final MobileClaimScheduler scheduler = new MobileClaimScheduler();
     private final Map<String, Long> blocks = new LinkedHashMap<>();
@@ -73,12 +86,24 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private JSONObject tip, lastRpcError;
     private String lastRpcScope = "";
     private long catalogValidatedAt;
-    private long generation, runSerial, captureSerial, attempts, valid, invalid, targetHits, submitted, unknown, cancelled;
+    private long generation, runSerial, captureSerial, attempts, valid, invalid, targetHits, submitted, unknown, cancelled, nextReceiptLookup;
     private long elapsedBeforePause, activeSince, nextDiscovery, nextBlock, retryAt, nextAttemptNanos, nextStartAcknowledgementNanos, nextSchedule, nextPreparation;
     private boolean scheduleDirty = true, admissionIdle = true;
     private int connectionsPerSecondLimit = DEFAULT_CONNECTIONS_PER_SECOND, concurrency = DEFAULT_CONCURRENCY;
     private boolean enabled, allowed, closed, healthy, unknownBlocked;
     private ReceiptStore receiptStore;
+    // Positive transport/Core evidence survives a failed final receipt only in
+    // this owner. A restored pending receipt cannot infer a terminal state.
+    private enum ReceiptState {
+        NOT_SENT("not-sent"), REJECTED("rejected"), SUBMITTED("submitted");
+        final String value;
+        ReceiptState(String value) { this.value = value; }
+    }
+    private static final class UncommittedReceipt {
+        final Winner winner; final ReceiptState state;
+        UncommittedReceipt(Winner winner, ReceiptState state) { this.winner = winner; this.state = state; }
+    }
+    private UncommittedReceipt uncommittedReceipt;
     public synchronized void configureLimits(int rate, int parallel) {
         require(rate >= 1 && rate <= MAX_CONNECTIONS_PER_SECOND && parallel >= 1 && parallel <= MAX_CONCURRENCY, "CLAIMS_LIMITS");
         if (closed) throw new IllegalStateException("CLAIMS_CLOSED");
@@ -96,17 +121,75 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
     public synchronized void restoreUnknownOutcome(String txid) {
         require(!enabled && operations.isEmpty(), "CLAIMS_RECEIPT_STATE");
-        lastTxid = hash(txid); unknownBlocked = true; unknown = Math.max(unknown, 1); status = "unknown-outcome"; lastError = "CLAIMS_UNKNOWN_OUTCOME";
+        lastTxid = hash(txid); uncommittedReceipt = null; unknownBlocked = true; unknown = Math.max(unknown, 1); status = "unknown-outcome"; lastError = "CLAIMS_UNKNOWN_OUTCOME";
     }
     /** A stopped engine may still be draining a proof or recording a sent outcome. */
     synchronized boolean canChangeEndpoint() {
         return !closed && !enabled && operations.isEmpty() && pendingTransmissions.isEmpty() &&
-            reservations.isEmpty() && activeCaptures.isEmpty();
+            reservations.isEmpty() && activeCaptures.isEmpty() && savedWinners.isEmpty();
     }
     /** Native owner calls only after authentic RPC lookup AND raw txid verification. Never restarts automatically. */
     public synchronized void resolveConfirmedOutcome(String txid) throws Exception {
-        require(unknownBlocked && lastTxid.equals(hash(txid)), "CLAIMS_RECEIPT_STATE");
-        recordReceipt(txid, "submitted"); unknownBlocked = false; status = "stopped"; lastError = "";
+        resolveConfirmedOutcome(txid, null);
+    }
+    public synchronized void resolveConfirmedOutcome(String txid, String transactionHex) throws Exception {
+        resolveConfirmedOutcome(txid, transactionHex, receiptLookupEpoch(txid));
+    }
+    synchronized long receiptLookupEpoch(String txid) {
+        require(!closed && unknownBlocked && lastTxid.equals(hash(txid)), "CLAIMS_RECEIPT_STATE");
+        return generation;
+    }
+    static final class ReceiptLookup {
+        final String txid; final long epoch;
+        ReceiptLookup(String txid, long epoch) { this.txid = txid; this.epoch = epoch; }
+    }
+    synchronized ReceiptLookup beginReceiptLookup() {
+        // A failed preference commit can already have changed its in-memory
+        // status to submitted. Only the live owner knows whether recovery was
+        // durably completed; startup restoration installs this same guard.
+        ReceiptLookup pending = pendingReceiptLookup();
+        require(pending != null, "CLAIMS_RECEIPT_STATE");
+        return pending;
+    }
+    synchronized ReceiptLookup pendingReceiptLookup() {
+        return !closed && unknownBlocked ? new ReceiptLookup(lastTxid, receiptLookupEpoch(lastTxid)) : null;
+    }
+    synchronized void resolveConfirmedReceipt(String txid, JSONObject response, long lookupEpoch) throws Exception {
+        require(!closed && generation == lookupEpoch && unknownBlocked && lastTxid.equals(hash(txid)), "CLAIMS_RECEIPT_STATE");
+        ReceiptEnvelope envelope = validateReceiptEnvelope(response, txid);
+        Winner saved = observedReceiptOwner(txid, response.getJSONObject("transaction").getString("hex"));
+        if (envelope.locationChanged) throw new ChainMoved();
+        recordResolvedReceipt(txid, saved);
+    }
+    synchronized void resolveConfirmedOutcome(String txid, String transactionHex, long lookupEpoch) throws Exception {
+        // Manual receipt reads can outlive Stop, policy suspension or Close.
+        // Do not let their old callback rewrite the durable receipt or counters.
+        require(!closed && generation == lookupEpoch && unknownBlocked && lastTxid.equals(hash(txid)), "CLAIMS_RECEIPT_STATE");
+        recordResolvedReceipt(txid, observedReceiptOwner(txid, transactionHex));
+    }
+    private Winner observedReceiptOwner(String txid, String transactionHex) {
+        Winner saved = null;
+        for (Winner winner : savedWinners.values()) if (txid.equals(winner.txid)) {
+            saved = winner; break;
+        }
+        validateObserved(transactionHex, txid, saved == null ? null : saved.transactionHex, saved == null ? null : saved.row.target);
+        return saved;
+    }
+    private void recordResolvedReceipt(String txid, Winner saved) throws Exception {
+        try { recordReceipt(txid, "submitted"); }
+        catch (Exception failure) {
+            // Metadata, raw identity/proof and the lookup epoch have already
+            // been validated. Keep that positive observation only alongside
+            // its original live bytes; a restored txid alone is insufficient.
+            if (saved != null && savedWinners.get(saved.row.key) == saved)
+                uncommittedReceipt = new UncommittedReceipt(saved, ReceiptState.SUBMITTED);
+            throw failure;
+        }
+        uncommittedReceipt = null; unknownBlocked = false; status = "stopped"; lastError = "";
+        if (saved != null) {
+            saved.acknowledged = true; saved.acknowledgedAt = now(); saved.rejected = saved.ownAbsenceValidated = false; saved.retryDue = now() + 30000;
+            if (!saved.submissionCounted) { submitted = increment(submitted); saved.submissionCounted = true; }
+        }
     }
     private synchronized void recordReceipt(String txid, String state) throws Exception {
         require(receiptStore != null, "CLAIMS_RECEIPT_UNAVAILABLE");
@@ -127,13 +210,22 @@ public final class MobileClaimsEngine implements AutoCloseable {
         long createStartLimiter(int rate); void setStartRate(long limiter, int rate); void resetStartSchedule(long limiter); void destroyStartLimiter(long limiter);
         long create(long limiter); void cancel(long handle); void destroy(long handle);
         long startedAtNanos(long handle);
+        default boolean hasCaptured(long handle) { return false; }
+        default void setStartAllowed(long limiter, boolean allowed) {}
+        default void bindBudget(long handle, String key, String target, String captured) {}
         JSONObject capture(JSONObject context, long handle) throws Exception;
     }
     interface Transactions {
         void validateReward(String address);
         long fee();
         JSONObject prepare(JSONObject bounty, String parent, String reward) throws Exception;
+        default JSONObject prepare(JSONObject bounty, String parent, String reward, NativeTransactions.FundingTransactionCache cache, NativeTransactions.FundingCheck check) throws Exception {
+            check.check(); JSONObject result = prepare(bounty, parent, reward); check.check(); return result;
+        }
         JSONObject attach(JSONObject prepared, String proof) throws Exception;
+        default void validateObserved(String raw, String expectedTxid, String originalHex, String target) throws Exception {
+            NativeTransactions.validateObservedClaim(raw, expectedTxid, originalHex, target);
+        }
     }
     public MobileClaimsEngine(MobileRpcClient client) {
         this(new RpcAccess() {
@@ -146,6 +238,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
             public long createStartLimiter(int rate) { return NativeClaims.createStartLimiter(rate); }
             public void setStartRate(long limiter, int rate) { NativeClaims.setStartRate(limiter, rate); }
             public void resetStartSchedule(long limiter) { NativeClaims.resetStartSchedule(limiter); }
+            public void setStartAllowed(long limiter, boolean allowed) { NativeClaims.setStartAllowed(limiter, allowed); }
+            public void bindBudget(long handle, String key, String target, String captured) { NativeClaims.bindBudget(handle, key, target, captured); }
+            public boolean hasCaptured(long handle) { return NativeClaims.hasCaptured(handle); }
             public void destroyStartLimiter(long limiter) { NativeClaims.destroyStartLimiter(limiter); }
             public long create(long limiter) { return NativeClaims.createCancellationHandle(limiter); }
             public void cancel(long handle) { NativeClaims.cancel(handle); }
@@ -163,6 +258,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             public void validateReward(String address) { WalletCrypto.decodeAddress(address); }
             public long fee() { return NativeTransactions.claimFee(FEE_RATE); }
             public JSONObject prepare(JSONObject bounty, String parent, String reward) throws Exception { return NativeTransactions.prepareClaim(bounty, parent, reward, FEE_RATE); }
+            public JSONObject prepare(JSONObject bounty, String parent, String reward, NativeTransactions.FundingTransactionCache cache, NativeTransactions.FundingCheck check) throws Exception { return cache.prepareClaim(bounty, parent, reward, FEE_RATE, check); }
             public JSONObject attach(JSONObject prepared, String bytes) throws Exception { return NativeTransactions.attachClaim(prepared, bytes); }
         }, true);
         if (client == null) throw new IllegalArgumentException("Missing native RPC client");
@@ -201,27 +297,42 @@ public final class MobileClaimsEngine implements AutoCloseable {
         synchronized (this) {
             if (closed || allowed == value) return;
             allowed = value;
-            if (!value) { pauseClock(); generation++; pending = new ArrayList<>(operations); discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); status = enabled ? "paused" : "stopped"; currentDomain = ""; }
+            if (!value) { pauseClock(); generation++; clearFunding(); pending = new ArrayList<>(operations); discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); status = enabled ? "paused" : "stopped"; currentDomain = ""; }
             else if (enabled && !unknownBlocked) { resetStartSchedule(); activeSince = now(); nextDiscovery = 0; status = "synchronizing"; }
         }
         cancelOwned(pending);
     }
     public synchronized void start(String address) {
         if (closed) throw new IllegalStateException("CLAIMS_CLOSED");
-        if (unknownBlocked) throw new IllegalStateException("CLAIMS_UNKNOWN_OUTCOME");
+        if (unknownBlocked && uncommittedReceipt == null) throw new IllegalStateException("CLAIMS_UNKNOWN_OUTCOME");
         transactions.validateReward(address);
         if (enabled) { require(address.equals(rewardAddress), "Stop claims before changing the reward address."); return; }
         if (!reservations.isEmpty() || !operations.isEmpty()) throw new IllegalStateException("CLAIMS_BUSY");
+        require(savedWinners.isEmpty() || rewardAddress == null || rewardAddress.equals(address), "Resume preserved claims before changing the reward address.");
+        if (unknownBlocked) {
+            UncommittedReceipt outcome = uncommittedReceipt;
+            Winner owner = outcome == null ? null : outcome.winner;
+            require(owner != null && lastTxid.equals(owner.txid) && savedWinners.get(owner.row.key) == owner, "CLAIMS_RECEIPT_STATE");
+            // Reconcile the durable crash guard before releasing the live one.
+            // Only this exact owner carries the validated terminal response;
+            // neither an absent RPC transaction nor a restart supplies it.
+            try { recordReceipt(owner.txid, outcome.state.value); }
+            catch (Exception failure) { throw new IllegalStateException("CLAIMS_RECEIPT_UNAVAILABLE", failure); }
+            if (outcome.state == ReceiptState.SUBMITTED) acknowledgeWinner(owner);
+            else if (outcome.state == ReceiptState.REJECTED) owner.rejected = true; // Still wait for committed availability, not merely disk recovery.
+            else owner.transmissionAttempted = false;
+            uncommittedReceipt = null; unknownBlocked = false;
+        }
         resetStartSchedule();
         if (rewardAddress != null && !rewardAddress.equals(address)) for (Candidate.Progress item : progress.values()) item.prepared = null;
-        rewardAddress = address; enabled = true; generation++; runSerial++; recentStarts.clear(); elapsedBeforePause = 0; activeSince = allowed ? now() : 0;
+        rewardAddress = address; enabled = true; generation++; clearFunding(); runSerial++; recentStarts.clear(); elapsedBeforePause = 0; activeSince = allowed ? now() : 0;
         attempts = valid = invalid = targetHits = submitted = unknown = cancelled = 0;
-        resetCatalog(); lastError = ""; lastRpcError = null; lastTxid = ""; nextDiscovery = nextBlock = retryAt = nextStartAcknowledgementNanos = nextSchedule = nextPreparation = 0;
+        resetCatalog(!savedWinners.isEmpty()); lastError = ""; lastRpcError = null; lastTxid = ""; nextDiscovery = nextBlock = retryAt = nextStartAcknowledgementNanos = nextSchedule = nextPreparation = nextReceiptLookup = 0;
         status = allowed ? "synchronizing" : "paused";
     }
     public void stop() {
         List<CompletableFuture<JSONObject>> pending;
-        synchronized (this) { if (closed && !enabled) return; enabled = false; pauseClock(); generation++; pending = new ArrayList<>(operations); discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); currentDomain = ""; status = unknownBlocked ? "unknown-outcome" : "stopped"; }
+        synchronized (this) { if (closed && !enabled) return; enabled = false; pauseClock(); generation++; clearFunding(); pending = new ArrayList<>(operations); discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); currentDomain = ""; status = unknownBlocked ? "unknown-outcome" : "stopped"; }
         cancelOwned(pending);
     }
     @Override public void close() {
@@ -246,21 +357,111 @@ public final class MobileClaimsEngine implements AutoCloseable {
         // Old cancelled FIFO entries may still be draining after a restart.
         if (!closed) proof.resetStartSchedule(startLimiter);
     }
-    private void pruneRetired() { retired.removeIf(key -> !progress.containsKey(key) && !reservations.contains(key)); }
+    private void pruneRetired() { retired.removeIf(key -> !progress.containsKey(key) && !reservations.contains(key) && !savedWinners.containsKey(key)); }
     private void pauseClock() { if (activeSince != 0) { elapsedBeforePause += Math.max(0, now() - activeSince); activeSince = 0; } }
     private synchronized void check(long epoch) { if (closed || !enabled || !allowed || epoch != generation) throw new Stopped(); }
+    private void clearFunding() { parents.clear(); fundingValidation.clear(); }
     private static final class Stopped extends RuntimeException { private static final long serialVersionUID = 1L; }
     private synchronized void resetCatalog() { resetCatalog(false); }
-    private synchronized void resetCatalog(boolean keepHashAnchor) { catalog.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; if (!keepHashAnchor) blockWindow = null; }
-    private static final class ChainMoved extends Exception { private static final long serialVersionUID = 1L; }
+    private synchronized void resetCatalog(boolean keepHashAnchor) {
+        if (keepHashAnchor) {
+            proof.setStartAllowed(startLimiter, false); acknowledgeStarts();
+            Map<String, Retained> preserved = new LinkedHashMap<>();
+            for (Capture capture : activeCaptures.values()) {
+                if (capture.started && !capture.cancelled && ownedAvailable(capture.row)) preserved.put(capture.row.key, new Retained(ownedRow(capture.row.key)));
+                else if (!capture.cancelled) { capture.cancelled = true; proof.cancel(capture.handle); }
+            }
+            // A queued callback may still own an obsolete winner after a spend
+            // commit. Preserve CURRENT state, never the winner's original row.
+            for (Winner winner : pendingWinners.values()) if (winnerRetainable(winner)) preserved.put(winner.row.key, new Retained(ownedRow(winner.row.key)));
+            for (Winner winner : savedWinners.values()) {
+                Candidate current = ownedRow(winner.row.key);
+                // Absence of current ownership is not permission to revive
+                // the original available row after a known reorganization.
+                if (current != null) preserved.put(winner.row.key, new Retained(current));
+            }
+            require(preserved.size() <= MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
+            retained.clear(); retained.putAll(preserved); resyncBlocks.clear();
+            for (Retained row : retained.values()) resyncBlocks.add(row.row.blockHash);
+            catalogGate = true; resyncSnapshotPending = true;
+        } else { retained.clear(); resyncBlocks.clear(); catalogGate = resyncSnapshotPending = false; }
+        catalog.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; if (!keepHashAnchor) blockWindow = null;
+    }
+    private static final class Retained {
+        Candidate row; boolean normalAged;
+        Retained(Candidate row) { this.row = row; }
+        Retained copy() throws Exception { Retained result = new Retained(row.copy()); result.normalAged = normalAged; return result; }
+    }
+    private void retain(Candidate row) {
+        if (retained.containsKey(row.key)) return;
+        require(retained.size() < MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY"); retained.put(row.key, new Retained(row));
+    }
+    private boolean protectedOutpoint(String key) {
+        if (reservations.contains(key) || savedWinners.containsKey(key)) return true;
+        for (Capture capture : activeCaptures.values()) if (capture.row.key.equals(key) && capture.started && !capture.cancelled) return true;
+        return false;
+    }
+    private void pruneRetained() {
+        retained.keySet().removeIf(key -> !protectedOutpoint(key));
+        Set<String> protectedBlocks = new HashSet<>();
+        for (Retained row : retained.values()) protectedBlocks.add(row.row.blockHash);
+        resyncBlocks.retainAll(protectedBlocks);
+    }
+    /** A completed coherent snapshot and protected-block revalidation are
+     * separate barriers. Draining a final miss only removes the latter. This
+     * runs after a release, never in the middle of a catalog publication. */
+    private void releaseObsoleteResyncGate() {
+        if (catalogGate && !resyncSnapshotPending && !replayPending && resyncBlocks.isEmpty()) {
+            catalogGate = false;
+            if (!closed) proof.setStartAllowed(startLimiter, catalogFresh() && enabled && allowed && !unknownBlocked);
+        }
+    }
+    private Candidate ownedRow(String key) { Candidate row = catalog.get(key); return row != null ? row : retained.containsKey(key) ? retained.get(key).row : null; }
+    private boolean ownedAvailable(Candidate captured) {
+        Candidate row = ownedRow(captured.key);
+        return row != null && row.supported && row.state.equals("available") && row.blockHash.equals(captured.blockHash) && row.sameMetadata(captured);
+    }
+    private boolean winnerOwnedAvailable(Winner winner) {
+        if (ownedAvailable(winner.row)) return true;
+        // The journal no longer tracks outputs outside its rolling window.
+        // A known-absent OWN transaction may therefore leave an old pending
+        // marker behind. Only replay its original signed bytes, not a fresh
+        // capture; a competing or confirmed spend never qualifies here.
+        Retained held = retained.get(winner.row.key);
+        return winner.acknowledged && winner.ownAbsenceValidated && !catalog.containsKey(winner.row.key)
+            && held != null && held.normalAged && held.row.state.equals("pending_spend")
+            && winner.txid != null && winner.txid.equals(held.row.spendingTxid)
+            && held.row.blockHash.equals(winner.row.blockHash) && held.row.sameMetadata(winner.row);
+    }
+    /** Retention is not transmission permission. A mempool competitor can
+     * disappear; keep the already verified proof while the exact funding
+     * identity is still owned, without sending until availability is fresh. */
+    private boolean winnerRetainable(Winner winner) {
+        Candidate row = ownedRow(winner.row.key);
+        return row != null && row.supported && row.blockHash.equals(winner.row.blockHash) && row.sameMetadata(winner.row)
+            && (row.state.equals("available") || row.state.equals("pending_spend") || row.state.equals("immature"));
+    }
+    private boolean winnerCanSubmit(Winner winner) {
+        if (!catalogFresh()) return false;
+        if (catalog.containsKey(winner.row.key)) return true;
+        // Normal aging is not evidence of a spend. Keep the validated proof
+        // and let sendrawtransaction/Core check the UTXO; do not describe the
+        // old row as freshly available or start another capture for it.
+        Retained held = retained.get(winner.row.key);
+        return held != null && held.normalAged && winnerOwnedAvailable(winner);
+    }
+    private static final class ChainMoved extends Exception {
+        private static final long serialVersionUID = 1L;
+        ChainMoved() { super("CLAIMS_SNAPSHOT_STALE"); }
+    }
 
     /** Discovery reads may retry independently, but never authorize work from an unboundedly old snapshot. */
-    private boolean catalogFresh() { return healthy && now() - catalogValidatedAt < CATALOG_FRESH_MS; }
+    private boolean catalogFresh() { return !catalogGate && healthy && now() - catalogValidatedAt < CATALOG_FRESH_MS; }
     private void expireCatalogWork() {
         cancelUnsafeQueuedTransmissions();
         discardIdleWinners();
         if (healthy && !catalogFresh()) {
-            cancelCaptures(null, -1); admissionIdle = true;
+            proof.setStartAllowed(startLimiter, false); admissionIdle = true;
             // Leave transmissions and their outcome/receipt ownership untouched.
             if (enabled && allowed && !unknownBlocked) status = "retrying";
         }
@@ -270,12 +471,12 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private void cancelUnsafeQueuedTransmissions() {
         for (Map.Entry<CompletableFuture<JSONObject>, Winner> entry : pendingTransmissions.entrySet()) {
             Winner winner = entry.getValue();
-            boolean usable = catalogFresh() && winnerUsable(winner);
+            boolean usable = winnerCanSubmit(winner) && winnerUsable(winner);
             // rowAvailable also excludes retired rows, including this winner's
             // own reservation, so it must not be used for this eligibility test.
             if (!usable && !winner.cancelledBeforeWrite && rpc.cancelBeforeWrite(entry.getKey())) {
                 winner.cancelledBeforeWrite = true;
-                winner.cancelledForStaleness = winnerUsable(winner) && !catalogFresh();
+                winner.cancelledForStaleness = winnerUsable(winner) && !winnerCanSubmit(winner);
             }
         }
     }
@@ -346,7 +547,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 synchronized (this) {
                     require(blocks.containsKey(blockHash) && row.height == blocks.get(blockHash), "CLAIMS_RPC_DATA");
                     Candidate.Progress previous = progress.get(row.key);
-                    if (previous != null) row.progress = previous;
+                    if (previous != null) {
+                        row.reuse(previous);
+                    }
                 }
                 require(staged.put(row.key, row) == null && staged.size() <= MAX_CATALOG, "CLAIMS_CAPACITY");
             }
@@ -390,13 +593,27 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
     private void replay(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
                         MobileClaimBlockWindow window, JSONObject first) throws Exception {
-        Map<String, Candidate> next = new LinkedHashMap<>(); String nextCursor; JSONObject nextTip;
+        synchronized (this) { check(epoch); replayPending = true; }
+        try { replaySnapshot(epoch, newBlock, staged, recent, startCursor, window, first); }
+        finally { synchronized (this) { replayPending = false; } }
+    }
+    private void replaySnapshot(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
+                                MobileClaimBlockWindow window, JSONObject first) throws Exception {
+        Map<String, Candidate> next = new LinkedHashMap<>(); Map<String, Retained> nextRetained = new LinkedHashMap<>(); String nextCursor; JSONObject nextTip;
         Map<String, Long> canonical; boolean replayAfterFirst;
         Set<String> dirtyBlocks = new HashSet<>();
+        Set<String> reopened = new HashSet<>();
+        Map<String, Candidate> exited = new LinkedHashMap<>();
         long validatedFrom = now();
         synchronized (this) {
             check(epoch);
-            for (Candidate row : catalog.values()) if ((recent == null || recent.containsKey(row.blockHash)) && !row.blockHash.equals(newBlock)) next.put(row.key, row.copy());
+            if (recent != null && !recent.equals(blocks)) proof.setStartAllowed(startLimiter, false);
+            acknowledgeStarts();
+            for (Retained row : retained.values()) nextRetained.put(row.row.key, row.copy());
+            for (Candidate row : catalog.values()) {
+                if ((recent == null || recent.containsKey(row.blockHash)) && !row.blockHash.equals(newBlock)) next.put(row.key, row.copy());
+                else if (!row.blockHash.equals(newBlock)) exited.put(row.key, row.copy());
+            }
             nextCursor = startCursor == null ? cursor : startCursor; nextTip = tip;
             canonical = new LinkedHashMap<>(recent == null ? blocks : recent);
             replayAfterFirst = first != null && window != blockWindow;
@@ -404,14 +621,23 @@ public final class MobileClaimsEngine implements AutoCloseable {
             // disappeared. Preserve public accounting for surviving outpoints.
             if (staged != null) for (Candidate source : staged.values()) {
                 Candidate row = source.copy();
-                Candidate existing = catalog.get(row.key);
-                if (existing != null) row.progress = existing.progress;
+                Candidate.Progress previous = progress.get(row.key);
+                if (previous != null) row.reuse(previous);
+                Candidate old = ownedRow(row.key);
+                // A reset/new watermark can skip available_again while paused.
+                // A complete same-identity snapshot proves that transition too,
+                // but an unchanged available row must not retry every rejection.
+                if (newBlock != null && newBlock.equals(row.blockHash) && old != null && old.state.equals("pending_spend") && row.state.equals("available")
+                        && row.blockHash.equals(old.blockHash) && row.sameMetadata(old)) reopened.add(row.key);
                 next.put(row.key, row);
+                if (nextRetained.containsKey(row.key)) { nextRetained.get(row.key).row = row; }
             }
+            if (newBlock != null) for (Retained row : nextRetained.values()) if (row.row.blockHash.equals(newBlock) && !next.containsKey(row.row.key)) row.row.state = "unavailable";
         }
         require(next.size() <= MAX_CATALOG, "CLAIMS_CAPACITY");
+        require(nextRetained.size() <= MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
         boolean more = true; long previousSequence = -1;
-        for (int page = 0; (more || replayAfterFirst) && page < 20; page++) {
+        for (int page = 0; (more || replayAfterFirst) && page < MAX_REPLAY_PAGES; page++) {
             JSONObject changes = page == 0 && first != null ? first : request("getbountychanges", new JSONObject().put("cursor", nextCursor), epoch);
             if (page > 0 || first == null) replayAfterFirst = false;
             nextTip = validateTip(changes.optJSONObject("tip"));
@@ -425,18 +651,36 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 require(sequence > previousSequence, "CLAIMS_RPC_DATA"); previousSequence = sequence;
                 String txid = hash(event.opt("txid")); long vout = integer(event.opt("vout"), 0, 0xffffffffL); String key = txid + ":" + vout;
                 String type = event.optString("type", ""); Candidate row = next.get(key);
-                if (type.equals("window_exit")) next.remove(key);
+                if (row == null && nextRetained.containsKey(key)) row = nextRetained.get(key).row;
+                if (type.equals("window_exit")) {
+                    if (row != null) exited.put(key, row);
+                    next.remove(key);
+                }
                 else if (type.equals("added")) {
                     String blockHash = hash(event.opt("block_hash")); long height = integer(event.opt("block_height"), 0, SAFE_MAX);
-                    if (row != null) require(row.blockHash.equals(blockHash) && row.height == height, "CLAIMS_RPC_DATA");
+                    if (row != null && !row.blockHash.equals(blockHash)) {
+                        // A re-mined funding transaction keeps its immutable
+                        // outputs, but its old proof/location is no longer owned.
+                        require(!canonical.containsKey(row.blockHash), "CLAIMS_RPC_DATA");
+                        row.state = "unavailable"; next.remove(key);
+                        if (nextRetained.containsKey(key)) nextRetained.get(key).row.state = "unavailable";
+                        row = null;
+                    }
+                    if (row != null) require(row.height == height, "CLAIMS_RPC_DATA");
                     if (canonical.containsKey(blockHash)) {
                         require(canonical.get(blockHash) == height, "CLAIMS_RPC_DATA");
                         if (row == null) dirtyBlocks.add(blockHash);
                     }
                 }
-                else if (type.equals("spent") || type.equals("pending_spend")) { hash(event.opt("spending_txid")); if (row != null) row.state = type.equals("spent") ? "spent" : "pending_spend"; }
+                else if (type.equals("spent") || type.equals("pending_spend")) {
+                    String spender = hash(event.opt("spending_txid"));
+                    if (row != null) { row.state = type; row.spendingTxid = spender; }
+                    if (nextRetained.containsKey(key)) { nextRetained.get(key).row.state = type; nextRetained.get(key).row.spendingTxid = spender; }
+                    if (exited.containsKey(key)) { exited.get(key).state = type; exited.get(key).spendingTxid = spender; }
+                }
                 else if (type.equals("available_again") || type.equals("matured")) {
-                    if (row != null && !row.state.equals("spent") && (type.equals("available_again") || row.state.equals("immature"))) row.state = row.coinbase && nextTip.getLong("height") - row.height + 1 < 100 ? "immature" : "available";
+                    if (row != null && !row.state.equals("spent") && (type.equals("available_again") || row.state.equals("immature"))) { row.state = row.coinbase && nextTip.getLong("height") - row.height + 1 < 100 ? "immature" : "available"; row.spendingTxid = null; }
+                    if (type.equals("available_again")) reopened.add(key);
                 } else throw new IllegalArgumentException("CLAIMS_RPC_DATA");
             }
             nextCursor = following;
@@ -448,21 +692,95 @@ public final class MobileClaimsEngine implements AutoCloseable {
         if (!MobileClaimBlockWindow.sameTip(nextTip, finalTip) || window != null && !MobileClaimBlockWindow.sameTip(window.tip(), finalTip)) throw new ChainMoved();
         synchronized (this) {
             check(epoch);
+            proof.setStartAllowed(startLimiter, false); acknowledgeStarts();
             Map<String, Long> nextBlocks = recent == null ? blocks : recent;
             if (newBlock != null && !nextBlocks.containsKey(newBlock)) throw new IllegalArgumentException("CLAIMS_SYNC_BUSY");
             Set<String> nextLoaded = new HashSet<>(loaded); nextLoaded.retainAll(nextBlocks.keySet()); if (newBlock != null) nextLoaded.add(newBlock);
             nextLoaded.removeAll(dirtyBlocks);
+            Map<Long, String> canonicalHeights = new HashMap<>(); for (Map.Entry<String, Long> block : nextBlocks.entrySet()) canonicalHeights.put(block.getValue(), block.getKey());
+            // Missing overlap also occurs after a long pause; it is not proof
+            // that an older funding output was reorganized or spent. Preserve
+            // already-admitted work and let Core validate the final UTXO/proof.
+            for (Candidate row : exited.values()) if (protectedOutpoint(row.key)) {
+                if (finalTip.getLong("height") - row.height < 600) row.state = "unavailable";
+                nextRetained.put(row.key, new Retained(row));
+            }
+            for (Retained row : nextRetained.values()) {
+                String canonicalHash = canonicalHeights.get(row.row.height);
+                if (row.row.height > finalTip.getLong("height") || canonicalHash != null && !canonicalHash.equals(row.row.blockHash)) row.row.state = "unavailable";
+                row.normalAged = (row.row.state.equals("available") || row.row.state.equals("pending_spend")) && !nextBlocks.containsKey(row.row.blockHash)
+                    && finalTip.getLong("height") - row.row.height >= 600;
+            }
+            nextRetained.keySet().removeIf(key -> !protectedOutpoint(key));
+            require(nextRetained.size() <= MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
             Map<String, Candidate.Progress> nextProgress = new LinkedHashMap<>(progress);
-            for (Candidate row : next.values()) nextProgress.put(row.key, row.progress);
-            Set<String> protectedKeys = new HashSet<>(reservations);
+            for (Candidate row : next.values()) {
+                Candidate.Progress latest = progress.get(row.key);
+                if (latest != null && latest != row.progress) {
+                    require(latest.metadata.equals(row.progress.metadata), "CLAIMS_RPC_DATA");
+                    // Re-mining staged a distinct Progress before journal/tip
+                    // I/O. A native callback may have consumed more budget in
+                    // that interval. Rebase its monotonic accounting at commit,
+                    // never the old block's preparation or proof ownership.
+                    row.progress.captures = row.progress.captures.max(latest.captures);
+                    row.progress.budgetExhausted |= latest.budgetExhausted;
+                }
+                nextProgress.put(row.key, row.progress);
+            }
+            Set<String> protectedKeys = new HashSet<>(reservations); protectedKeys.addAll(savedWinners.keySet());
             for (Capture capture : activeCaptures.values()) protectedKeys.add(capture.row.key);
-            nextProgress.entrySet().removeIf(item -> (!nextBlocks.containsKey(item.getValue().blockHash) || nextLoaded.contains(item.getValue().blockHash) && !next.containsKey(item.getKey())) && !protectedKeys.contains(item.getKey()));
+            long oldestHeight = Math.max(0, finalTip.getLong("height") - 599);
+            for (var iterator = nextProgress.entrySet().iterator(); iterator.hasNext();) {
+                Map.Entry<String, Candidate.Progress> entry = iterator.next(); Candidate.Progress item = entry.getValue();
+                if (protectedKeys.contains(entry.getKey())) continue;
+                if (!nextBlocks.containsKey(item.blockHash)) {
+                    // A funding reorg precedes discovery of its re-mined tx.
+                    // Keep only bounded accounting through that gap, never an
+                    // old preparation/proof or an eligible catalog candidate.
+                    if (item.height >= oldestHeight) entry.setValue(item.accountingOnly()); else iterator.remove();
+                } else if (nextLoaded.contains(item.blockHash) && !next.containsKey(entry.getKey())) iterator.remove();
+            }
             // Validate the complete prospective state before publishing any of
             // it: protected old captures/winners can outlive their window.
             require(nextProgress.size() <= MAX_PROGRESS, "CLAIMS_CAPACITY");
+            // Receipt bytes can be compacted after confirmation, but retirement
+            // is not eternal if that confirmation is later orphaned. Require a
+            // positive canonical conflict, then a newly streamed funding block;
+            // an old available row or ordinary window aging proves neither.
+            Set<String> confirmedReopened = new HashSet<>();
+            for (Map.Entry<String, Candidate.Progress> entry : nextProgress.entrySet()) {
+                Candidate.Progress item = entry.getValue(); ConfirmedClaim completed = item.confirmed;
+                if (completed == null || completed.reopened) continue;
+                String canonicalHash = canonicalHeights.get(completed.height);
+                if (completed.blockHash.equals(canonicalHash)) { completed.orphaned = false; completed.reloadedFundingBlock = null; continue; }
+                if (!completed.orphaned && (finalTip.getLong("height") < completed.height || canonicalHash != null && !canonicalHash.equals(completed.blockHash))) completed.orphaned = true;
+                if (!completed.orphaned) continue;
+                Candidate row = next.get(entry.getKey());
+                if (newBlock != null && newBlock.equals(item.blockHash) && staged != null && staged.containsKey(entry.getKey())
+                        && row != null && row.blockHash.equals(item.blockHash) && row.progress.metadata.equals(item.metadata)) completed.reloadedFundingBlock = item.blockHash;
+                if (item.blockHash.equals(completed.reloadedFundingBlock) && row != null && row.blockHash.equals(item.blockHash) && row.progress.metadata.equals(item.metadata) && row.state.equals("available")) {
+                    completed.reopened = true; confirmedReopened.add(entry.getKey());
+                } else if (!item.blockHash.equals(completed.reloadedFundingBlock) && nextBlocks.containsKey(item.blockHash)) nextLoaded.remove(item.blockHash);
+            }
             if (recent != null) { blocks.clear(); blocks.putAll(recent); }
             if (window != null) blockWindow = window;
             loaded.clear(); loaded.addAll(nextLoaded); catalog.clear(); catalog.putAll(next);
+            retained.clear(); retained.putAll(nextRetained); pruneRetained();
+            // Reopening is evidence only after the complete journal/final tip
+            // fence commits. Never let a partial page authorize a new claim.
+            for (String key : reopened) {
+                Candidate row = ownedRow(key);
+                if (row == null || !row.state.equals("available")) continue;
+                Winner pending = pendingWinners.get(key), saved = savedWinners.get(key);
+                if (pending != null) pending.reopened = true;
+                if (saved != null) { saved.reopened = true; saved.retryDue = 0; }
+                Candidate.Progress item = nextProgress.get(key);
+                if (pending == null && saved == null && (item == null || item.confirmed == null || item.confirmed.reopened)) retired.remove(key);
+            }
+            for (String key : confirmedReopened) if (!pendingWinners.containsKey(key) && !savedWinners.containsKey(key)) retired.remove(key);
+            resyncBlocks.retainAll(nextBlocks.keySet()); if (newBlock != null) resyncBlocks.remove(newBlock);
+            resyncSnapshotPending = false;
+            if (resyncBlocks.isEmpty()) catalogGate = false;
             progress.clear(); progress.putAll(nextProgress); scheduleDirty = true;
             if (recent != null) {
                 Set<String> policies = new HashSet<>(); for (Candidate.Progress item : progress.values()) policies.add(item.policy);
@@ -470,7 +788,13 @@ public final class MobileClaimsEngine implements AutoCloseable {
             }
             pruneRetired();
             cursor = nextCursor; tip = nextTip; healthy = true; catalogValidatedAt = validatedFrom;
+            for (Capture capture : activeCaptures.values()) {
+                boolean invalid = !ownedAvailable(capture.row);
+                boolean outside = !catalog.containsKey(capture.row.key);
+                if (!capture.cancelled && (invalid || outside && !capture.started)) { capture.cancelled = true; proof.cancel(capture.handle); }
+            }
             cancelUnsafeQueuedTransmissions();
+            proof.setStartAllowed(startLimiter, catalogFresh() && enabled && allowed && !closed);
         }
     }
 
@@ -489,16 +813,23 @@ public final class MobileClaimsEngine implements AutoCloseable {
         try {
             if (now() >= nextDiscovery) discover(epoch);
             String missing = null;
-            synchronized (this) { for (String block : blocks.keySet()) if (!loaded.contains(block)) { missing = block; break; } }
+            synchronized (this) {
+                for (String block : resyncBlocks) if (blocks.containsKey(block) && !loaded.contains(block)) { missing = block; break; }
+                if (missing == null) for (Candidate.Progress item : progress.values()) if (item.confirmed != null && item.confirmed.orphaned && !item.confirmed.reopened && !item.blockHash.equals(item.confirmed.reloadedFundingBlock)
+                        && blocks.containsKey(item.blockHash) && !loaded.contains(item.blockHash)) { missing = item.blockHash; break; }
+                if (missing == null) for (String block : blocks.keySet()) if (!loaded.contains(block)) { missing = block; break; }
+            }
             stage = "catalog";
             scope = missing == null ? "" : missing;
             if (missing != null && now() >= nextBlock) loadBlock(missing, epoch);
+            stage = "receipt"; scope = "";
+            reconcileSaved(epoch);
             Candidate candidate;
             synchronized (this) {
                 check(epoch); refreshSchedule();
                 MobileClaimScheduler.Selection preparation = catalogFresh() ? scheduler.next(now(), false) : null;
-                candidate = preparation == null ? null : preparation.row;
-                status = !catalogFresh() || pendingReadDiagnostic() ? "retrying" : candidate == null && scheduler.next(now(), true) == null ? (loaded.size() < blocks.size() ? "synchronizing" : "waiting") : "claiming";
+                candidate = heldWinnerCount() >= MAX_RETAINED_WINNERS || preparation == null ? null : preparation.row;
+                status = !catalogFresh() || pendingReadDiagnostic() ? "retrying" : heldWinnerCount() >= MAX_RETAINED_WINNERS ? "waiting" : candidate == null && scheduler.next(now(), true) == null ? (loaded.size() < blocks.size() ? "synchronizing" : "waiting") : "claiming";
             }
             stage = "funding";
             scope = candidate == null ? "" : candidate.key;
@@ -510,19 +841,30 @@ public final class MobileClaimsEngine implements AutoCloseable {
                     // A normal block race is not a new wallet generation and
                     // must not discard retained, proven-unsent winners.
                     healthy = false; nextDiscovery = 0; retryAt = now() + 1000; status = "retrying";
-                    cancelCaptures(null, -1); cancelUnsafeQueuedTransmissions(); resetStartSchedule();
+                    proof.setStartAllowed(startLimiter, false); cancelUnsafeQueuedTransmissions(); resetStartSchedule();
                 }
             }
         }
         catch (ReadFailure error) {
             synchronized (this) { if (epoch == generation && enabled) { recordRpcError(error.failure, error.method, stage); lastRpcScope = scope; } }
-            if (!retryRead(error.failure, epoch)) failed(error.failure, epoch, false);
+            if (!retryRead(error.failure, error.method, epoch)) failed(error.failure, epoch, false);
         }
         catch (Exception | LinkageError error) { failed(error instanceof JSONException ? new IllegalArgumentException("CLAIMS_RPC_DATA", error) : error, epoch, false); }
     }
     /** This entry point is deliberately confined to maintain() READ failures. */
-    private synchronized boolean retryRead(MobileRpcClient.RpcFailure error, long epoch) {
-        if (error.unknownOutcome || !java.util.Arrays.asList("RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "-32029", "-32030").contains(error.code)) return false;
+    private synchronized boolean retryRead(MobileRpcClient.RpcFailure error, String method, long epoch) {
+        // EOF after a written read has these conservative protocol/stream codes.
+        // Only the transport's positive loss evidence makes them recoverable:
+        // malformed replies and financial outcome ambiguity remain failures.
+        boolean disconnectedRead = error.transportLoss && !error.explicitRejection &&
+            (error.code.equals("RPC_PROTOCOL") || error.code.equals("RPC_STREAM_INCOMPLETE"));
+        // This code means a temporarily unavailable funding lookup ONLY here.
+        // sendrawtransaction uses it for an ambiguous financial outcome and
+        // must never inherit read retry semantics.
+        boolean fundingUnavailable = method.equals("gettransaction") && error.code.equals("-32002") &&
+            error.nodeCode == null && !error.explicitRejection;
+        if (error.unknownOutcome || (!disconnectedRead && !fundingUnavailable &&
+            !java.util.Arrays.asList("RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "-32001", "-32029", "-32030").contains(error.code))) return false;
         if (epoch != generation || !enabled) return true;
         long delay = error.code.equals("-32029") ? 60000 : 5000;
         delay = Math.max(delay, Math.min(60000, Math.max(0, error.retryAfterMs)));
@@ -566,10 +908,17 @@ public final class MobileClaimsEngine implements AutoCloseable {
             if (epoch != generation || !enabled) return;
             healthy = false; currentDomain = "";
             String code = error instanceof MobileRpcClient.RpcFailure ? ((MobileRpcClient.RpcFailure) error).code : safeCode(error.getMessage());
-            if (code.equals("-32011") || code.equals("-32004") || code.equals("CLAIMS_RESYNC")) resetCatalog(true);
+            if (code.equals("-32011") || code.equals("-32004") || code.equals("CLAIMS_RESYNC") || code.equals("CLAIMS_SYNC_BUSY")) {
+                // A replay budget is a work bound, not invalid server data.
+                // Repeating its original cursor can never drain a larger
+                // backlog. Obtain a fresh watermark before reloading streams,
+                // retaining admitted proofs/counters behind the resync gate.
+                resetCatalog(true); lastError = code; status = "retrying"; retryAt = now() + 1000; nextDiscovery = 0;
+                cancelUnsafeQueuedTransmissions(); resetStartSchedule(); return;
+            }
             if (code.equals("CLAIMS_WRONG_NETWORK") || code.equals("CLAIMS_CAPACITY") || code.equals("CLAIMS_RPC_DATA") || code.equals("CLAIMS_NATIVE_DATA") || code.equals("CLAIMS_RECEIPT_UNAVAILABLE") || error instanceof LinkageError) { enabled = false; pauseClock(); status = "error"; }
             else { status = "retrying"; retryAt = now() + (code.equals("-32029") ? 60000 : 5000); nextDiscovery = 0; }
-            lastError = code; generation++; cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts();
+            lastError = code; generation++; clearFunding(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts();
             cancelUnsafeQueuedTransmissions();
             // A failed maintenance read is already complete; it must not
             // manufacture an unknown outcome for an unrelated transmission.
@@ -581,7 +930,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
 
     private void prepare(Candidate row, long epoch) throws Exception {
         JSONObject prepared;
-        synchronized (this) { check(epoch); if (!rowAvailable(row.key)) return; prepared = row.progress.prepared; }
+        synchronized (this) { check(epoch); if (!catalogFresh() || !rowAvailable(row.key)) return; prepared = row.progress.prepared; }
         if (prepared == null) {
             String txid = row.bounty.getString("txid"), parentHex;
             synchronized (this) { parentHex = parents.get(txid); if (parentHex == null && now() < nextPreparation) return; }
@@ -593,9 +942,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 validateTip(parent.optJSONObject("tip")); JSONObject tx = parent.optJSONObject("transaction");
                 require(tx != null && tx.opt("hex") instanceof String, "CLAIMS_RPC_DATA"); parentHex = tx.getString("hex");
             }
-            prepared = transactions.prepare(row.bounty, parentHex, rewardAddress);
+            prepared = transactions.prepare(row.bounty, parentHex, rewardAddress, fundingValidation, () -> check(epoch));
             synchronized (this) {
-                check(epoch); Candidate current = catalog.get(row.key); if (current == null || !rowAvailable(row.key)) return;
+                check(epoch); Candidate current = catalog.get(row.key); if (!catalogFresh() || current == null || !rowAvailable(row.key)) return;
                 parents.putValidated(txid, parentHex); current.progress.prepared = prepared;
                 readRecovered("funding");
             }
@@ -630,18 +979,27 @@ public final class MobileClaimsEngine implements AutoCloseable {
         long admittedAt = nanoClock.getAsLong();
         if (admittedAt >= nextStartAcknowledgementNanos) acknowledgeStarts();
         expireCatalogWork();
-        if (closed || !enabled || !allowed || unknownBlocked || !catalogFresh() || reservations.size() >= MAX_CONCURRENCY) { admissionIdle = true; return null; }
+        if (closed || !enabled || !allowed || unknownBlocked || !catalogFresh() || reservations.size() >= MAX_CONCURRENCY || heldWinnerCount() + activeCaptures.size() >= MAX_RETAINED_WINNERS) { admissionIdle = true; return null; }
         // Full capacity is still continuous demand; preserve the global phase.
         if (activeCaptures.size() >= concurrency || admittedAt < nextAttemptNanos) return null;
+        // Stop/Start creates a fresh native budget key. The prior run must
+        // finish importing any captured-but-cancelled observations before a
+        // new key is seeded, even though Start itself may already be enabled.
+        // LinkedHashMap preserves admission order; this gate itself prevents
+        // different runs from mixing, so inspecting its oldest entry suffices.
+        if (!activeCaptures.isEmpty() && activeCaptures.values().iterator().next().run != runSerial) return null;
         refreshSchedule(); MobileClaimScheduler.Selection selection = scheduler.next(now(), true);
         if (selection == null) { admissionIdle = true; return null; }
         Candidate row = selection.row;
         if (!rowAvailable(row.key) || !row.budget()) { scheduler.remove(row.key); return null; }
         if (!selection.recovery && !MobileClaimScheduler.worth(row.raw, MobileClaimScheduler.rate(row, domains))) { scheduleDirty = true; return null; }
         if (!domains.containsKey(row.policy)) { require(domains.size() < MAX_DOMAINS * 7, "CLAIMS_CAPACITY"); domains.put(row.policy, new PerformanceWindow(this::now)); }
-        Capture capture = new Capture(++captureSerial, generation, runSerial, row, proof.create(startLimiter), selection);
+        long handle = proof.create(startLimiter);
+        try { proof.bindBudget(handle, Long.toHexString(runSerial) + ":" + row.key, row.target, row.progress.captures.toString()); }
+        catch (RuntimeException | LinkageError error) { proof.destroy(handle); throw error; }
+        Capture capture = new Capture(++captureSerial, generation, runSerial, row, handle, selection);
+        if (!scheduler.reserve(selection, now())) { proof.destroy(handle); return null; }
         activeCaptures.put(capture.id, capture); currentDomain = row.domain;
-        scheduler.reserve(selection);
         // Idle time earns no credit. Advance first, then retain at most one
         // second of debt, using time after ACK/selection/handle creation work.
         // This phase is global; native independently caps actual TCP starts.
@@ -669,25 +1027,45 @@ public final class MobileClaimsEngine implements AutoCloseable {
         long startedAt = proof.startedAtNanos(capture.handle);
         if (startedAt == 0) return;
         capture.started = true;
-        scheduler.acknowledge(capture.selection, TimeUnit.NANOSECONDS.toMillis(startedAt));
+        // Scheduler deadlines are whole milliseconds. Round the native event
+        // up, not down, so fractional milliseconds cannot shorten 250 ms.
+        long probeStartedMs = TimeUnit.NANOSECONDS.toMillis(startedAt) + (startedAt % 1_000_000 == 0 ? 0 : 1);
+        scheduler.acknowledge(capture.selection, probeStartedMs);
         if (capture.run != runSerial) return;
         attempts = increment(attempts);
         recentStarts.record(startedAt, nanoClock.getAsLong());
     }
     private static final class Capture {
-        final long id, epoch, run, handle; final Candidate row; final MobileClaimScheduler.Selection selection; boolean cancelled, started;
+        final long id, epoch, run, handle; final Candidate row; final MobileClaimScheduler.Selection selection; boolean cancelled, started, outcomeCounted, budgetCounted;
         Capture(long id, long epoch, long run, Candidate row, long handle, MobileClaimScheduler.Selection selection) { this.id = id; this.epoch = epoch; this.run = run; this.row = row; this.handle = handle; this.selection = selection; }
     }
     private synchronized void releaseCapture(Capture capture) {
         if (activeCaptures.remove(capture.id) == null) return;
         acknowledgeStart(capture);
+        if (!capture.budgetCounted && proof.hasCaptured(capture.handle)) accountCaptured(capture);
         scheduler.release(capture.selection);
         proof.destroy(capture.handle);
+        pruneRetained();
+        releaseObsoleteResyncGate();
         currentDomain = activeCaptures.isEmpty() ? "" : activeCaptures.values().iterator().next().row.domain;
+    }
+    private void accountCaptured(Capture capture) {
+        if (capture.budgetCounted) return;
+        capture.budgetCounted = true;
+        Candidate row = capture.row;
+        row.progress.captures = row.progress.captures.add(BigInteger.ONE).min(MAX_CAPTURES);
+        Candidate.Progress current = progress.get(row.key);
+        // A reorg may already have copied this outpoint's accounting while the
+        // old native call was draining. Import this handle once into both views,
+        // without reviving removed work or crediting a new run's UI counters.
+        if (current != null && current.metadata.equals(row.progress.metadata)) {
+            if (current != row.progress) current.captures = current.captures.add(BigInteger.ONE).min(MAX_CAPTURES);
+            if (current.captures.compareTo(row.captureStopCount) >= 0) scheduler.remove(row.key);
+        }
     }
     private void capture(Capture capture, boolean asyncSubmit) {
         try { captureResult(capture, asyncSubmit); }
-        catch (Stopped stopped) { /* Cancellation is neutral, not a performance sample. */ }
+        catch (Stopped stopped) { countCancelled(capture); }
         catch (Exception | LinkageError error) { failed(error, capture.epoch); }
         finally { releaseCapture(capture); }
     }
@@ -703,9 +1081,16 @@ public final class MobileClaimsEngine implements AutoCloseable {
             }
             result = proof.capture(context, capture.handle);
             synchronized (this) { acknowledgeStart(capture); check(epoch); if (capture.cancelled) throw new Stopped(); }
-        } catch (Stopped stopped) { countCancelled(capture); throw stopped; }
-        catch (IllegalStateException failure) {
-            if ("CLAIM_CANCELLED".equals(failure.getMessage())) { countCancelled(capture); throw new Stopped(); }
+        } catch (IllegalStateException failure) {
+            if ("CLAIM_CANCELLED".equals(failure.getMessage())) throw new Stopped();
+            if ("CLAIM_BUDGET".equals(failure.getMessage())) {
+                synchronized (this) {
+                    acknowledgeStart(capture); check(epoch); if (capture.cancelled) throw new Stopped();
+                    require(!capture.started, "CLAIMS_NATIVE_DATA");
+                    row.progress.budgetExhausted = true; scheduler.remove(row.key);
+                }
+                return;
+            }
             if (java.util.Arrays.asList("CLAIM_DNS", "CLAIM_CONTEXT", "CLAIM_TIMEOUT", "CLAIM_BUSY", "CLAIM_LOCAL_UNAVAILABLE").contains(failure.getMessage())) {
                 synchronized (this) {
                     check(epoch);
@@ -726,22 +1111,25 @@ public final class MobileClaimsEngine implements AutoCloseable {
         String nativeCode = result.optString("errorCode", "");
         boolean locallyUnavailable = nativeCode.equals("CLAIM_LOCAL_UNAVAILABLE");
         require(!locallyUnavailable || !captured && !validationPassed && !verified && !hit, "CLAIMS_NATIVE_DATA");
+        Winner winner;
         synchronized (this) {
             check(epoch);
             // A missing local route/family says nothing about the server's
             // speed. Preserve real attempts/failures without poisoning rank.
             if (!locallyUnavailable) domains.get(row.policy).record(validationPassed, duration / 1000.0);
-            if (captured) { row.progress.captures = row.progress.captures.add(BigInteger.ONE).min(MAX_CAPTURES); if (!row.budget()) scheduler.remove(row.key); }
+            if (captured) accountCaptured(capture);
             if (validationPassed) valid = increment(valid); else invalid = increment(invalid);
+            capture.outcomeCounted = true;
             if (hit) targetHits = increment(targetHits);
             if (!pendingReadDiagnostic()) lastError = verified ? "" : java.util.Arrays.asList("CLAIM_NETWORK", "CLAIM_TLS", "CLAIM_CERTIFICATE", "CLAIM_TIMEOUT", "CLAIM_LOCAL_UNAVAILABLE").contains(nativeCode) ? nativeCode : "CLAIM_INVALID_PROOF";
-        }
-        if (!hit) return;
-        require(result.opt("proof") instanceof String, "CLAIMS_NATIVE_DATA");
-        Winner winner = new Winner(row, prepared, result.getString("proof"), epoch);
-        synchronized (this) {
+            if (!hit) return;
+            require(result.opt("proof") instanceof String, "CLAIMS_NATIVE_DATA");
+            winner = new Winner(row, prepared, result.getString("proof"), epoch);
             check(epoch);
-            if (capture.cancelled || !rowAvailable(row.key) || !catalog.get(row.key).blockHash.equals(row.blockHash)) return;
+            if (capture.cancelled || !ownedAvailable(row)) return;
+            // Counting the verified hit and publishing its owner is one commit.
+            // A pending-spend notification between them would otherwise discard
+            // this completed proof before the winner's retention rules can run.
             // Freshness expiring as verification completes pauses broadcasting,
             // not retention of this already-validated, still-owned proof.
             require(pendingWinners.size() < MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
@@ -753,11 +1141,20 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private void queueWinner(Winner winner, boolean asyncSubmit) {
         synchronized (this) {
             if (pendingWinners.get(winner.row.key) != winner || winner.scheduled || winner.retryDue > now()) return;
+            if (winnerUsable(winner) && !winnerCanSubmit(winner)) {
+                winner.keepForRetry = true; winner.retryDue = now() + 1000;
+                status = "retrying";
+                return; // Incoherent discovery state never occupies the executor.
+            }
             winner.scheduled = true; winner.keepForRetry = false;
         }
         Runnable submit = () -> {
             try { submit(winner); }
-            catch (Stopped stopped) { /* A queued winner was stopped before transmission. */ }
+            catch (Stopped stopped) {
+                synchronized (MobileClaimsEngine.this) {
+                    if (!winner.transmissionAttempted && !closed && winnerRetainable(winner)) winner.keepForRetry = true;
+                }
+            }
             catch (Exception | LinkageError failure) { failed(failure, winner.epoch); }
             finally {
                 synchronized (MobileClaimsEngine.this) {
@@ -772,53 +1169,196 @@ public final class MobileClaimsEngine implements AutoCloseable {
         } else submit.run();
     }
     private static final class Winner {
-        final Candidate row; final JSONObject prepared; final String proof; final long epoch;
+        final Candidate row; final JSONObject prepared; final String proof; long epoch;
         boolean transmissionAttempted, cancelledBeforeWrite, cancelledForStaleness, scheduled, keepForRetry;
+        boolean acknowledged, submissionCounted, rejected, reopened, ownAbsenceValidated;
         String transactionHex, txid;
-        long retryDue;
+        long retryDue, acknowledgedAt;
         int failures;
         Winner(Candidate row, JSONObject prepared, String proof, long epoch) { this.row = row; this.prepared = prepared; this.proof = proof; this.epoch = epoch; }
     }
     private synchronized void releaseWinner(Winner winner) {
         if (pendingWinners.get(winner.row.key) != winner) return;
+        if (winner.keepForRetry && !winner.transmissionAttempted && !unknownBlocked && !closed && winnerRetainable(winner)) saveWinner(winner);
         pendingWinners.remove(winner.row.key);
         reservations.remove(winner.row.key);
+        pruneRetained();
+        releaseObsoleteResyncGate();
         // A winner queued behind another output has not been sent yet. Pause,
         // offline and transient discovery failures must not retire it forever.
-        if (!winner.transmissionAttempted) { retired.remove(winner.row.key); scheduleDirty = true; }
+        if ((!winner.transmissionAttempted || winner.rejected && winner.reopened) && !savedWinners.containsKey(winner.row.key)) { retired.remove(winner.row.key); scheduleDirty = true; }
     }
     private boolean winnerUsable(Winner winner) {
-        Candidate current = catalog.get(winner.row.key);
         return !closed && enabled && allowed && !unknownBlocked && winner.epoch == generation
             && pendingWinners.get(winner.row.key) == winner && reservations.contains(winner.row.key)
-            && current != null && current.supported && current.state.equals("available")
-            && current.blockHash.equals(winner.row.blockHash);
+            && winnerOwnedAvailable(winner);
     }
     private void discardIdleWinners() {
-        for (Winner winner : new ArrayList<>(pendingWinners.values())) if (!winner.scheduled && !winnerUsable(winner)) releaseWinner(winner);
+        for (Winner winner : new ArrayList<>(pendingWinners.values())) if (!winner.scheduled && !winnerUsable(winner)) {
+            if (!winner.transmissionAttempted && winnerRetainable(winner)) winner.keepForRetry = true;
+            releaseWinner(winner);
+        }
     }
     private void retryWinners(boolean asynchronous) {
         List<Winner> due = new ArrayList<>();
         synchronized (this) {
             discardIdleWinners();
             if (!catalogFresh()) return;
-            for (Winner winner : pendingWinners.values()) if (!winner.scheduled && winner.retryDue <= now() && winnerUsable(winner)) due.add(winner);
+            for (Winner winner : pendingWinners.values()) if (!winner.scheduled && winner.retryDue <= now() && winnerUsable(winner) && winnerCanSubmit(winner)) due.add(winner);
         }
         for (Winner winner : due) queueWinner(winner, asynchronous);
     }
+    private int heldWinnerCount() {
+        int count = pendingWinners.size();
+        for (String key : savedWinners.keySet()) if (!pendingWinners.containsKey(key)) count++;
+        return count;
+    }
+    private void saveWinner(Winner winner) {
+        require(savedWinners.containsKey(winner.row.key) || pendingWinners.containsKey(winner.row.key) || heldWinnerCount() < MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
+        savedWinners.put(winner.row.key, winner); retired.add(winner.row.key);
+    }
+    private void forgetSaved(Winner winner) {
+        if (savedWinners.get(winner.row.key) != winner) return;
+        savedWinners.remove(winner.row.key); pruneRetained(); releaseObsoleteResyncGate();
+    }
+    private void validateObserved(String raw, String expectedTxid, String originalHex, String target) {
+        try { transactions.validateObserved(raw, expectedTxid, originalHex, target); }
+        catch (Exception failure) { throw new IllegalArgumentException("CLAIMS_RPC_DATA", failure); }
+    }
+    /** Shared by manual recovery and automatic reconciliation. A matching raw
+     * txid does not make contradictory receipt/location metadata trustworthy. */
+    private static final class ReceiptEnvelope {
+        final JSONObject tip; final boolean locationChanged;
+        ReceiptEnvelope(JSONObject tip, boolean locationChanged) { this.tip = tip; this.locationChanged = locationChanged; }
+    }
+    private static ReceiptEnvelope validateReceiptEnvelope(JSONObject response, String expectedTxid) throws JSONException {
+        require(response != null, "CLAIMS_RPC_DATA");
+        JSONObject receiptTip = validateTip(response.optJSONObject("tip"));
+        JSONObject transaction = response.optJSONObject("transaction");
+        require(transaction != null && transaction.opt("hex") instanceof String, "CLAIMS_RPC_DATA");
+        require(!transaction.has("txid") || expectedTxid.equals(hash(transaction.opt("txid"))), "CLAIMS_RPC_DATA");
+        String location = response.optString("status", "");
+        require(location.equals("pending") || location.equals("confirmed"), "CLAIMS_RPC_DATA");
+        boolean changed = false;
+        // The index location and Core's verbose transaction are separate reads.
+        // A well-typed disagreement can be a block/reorg between those reads.
+        // Validate every field (and the raw proof at the caller) before retrying;
+        // never accept the contradiction as an ACK or compact its retained bytes.
+        if (location.equals("pending")) {
+            require(!response.has("block_hash") && !response.has("block_height"), "CLAIMS_RPC_DATA");
+            if (transaction.has("blockhash")) { hash(transaction.opt("blockhash")); changed = true; }
+            if (transaction.has("confirmations")) changed |= integer(transaction.opt("confirmations"), 0, SAFE_MAX) > 0;
+        } else {
+            String block = hash(response.opt("block_hash"));
+            long height = integer(response.opt("block_height"), 0, receiptTip.getLong("height"));
+            require(height != 0 || block.equals(GENESIS), "CLAIMS_RPC_DATA");
+            require(height != receiptTip.getLong("height") || block.equals(receiptTip.getString("hash")), "CLAIMS_RPC_DATA");
+            if (transaction.has("confirmations")) changed |= integer(transaction.opt("confirmations"), 0, SAFE_MAX) == 0;
+            if (transaction.has("blockhash")) changed |= !block.equals(hash(transaction.opt("blockhash")));
+        }
+        return new ReceiptEnvelope(receiptTip, changed);
+    }
+    private boolean restoreSaved(Winner winner, long epoch) {
+        if (savedWinners.get(winner.row.key) != winner || reservations.size() >= MAX_CONCURRENCY || !catalogFresh() || !winnerOwnedAvailable(winner)
+                || winner.acknowledged && catalogValidatedAt <= winner.acknowledgedAt) return false;
+        winner.epoch = epoch; winner.transmissionAttempted = false; winner.keepForRetry = true;
+        winner.scheduled = false; winner.cancelledBeforeWrite = winner.cancelledForStaleness = false;
+        // Keep the retained owner until a definitive outcome. A new pending
+        // spend can cancel this quota-queued replay before any byte is sent;
+        // that must not erase an earlier ACK or its original signed bytes.
+        pendingWinners.put(winner.row.key, winner); reservations.add(winner.row.key);
+        return true;
+    }
+    /** ACK retention is in-memory and bounded. Never invent a second proof or
+     * treat an old available snapshot as permission to duplicate a submission.
+     * Receipt reads share the funding method's 1.5-second admission budget. */
+    private void reconcileSaved(long epoch) throws Exception {
+        Winner lookup = null;
+        synchronized (this) {
+            check(epoch); if (!catalogFresh()) return;
+            for (Winner winner : new ArrayList<>(savedWinners.values())) {
+                if (winner.scheduled || pendingWinners.containsKey(winner.row.key)) continue;
+                Candidate current = ownedRow(winner.row.key);
+                if (!winner.acknowledged) {
+                    if (current != null && (!current.blockHash.equals(winner.row.blockHash) || !current.sameMetadata(winner.row) || current.state.equals("unavailable") || current.state.equals("spent"))) {
+                        forgetSaved(winner); retired.remove(winner.row.key); scheduleDirty = true; continue;
+                    }
+                    if (winner.retryDue <= now() && (!winner.rejected || winner.reopened)) restoreSaved(winner, epoch);
+                } else if (winner.retryDue <= now() && now() >= nextReceiptLookup && now() >= nextPreparation
+                        && (lookup == null || winner.retryDue < lookup.retryDue)) {
+                    // Service the oldest deadline, not insertion order. Two
+                    // early absent claims can otherwise alternate 5-second
+                    // retries and starve every later receipt indefinitely.
+                    lookup = winner;
+                }
+            }
+            if (lookup == null) return;
+            nextPreparation = now() + 1500;
+            // Receipt reconciliation must leave funding admission slots too.
+            nextReceiptLookup = now() + 3000;
+            lookup.retryDue = now() + 30000;
+        }
+        final Winner winner = lookup;
+        JSONObject response;
+        try { response = request("gettransaction", new JSONObject().put("txid", winner.txid), epoch); }
+        catch (ReadFailure failure) {
+            if (!failure.failure.code.equals("-32004") || failure.failure.unknownOutcome || failure.failure.explicitRejection || failure.failure.nodeCode != null) throw failure;
+            synchronized (this) {
+                check(epoch); if (savedWinners.get(winner.row.key) != winner) return;
+                winner.retryDue = now() + 5000;
+                winner.ownAbsenceValidated = true;
+                // The exact transaction is absent AND a coherent catalog says
+                // the same funding output is available. Core still validates
+                // the same signed bytes on retransmission.
+                if (catalogValidatedAt > winner.acknowledgedAt && winnerOwnedAvailable(winner) && (!winner.rejected || winner.reopened)) { winner.retryDue = now(); restoreSaved(winner, epoch); }
+                readRecovered("receipt");
+            }
+            return;
+        }
+        ReceiptEnvelope envelope = validateReceiptEnvelope(response, winner.txid);
+        JSONObject transaction = response.getJSONObject("transaction");
+        validateObserved(transaction.getString("hex"), winner.txid, winner.transactionHex, winner.row.target);
+        if (envelope.locationChanged) throw new ChainMoved();
+        JSONObject confirmedTip = envelope.tip;
+        String location = response.getString("status");
+        String block = null; long height = -1;
+        if (location.equals("confirmed")) {
+            block = response.getString("block_hash"); height = response.getLong("block_height");
+        }
+        synchronized (this) {
+            check(epoch); if (savedWinners.get(winner.row.key) != winner) return;
+            if (!MobileClaimBlockWindow.sameTip(tip, confirmedTip)) throw new ChainMoved();
+            winner.ownAbsenceValidated = false;
+            if (location.equals("confirmed")) {
+                for (Map.Entry<String, Long> known : blocks.entrySet()) if (known.getValue() == height) require(known.getKey().equals(block), "CLAIMS_RPC_DATA");
+                Candidate.Progress item = progress.get(winner.row.key);
+                // sameTip above anchors the receipt to a local snapshot that
+                // has already reached height; a receipt ahead of local sync
+                // cannot later be mistaken for a chain rollback.
+                if (item != null && item.blockHash.equals(winner.row.blockHash) && item.metadata.equals(winner.row.progress.metadata))
+                    item.confirmed = new ConfirmedClaim(winner.txid, block, height, winner.submissionCounted);
+                forgetSaved(winner);
+            }
+            readRecovered("receipt");
+        }
+    }
     private synchronized void retainUnsentWinner(Winner winner, String code, long retryAfterMs) {
-        if (!winnerUsable(winner)) return;
-        boolean transientFailure = java.util.Arrays.asList("RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "-32029", "-32030").contains(code);
-        if (!transientFailure && !(code.equals("RPC_CANCELLED") && winner.cancelledForStaleness)) return;
+        boolean transientFailure = java.util.Arrays.asList("RPC_TIMEOUT", "RPC_UNAVAILABLE", "RPC_BUSY", "-32001", "-32029", "-32030").contains(code);
+        if (!transientFailure && !(code.equals("RPC_CANCELLED") && (winner.cancelledForStaleness || winner.epoch != generation || !enabled || !allowed))) return;
+        if (unknownBlocked || closed || !winnerRetainable(winner)) return;
         long delay = Math.max(Math.min(30000L, 1000L << winner.failures), Math.max(0, retryAfterMs));
         winner.failures = Math.min(5, winner.failures + 1);
         winner.retryDue = now() + Math.min(SAFE_MAX - now(), delay);
-        winner.keepForRetry = true; status = "retrying"; lastError = code;
+        winner.keepForRetry = true;
+        if (winner.epoch == generation && enabled && allowed) { status = "retrying"; lastError = code; }
     }
     private synchronized void countCancelled(Capture capture) {
-        // Stop invalidates an epoch, but keep its cancellation counter until a
-        // NEW run starts. Old workers may not mutate that new run's counters.
-        if (capture.epoch == generation || !enabled && capture.epoch + 1 == generation) cancelled = increment(cancelled);
+        // Automatic network/background pauses invalidate epochs without ending
+        // the run. Count their drained captures, but never mutate a NEW run.
+        if (capture.run == runSerial && !capture.outcomeCounted) {
+            cancelled = increment(cancelled);
+            capture.outcomeCounted = true;
+        }
     }
     private void submit(Winner winner) throws Exception {
         Candidate row = winner.row; long epoch = winner.epoch;
@@ -830,8 +1370,11 @@ public final class MobileClaimsEngine implements AutoCloseable {
         final String expectedTxid = winner.txid;
         final CompletableFuture<JSONObject> transmission;
         synchronized (this) {
+            Candidate.Progress item = progress.get(winner.row.key);
+            if (item != null && item.confirmed != null && item.confirmed.counted && item.confirmed.txid.equals(winner.txid)) winner.submissionCounted = true;
+            if (!closed && pendingWinners.get(winner.row.key) == winner) saveWinner(winner);
             check(epoch); if (!winnerUsable(winner)) return;
-            if (!catalogFresh()) {
+            if (!winnerCanSubmit(winner)) {
                 // Queued behind another output, or a retry whose read refresh
                 // is still pending: no transmission has been enqueued here.
                 winner.keepForRetry = true; winner.retryDue = now() + 1000; status = "retrying";
@@ -840,11 +1383,11 @@ public final class MobileClaimsEngine implements AutoCloseable {
             // Enqueue and register under the same lifecycle lock: Stop can
             // either precede transmission, or cancel/retain its outcome.
             recordReceipt(expectedTxid, "pending");
-            winner.transmissionAttempted = true; winner.cancelledBeforeWrite = winner.cancelledForStaleness = false;
+            winner.transmissionAttempted = true; winner.cancelledBeforeWrite = winner.cancelledForStaleness = false; winner.rejected = winner.reopened = false;
             try { transmission = rpc.broadcast(winner.transactionHex, this, () -> {
                 check(epoch);
-                if (!catalogFresh() || !winnerUsable(winner)) {
-                    winner.cancelledForStaleness = winnerUsable(winner) && !catalogFresh();
+                if (!winnerCanSubmit(winner) || !winnerUsable(winner)) {
+                    winner.cancelledForStaleness = winnerUsable(winner) && !winnerCanSubmit(winner);
                     throw new Stopped();
                 }
             }); }
@@ -858,27 +1401,21 @@ public final class MobileClaimsEngine implements AutoCloseable {
             try { response = transmission.get(); }
             catch (ExecutionException failure) { if (failure.getCause() instanceof Exception) throw (Exception) failure.getCause(); throw new IllegalStateException("CLAIMS_RPC", failure.getCause()); }
             if (!expectedTxid.equals(response.opt("txid"))) { uncertain(expectedTxid); return; }
-            recordReceipt(expectedTxid, "submitted");
-            synchronized (this) { submitted = increment(submitted); if (epoch == generation && enabled && lastRpcError == null && catalogFresh()) status = "submitted"; }
+            recordAcknowledged(winner, epoch);
         } catch (MobileRpcClient.RpcFailure error) {
             synchronized (this) { if (epoch == generation) recordRpcError(error, "sendrawtransaction", "submission"); }
             if (error.unknownOutcome || Integer.valueOf(-27).equals(error.nodeCode)) { uncertain(expectedTxid); return; }
-            if (error.notSent) {
-                if (!notSent(winner, expectedTxid)) return;
+            if (error.notSent || error.notForwarded) {
                 retainUnsentWinner(winner, error.code, error.retryAfterMs);
+                notSent(winner, expectedTxid);
                 return;
             }
             if (winner.cancelledBeforeWrite && error.code.equals("RPC_CANCELLED")) {
-                if (notSent(winner, expectedTxid)) retainUnsentWinner(winner, error.code, error.retryAfterMs);
+                retainUnsentWinner(winner, error.code, error.retryAfterMs); notSent(winner, expectedTxid);
                 return;
             }
-            if (error.explicitRejection && error.code.equals("-32020") && error.nodeCode != null) {
-                try { recordReceipt(expectedTxid, "rejected"); } catch (Exception receiptFailure) { uncertain(expectedTxid); return; }
-                synchronized (this) { if (epoch == generation) { lastError = "CLAIMS_REJECTED"; nextDiscovery = 0; } } return;
-            }
             if (error.explicitRejection) {
-                try { recordReceipt(expectedTxid, "rejected"); } catch (Exception receiptFailure) { uncertain(expectedTxid); return; }
-                synchronized (this) { if (epoch == generation) { lastError = "CLAIMS_REJECTED"; nextDiscovery = 0; } }
+                recordRejected(winner, epoch);
                 return;
             }
             // False unknownOutcome alone is not positive evidence of no write.
@@ -886,7 +1423,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
         } catch (Exception unexpected) {
             synchronized (this) {
                 if (winner.cancelledBeforeWrite) {
-                    if (notSent(winner, expectedTxid)) retainUnsentWinner(winner, "RPC_CANCELLED", 0);
+                    retainUnsentWinner(winner, "RPC_CANCELLED", 0); notSent(winner, expectedTxid);
                     return;
                 }
             }
@@ -899,18 +1436,55 @@ public final class MobileClaimsEngine implements AutoCloseable {
         try {
             recordReceipt(txid, "not-sent");
             // ReleaseWinner may make this output eligible again only after the
-            // durable pending receipt has been replaced by proven non-sending.
+            // durable pending receipt has been replaced by proven non-sending
+            // or an explicit gateway response proving no forwarding to Core.
             winner.transmissionAttempted = false;
             return true;
-        } catch (Exception receiptFailure) { uncertain(txid); return false; }
+        } catch (Exception receiptFailure) {
+            uncertain(txid);
+            uncommittedReceipt = new UncommittedReceipt(winner, ReceiptState.NOT_SENT);
+            return false;
+        }
+    }
+    private synchronized void recordRejected(Winner winner, long epoch) {
+        // An explicit rejection is not an unknown network outcome. A failed
+        // durable write must keep the crash guard, but must not erase the live
+        // response or allow immediate replay of a still-rejected transaction.
+        winner.rejected = true; saveWinner(winner);
+        try { recordReceipt(winner.txid, "rejected"); }
+        catch (Exception receiptFailure) {
+            uncertain(winner.txid);
+            uncommittedReceipt = new UncommittedReceipt(winner, ReceiptState.REJECTED);
+            return;
+        }
+        if (epoch == generation) { lastError = "CLAIMS_REJECTED"; nextDiscovery = 0; }
+    }
+    private void acknowledgeWinner(Winner winner) {
+        if (!winner.submissionCounted) { submitted = increment(submitted); winner.submissionCounted = true; }
+        winner.acknowledged = true; winner.acknowledgedAt = now(); winner.rejected = winner.ownAbsenceValidated = false;
+        winner.retryDue = now() + 30000; saveWinner(winner);
+    }
+    private synchronized void recordAcknowledged(Winner winner, long epoch) {
+        // A validated ACK may leave the mempool before a manual lookup can
+        // find it. Preserve that live evidence across a failed durable write;
+        // recovery still commits submitted before the normal receipt/freshness
+        // gates can ever authorize replay of these exact signed bytes.
+        try { recordReceipt(winner.txid, "submitted"); }
+        catch (Exception receiptFailure) {
+            uncertain(winner.txid);
+            uncommittedReceipt = new UncommittedReceipt(winner, ReceiptState.SUBMITTED);
+            return;
+        }
+        acknowledgeWinner(winner);
+        if (epoch == generation && enabled && lastRpcError == null && catalogFresh()) status = "submitted";
     }
     private synchronized boolean rowAvailable(String key) { Candidate row = catalog.get(key); return row != null && row.supported && row.state.equals("available") && !retired.contains(key); }
     private synchronized void uncertain(String txid) {
         // Even a simultaneous Stop must retain this information: transmission
         // already occurred and must not become a silently retryable claim.
-        lastTxid = txid; unknown = increment(unknown); unknownBlocked = true; enabled = false; pauseClock(); status = "unknown-outcome"; lastError = "CLAIMS_UNKNOWN_OUTCOME";
+        lastTxid = txid; uncommittedReceipt = null; unknown = increment(unknown); unknownBlocked = true; enabled = false; pauseClock(); status = "unknown-outcome"; lastError = "CLAIMS_UNKNOWN_OUTCOME";
         try { recordReceipt(txid, "unknown"); } catch (Exception ignored) { /* The pre-write pending receipt remains a conservative crash guard. */ }
-        generation++; discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); cancelOwned(new ArrayList<>(operations));
+        generation++; clearFunding(); discardIdleWinners(); cancelCaptures(null, -1); resetStartSchedule(); acknowledgeStarts(); cancelOwned(new ArrayList<>(operations));
     }
 
     /** Bounded hour of real observations, matching the native claimer. The
@@ -950,18 +1524,32 @@ public final class MobileClaimsEngine implements AutoCloseable {
         }
         double rate() { advance(); return Math.max(Double.MIN_VALUE, Math.min(Double.MAX_VALUE, (5.0 + connections) / (1.0 + totalTime))); }
     }
+    private static final class ConfirmedClaim {
+        final String txid, blockHash; final long height; final boolean counted;
+        boolean orphaned, reopened; String reloadedFundingBlock;
+        ConfirmedClaim(String txid, String blockHash, long height, boolean counted) {
+            this.txid = txid; this.blockHash = blockHash; this.height = height; this.counted = counted;
+        }
+    }
     static final class Candidate {
         final JSONObject bounty; final String key, domain, policy, target, blockHash; final int mask; final long height; final boolean coinbase, supported;
         final BigInteger raw, targetPlusOne, captureStopCount;
         final String outpointOrder; final long outputIndex;
         private BigInteger cachedPriority; private int cachedFactor;
-        String state; Progress progress;
+        String state, spendingTxid; Progress progress;
         static final class Progress {
-            final int factor; final String blockHash, policy;
-            JSONObject prepared; BigInteger captures = BigInteger.ZERO;
-            Progress(int factor, String blockHash, String policy) {
+            final int factor; final String blockHash, policy, metadata; final long height;
+            JSONObject prepared; BigInteger captures = BigInteger.ZERO; boolean budgetExhausted;
+            ConfirmedClaim confirmed;
+            Progress(int factor, String blockHash, long height, String policy, String metadata) {
                 require(factor >= MobileClaimScheduler.FACTOR_SCALE && factor <= MobileClaimScheduler.FACTOR_MAX, "CLAIMS_PRIORITY_FACTOR");
-                this.factor = factor; this.blockHash = blockHash; this.policy = policy;
+                this.factor = factor; this.blockHash = blockHash; this.height = height; this.policy = policy; this.metadata = metadata;
+            }
+            Progress accountingOnly() {
+                if (prepared == null) return this;
+                Progress result = new Progress(factor, blockHash, height, policy, metadata);
+                result.captures = captures; result.budgetExhausted = budgetExhausted; result.confirmed = confirmed;
+                return result;
             }
         }
         Candidate(JSONObject source, String expectedBlock, long fee) throws Exception {
@@ -978,6 +1566,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             require(NativeTransactions.canonicalDomain(domain), "CLAIMS_RPC_DATA");
             policy = domain + ":" + mask;
             state = bounty.optString("status", ""); require(java.util.Arrays.asList("available", "immature", "pending_spend", "spent").contains(state), "CLAIMS_RPC_DATA");
+            if (bounty.has("spending_txid") && !bounty.isNull("spending_txid")) spendingTxid = hash(bounty.opt("spending_txid"));
             // These can be valid on-chain outputs, but cannot safely be dialed
             // by this public-only native engine. Do not let one poison others.
             supported = roots == 1 && domain.contains(".") && !domain.matches("[0-9]+(?:\\.[0-9]+){3}") && !domain.endsWith(".localhost") && !domain.endsWith(".local") && !domain.endsWith(".internal");
@@ -986,15 +1575,26 @@ public final class MobileClaimsEngine implements AutoCloseable {
             String txid = bounty.getString("txid"); StringBuilder order = new StringBuilder(64);
             for (int index = 62; index >= 0; index -= 2) order.append(txid, index, index + 2);
             outpointOrder = order.toString(); outputIndex = bounty.getLong("vout");
-            progress = new Progress(factor, blockHash, policy);
+            progress = new Progress(factor, blockHash, height, policy, domain + ":" + amount + ":" + target + ":" + roots + ":" + mask + ":" + coinbase);
         }
         Candidate copy() throws Exception { return new Candidate(this); }
-        private Candidate(Candidate source) throws Exception { bounty = MobileClaimsEngine.copy(source.bounty); key = source.key; domain = source.domain; policy = source.policy; target = source.target; blockHash = source.blockHash; mask = source.mask; height = source.height; coinbase = source.coinbase; supported = source.supported; raw = source.raw; targetPlusOne = source.targetPlusOne; captureStopCount = source.captureStopCount; outpointOrder = source.outpointOrder; outputIndex = source.outputIndex; state = source.state; progress = source.progress; }
+        private Candidate(Candidate source) throws Exception { bounty = MobileClaimsEngine.copy(source.bounty); key = source.key; domain = source.domain; policy = source.policy; target = source.target; blockHash = source.blockHash; mask = source.mask; height = source.height; coinbase = source.coinbase; supported = source.supported; raw = source.raw; targetPlusOne = source.targetPlusOne; captureStopCount = source.captureStopCount; outpointOrder = source.outpointOrder; outputIndex = source.outputIndex; state = source.state; spendingTxid = source.spendingTxid; progress = source.progress; }
         BigInteger priority() {
             if (cachedPriority == null || cachedFactor != progress.factor) { cachedFactor = progress.factor; cachedPriority = raw.multiply(BigInteger.valueOf(cachedFactor)); }
             return cachedPriority;
         }
-        boolean budget() { return progress.captures.compareTo(captureStopCount) < 0; }
+        boolean budget() { return !progress.budgetExhausted && progress.captures.compareTo(captureStopCount) < 0; }
+        boolean sameMetadata(Candidate other) { return progress.metadata.equals(other.progress.metadata); }
+        void reuse(Progress previous) {
+            require(previous.metadata.equals(progress.metadata), "CLAIMS_RPC_DATA");
+            if (previous.blockHash.equals(blockHash)) { progress = previous; return; }
+            // Re-mining changes chain context, not the same outpoint's exact
+            // successful-capture budget or stable random priority factor.
+            Progress relocated = new Progress(previous.factor, blockHash, height, policy, progress.metadata);
+            relocated.captures = previous.captures; relocated.budgetExhausted = previous.budgetExhausted;
+            relocated.confirmed = previous.confirmed; // Small receipt metadata, never the old proof or preparation.
+            progress = relocated; // Prepared work/proofs are not transplanted.
+        }
     }
     static Candidate select(Iterable<Candidate> candidates, Map<String, PerformanceWindow> stats, Set<String> retired) {
         Map<String, Candidate> perDomain = new HashMap<>();
@@ -1024,10 +1624,15 @@ public final class MobileClaimsEngine implements AutoCloseable {
             acknowledgeStarts();
             JSONArray measured = new JSONArray();
             for (Map.Entry<String, PerformanceWindow> entry : domains.entrySet()) { PerformanceWindow value = entry.getValue(); double measuredRate = value.rate(); String policy = entry.getKey(); int separator = policy.lastIndexOf(':'); measured.put(new JSONObject().put("domain", policy.substring(0, separator)).put("signatureAlgorithmsMask", Integer.parseInt(policy.substring(separator + 1))).put("connections", value.connections).put("totalTime", value.totalTime).put("rate", measuredRate).put("completed", value.completed)); }
-            int eligible = 0; for (Candidate row : catalog.values()) if (rowAvailable(row.key) && row.budget()) eligible++;
+            int available = 0, eligible = 0;
+            for (Candidate row : catalog.values()) if (rowAvailable(row.key) && row.budget()) {
+                available++; if (row.raw.signum() > 0 && MobileClaimScheduler.worth(row.raw, MobileClaimScheduler.rate(row, domains))) eligible++;
+            }
             long elapsed = elapsedBeforePause + (activeSince == 0 ? 0 : Math.max(0, now() - activeSince));
             return new JSONObject().put("enabled", enabled).put("allowed", allowed).put("running", enabled && allowed && !closed && !unknownBlocked)
-                .put("status", status).put("currentDomain", currentDomain).put("eligible", eligible).put("discoveredBlocks", loaded.size()).put("totalBlocks", blocks.size())
+                .put("status", status).put("currentDomain", currentDomain).put("eligible", eligible).put("available", available).put("economicFiltered", available - eligible)
+                .put("waitingReason", status.equals("waiting") && heldWinnerCount() >= MAX_RETAINED_WINNERS ? "retained-capacity" : status.equals("waiting") && available > 0 && eligible == 0 ? "economic-floor" : "")
+                .put("retainedSubmissions", heldWinnerCount()).put("discoveredBlocks", loaded.size()).put("totalBlocks", blocks.size())
                 .put("discoveryComplete", cursor != null && loaded.size() == blocks.size()).put("attempts", attempts).put("valid", valid).put("invalid", invalid).put("targetHits", targetHits)
                 .put("submitted", submitted).put("unknown", unknown).put("cancelled", cancelled).put("elapsedSeconds", elapsed / 1000.0).put("connectionsPerSecond", recentStarts.rate(nanoClock.getAsLong())).put("connectionsPerSecondLimit", connectionsPerSecondLimit).put("concurrency", concurrency).put("activeConnections", activeCaptures.size())
                 .put("lastTxid", lastTxid).put("lastError", lastError).put("lastRpcError", lastRpcError == null ? JSONObject.NULL : copy(lastRpcError)).put("domains", measured);

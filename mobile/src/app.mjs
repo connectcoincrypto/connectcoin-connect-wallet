@@ -20,6 +20,7 @@ import { nativeActionState, nativeControlState } from './native-controls.mjs';
 import { paymentProgressText } from './payment-progress.mjs';
 import { parsePaymentBatch, parsePaymentBatchResponse, parsePaymentBatchDismissal, paymentBatchTotals } from './payment-batch.mjs';
 import { claimsErrorText } from './claims-diagnostics.mjs';
+import { claimsStatusText } from './claims-status.mjs';
 import { createTransactionDetails } from './transaction-details.mjs';
 import { DEFAULT_SETTINGS, parseSettings, rpcEndpoint, resolvedTheme } from './settings.mjs';
 import { nativeCapabilities } from './platform.mjs';
@@ -517,13 +518,13 @@ function renderClaims() {
   $('background').checked = policy.allowBackground;
   $('background').disabled = !capabilities.backgroundClaims;
   $('background').closest('label').hidden = platform === 'ios';
-  $('claims-status').textContent = !native ? 'Preview · native claims not available' : claims ? `${claims.policyStatus} · ${claims.status}` : status.reason;
+  $('claims-status').textContent = !native ? 'Preview · native claims not available' : claims ? claimsStatusText(claims) : status.reason;
   $('start-claims').disabled = controls.startDisabled;
   $('stop-claims').disabled = controls.stopDisabled;
   $('background-claims').hidden = settingsOpen || !native || Boolean(session.state.address) || !(claims?.enabled || claims?.requested);
-  $('background-claims-status').textContent = claims ? `${claims.policyStatus} · ${claims.status}` : '';
+  $('background-claims-status').textContent = claims ? claimsStatusText(claims) : '';
   $('stop-background-claims').disabled = controls.stopDisabled;
-  for (const key of ['attempts', 'valid', 'invalid', 'targetHits', 'submitted', 'unknown', 'connectionsPerSecond', 'activeConnections', 'eligible']) {
+  for (const key of ['attempts', 'valid', 'invalid', 'targetHits', 'submitted', 'unknown', 'connectionsPerSecond', 'activeConnections', 'available', 'eligible', 'economicFiltered']) {
     const value = claims?.[key]; $('claims-' + key).textContent = Number.isFinite(value) ? value.toLocaleString('en-US', { maximumFractionDigits: 2 }) : '0';
   }
   $('claims-domain').textContent = claims?.currentDomain ? `Current domain: ${claims.currentDomain}` : '';

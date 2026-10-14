@@ -42,7 +42,7 @@ mobile_verifier_replace([=[    CertificateChain chain;
         !CheckSuppliedCertificateTimes(chain.value, validation_time, error) ||
         !CheckLeafUsage(chain.value, error)) {
         return false;
-    }]=] [=[    const auto* cached = MobileCertificates(proof, error);
+    }]=] [=[    const auto cached = MobileCertificates(proof, error);
     if (!cached || !MobileCheckCertificateTime(*cached, validation_time, error)) return false;
     auto& chain = cached->chain;]=])
 string(REPLACE
@@ -52,3 +52,4 @@ string(REPLACE
 set(MOBILE_VERIFIER "${CMAKE_CURRENT_BINARY_DIR}/generated/consensus/p2c_x509_mobile.cpp")
 file(WRITE "${MOBILE_VERIFIER}" "// Generated mobile adaptation: thread-owned immutable DER/static signature caches.\n// Original process-lifetime/shared-cache comments below describe upstream only.\n#include <algorithm>\n#include <deque>\n#include <memory>\n#ifdef CONNECTWALLET_NATIVE_TESTS\nnamespace connectwallet { void NativeVerificationObserverForTest(const void*); }\n#endif\n${VERIFIER_SOURCE}\n#ifdef _WIN32\nvoid ReleaseMobileP2CRootStoreForThread() { RootStoreV1(true); MobileCaches(true); }\n#endif\n")
 file(APPEND "${MOBILE_VERIFIER}" "\n#ifdef CONNECTWALLET_NATIVE_TESTS\nstd::array<size_t,4> MobileVerifierCacheStatsForTest() { const auto& cache=*MobileCaches(); return {cache.parse_hits,cache.parse_misses,cache.time_checks,cache.signature_hits}; }\n#endif\n")
+file(APPEND "${MOBILE_VERIFIER}" "\n#ifdef CONNECTWALLET_NATIVE_TESTS\nvoid CheckMobileVerifierLruForTest(const P2CTlsProofView& proof) { MobileCheckLru(proof); }\n#endif\n")
