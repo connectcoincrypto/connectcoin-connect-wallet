@@ -327,6 +327,20 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.6') {
+    const highlights = [
+      '## New in 1.1.6',
+      '',
+      '- **Native Automatic Claims:** the desktop runtime now uses a C++ helper with bundled Mbed TLS instead of Python. Reusable TLS contexts, bounded certificate caches and less repeated parsing reduce redundant work. Certificate-chain, domain, time, policy, CertificateVerify-signature and work-target validation remain required; no fixed throughput or CPU improvement is promised.',
+      '- **More efficient bounty discovery:** incremental updates avoid redundant full-window downloads on compatible RPC servers. Reorganizations use progressively wider recovery windows, while catalog validation and admission controls prevent new attempts from using an obsolete snapshot.',
+      '- **Proof and submission recovery:** valid pending proofs are retained across temporary RPC failures and catalog aging. Leaving the discovery window is not treated as proof that a bounty was spent. Saved submissions are revalidated before sending; uncertain broadcast outcomes remain distinct from confirmed rejection and are reconciled without blindly creating another claim.',
+      '- **Consistent scheduling and counters:** bounded queues, economic priority, cancellation, pause/resume and RPC backpressure have additional race and recovery checks. Actual connections per second continues to measure TCP starts in the last ten seconds. Saved limits and the existing single TCP-start pacing policy are preserved.',
+      '- **Wallet robustness:** bounded funding-transaction caching retains local ownership, amount and transaction checks. Additional tests cover wallet replacement, cancelled work, stale replies and interrupted persistence.',
+      '',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.5') {
     const highlights = [
       '## New in 1.1.5',

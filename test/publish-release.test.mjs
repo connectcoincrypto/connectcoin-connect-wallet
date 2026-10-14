@@ -64,6 +64,26 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.6 release notes describe the native runtime, recovery and retained safety checks', () => {
+  const notes = releaseNotes('1.1.6', '5678', sha);
+  for (const text of [
+    '# ConnectWallet 1.1.6', '## New in 1.1.6', 'no Python runtime is required',
+    'C++ helper with bundled Mbed TLS', 'validation remain required',
+    'no fixed throughput or CPU improvement is promised', 'incremental updates',
+    'uncertain broadcast outcomes', 'revalidated before sending',
+    'TCP starts in the last ten seconds', 'single TCP-start pacing policy',
+    'ownership, amount and transaction checks', 'mobile app is not included',
+    'wallet keys or the encrypted wallet format', 'Installers use English',
+    'Windows downloads are unsigned', 'not Developer-ID signed or notarized',
+    'SHA256SUMS', '/blob/v1.1.6/README.md', '/actions/runs/5678', sha,
+  ]) assert.ok(notes.includes(text), text);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.ok(notes.indexOf('## New in 1.1.6') < notes.indexOf('## Downloads'));
+  for (const previous of ['1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', '1.1.5', '1.2.0']) {
+    assert.ok(!releaseNotes(previous, '5678', sha).includes('## New in 1.1.6'));
+  }
+});
+
 test('1.1.5 release notes describe claims changes without weakening validation or promising throughput', () => {
   const notes = releaseNotes('1.1.5', '5678', sha);
   for (const text of [
