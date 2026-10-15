@@ -243,7 +243,9 @@ final class ClaimRecentWindowTests: XCTestCase {
             let known = try ClaimRecentWindow(recentWindow(height == 19 ? 20 : max(0, height - 1)))
             let f = WindowFixture(recentWindow(height))
             let result = try await f.run(known: known, cursor: height == 0 ? nil : "old")
-            XCTAssertEqual(f.hashCounts, [5])
+            // A missing journal cursor requests a fresh full manifest even
+            // near genesis; warm anchored continuations still use a prefix.
+            XCTAssertEqual(f.hashCounts, height == 0 ? [600] : [5])
             XCTAssertEqual(result.window.blocks.count, Int(height + 1))
             XCTAssertEqual(result.window.blocks.last?.hash, NativePaymentChecks.GENESIS)
         }
