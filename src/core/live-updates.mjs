@@ -8,6 +8,51 @@ const address = value => typeof value === 'string' && value.length >= 8 && value
 const capacityError = () => Object.assign(new Error('RPC address subscription capacity reached. Use Refresh to update balances and transactions for untracked addresses.'), { code: 'LIVE_UPDATE_ADDRESS_CAPACITY' });
 const capabilityError = () => Object.assign(new Error('This RPC server does not support address-change subscriptions. Use Refresh to update wallet balances and transactions. Network and bounty updates remain live.'), { code: 'LIVE_UPDATE_ADDRESS_UNSUPPORTED' });
 
+/** A delayed wakeup must not erase the catalog. Confirm its apparent rollback
+ * against a fresh RPC view, including ancestry if the new fork already grew. */
+export async function confirmTipChange({ rpc, network, previous, signal, check = () => {} }) {
+  const query = async (method, params = {}) => {
+    check();
+    const response = await rpc.request(method, params, { signal });
+    check();
+    return response;
+  };
+  const sameTip = (left, right) => {
+    if (left.hash !== right.hash) return false;
+    if (left.height !== right.height || left.mediantime !== right.mediantime ||
+        left.chain !== right.chain || left.genesis_hash !== right.genesis_hash) throw new Error('Inconsistent RPC chain-tip metadata.');
+    return true;
+  };
+  const tip = validateTip(await query('getchaintip'), network);
+  if (sameTip(previous, tip)) return { tip, reset: false };
+  if (tip.height <= previous.height) return { tip, reset: true };
+  const count = Math.min(600, tip.height - previous.height + 1);
+  let recent;
+  try { recent = await query('getrecentblockhashes', { count }); }
+  catch (error) {
+    if (error?.code !== -32602) throw error;
+    recent = await query('getrecentblockhashes');
+  }
+  const snapshotTip = validateTip(recent?.tip, network);
+  const length = recent?.blocks?.length, fullLength = Math.min(600, snapshotTip.height + 1);
+  if (recent?.window !== 600 || !Array.isArray(recent.blocks) ||
+      (length !== Math.min(count, snapshotTip.height + 1) && length !== fullLength)) throw new Error('Incomplete RPC canonical-tip window.');
+  const hashes = new Set();
+  for (const [index, block] of recent.blocks.entries()) {
+    if (!plain(block) || typeof block.hash !== 'string' || !/^[0-9a-f]{64}$/.test(block.hash) ||
+        block.height !== snapshotTip.height - index || hashes.has(block.hash) ||
+        (index === 0 && block.hash !== snapshotTip.hash) ||
+        (block.height === 0 && block.hash !== snapshotTip.genesis_hash)) throw new Error('Invalid RPC canonical-tip sequence.');
+    hashes.add(block.hash);
+  }
+  if (!sameTip(tip, snapshotTip) || !sameTip(snapshotTip, validateTip(await query('getchaintip'), network))) {
+    throw new Error('Chain changed while confirming a live-update rollback; retrying.');
+  }
+  // Beyond the bounded window ancestry cannot be proven: retain the existing
+  // conservative full-resync behavior, but only after a coherent RPC snapshot.
+  return { tip: snapshotTip, reset: recent.blocks.find(block => block.height === previous.height)?.hash !== previous.hash };
+}
+
 /** Notifications are wakeups, never authoritative balances, bounties or cursors. */
 export class LiveUpdates {
   constructor({ rpc, network, isActive, getAddresses, onChange, onError = () => {},

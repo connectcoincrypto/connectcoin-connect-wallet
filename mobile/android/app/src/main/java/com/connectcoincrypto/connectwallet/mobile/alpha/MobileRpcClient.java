@@ -59,13 +59,14 @@ public final class MobileRpcClient implements AutoCloseable {
     private static final Map<String, Set<String>> PARAMS;
     static {
         Map<String, Set<String>> methods = new HashMap<>();
-        methods.put("getchaintip", keys()); methods.put("getrecentblockhashes", keys("count"));
+        methods.put("getchaintip", keys()); methods.put("getrecentblockhashes", keys("count", "include_bounty_counts"));
         methods.put("getaddressbalance", keys("address"));
         methods.put("getaddresshistory", keys("address", "cursor"));
         methods.put("getaddressutxos", keys("address", "cursor", "include_pending_spent"));
         methods.put("getaddresschanges", keys("addresses", "cursor"));
-        methods.put("gettransaction", keys("txid")); methods.put("gettransactions", keys("txids"));
-        methods.put("getbountychanges", keys("cursor"));
+        methods.put("gettransaction", keys("txid", "raw_only")); methods.put("gettransactions", keys("txids"));
+        methods.put("gettransactionstatus", keys("txid"));
+        methods.put("getbountychanges", keys("cursor", "include_bounties", "compact", "compact_version", "known_tip", "known_state"));
         methods.put("getblockbounties", keys("block_hash"));
         methods.put("sendrawtransaction", keys("transaction_hex"));
         PARAMS = Collections.unmodifiableMap(methods);
@@ -156,7 +157,8 @@ public final class MobileRpcClient implements AutoCloseable {
     private Connection connection;
     private int bufferedFrames;
     private long bufferedBytes;
-    private long generation, sequence;
+    private long generation, sequence, connectionEpoch;
+    synchronized long connectionEpoch() { return connectionEpoch; }
     private boolean active, closed, networkSuspended;
 
     public MobileRpcClient(TcpEndpoint endpoint) {
@@ -305,7 +307,7 @@ public final class MobileRpcClient implements AutoCloseable {
         try {
             for (String name : allowed) {
                 if (!params.has(name)) {
-                    if (!name.equals("cursor") && !name.equals("include_pending_spent") && !name.equals("count")) throw failure("RPC_INVALID");
+                    if (!keys("cursor", "include_pending_spent", "count", "include_bounty_counts", "raw_only", "include_bounties", "compact", "compact_version", "known_tip", "known_state").contains(name)) throw failure("RPC_INVALID");
                     continue;
                 }
                 Object value = params.opt(name);
@@ -317,8 +319,17 @@ public final class MobileRpcClient implements AutoCloseable {
                     case "cursor":
                         if (value != JSONObject.NULL && (!(value instanceof String) || !((String) value).matches("[A-Za-z0-9_.-]{1,1024}"))) throw failure("RPC_INVALID");
                         clean.put(name, value); break;
-                    case "include_pending_spent":
+                    case "include_pending_spent": case "include_bounty_counts": case "raw_only": case "include_bounties": case "compact":
                         if (!(value instanceof Boolean)) throw failure("RPC_INVALID"); clean.put(name, value); break;
+                    case "compact_version":
+                        if (!(value instanceof Integer || value instanceof Long) || (((Number)value).longValue() != 2 && ((Number)value).longValue() != 3)) throw failure("RPC_INVALID");
+                        clean.put(name, value); break;
+                    case "known_state": clean.put(name, hash(value)); break;
+                    case "known_tip":
+                        if (!(value instanceof JSONObject)) throw failure("RPC_INVALID");
+                        JSONObject anchor = (JSONObject)value; Object height = anchor.opt("height");
+                        if (anchor.length() != 2 || !(height instanceof Integer || height instanceof Long) || ((Number)height).longValue() < 0 || ((Number)height).longValue() > MAX_SAFE_INTEGER) throw failure("RPC_INVALID");
+                        clean.put(name, new JSONObject().put("height", height).put("hash", hash(anchor.opt("hash")))); break;
                     case "txid": case "block_hash": clean.put(name, hash(value)); break;
                     case "transaction_hex":
                         if (!(value instanceof String) || ((String) value).length() < 20 || ((String) value).length() > 800000 || ((String) value).length() % 2 != 0 || !((String) value).matches("[0-9a-fA-F]+")) throw failure("RPC_INVALID");
@@ -336,6 +347,10 @@ public final class MobileRpcClient implements AutoCloseable {
                 }
             }
         } catch (JSONException error) { throw failure("RPC_INVALID"); }
+        if (clean.has("compact_version") && (!Boolean.TRUE.equals(clean.opt("compact")) || !Boolean.TRUE.equals(clean.opt("include_bounties")))) throw failure("RPC_INVALID");
+        if (Boolean.TRUE.equals(clean.opt("compact")) && !Boolean.TRUE.equals(clean.opt("include_bounties"))) throw failure("RPC_INVALID");
+        if (clean.has("known_tip") && !Boolean.TRUE.equals(clean.opt("include_bounties"))) throw failure("RPC_INVALID");
+        if (clean.has("known_state") && (!Boolean.TRUE.equals(clean.opt("compact")) || !clean.has("known_tip") || !(clean.opt("cursor") instanceof String))) throw failure("RPC_INVALID");
         return clean;
     }
     private static String hash(Object value) throws RpcFailure {
@@ -402,7 +417,7 @@ public final class MobileRpcClient implements AutoCloseable {
                 if (job.connection.lost) throw failure("RPC_UNAVAILABLE");
                 return job.connection;
             }
-            if (connection == null || connection.lost) connection = new Connection();
+            if (connection == null || connection.lost) { connection = new Connection(); connectionEpoch++; }
             job.connection = connection; return connection;
         }
     }

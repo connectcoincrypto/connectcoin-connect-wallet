@@ -45,6 +45,50 @@ test('claims diagnostics retain high concurrency without widening unrelated meta
   for (const row of stored.slice(valid.length)) assert.deepEqual(row.details, {});
 });
 
+test('catalog gate diagnostics retain only approved reasons and typed admission metadata', async t => {
+  const log = new DiagnosticLog({ directory: await fixture(t) });
+  const reasons = ['initial', 'work-budget', 'data-unavailable', 'cursor-invalid', 'journal-reset', 'notification-reset', 'tip-confirmation'];
+  const expected = [];
+  for (const event of ['claims.catalog_blocked', 'claims.catalog_released']) {
+    for (const [index, catalogReason] of reasons.entries()) {
+      const details = { catalogReason, durationMs: index + 0.5, preparedCapturesAllowed: index % 2 === 0 };
+      log.record(event, { ...details, address: 'PRIVATE-CATALOG-CANARY', cursor: 'PRIVATE-CATALOG-CANARY',
+        blockHash: 'PRIVATE-CATALOG-CANARY', proof: 'PRIVATE-CATALOG-CANARY' });
+      expected.push({ event, details });
+    }
+  }
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.deepEqual(stored.map(({ event, details }) => ({ event, details })), expected);
+  assert.equal(JSON.stringify(stored).includes('PRIVATE-CATALOG-CANARY'), false);
+  assert.equal(log.snapshot().errors, 0);
+  assert.equal(log.snapshot().dropped, 0);
+});
+
+test('catalog gate diagnostics redact unknown reasons, coercible flags and invalid durations', async t => {
+  const log = new DiagnosticLog({ directory: await fixture(t) });
+  const secret = 'PRIVATE-CATALOG-ENDPOINT';
+  const invalid = [
+    { catalogReason: secret, preparedCapturesAllowed: secret, durationMs: -1 },
+    { catalogReason: ['initial'], preparedCapturesAllowed: 1, durationMs: Infinity },
+    { catalogReason: new String('work-budget'), preparedCapturesAllowed: new Boolean(false), durationMs: 86400001 },
+    { catalogReason: null, preparedCapturesAllowed: 'false', durationMs: '5' },
+  ];
+  for (const details of invalid) log.record('claims.catalog_blocked', details);
+  log.record('claims.catalog_released', Object.create({ catalogReason: 'initial', preparedCapturesAllowed: true, durationMs: 5 }));
+  let invoked = 0;
+  log.record('claims.catalog_released', Object.defineProperties({}, Object.fromEntries(
+    ['catalogReason', 'preparedCapturesAllowed', 'durationMs'].map(key => [key, { get() { invoked++; return secret; } }]))));
+  log.record('claims.catalog_' + secret, { catalogReason: 'initial' });
+  await log.flush();
+  const stored = await rows(log.snapshot().file);
+  assert.equal(stored.length, invalid.length + 2);
+  for (const row of stored) assert.deepEqual(row.details, {});
+  assert.equal(invoked, 0);
+  assert.equal(log.snapshot().dropped, 1);
+  assert.equal((await readFile(log.snapshot().file, 'utf8')).includes(secret), false);
+});
+
 test('helper DNS, blocked destination and target exhaustion retain safe distinct reasons', () => {
   for (const [message, category] of [
     ['DNS resolution failed for private-canary.example: system diagnostic', 'dns'],

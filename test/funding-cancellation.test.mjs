@@ -104,7 +104,7 @@ for (const stage of ['quota', 'connection']) test(`STOP during funding ${stage} 
   assert.equal(service.fundingCache.get(bounty.txid), raw);
   assert.equal(await service.funding(bounty.txid), raw);
   assert.deepEqual(requests.map(({ method, params }) => ({ method, params })), [
-    { method: 'gettransaction', params: { txid: bounty.txid } },
+    { method: 'gettransaction', params: { txid: bounty.txid, raw_only: true } },
   ]);
   assert.equal(service.reserved.size, 0);
   assert.equal(service.error, null);
@@ -117,7 +117,7 @@ test('an eventual shared failure after the only waiter aborts is observed and pe
   t.after(() => process.off('unhandledRejection', listener));
   let calls = 0;
   const { service, bounty, raw, response } = serviceFixture(t, { request(method, params, options) {
-    assert.equal(method, 'gettransaction'); assert.deepEqual(params, { txid: bounty.txid });
+    assert.equal(method, 'gettransaction'); assert.deepEqual(params, { txid: bounty.txid, raw_only: true });
     assert.equal(options?.signal, undefined, 'the shared RPC must outlive an individual claim signal');
     calls++; entered.resolve(); return calls === 1 ? read.promise : Promise.resolve(response);
   } });

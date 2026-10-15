@@ -181,6 +181,8 @@ public final class MobileRpcClient: @unchecked Sendable {
     private let window: TimeInterval
     private var wire: RpcWire?, ready = false, active = false, retired = false
     private var epoch: UInt64 = 0
+    // Endpoint capabilities belong to this transport lifetime, not the wallet.
+    private var claimCompact = 3, claimRows = true, claimBlocks = true, claimCounts = true, claimRaw = true, claimStatus = true
     private var buffer = Data()
     private var jobs: [String: Job] = [:], order: [String] = []
     private var history: [String: [TimeInterval]] = [:], cooldowns: [String: TimeInterval] = [:]
@@ -240,6 +242,66 @@ public final class MobileRpcClient: @unchecked Sendable {
     public func call(_ method: String, _ params: JSONObject = [:]) async throws -> JSONObject {
         try walletRequire(!["sendrawtransaction", "getblockbounties"].contains(method), "Unsupported native RPC method")
         return try await operation(method, params)
+    }
+    /// Optional traffic features fall back only on explicit unsupported schema
+    /// replies. Timeouts, malformed data and server failures never downgrade.
+    func claimRead(_ method: String, _ params: JSONObject = [:]) async throws -> JSONObject {
+        for _ in 0..<8 {
+            try Task.checkCancellation()
+            let state = queue.sync { (wire == nil ? epoch &+ 1 : epoch, claimCompact, claimRows, claimBlocks, claimCounts, claimRaw, claimStatus) }
+            var request = params
+            if method == "getbountychanges" {
+                if !state.2 { request.removeValue(forKey: "include_bounties"); request.removeValue(forKey: "known_tip") }
+                if !state.3 { request.removeValue(forKey: "known_tip") }
+                if !state.2 || state.1 == 0 {
+                    request.removeValue(forKey: "compact"); request.removeValue(forKey: "compact_version"); request.removeValue(forKey: "known_state")
+                } else if request["compact"] != nil {
+                    if state.1 == 1 { request.removeValue(forKey: "compact_version") } else { request["compact_version"] = state.1 }
+                }
+                if request["known_tip"] == nil { request.removeValue(forKey: "known_state") }
+            }
+            if method == "getrecentblockhashes" && !state.4 { request.removeValue(forKey: "include_bounty_counts") }
+            if method == "gettransaction" && !state.5 { request.removeValue(forKey: "raw_only") }
+            let actual = method == "gettransactionstatus" && !state.6 ? "gettransaction" : method
+            do {
+                let response = try await call(actual, request)
+                if method == "gettransactionstatus" {
+                    // The chosen method is local capability state, never a
+                    // response-shape heuristic controlled by the peer.
+                    if actual == "gettransactionstatus" { try walletRequire(response["transaction"] == nil, "CLAIMS_RPC_DATA") }
+                    else { try walletRequire(response["transaction"] is JSONObject, "CLAIMS_RPC_DATA") }
+                }
+                if method == "getbountychanges", let compact = response["compact"] {
+                    let version = try PJ.integer(compact, 1, 3)
+                    try walletRequire(request["compact"] as? Bool == true && version <= Int64(state.1), "CLAIMS_RPC_DATA")
+                    let bound = response["unchanged"] != nil || response["tip"] is [Any] || response["tip"] is NSNull
+                    if bound {
+                        try walletRequire(request["known_state"] is String && request["known_tip"] != nil && request["cursor"] is String,
+                            "CLAIMS_RPC_DATA")
+                    }
+                }
+                return response
+            }
+            catch let failure as RpcFailure {
+                let changed: Bool = queue.sync {
+                    // The first request can create a new connection. A reply
+                    // cannot outlive its wire: operation fails on disconnect.
+                    guard epoch == state.0 else { return false }
+                    if failure.code == "-32601" && actual == "gettransactionstatus" { claimStatus = false; return true }
+                    guard failure.code == "-32602" else { return false }
+                    if method == "gettransaction" && request["raw_only"] != nil { claimRaw = false; return true }
+                    if method == "getrecentblockhashes" && request["include_bounty_counts"] != nil { claimCounts = false; return true }
+                    if method == "getbountychanges" {
+                        if request["compact"] != nil { claimCompact = max(0, state.1 - 1); return true }
+                        if request["known_tip"] != nil { claimBlocks = false; return true }
+                        if request["include_bounties"] != nil { claimRows = false; return true }
+                    }
+                    return false
+                }
+                if !changed { throw failure }
+            }
+        }
+        throw RpcFailure("RPC_INVALID")
     }
     public func broadcast(_ hex: String, permit: RpcBroadcastPermit? = nil) async throws -> JSONObject {
         try await operation("sendrawtransaction", ["transaction_hex": hex], permit:permit)
@@ -439,6 +501,7 @@ public final class MobileRpcClient: @unchecked Sendable {
     }
     private func failWire(_ code: String) {
         epoch &+= 1; wire?.cancel(); wire = nil; ready = false; connectStarted = nil; buffer.removeAll(keepingCapacity: false)
+        claimCompact = 3; claimRows = true; claimBlocks = true; claimCounts = true; claimRaw = true; claimStatus = true
         for job in Array(jobs.values) {
             var error = RpcFailure(code); error.unknownOutcome = job.method == "sendrawtransaction" && job.written
             finish(job, .failure(error))
@@ -455,10 +518,11 @@ public final class MobileRpcClient: @unchecked Sendable {
     }
     public static func hash(_ value: String) -> Bool { value.range(of: "\\A[0-9a-fA-F]{64}\\z", options: .regularExpression) != nil }
     public static func validateParams(_ method: String, _ params: JSONObject, subscriptions: Bool = false) throws -> JSONObject {
-        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": ["count"],
+        let methods: [String: Set<String>] = ["getchaintip": [], "getrecentblockhashes": ["count", "include_bounty_counts"],
             "getaddressbalance": ["address"], "getaddresshistory": ["address", "cursor"],
             "getaddressutxos": ["address", "cursor", "include_pending_spent"], "getaddresschanges": ["addresses", "cursor"],
-            "gettransaction": ["txid"], "gettransactions": ["txids"], "getbountychanges": ["cursor"],
+            "gettransaction": ["txid", "raw_only"], "gettransactionstatus": ["txid"], "gettransactions": ["txids"],
+            "getbountychanges": ["cursor", "include_bounties", "known_tip", "compact", "compact_version", "known_state"],
             "getblockbounties": ["block_hash"], "sendrawtransaction": ["transaction_hex"],
             "subscribeaddress": ["address", "changes_only"], "subscribetip": []]
         guard let allowed = methods[method], Set(params.keys).isSubset(of: allowed),
@@ -466,7 +530,7 @@ public final class MobileRpcClient: @unchecked Sendable {
         if subscriptions { try walletRequire(["subscribeaddress","subscribetip","getchaintip"].contains(method), "RPC_INVALID") }
         var clean: JSONObject = [:]
         for key in allowed {
-            guard let value = params[key] else { if ["cursor", "include_pending_spent", "count"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
+            guard let value = params[key] else { if ["cursor", "include_pending_spent", "count", "include_bounty_counts", "raw_only", "include_bounties", "known_tip", "compact", "compact_version", "known_state"].contains(key) { continue }; throw RpcFailure("RPC_INVALID") }
             switch key {
             case "count":
                 clean[key] = try JSON.integer(value, min: 1, max: 600)
@@ -477,7 +541,11 @@ public final class MobileRpcClient: @unchecked Sendable {
                 var normalized = [String]()
                 for address in addresses { let text = try JSON.string(address); _ = try WalletCrypto.decodeAddress(text); normalized.append(text.lowercased()) }
                 try walletRequire(Set(normalized).count == normalized.count,"RPC_INVALID"); clean[key] = normalized
-            case "txid", "block_hash":
+            case "known_tip":
+                let tip = try PJ.object(value); try PJ.keys(tip, ["height", "hash"])
+                clean[key] = ["height": try PJ.integer(tip["height"], 0, 9_007_199_254_740_991), "hash": try PJ.hash(tip["hash"])] as JSONObject
+            case "compact_version": clean[key] = try PJ.integer(value, 2, 3)
+            case "txid", "block_hash", "known_state":
                 let text = try JSON.string(value); try walletRequire(hash(text), "RPC_INVALID"); clean[key] = text.lowercased()
             case "txids":
                 let ids = try JSON.array(value); try walletRequire(!ids.isEmpty && ids.count <= 32, "RPC_INVALID")
@@ -487,7 +555,7 @@ public final class MobileRpcClient: @unchecked Sendable {
             case "cursor":
                 if value is NSNull { clean[key] = NSNull() }
                 else { let text = try JSON.string(value); try walletRequire(text.range(of:"\\A[A-Za-z0-9_.-]{1,1024}\\z",options:.regularExpression) != nil,"RPC_INVALID"); clean[key] = text }
-            case "include_pending_spent", "changes_only":
+            case "include_pending_spent", "changes_only", "include_bounty_counts", "raw_only", "include_bounties", "compact":
                 let boolean = try JSON.boolean(value); try walletRequire(key != "changes_only" || boolean,"RPC_INVALID"); clean[key] = boolean
             case "transaction_hex":
                 let hex = try JSON.string(value)
@@ -496,6 +564,9 @@ public final class MobileRpcClient: @unchecked Sendable {
             default: throw RpcFailure("RPC_INVALID")
             }
         }
+        if clean["compact_version"] != nil { try walletRequire(clean["compact"] as? Bool == true, "RPC_INVALID") }
+        if clean["known_state"] != nil { try walletRequire(clean["compact"] as? Bool == true && clean["cursor"] is String && clean["known_tip"] != nil, "RPC_INVALID") }
+        if clean["known_tip"] != nil || clean["compact"] as? Bool == true { try walletRequire(clean["include_bounties"] as? Bool == true, "RPC_INVALID") }
         return clean
     }
 }

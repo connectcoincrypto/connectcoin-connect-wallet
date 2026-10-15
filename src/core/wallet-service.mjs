@@ -10,6 +10,7 @@ import { createPublicAccountDeriver, generateMnemonic, normalizeMnemonic, valida
 import { createVault, unlockVault, updateVault, validatePassword, replaceVault, vaultFingerprint } from './vault.mjs';
 import { MAX_PAYMENT_INPUTS, MAX_PAYMENT_PARENT_HEX_BYTES, selectPaymentFunding, FundingTransactionCache, attachClaimProof, parseTransaction, parseCoinAmount, formatCoinAmount, estimateClaimFee, transactionIdFromRaw, normalizeDomain, workTargetForExpectedConnections } from './transaction.mjs';
 import { FundingBytesCache } from './funding-cache.mjs';
+import { validateIndexedClaimStatus } from './claim-receipt.mjs';
 import { buildPaymentInWorker } from './payment-builder.mjs';
 import { ClaimsEngine, getClaimsHelper, isKnownClaimRejection } from './claims.mjs';
 import { bountyKey, discoverBounties, readBountyBlock, BountyDiscoveryBusy } from './bounty-discovery.mjs';
@@ -18,7 +19,7 @@ import { StatePublisher } from './state-publisher.mjs';
 import { performance } from 'node:perf_hooks';
 import { selectVaultFile, VAULT_NAME } from './profile-paths.mjs';
 import { createRsaProbe } from './rsa-probe.mjs';
-import { LiveUpdates } from './live-updates.mjs';
+import { LiveUpdates, confirmTipChange } from './live-updates.mjs';
 import { EventRefresh } from './event-refresh.mjs';
 import { addressSetKey, beginAddressSync, setAddressBaseline, updateAddressSync, addressSyncSnapshot } from './address-sync.mjs';
 import { setImmediate as yieldTask } from 'node:timers/promises';
@@ -96,6 +97,7 @@ export class WalletService extends EventEmitter {
     this.settingsWrite = Promise.resolve(); this.claimToggleGeneration = 0; this.claimsResumePending = false;
     this.walletGeneration = 0; this.claimsReviewRequired = false; this.claimsReviewGeneration = 0;
     this.claimRevision = 0; this.claimCatalogGate = null;
+    this.bountyCapabilities = {};
   }
   async initialize() {
     this.vaultFile = selectVaultFile(this.directory);
@@ -118,6 +120,7 @@ export class WalletService extends EventEmitter {
     this.stopLiveUpdates();
     this.cancelSendPreview();
     this.batchFundingSupported = undefined;
+    this.bountyCapabilities = {};
     this.rpc?.close(); this.refreshing = null; this.clearFundingCache(); this.fundingPending.clear();
     const rpc = this.clientFactory({ ...this.config.rpc, onDiagnostic: (event, details) => this.recordDiagnostic(event, details) }); this.rpc = rpc;
     this.releaseClaimCatalog();
@@ -142,20 +145,9 @@ export class WalletService extends EventEmitter {
         await this.bountySync;
       } else if (this.engine.enabled) await this.syncBounties();
     } });
-    this.liveUpdates = new LiveUpdates({ rpc, network: this.config.network, isActive: active,
-      getAddresses: () => {
-        // Watch the currently displayed receive/change addresses first when a
-        // large recovered wallet reaches the shared server subscription limit.
-        const current = this.accounts.filter(account => account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
-        return [...new Set([...current, ...this.accounts, ...this.accountCache.values()].map(account => account.address))];
-      },
-      onChange: ({ wallet, bounties, reset, catchup, tip }) => {
+    let noticeRevision = 0, tipCheckPending = false;
+    const applyChange = ({ wallet, bounties, reset, catchup, tip }) => {
         if (!active()) return;
-        const previous = this.confirmationTip ?? this.tip;
-        // A rollback/same-height replacement is a reset even if a server omitted
-        // its reorg flag. Ordinary height growth changes display counters only.
-        reset ||= Boolean(tip && previous && (tip.height < previous.height ||
-          tip.height === previous.height && tip.hash !== previous.hash));
         if (reset) {
           wallet = true; bounties = true;
           this.walletChainRevision++;
@@ -183,6 +175,53 @@ export class WalletService extends EventEmitter {
           // revision is not acknowledged and the waiter retries the snapshot.
           this.walletUpdates.request();
         }
+    };
+    this.tipUpdates = new EventRefresh({ isActive: active, run: async () => {
+      if (!tipCheckPending) return;
+      const previous = this.confirmationTip ?? this.tip;
+      if (!previous) { tipCheckPending = false; return; }
+      const watch = this.liveUpdates, generation = watch.generation, epoch = this.epoch;
+      const revision = noticeRevision, chainRevision = this.walletChainRevision;
+      const current = () => active() && this.liveUpdates === watch && !watch.closed &&
+        watch.generation === generation && this.epoch === epoch;
+      const check = () => {
+        if (!current()) throw Object.assign(new Error('Live tip confirmation cancelled.'), { name: 'AbortError' });
+      };
+      const result = await confirmTipChange({ rpc, network: this.config.network, previous,
+        signal: watch.abort.signal, check });
+      if (!current()) return;
+      const latest = this.confirmationTip ?? this.tip;
+      if (revision !== noticeRevision || chainRevision !== this.walletChainRevision ||
+          latest?.hash !== previous.hash || latest?.height !== previous.height || latest?.mediantime !== previous.mediantime) {
+        this.tipUpdates.request(); return;
+      }
+      tipCheckPending = false;
+      applyChange({ ...result, bounties: true, wallet: result.reset });
+    } });
+    this.liveUpdates = new LiveUpdates({ rpc, network: this.config.network, isActive: active,
+      getAddresses: () => {
+        // Watch the currently displayed receive/change addresses first when a
+        // large recovered wallet reaches the shared server subscription limit.
+        const current = this.accounts.filter(account => account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
+        return [...new Set([...current, ...this.accounts, ...this.accountCache.values()].map(account => account.address))];
+      },
+      onChange: flags => {
+        if (!active()) return;
+        const { reset, tip } = flags, previous = this.confirmationTip ?? this.tip;
+        if (reset || tip) noticeRevision++;
+        if (reset) {
+          // Explicit journal/reorg invalidations remain immediate and supersede
+          // any older asynchronous check, including on the same connection.
+          tipCheckPending = false;
+          applyChange(flags); return;
+        }
+        if (tip && previous && (tip.height < previous.height ||
+            tip.height === previous.height && tip.hash !== previous.hash)) {
+          tipCheckPending = true; this.tipUpdates.request();
+          applyChange({ ...flags, tip: undefined }); return;
+        }
+        applyChange(flags);
+        if (tipCheckPending && tip) this.tipUpdates.request();
       },
       onError: error => {
         if (!active()) return;
@@ -201,6 +240,7 @@ export class WalletService extends EventEmitter {
     });
     rpc.on('disconnected', () => {
       if (this.rpc !== rpc) return;
+      this.bountyCapabilities = {};
       this.claimsResumePending = Boolean(this.session && this.config.claims.enabled && !this.claimsReviewRequired);
       this.claimRevision++; this.claimToggleGeneration++;
       this.walletUpdateRevision++;
@@ -215,7 +255,7 @@ export class WalletService extends EventEmitter {
   }
   stopLiveUpdates() {
     clearTimeout(this.claimReceiptTimer); this.claimReceiptTimer = null;
-    this.liveUpdates?.close(); this.walletUpdates?.close(); this.bountyUpdates?.close();
+    this.liveUpdates?.close(); this.walletUpdates?.close(); this.bountyUpdates?.close(); this.tipUpdates?.close();
   }
   createEngine() {
     this.engine = new ClaimsEngine({
@@ -227,7 +267,15 @@ export class WalletService extends EventEmitter {
       prepare: (bounty, options) => this.prepareAutomaticClaim(bounty, options),
       submit: (prepared, proof, options) => this.submitAutomaticClaim(prepared, proof, options),
       getNetReward: bounty => BigInt(bounty.amount) - BigInt(estimateClaimFee(this.config.feeRate)),
-      getValidationTime: () => validateTip(this.tip, this.config.network).mediantime,
+      getValidationTime: context => {
+        // A reset may temporarily clear the current tip, but not the validated
+        // hash anchor. Prefer its MTP over a long-lived proposal's older time.
+        // The proposal fallback is only for preserved work behind the write
+        // barrier, never a substitute for validating a new RPC tip.
+        const tip = this.tip ?? (this.claimCatalogGate ? this.claimWindow?.tip : null);
+        if (!tip && this.claimCatalogGate && context) return context.validation_time;
+        return validateTip(tip, this.config.network).mediantime;
+      },
       options: { connectionsPerSecond: this.config.claims.maxConnectionsPerSecond, concurrency: this.config.claims.maxConcurrent },
       onState: state => {
         this.claimInfo = state;
@@ -859,7 +907,16 @@ export class WalletService extends EventEmitter {
     const entry = { epoch, rpc, generation };
     entry.promise = Promise.resolve().then(async () => {
       check();
-      const result = await rpc.request('gettransaction', { txid });
+      const capabilities = this.bountyCapabilities, rawOnly = capabilities.rawFunding !== false;
+      let result;
+      try { result = await rpc.request('gettransaction', { txid, ...(rawOnly ? { raw_only: true } : {}) }); }
+      catch (error) {
+        // Only an explicit unsupported option permits an expanded retry. A
+        // timeout, malformed success or missing parent never downgrades checks.
+        if (!rawOnly || error.code !== -32602) throw error;
+        check(); capabilities.rawFunding = false;
+        result = await rpc.request('gettransaction', { txid });
+      }
       check();
       const raw = this.checkResponse(result).transaction?.hex;
       if (transactionIdFromRaw(raw) !== txid) throw new Error('The RPC server supplied transaction bytes that do not match their ID.');
@@ -1418,6 +1475,7 @@ export class WalletService extends EventEmitter {
     const result = await discoverBounties({
       rpc, network: this.config.network, lookback: this.config.claims.lookbackBlocks,
       previous: this.claimBlocks, previousWindow: this.claimWindow, cursor: this.claimCursor, check,
+      capabilities: this.bountyCapabilities,
       onInvalidate: (row, reason) => {
         if (reason === 'pending_spend' || reason === undefined && row.status === 'pending_spend') engine.preservePendingWinner(bountyKey(row));
         if (reason !== 'window_exit') this.invalidateClaim(bountyKey(row),
@@ -1440,7 +1498,7 @@ export class WalletService extends EventEmitter {
           }
         }
       },
-      onReset: () => { check(); this.blockClaimCatalog(); },
+      onReset: ({ reason }) => { check(); this.blockClaimCatalog(reason); },
       readBlock: (hash, options) => this.blockBounties(hash, { ...options, rpc, epoch }),
     });
     check();
@@ -1529,7 +1587,7 @@ export class WalletService extends EventEmitter {
     this.claimReceiptTimer.unref?.();
   }
   async reconcileAcceptedClaims(check) {
-    const engine = this.engine, rpc = this.rpc;
+    const engine = this.engine;
     if (!engine.acceptedProofs?.size) return;
     if ((this.claimReceiptNext ?? 0) > Date.now()) { this.scheduleClaimReceipts(); return; }
     const due = [...engine.acceptedProofs].filter(([, record]) => record.due <= Date.now()).sort((a, b) => a[1].due - b[1].due).slice(0, 4);
@@ -1539,27 +1597,18 @@ export class WalletService extends EventEmitter {
     for (const [key, record] of due) {
       check(); record.due = Date.now() + 30000;
       try {
-        const response = this.checkResponse(await rpc.request('gettransaction', { txid: record.txid })); check();
+        const response = await this.readClaimReceipt(record, check); check();
         // A replay may have received a newer ACK while this read was queued.
         // Its older missing/pending result cannot reopen that new acceptance,
         // release its reservation or compact its replacement witness owner.
         if (engine.acceptedProofs.get(key) !== record) continue;
-        const raw = response.transaction?.hex;
-        if (transactionIdFromRaw(raw) !== record.txid || response.transaction.txid !== undefined && response.transaction.txid !== record.txid) throw new Error('Claim receipt transaction does not match its preserved identity.');
-        const observed = parseTransaction(raw);
-        // txid excludes the witness: another instance may have confirmed a
-        // different TLS proof for this exact input/payout. Authenticate its
-        // framing, challenge and work against our original unsigned proposal;
-        // never replace the locally preserved proof or bytes used for replay.
-        if (observed.inputs.length !== 1 || observed.inputs[0].witness.length !== 1 ||
-            attachClaimProof(record.prepared, observed.inputs[0].witness[0]).hex !== raw) throw new Error('Claim receipt witness is not bound to its preserved proposal.');
         if (response.status === 'confirmed') {
           if (!Number.isSafeInteger(response.block_height) || response.block_height < 0 || response.block_height > response.tip.height ||
               typeof response.block_hash !== 'string' || !HASH.test(response.block_hash) ||
               response.block_height === 0 && response.block_hash !== response.tip.genesis_hash ||
               response.block_height === response.tip.height && response.block_hash !== response.tip.hash ||
-              response.transaction.blockhash !== undefined && response.transaction.blockhash !== response.block_hash ||
-              response.transaction.confirmations !== undefined && (!Number.isSafeInteger(response.transaction.confirmations) || response.transaction.confirmations <= 0)) throw new Error('Invalid confirmed claim receipt.');
+              response.transaction?.blockhash !== undefined && response.transaction.blockhash !== response.block_hash ||
+              response.transaction?.confirmations !== undefined && (!Number.isSafeInteger(response.transaction.confirmations) || response.transaction.confirmations <= 0)) throw new Error('Invalid confirmed claim receipt.');
           // Receipt indexing can advance before discovery. Keep the witness
           // until our coherent window catches up, otherwise its merely lower
           // cached tip could be mistaken for a later rollback of this block.
@@ -1609,15 +1658,66 @@ export class WalletService extends EventEmitter {
     }
     clearTimeout(this.claimReceiptTimer); this.claimReceiptTimer = null; this.scheduleClaimReceipts();
   }
-  blockClaimCatalog() {
-    this.claimCatalogGate ??= Promise.withResolvers();
-    // Existing captures may finish and retain their proofs. New admissions and
-    // preparatory work wait without closing the native pool or clearing caches.
-    this.engine?.setCatalogBlocked?.(true);
+  async readClaimReceipt(record, check) {
+    check();
+    // The original verified proof stays local. A receipt describes the same
+    // input/payout (txid), not a replacement witness supplied by the server.
+    const signed = attachClaimProof(record.prepared, record.pending.proof);
+    const saved = this.#signedClaims.get(record.prepared);
+    if (signed.txid !== record.txid || saved &&
+        (saved.proof !== record.pending.proof || saved.signed.hex !== signed.hex || saved.signed.txid !== signed.txid)) {
+      throw new Error('Preserved claim transaction or proof changed before reconciliation.');
+    }
+    const rpc = this.rpc, capabilities = this.bountyCapabilities;
+    const checkOwner = () => {
+      check();
+      if (this.rpc !== rpc || this.bountyCapabilities !== capabilities ||
+          attachClaimProof(record.prepared, record.pending.proof).hex !== signed.hex) {
+        throw new Error('Claim receipt context or preserved proof changed during reconciliation.');
+      }
+    };
+    if (capabilities.claimStatus !== false) {
+      let result, unsupported = false;
+      try { result = await rpc.request('gettransactionstatus', { txid: record.txid }); }
+      catch (error) {
+        if (error.code !== -32601) throw error;
+        checkOwner(); capabilities.claimStatus = false; unsupported = true;
+      }
+      checkOwner();
+      if (!unsupported) {
+        validateIndexedClaimStatus(result, record.txid, this.config.network, this.claimWindow);
+        return result;
+      }
+    }
+    // Legacy servers explicitly lacking the status method keep their full
+    // receipt validation. Successful malformed status replies never get here.
+    const response = this.checkResponse(await rpc.request('gettransaction', { txid: record.txid })); checkOwner();
+    const raw = response.transaction?.hex;
+    if (transactionIdFromRaw(raw) !== record.txid || response.transaction.txid !== undefined && response.transaction.txid !== record.txid) {
+      throw new Error('Claim receipt transaction does not match its preserved identity.');
+    }
+    const observed = parseTransaction(raw);
+    if (observed.inputs.length !== 1 || observed.inputs[0].witness.length !== 1 ||
+        attachClaimProof(record.prepared, observed.inputs[0].witness[0]).hex !== raw) {
+      throw new Error('Claim receipt witness is not bound to its preserved proposal.');
+    }
+    return response;
+  }
+  blockClaimCatalog(catalogReason = 'notification-reset') {
+    if (!this.claimCatalogGate) {
+      this.claimCatalogGate = { ...Promise.withResolvers(), started: performance.now(), catalogReason };
+      this.recordDiagnostic('claims.catalog_blocked', { stage: 'discovery', catalogReason, preparedCapturesAllowed: true });
+    }
+    // Catalog uncertainty blocks preparation and submission, not cryptographic
+    // work on already authenticated proposals. A winner waits for the complete
+    // replacement snapshot; known spends/reorgs still invalidate its job.
+    this.engine?.setCatalogBlocked?.(true, { allowPreparedCaptures: true });
   }
   releaseClaimCatalog() {
     const gate = this.claimCatalogGate; this.claimCatalogGate = null;
     gate?.resolve(); this.engine?.setCatalogBlocked?.(false);
+    if (gate) this.recordDiagnostic('claims.catalog_released', { stage: 'discovery', catalogReason: gate.catalogReason,
+      durationMs: Math.round(performance.now() - gate.started) });
   }
   async waitForClaimCatalog(check, signal) {
     const cancelled = () => Object.assign(new Error('Automatic Claims preparation or submission cancelled.'), { name: 'AbortError', code: 'ABORT_ERR', notSent: true });
@@ -1799,7 +1899,7 @@ export class WalletService extends EventEmitter {
     this.closed = true;
     clearInterval(this.timer);
     const refreshing = this.refreshing;
-    const liveWork = [this.liveUpdates?.running, this.walletUpdates?.running, this.bountyUpdates?.running, this.bountySync].filter(Boolean);
+    const liveWork = [this.liveUpdates?.running, this.walletUpdates?.running, this.bountyUpdates?.running, this.tipUpdates?.running, this.bountySync].filter(Boolean);
     // lock() publishes cleared sensitive state synchronously before its first await.
     const locking = this.lock();
     this.statePublisher.close();

@@ -8,11 +8,13 @@ const EVENTS = new Set([
   'wallet.started', 'wallet.closed', 'wallet.refresh_failed', 'wallet.refresh_cancelled', 'wallet.discovery_failed', 'wallet.discovery_cancelled', 'wallet.subscription_failed',
   'payment.prepare_started', 'payment.prepared', 'payment.prepare_failed', 'payment.prepare_cancelled',
   'claims.started', 'claims.stopped', 'claims.suspended', 'claims.resumed', 'claims.progress', 'claims.failed',
+  'claims.catalog_blocked', 'claims.catalog_released',
   'claim.started', 'claim.succeeded', 'claim.failed',
   'claim.cancelled', 'rpc.connected', 'rpc.disconnected', 'rpc.failed', 'rpc.cancelled', 'rpc.slow', 'helper.failed',
 ]);
 const STAGES = new Set(['prepare', 'network', 'outputs', 'funding', 'signing', 'dns', 'proof', 'submit', 'refresh', 'discovery', 'connect', 'request', 'stream', 'lifecycle']);
 const REASONS = new Set(['stop', 'locked', 'suspend', 'clear', 'unavailable', 'window-exit', 'sibling-proof', 'fatal', 'other']);
+const CATALOG_REASONS = new Set(['initial', 'work-budget', 'data-unavailable', 'cursor-invalid', 'journal-reset', 'notification-reset', 'tip-confirmation']);
 const DURATION_SCOPES = new Set(['stage', 'run']);
 const RPC_FAILURE_SOURCES = new Set(['pre-write', 'rpc-reply', 'request-timeout', 'stream-timeout',
   'stream-deadline', 'stream-incomplete', 'socket-close', 'socket-write', 'protocol', 'client-close']);
@@ -24,7 +26,7 @@ const PROCESS_SIGNALS = new Set([
 ]);
 const METHODS = new Set([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties', 'getaddressbalance',
-  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactions', 'sendrawtransaction',
+  'getaddresshistory', 'getaddressutxos', 'getaddresschanges', 'gettransaction', 'gettransactionstatus', 'gettransactions', 'sendrawtransaction',
   'getbountychanges', 'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe',
 ]);
 const OS_CODES = new Set([
@@ -151,6 +153,8 @@ function sanitize(details) {
   if (METHODS.has(method)) clean.method = method;
   const reason = own(details, 'reason'), durationScope = own(details, 'durationScope');
   if (REASONS.has(reason)) clean.reason = reason;
+  const catalogReason = own(details, 'catalogReason');
+  if (CATALOG_REASONS.has(catalogReason)) clean.catalogReason = catalogReason;
   if (DURATION_SCOPES.has(durationScope)) clean.durationScope = durationScope;
   const failureSource = own(details, 'failureSource');
   if (RPC_FAILURE_SOURCES.has(failureSource)) clean.failureSource = failureSource;
@@ -160,7 +164,7 @@ function sanitize(details) {
     const value = own(details, key);
     if (Number.isFinite(value) && value >= minimum && value <= maximum && (key === 'durationMs' || Number.isSafeInteger(value))) clean[key] = value;
   }
-  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady', 'sent', 'notSent']) {
+  for (const key of ['enabled', 'paused', 'unknownOutcome', 'helperReady', 'sent', 'notSent', 'preparedCapturesAllowed']) {
     const value = own(details, key);
     if (typeof value === 'boolean') clean[key] = value;
   }

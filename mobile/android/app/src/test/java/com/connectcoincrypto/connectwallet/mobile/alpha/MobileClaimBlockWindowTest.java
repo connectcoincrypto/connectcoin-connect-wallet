@@ -76,7 +76,7 @@ public class MobileClaimBlockWindowTest {
             JSONObject full = window(height, 0, 0); List<Integer> counts = new ArrayList<>();
             MobileClaimBlockWindow result = MobileClaimBlockWindow.refresh(cache(window(Math.max(0, height - 1), 0, 0)), full.getJSONObject("tip"), true,
                 params -> { counts.add(params.optInt("count", 600)); return prefix(full, params); });
-            assertEquals(List.of(5), counts); complete(result, full); assertTrue(result.blocks().containsKey(GENESIS));
+            assertEquals(List.of(600), counts); complete(result, full); assertTrue(result.blocks().containsKey(GENESIS));
         }
     }
     @Test public void legacyRejectingCountFallsBackOnlyForInvalidParams() throws Exception {

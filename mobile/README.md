@@ -1,6 +1,6 @@
 # ConnectWallet mobile
 
-Android and iOS applications, isolated from desktop and installed as `com.connectcoincrypto.connectwallet.mobile.alpha`. Version `1.0.0`, English UI. The application identifier stays unchanged so updates retain existing wallets and settings. The desktop build remains unchanged. The native iOS app, build instructions and platform differences are documented in [ios/README.md](ios/README.md).
+Android and iOS applications, isolated from desktop and installed as `com.connectcoincrypto.connectwallet.mobile.alpha`. Version `1.0.0`, English UI. The application identifier stays unchanged so updates retain existing wallets and settings. Mobile packaging stays separate from the desktop build. The native iOS app, build instructions and platform differences are documented in [ios/README.md](ios/README.md).
 
 ## Android reference feature set
 
@@ -45,8 +45,9 @@ The detailed behaviors in this section describe the Android reference implementa
 ## Adaptive claims discovery (Android and iOS)
 
 The complete, validated 600-block hash window is cached in memory. An unchanged
-tip does not download the list again. New blocks and reorganizations request
-5, then 100, then 600 hashes only as necessary to reconstruct the entire window
+tip does not download the list again. Compatible servers extend it with canonical
+block deltas on ordinary new blocks. Reorganizations, missing deltas and legacy
+servers request 5, then 100, then 600 hashes only as necessary to reconstruct the entire window
 using an overlap that agrees on hash, height and ancestry. A rollback with a
 missing cached tail still requires the complete response. Legacy servers can
 return a full window or explicitly reject `count`, allowing a full-window retry;
@@ -64,11 +65,20 @@ availability and is not polled through nonexistent out-of-window RPC methods.
 
 Journal pagination and mempool changes continue even with an unchanged tip.
 Hash refreshes keep their original journal checkpoint and replay changes that
-arrived during the query. A final lightweight tip check guards publication of
-the staged catalog, cursor and window. Bounty streams still load progressively;
-having 600 hashes does not mark 600 bounty streams as read. A cursor reset
-requires a fresh query and new bounty streams; hashes alone are not bounty state.
+arrived during the query. With enriched-feed servers, the final validated journal
+response guards publication of the staged catalog, cursor and window without a
+duplicate tip query; the legacy mobile path retains its explicit tip fence. Enriched
+events carry full validated bounty rows. A manifest count of all bounty outputs
+can prove a block empty or complete from those rows; neither a hash alone nor
+a count of only available/profitable rows is sufficient. Incomplete blocks still
+load through bounded streams. Compact v1-v3 replies retain request-base binding,
+row-digest, cursor, chain and confirmation checks; unresolved references retry
+the same watermark with expanded data. A cursor reset
+requires a fresh query and revalidated bounty state; hashes alone are not bounty state.
 The existing per-method quotas, proof checks and claim counters are unchanged.
+Connection-scoped capability negotiation allows compatible legacy servers;
+malformed responses never authorize a downgrade. Claim funding uses raw-only
+parent replies where supported, retaining transaction-ID/output verification.
 
 ### Accepted and rejected claim retention
 
@@ -90,11 +100,13 @@ that conflict remains. Confirmed spends and conflicting funding still block it.
 Unknown outcomes remain paused for explicit receipt checking and never use the
 automatic absent-transaction path without that resolution.
 
-Transaction IDs exclude the proof witness. A receipt may contain a different
-proof for the same transaction, but its canonical non-witness data must match
-the preserved claim, and its proof framing, challenge and retained work target
-(when available) must validate. A
-receipt never substitutes its bytes for the original retransmission payload.
+Transaction IDs exclude the proof witness. Compact indexed receipts describe
+the preserved transaction's status and canonical block location; the original
+local transaction/proof is revalidated before requesting that metadata. If a
+server explicitly lacks the status method, the full legacy receipt can contain
+a different proof for the same transaction, but its canonical non-witness data,
+proof framing, challenge and retained work target (when available) must validate.
+A receipt never substitutes its bytes for the original retransmission payload.
 Receipt scheduling prioritizes overdue records so repeated misses cannot
 indefinitely starve later confirmations; late results must still belong to the
 current lifecycle before they can update receipt state.

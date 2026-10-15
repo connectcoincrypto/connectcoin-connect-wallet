@@ -142,6 +142,81 @@ private final class RpcTestWire: RpcWire, @unchecked Sendable {
 }
 
 final class MobileRpcClientTests: XCTestCase {
+    func testClaimsRawOnlyFallbackIsExplicitAndResetsWithConnection() async throws {
+        let wire = RpcTestWire(), client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+        let params: JSONObject = ["txid": String(repeating: "a", count: 64), "raw_only": true]
+        let first = Task { try await client.claimRead("gettransaction", params) }
+        try await eventually { wire.sent.count == 1 }
+        XCTAssertEqual(try PJ.object(wire.sent[0]["params"])["raw_only"] as? Bool, true)
+        wire.reject(wire.sent[0], code: -32602)
+        try await eventually { wire.sent.count == 2 }
+        XCTAssertNil(try PJ.object(wire.sent[1]["params"])["raw_only"])
+        wire.reply(wire.sent[1], result: [:]); _ = try await first.value
+        let second = Task { try await client.claimRead("gettransaction", params) }
+        try await eventually { wire.sent.count == 3 }
+        XCTAssertNil(try PJ.object(wire.sent[2]["params"])["raw_only"])
+        wire.reply(wire.sent[2], result: [:]); _ = try await second.value
+        client.cancelAll()
+        let third = Task { try await client.claimRead("gettransaction", params) }
+        try await eventually { wire.sent.count == 4 }
+        XCTAssertEqual(try PJ.object(wire.sent[3]["params"])["raw_only"] as? Bool, true)
+        wire.reply(wire.sent[3], result: [:]); _ = try await third.value
+    }
+    func testClaimStatusFallbackRequiresMethodNotFoundAndRejectsInoculatedLegacyPayload() async throws {
+        for code in [-32601, -32602, -32002] {
+            let wire = RpcTestWire(), client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+            let lookup = Task { try await client.claimRead("gettransactionstatus", ["txid": self.fixtureHash]) }
+            try await eventually { wire.sent.count == 1 }; wire.reject(wire.sent[0], code: code)
+            if code == -32601 {
+                try await eventually { wire.sent.count == 2 }
+                XCTAssertEqual(wire.sent[1]["method"] as? String, "gettransaction")
+                wire.reply(wire.sent[1], result: ["transaction": ["hex": "retained by full validator"]])
+                _ = try await lookup.value
+            } else {
+                do { _ = try await lookup.value; XCTFail("Non-capability failure was downgraded") } catch {}
+                XCTAssertEqual(wire.sent.count, 1)
+            }
+        }
+        let wire = RpcTestWire(), client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+        let malformed = Task { try await client.claimRead("gettransactionstatus", ["txid": self.fixtureHash]) }
+        try await eventually { wire.sent.count == 1 }
+        wire.reply(wire.sent[0], result: ["txid": String(repeating: "b", count: 64), "transaction": ["hex": "injected"]])
+        do { _ = try await malformed.value; XCTFail("Status response masqueraded as legacy receipt") } catch {}
+        XCTAssertEqual(wire.sent.count, 1)
+    }
+    func testClaimCompactNegotiationAndMalformedResponsesDoNotDowngrade() async throws {
+        let wire = RpcTestWire(), client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+        let params: JSONObject = ["include_bounties": true, "compact": true, "compact_version": 3]
+        let read = Task { try await client.claimRead("getbountychanges", params) }
+        for index in 0..<3 {
+            try await eventually { wire.sent.count == index + 1 }
+            let sent = try PJ.object(wire.sent[index]["params"])
+            XCTAssertEqual(sent["compact_version"] as? Int, index == 2 ? nil : 3 - index)
+            wire.reject(wire.sent[index], code: -32602)
+        }
+        try await eventually { wire.sent.count == 4 }
+        XCTAssertNil(try PJ.object(wire.sent[3]["params"])["compact"])
+        wire.reply(wire.sent[3], result: ["compact": 3, "unchanged": true])
+        do { _ = try await read.value; XCTFail("Unrequested compressed response accepted") } catch {}
+        XCTAssertEqual(wire.sent.count, 4)
+    }
+    func testLegacyColdNegotiationAlsoStripsWarmKnownTip() async throws {
+        let wire = RpcTestWire(), client = MobileRpcClient(factory: { wire }); defer { client.close() }; client.setActive(true)
+        let cold = Task { try await client.claimRead("getbountychanges", ["include_bounties": true, "compact": true, "compact_version": 3]) }
+        for index in 0..<4 {
+            try await eventually { wire.sent.count == index + 1 }
+            wire.reject(wire.sent[index], code: -32602)
+        }
+        try await eventually { wire.sent.count == 5 }
+        XCTAssertTrue(try PJ.object(wire.sent[4]["params"]).isEmpty)
+        wire.reply(wire.sent[4], result: [:]); _ = try await cold.value
+        let warm = Task { try await client.claimRead("getbountychanges", ["cursor": "base", "include_bounties": true,
+            "compact": true, "compact_version": 3, "known_tip": ["height": 1, "hash": self.fixtureHash] as JSONObject,
+            "known_state": self.fixtureHash]) }
+        try await eventually { wire.sent.count == 6 }
+        XCTAssertEqual(Set(try PJ.object(wire.sent[5]["params"]).keys), ["cursor"])
+        wire.reply(wire.sent[5], result: [:]); _ = try await warm.value
+    }
     private let address = "cc1p4t449ht5jnpkzpyaue7vdq8g867th0d7kymr0kfvmpzlwqcg4a0qc59p3e"
     private let fixtureHash = String(repeating:"aa",count:32)
     private func eventually(_ condition: () -> Bool) async throws {

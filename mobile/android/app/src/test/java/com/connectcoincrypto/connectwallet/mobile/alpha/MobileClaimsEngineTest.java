@@ -83,6 +83,7 @@ public class MobileClaimsEngineTest {
         final List<Integer> windowCounts = new ArrayList<>();
         final List<String> blockReads = new ArrayList<>();
         final List<String> journalCursors = new ArrayList<>();
+        final List<JSONObject> requestParams = new ArrayList<>();
         final List<String> boundBudgets = new ArrayList<>();
         final Map<String, JSONArray> blockRows = new HashMap<>();
         final Map<String, JSONArray> changesByCursor = new HashMap<>();
@@ -101,6 +102,8 @@ public class MobileClaimsEngineTest {
         int changesCount, captures, prepared, attaches, broadcasts, destroys, cancellations, acknowledgementPolls;
         boolean incomplete, badParent, failReceipt, fakeTime, hideAcknowledgements, limiterDestroyed;
         boolean repeatCursor, startsAllowed = true, queuedBroadcast, capturedBeforeFailure;
+        boolean modern, rejectEnriched, rejectRaw;
+        long rpcEpoch;
         long handleSerial = 6;
         Exception nativeFailure;
         final Map<String, Exception> readFailures = new HashMap<>();
@@ -115,17 +118,28 @@ public class MobileClaimsEngineTest {
             engine.setReceiptStore((txid, status) -> { if (failReceipt) throw new IOException("fixture"); assertEquals(CLAIM, txid); receipts.add(status); });
         }
         void start() { engine.start("fixture-public-address"); engine.setAllowed(true); }
+        public long connectionEpoch() { return rpcEpoch; }
         public CompletableFuture<JSONObject> call(String method, JSONObject params) {
             calls.add(method);
+            requestParams.add(params);
             if (readFailures.containsKey(method)) return failed(readFailures.get(method));
+            try {
+                if (rejectEnriched && method.equals("getbountychanges") && params.has("include_bounties")) {
+                    if (rpcEpoch == 0) rpcEpoch++;
+                    return failed(rpcFailure("-32602", method, 0));
+                }
+                if (rejectRaw && method.equals("gettransaction") && params.has("raw_only")) return failed(rpcFailure("-32602", method, 0));
+            } catch (Exception error) { return failed(error); }
             try { switch (method) {
                 case "getchaintip": if (onTip != null) onTip.run(); return CompletableFuture.completedFuture(currentTip);
                 case "getbountychanges": {
                     int page = changesCount++;
-                    if (page == 0) assertEquals(0, params.length()); else assertTrue(params.has("cursor"));
+                    if (page == 0) assertFalse(params.has("cursor")); else assertTrue(params.has("cursor"));
                     journalCursors.add(params.optString("cursor", ""));
                     JSONObject scripted = journalReplies.get(params.optString("cursor", ""));
                     if (scripted != null) return CompletableFuture.completedFuture(scripted);
+                    if (modern && params.has("known_state")) return CompletableFuture.completedFuture(new JSONObject().put("compact", 3).put("unchanged", true));
+                    if (modern) return CompletableFuture.completedFuture(new JSONObject().put("compact", 3).put("tip", currentTip).put("next_cursor", "cursor" + page));
                     JSONArray events = changesByCursor.getOrDefault(params.optString("cursor", ""), page < changes.size() ? changes.get(page) : new JSONArray());
                     return CompletableFuture.completedFuture(new JSONObject().put("tip", currentTip).put("next_cursor", repeatCursor ? params.getString("cursor") : "cursor" + page).put("has_more", false).put("changes", events));
                 }
@@ -136,8 +150,18 @@ public class MobileClaimsEngineTest {
                     JSONArray recent = new JSONArray();
                     if (currentTip.getLong("height") == 1) recent.put(new JSONObject().put("height", 1).put("hash", currentTip.getString("hash")));
                     recent.put(new JSONObject().put("height", 0).put("hash", GENESIS));
-                    return CompletableFuture.completedFuture(new JSONObject().put("tip", currentTip).put("window", 600).put("blocks", recent));
+                    JSONObject manifest = new JSONObject().put("tip", currentTip).put("window", 600).put("blocks", recent);
+                    if (modern) {
+                        manifest.put("bounty_counts", 1);
+                        for (int i = 0; i < recent.length(); i++) recent.getJSONObject(i).put("bounty_count", rows.length());
+                    }
+                    return CompletableFuture.completedFuture(manifest);
                 }
+                case "gettransactionstatus":
+                    if (!modern) return failed(rpcFailure("-32601", method, 0)); // Legacy fixture.
+                    receiptLookups++;
+                    if (receiptFailure != null) return failed(receiptFailure);
+                    return CompletableFuture.completedFuture(receiptResponse == null ? new JSONObject().put("tip", currentTip).put("txid", CLAIM).put("status", "pending").put("confirmations", 0) : receiptResponse);
                 case "gettransaction":
                     if (CLAIM.equals(params.optString("txid"))) {
                         receiptLookups++;
@@ -186,6 +210,7 @@ public class MobileClaimsEngineTest {
         public JSONObject prepare(JSONObject value, String parent, String reward) throws Exception { prepared++; if (!parent.equals("parent-fixture")) throw new IllegalArgumentException("bad raw parent"); if (onPrepare != null) onPrepare.run(); return new JSONObject().put("challenge", "challenge"); }
         public JSONObject attach(JSONObject prepared, String proof) throws Exception { attaches++; if (onAttach != null) onAttach.run(); return new JSONObject().put("txid", CLAIM).put("hex", "complete-fixture"); }
         public void validateObserved(String raw, String expectedTxid, String originalHex, String target) {
+            if (modern) calls.add("validateObserved");
             if (!CLAIM.equals(expectedTxid) || originalHex != null && !originalHex.equals("complete-fixture")
                     || !("complete-fixture".equals(raw) || alternateObservedHex != null && alternateObservedHex.equals(raw))) throw new IllegalArgumentException("CLAIMS_RPC_DATA");
         }
@@ -205,6 +230,151 @@ public class MobileClaimsEngineTest {
             cursor = following;
         }
         return cursor;
+    }
+    private static Fixture modernEmpty() throws Exception {
+        Fixture f = new Fixture(true); f.modern = true; f.rows = new JSONArray(); f.start(); maintain(f.engine); return f;
+    }
+    private static JSONObject modernRow(int output) throws Exception {
+        return bounty("example.com", TXID, output, MAX_TARGET, "10000000000").put("block_height", 1)
+            .put("block_hash", MobileClaimBlockWindowTest.canonical(1)).put("spending_txid", JSONObject.NULL);
+    }
+    private static JSONObject added(int sequence, JSONObject row) throws Exception {
+        return new JSONObject().put("type", "added").put("sequence", sequence).put("tip_ref", -1).put("bounty", row);
+    }
+    private static JSONObject advanceModern(Fixture f, int count, JSONArray events) throws Exception {
+        f.recentOverride = MobileClaimBlockWindowTest.window(1, 0, 0).put("bounty_counts", 1);
+        f.currentTip = f.recentOverride.getJSONObject("tip");
+        f.recentOverride.getJSONArray("blocks").getJSONObject(0).put("bounty_count", count);
+        f.recentOverride.getJSONArray("blocks").getJSONObject(1).put("bounty_count", 0);
+        JSONObject page = new JSONObject().put("compact", 3).put("tip", new JSONArray().put(1).put(f.currentTip.getString("hash")).put(f.currentTip.get("mediantime")))
+            .put("block_delta", new JSONArray().put(new JSONArray().put(JSONObject.NULL).put(count))).put("changes", events).put("next_cursor", "modern1");
+        f.journalReplies.put((String)engineField(f.engine, "cursor"), page); setEngineField(f.engine, "nextDiscovery", 0L); return page;
+    }
+    @Test public void countedEmptyGenesisAndNewBlockNeedNoStreamsOrDuplicateFenceQueries() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            assertTrue(f.blockReads.isEmpty()); assertEquals(List.of(600), f.windowCounts);
+            assertEquals(2, f.changesCount); assertFalse(f.calls.contains("getchaintip"));
+            int reads = f.changesCount;
+            advanceModern(f, 0, new JSONArray()); maintain(f.engine);
+            assertEquals(reads + 1, f.changesCount); assertEquals(List.of(600), f.windowCounts); assertTrue(f.blockReads.isEmpty());
+            assertEquals(2, ((Set<?>)engineField(f.engine, "loaded")).size());
+        }
+    }
+    @Test public void completeFeedBlockUsesAllUniqueRowsWithoutStreamOrSecondPoll() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            int reads = f.changesCount;
+            advanceModern(f, 2, new JSONArray().put(added(1, modernRow(0))).put(added(2, modernRow(1)))); maintain(f.engine);
+            assertEquals(reads + 1, f.changesCount); assertTrue(f.blockReads.isEmpty()); assertEquals(List.of(600), f.windowCounts);
+            assertEquals(2, ((Map<?, ?>)engineField(f.engine, "catalog")).size());
+            assertTrue(((Map<?, ?>)engineField(f.engine, "feedCandidates")).isEmpty());
+            assertTrue(f.requestParams.stream().anyMatch(p -> Boolean.TRUE.equals(p.opt("raw_only"))));
+        }
+    }
+    @Test public void mixedLegacyStateChangesRequireAStreamBeforeInlineAdmission() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            advanceModern(f, 1, new JSONArray().put(added(1, modernRow(0)))).put("has_more", true);
+            JSONObject spent = new JSONObject().put("sequence", 2).put("type", "spent").put("txid", TXID).put("vout", 0).put("spending_txid", CLAIM);
+            f.journalReplies.put("modern1", new JSONObject().put("tip", f.currentTip).put("next_cursor", "legacy2").put("has_more", false).put("changes", new JSONArray().put(spent)));
+            setEngineField(f.engine, "nextBlock", Long.MAX_VALUE); maintain(f.engine);
+            assertTrue(((Map<?, ?>)engineField(f.engine, "catalog")).isEmpty());
+            @SuppressWarnings("unchecked") Map<String, Map<String, MobileClaimsEngine.Candidate>> pending = (Map<String, Map<String, MobileClaimsEngine.Candidate>>)engineField(f.engine, "feedCandidates");
+            Map<String, MobileClaimsEngine.Candidate> rows = pending.get(f.currentTip.getString("hash"));
+            assertEquals("spent", rows.get(TXID + ":0").state); assertEquals(CLAIM, rows.get(TXID + ":0").spendingTxid);
+            assertEquals(0, f.prepared); assertTrue(f.blockReads.isEmpty()); assertTrue(f.calls.contains("getchaintip"));
+            assertTrue(((Set<?>)engineField(f.engine, "feedNeedsStream")).contains(f.currentTip.getString("hash")));
+        }
+    }
+    @Test public void partialFeedCandidatesSurviveCursorCommitAndCheckLaterStreamMembership() throws Exception {
+        for (boolean omit : new boolean[]{false, true}) try (Fixture f = modernEmpty()) {
+            JSONObject first = modernRow(0).put("status", "spent").put("spending_txid", CLAIM);
+            advanceModern(f, 2, new JSONArray().put(added(1, first))); setEngineField(f.engine, "nextBlock", Long.MAX_VALUE); maintain(f.engine);
+            assertEquals("modern1", engineField(f.engine, "cursor")); assertEquals(0, ((Map<?, ?>)engineField(f.engine, "catalog")).size());
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "feedCandidates")).size());
+            f.blockRows.put(f.currentTip.getString("hash"), new JSONArray().put(modernRow(omit ? 2 : 0)).put(modernRow(1)));
+            setEngineField(f.engine, "nextBlock", 0L); maintain(f.engine);
+            if (omit) {
+                assertFalse((Boolean)engineField(f.engine, "healthy")); assertEquals(0, f.prepared);
+            } else {
+                assertEquals(2, ((Map<?, ?>)engineField(f.engine, "catalog")).size());
+                assertTrue(((Map<?, ?>)engineField(f.engine, "feedCandidates")).isEmpty());
+            }
+            assertEquals(0, f.captures); assertEquals(0, f.broadcasts);
+        }
+    }
+    @Test public void unknownLegacyAdditionCannotPromoteOtherwiseCountCompleteInlineRows() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            advanceModern(f, 1, new JSONArray().put(added(1, modernRow(0)))).put("has_more", true);
+            JSONObject unknown = new JSONObject().put("sequence", 2).put("type", "added").put("txid", TXID).put("vout", 1)
+                .put("block_hash", f.currentTip.getString("hash")).put("block_height", 1);
+            f.journalReplies.put("modern1", new JSONObject().put("tip", f.currentTip).put("next_cursor", "legacy2").put("has_more", false).put("changes", new JSONArray().put(unknown)));
+            setEngineField(f.engine, "nextBlock", Long.MAX_VALUE); maintain(f.engine);
+            assertTrue(((Map<?, ?>)engineField(f.engine, "catalog")).isEmpty());
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "feedCandidates")).size());
+            assertTrue(((Set<?>)engineField(f.engine, "feedNeedsStream")).contains(f.currentTip.getString("hash")));
+            assertFalse(((Set<?>)engineField(f.engine, "loaded")).contains(f.currentTip.getString("hash")));
+        }
+    }
+    @Test public void loadedBlockCannotAcceptContradictoryAuthoritativeCardinality() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            advanceModern(f, 1, new JSONArray().put(added(1, modernRow(0)))); maintain(f.engine);
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "catalog")).size());
+            // Model a previously legacy-loaded cache receiving its first count.
+            f.recentOverride.getJSONArray("blocks").getJSONObject(0).put("bounty_count", 2);
+            setEngineField(f.engine, "blockWindow", MobileClaimBlockWindowTest.cache(f.recentOverride));
+            setEngineField(f.engine, "nextDiscovery", 0L); maintain(f.engine);
+            assertFalse((Boolean)engineField(f.engine, "healthy")); assertEquals(0, f.captures);
+        }
+    }
+    @Test public void orphanedHistoricalPublicationCannotPublishStateOrAdvanceCursor() throws Exception {
+        try (Fixture f = modernEmpty()) {
+            advanceModern(f, 1, new JSONArray().put(added(1, modernRow(0)))); maintain(f.engine);
+            String before = (String)engineField(f.engine, "cursor");
+            JSONObject state = modernRow(0).put("status", "spent").put("spending_txid", CLAIM);
+            JSONObject orphan = new JSONObject(f.currentTip.toString()).put("hash", repeat("ee", 32));
+            JSONObject nextTip = new JSONObject(f.currentTip.toString()).put("height", 2).put("hash", repeat("dd", 32));
+            JSONObject e = new JSONObject().put("sequence", 2).put("type", "spent").put("txid", TXID).put("vout", 0).put("tip_ref", 0)
+                .put("bounty_ref", MobileBountyCodec.immutableDigest(state)).put("bounty_delta", new JSONObject().put("status", "spent").put("spending_txid", CLAIM));
+            f.journalReplies.put(before, new JSONObject().put("compact", 3).put("tip", new JSONArray().put(2).put(nextTip.getString("hash")).put(nextTip.get("mediantime")))
+                .put("block_delta", new JSONArray().put(new JSONArray().put(JSONObject.NULL).put(0))).put("next_cursor", "orphan2").put("tips", new JSONArray().put(orphan)).put("changes", new JSONArray().put(e)));
+            setEngineField(f.engine, "nextDiscovery", 0L); maintain(f.engine);
+            assertEquals(before, engineField(f.engine, "cursor")); assertFalse((Boolean)engineField(f.engine, "healthy")); assertEquals(0, f.broadcasts);
+        }
+    }
+    @Test public void compactPendingReceiptValidatesOwnedBytesBeforeStatusAndRetainsProof() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.start(); f.nativeResult = proof(true, true, 200); f.engine.tick();
+            assertEquals(1, f.broadcasts); assertEquals(1, ((Map<?, ?>)engineField(f.engine, "savedWinners")).size());
+            f.modern = true; f.rpcEpoch++; f.calls.clear(); f.clock.addAndGet(TimeUnit.SECONDS.toNanos(31));
+            // Keep the previously validated legacy feed while exercising receipts.
+            f.journalReplies.put((String)engineField(f.engine, "cursor"), new JSONObject().put("tip", f.currentTip).put("next_cursor", "receiptfence").put("has_more", false).put("changes", new JSONArray()));
+            maintain(f.engine);
+            assertTrue(f.calls.toString(), f.calls.indexOf("validateObserved") < f.calls.indexOf("gettransactionstatus")); assertTrue(f.calls.toString(), f.calls.contains("gettransactionstatus"));
+            assertEquals(1, ((Map<?, ?>)engineField(f.engine, "savedWinners")).size()); assertEquals(1, f.broadcasts); assertEquals(1, f.captures);
+            assertEquals(1, f.engine.snapshot().getLong("submitted"));
+        }
+    }
+    @Test public void firstSocketCompatibilityIsRememberedAndOnlyNewSocketReprobes() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.rejectEnriched = true; f.start(); maintain(f.engine);
+            long probes = f.requestParams.stream().filter(p -> p.has("include_bounties")).count();
+            assertEquals(4, probes); assertEquals(1L, engineField(f.engine, "capabilityEpoch"));
+            setEngineField(f.engine, "nextDiscovery", 0L); maintain(f.engine);
+            assertEquals(probes, f.requestParams.stream().filter(p -> p.has("include_bounties")).count());
+            f.rpcEpoch++; setEngineField(f.engine, "nextDiscovery", 0L); maintain(f.engine);
+            assertTrue(f.requestParams.stream().filter(p -> p.has("include_bounties")).count() > probes);
+        }
+    }
+    @Test public void rawFundingFallbackRequiresExplicitParameterRejection() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            f.rejectRaw = true; f.start(); maintain(f.engine);
+            assertEquals(1, f.prepared); assertFalse((Boolean)engineField(f.engine, "rawFunding"));
+            assertEquals(1, f.requestParams.stream().filter(p -> p.has("raw_only")).count());
+        }
+        try (Fixture f = new Fixture(true)) {
+            f.readFailures.put("gettransaction", rpcFailure("RPC_TIMEOUT", "gettransaction", 0)); f.start(); maintain(f.engine);
+            assertEquals(0, f.prepared); assertTrue((Boolean)engineField(f.engine, "rawFunding"));
+            assertEquals(1, f.requestParams.stream().filter(p -> p.has("raw_only")).count());
+        }
     }
     private static void warmFunding(MobileClaimsEngine engine) throws Exception {
         JSONObject output = new JSONObject().put("type", 2).put("amount", "10000000000").put("domain", "example.com").put("target", MAX_TARGET).put("rootVersion", 1).put("mask", 7);
@@ -960,7 +1130,7 @@ public class MobileClaimsEngineTest {
             f.readFailures.clear(); f.changes.clear(); f.changesCount = 0;
             f.rows = new JSONArray().put(bounty().put("status", "spent"));
             f.clock.addAndGet(TimeUnit.SECONDS.toNanos(5)); maintain(f.engine);
-            assertEquals(List.of(600, 5), f.windowCounts); assertEquals(List.of(GENESIS, GENESIS), f.blockReads);
+            assertEquals(List.of(600, 600), f.windowCounts); assertEquals(List.of(GENESIS, GENESIS), f.blockReads);
             assertEquals(0, f.engine.snapshot().getInt("eligible")); assertTrue(f.engine.snapshot().getBoolean("enabled"));
         }
     }

@@ -145,6 +145,23 @@ public class MobileRpcClientTest {
         MobileRpcClient.TcpEndpoint endpoint = new MobileRpcClient.TcpEndpoint("RPC.EXAMPLE.COM", 48190);
         assertEquals("rpc.example.com", endpoint.hostname); assertEquals(48190, endpoint.port);
     }
+    @Test public void trafficFlagsAreStrictAndKnownStateNeedsOwnedCursorAndAnchor() throws Exception {
+        assertTrue(MobileRpcClient.validateParams("gettransaction", new JSONObject().put("txid", HASH).put("raw_only", true)).getBoolean("raw_only"));
+        assertEquals(HASH, MobileRpcClient.validateParams("gettransactionstatus", new JSONObject().put("txid", HASH)).getString("txid"));
+        assertTrue(MobileRpcClient.validateParams("getrecentblockhashes", new JSONObject().put("include_bounty_counts", true)).getBoolean("include_bounty_counts"));
+        JSONObject anchor = new JSONObject().put("height", 7).put("hash", HASH);
+        JSONObject args = new JSONObject().put("cursor", "owned").put("include_bounties", true).put("compact", true).put("compact_version", 3).put("known_tip", anchor).put("known_state", HASH);
+        JSONObject clean = MobileRpcClient.validateParams("getbountychanges", args); anchor.put("height", 99);
+        assertEquals(7, clean.getJSONObject("known_tip").getInt("height"));
+        for (String key : new String[]{"cursor", "include_bounties", "compact", "known_tip"}) {
+            JSONObject invalid = new JSONObject(clean.toString()); invalid.remove(key); invalid("getbountychanges", invalid);
+        }
+        for (Object value : new Object[]{JSONObject.NULL, "true", 1}) {
+            invalid("gettransaction", new JSONObject().put("txid", HASH).put("raw_only", value));
+            invalid("getrecentblockhashes", new JSONObject().put("include_bounty_counts", value));
+        }
+        for (Object version : new Object[]{1, 4, true, "3", 3.0, JSONObject.NULL}) invalid("getbountychanges", new JSONObject(clean.toString()).put("compact_version", version));
+    }
 
     @Test public void endpointReplacementCancelsOldQueriesAndRoutesOnlyToTheSelectedEndpoint() throws Exception {
         CountDownLatch querySeen = new CountDownLatch(1), release = new CountDownLatch(1);

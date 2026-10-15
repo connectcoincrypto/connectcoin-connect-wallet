@@ -69,6 +69,11 @@ public final class MobileClaimsEngine implements AutoCloseable {
     // proven-unsent work also survives without occupying a submission slot.
     private final Map<String, Winner> savedWinners = new LinkedHashMap<>();
     private final Map<String, Candidate> catalog = new LinkedHashMap<>();
+    // Partial enriched blocks are never scheduler-visible. Keep their full
+    // validated identities until a stream proves completeness (or the block
+    // exits), so advancing the journal cannot erase consistency evidence.
+    private final Map<String, Map<String, Candidate>> feedCandidates = new LinkedHashMap<>();
+    private final Set<String> feedNeedsStream = new HashSet<>();
     // Only already-dispatched captures and verified winners may outlive the
     // discovery window. These rows are NEVER scheduler candidates.
     private final Map<String, Retained> retained = new LinkedHashMap<>();
@@ -81,6 +86,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private final MobileClaimScheduler scheduler = new MobileClaimScheduler();
     private final Map<String, Long> blocks = new LinkedHashMap<>();
     private MobileClaimBlockWindow blockWindow;
+    private long capabilityEpoch = Long.MIN_VALUE;
+    private int compactVersion = 3;
+    private boolean enrichedFeed = true, blockDeltas = true, bountyCounts = true, rawFunding = true, compactReceipts = true;
     private final Set<String> loaded = new HashSet<>(), retired = new HashSet<>();
     private String cursor, rewardAddress, currentDomain = "", status = "stopped", lastError = "", lastTxid = "";
     private JSONObject tip, lastRpcError;
@@ -197,6 +205,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
 
     interface RpcAccess {
+        default long connectionEpoch() { return 0; }
         CompletableFuture<JSONObject> call(String method, JSONObject params);
         CompletableFuture<JSONObject> stream(String hash, MobileRpcClient.ChunkConsumer consumer);
         CompletableFuture<JSONObject> broadcast(String hex);
@@ -229,6 +238,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
     public MobileClaimsEngine(MobileRpcClient client) {
         this(new RpcAccess() {
+            public long connectionEpoch() { return client.connectionEpoch(); }
             public CompletableFuture<JSONObject> call(String method, JSONObject params) { return client.call(method, params); }
             public CompletableFuture<JSONObject> stream(String hash, MobileRpcClient.ChunkConsumer consumer) { return client.streamBounties(hash, consumer); }
             public CompletableFuture<JSONObject> broadcast(String hex) { return client.broadcast(hex); }
@@ -385,7 +395,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             for (Retained row : retained.values()) resyncBlocks.add(row.row.blockHash);
             catalogGate = true; resyncSnapshotPending = true;
         } else { retained.clear(); resyncBlocks.clear(); catalogGate = resyncSnapshotPending = false; }
-        catalog.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; if (!keepHashAnchor) blockWindow = null;
+        catalog.clear(); feedCandidates.clear(); feedNeedsStream.clear(); blocks.clear(); loaded.clear(); scheduler.clear(); scheduleDirty = admissionIdle = true; cursor = null; tip = null; healthy = false; catalogValidatedAt = 0; if (!keepHashAnchor) blockWindow = null;
     }
     private static final class Retained {
         Candidate row; boolean normalAged;
@@ -497,6 +507,56 @@ public final class MobileClaimsEngine implements AutoCloseable {
         try { return waitFor(rpc.call(method, params), epoch); }
         catch (MobileRpcClient.RpcFailure failure) { throw new ReadFailure(method, failure); }
     }
+    private void capabilities() {
+        long current = rpc.connectionEpoch();
+        if (current != capabilityEpoch) { capabilityEpoch = current; compactVersion = 3; enrichedFeed = blockDeltas = bountyCounts = rawFunding = compactReceipts = true; }
+    }
+    private Map<String, JSONObject> ownedRows() throws Exception {
+        Map<String, JSONObject> rows = new LinkedHashMap<>();
+        synchronized (this) {
+            for (Candidate row : catalog.values()) rows.put(row.key, copy(row.bounty));
+            for (Retained row : retained.values()) rows.putIfAbsent(row.row.key, copy(row.row.bounty));
+            for (Map<String, Candidate> candidates : feedCandidates.values()) for (Candidate row : candidates.values()) rows.putIfAbsent(row.key, copy(row.bounty));
+        }
+        return rows;
+    }
+    private JSONObject changes(String checkpoint, MobileClaimBlockWindow window, Map<String, JSONObject> rows, long epoch) throws Exception {
+        return changes(checkpoint, window, rows, epoch, -1);
+    }
+    private JSONObject changes(String checkpoint, MobileClaimBlockWindow window, Map<String, JSONObject> rows, long epoch, long minimumSequence) throws Exception {
+        capabilities(); boolean expandedReplay = false;
+        for (int attempt = 0; attempt < 7; attempt++) {
+            JSONObject params = new JSONObject(); if (checkpoint != null) params.put("cursor", checkpoint);
+            if (enrichedFeed) params.put("include_bounties", true);
+            JSONObject base = window == null || checkpoint == null || !enrichedFeed || !blockDeltas ? null : window.tip();
+            if (base != null) params.put("known_tip", new JSONObject().put("height", base.get("height")).put("hash", base.get("hash")));
+            int requested = enrichedFeed && !expandedReplay ? compactVersion : 0;
+            if (requested > 0) { params.put("compact", true); if (requested > 1) params.put("compact_version", requested); if (base != null) params.put("known_state", MobileBountyCodec.stateDigest(base, checkpoint)); }
+            JSONObject response;
+            try { response = request("getbountychanges", params, epoch); }
+            catch (ReadFailure error) {
+                capabilities();
+                if (!"-32602".equals(error.failure.code) || !enrichedFeed) throw error;
+                if (requested > 1) compactVersion = requested - 1;
+                else if (requested == 1) compactVersion = 0;
+                else if (base != null) blockDeltas = false;
+                else enrichedFeed = false;
+                continue;
+            }
+            // A socket replacement resets learned capabilities. Never bind the
+            // next connection to an old unsupported-method conclusion.
+            long currentEpoch = rpc.connectionEpoch(); if (currentEpoch != capabilityEpoch) { capabilities(); }
+            try {
+                JSONObject normalized = MobileBountyCodec.decode(response, base, checkpoint, rows, requested,
+                    window == null ? java.util.Collections.emptyMap() : window.blocks(), window == null ? java.util.Collections.emptyMap() : window.counts(), minimumSequence);
+                if (!normalized.has("bounty_deltas")) { enrichedFeed = false; compactVersion = 0; }
+                if (base != null && !normalized.has("block_deltas")) blockDeltas = false;
+                if (response.has("compact")) compactVersion = (int)MobileBountyCodec.number(response.opt("compact"), 1, requested);
+                return normalized;
+            } catch (MobileBountyCodec.UnknownReference unknown) { require(!expandedReplay, "CLAIMS_RPC_DATA"); expandedReplay = true; }
+        }
+        throw new IllegalArgumentException("CLAIMS_RPC_DATA");
+    }
     static JSONObject validateTip(JSONObject value) throws JSONException {
         require(value != null && "main".equals(value.opt("chain")) && GENESIS.equals(value.opt("genesis_hash")), "CLAIMS_WRONG_NETWORK");
         String id = hash(value.opt("hash")); long height = integer(value.opt("height"), 0, SAFE_MAX);
@@ -510,7 +570,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
         // original journal cursor until commit and bound repeated reorgs.
         for (int pass = 0; pass < 3; pass++) {
             String startCursor = originalCursor;
-            JSONObject first = request("getbountychanges", startCursor == null ? new JSONObject() : new JSONObject().put("cursor", startCursor), epoch);
+            JSONObject first = changes(startCursor, startCursor == null ? null : known, ownedRows(), epoch);
             JSONObject expected = validateTip(first.optJSONObject("tip"));
             JSONArray firstEvents = journalEvents(first);
             boolean force = startCursor == null;
@@ -518,19 +578,29 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 require(firstEvents.length() == 0 && Boolean.FALSE.equals(first.opt("has_more")), "CLAIMS_RPC_DATA");
                 startCursor = validCursor(first.opt("next_cursor")); first = null;
             }
-            MobileClaimBlockWindow refreshed = refreshWindow(known, expected, force, epoch);
+            MobileClaimBlockWindow refreshed = force ? null : MobileClaimBlockWindow.fromDelta(known, first);
+            boolean readAfterFirst = refreshed == null && (force || known == null || !MobileClaimBlockWindow.sameTip(known.tip(), expected));
+            if (refreshed == null) refreshed = refreshWindow(known, expected, force, epoch);
             // Publish recent blocks and deltas together. A failed read cannot
             // make a new tip or partially refreshed catalog visible to workers.
             try {
-                replay(epoch, null, null, refreshed.blocks(), startCursor, refreshed, first);
+                replay(epoch, null, null, refreshed.blocks(), startCursor, refreshed, first, readAfterFirst);
                 synchronized (this) { check(epoch); nextDiscovery = now() + 10000; readRecovered("discovery"); }
                 return;
             } catch (ChainMoved moved) { if (pass == 2) throw moved; known = refreshed; }
         }
     }
     private MobileClaimBlockWindow refreshWindow(MobileClaimBlockWindow known, JSONObject expected, boolean force, long epoch) throws Exception {
+        capabilities();
         try { return MobileClaimBlockWindow.refresh(known, expected, force,
-            params -> { check(epoch); return waitFor(rpc.call("getrecentblockhashes", params), epoch); }); }
+            params -> {
+                check(epoch); JSONObject requested = copy(params); if (bountyCounts) requested.put("include_bounty_counts", true);
+                JSONObject result;
+                try { result = waitFor(rpc.call("getrecentblockhashes", requested), epoch); }
+                catch (MobileRpcClient.RpcFailure failure) { capabilities(); if (!bountyCounts || !"-32602".equals(failure.code)) throw failure; bountyCounts = false; result = waitFor(rpc.call("getrecentblockhashes", params), epoch); }
+                capabilities();
+                if (!result.has("bounty_counts")) bountyCounts = false; return result;
+            }); }
         catch (MobileRpcClient.RpcFailure failure) { throw new ReadFailure("getrecentblockhashes", failure); }
     }
     private void loadBlock(String blockHash, long epoch) throws Exception {
@@ -557,18 +627,20 @@ public final class MobileClaimsEngine implements AutoCloseable {
         // Reuse the completed stream across ordinary new-block races, but
         // always replay from BEFORE that stream. Advancing the public cursor
         // separately would lose spends that arrived while the stream ran.
-        JSONObject first = null; Map<String, Long> recent = null;
+        JSONObject first = null; Map<String, Long> recent = null; boolean readAfterFirst = false;
         for (int pass = 0; pass < 3; pass++) {
             boolean canonical = known.blocks().containsKey(blockHash) && known.blocks().get(blockHash) == blockHeight;
             try {
-                replay(epoch, canonical ? blockHash : null, canonical ? staged : null, recent, originalCursor, known, first);
+                replay(epoch, canonical ? blockHash : null, canonical ? staged : null, recent, originalCursor, known, first, readAfterFirst);
                 break;
             } catch (ChainMoved moved) {
                 if (pass == 2) throw moved;
-                first = request("getbountychanges", new JSONObject().put("cursor", originalCursor), epoch);
+                first = changes(originalCursor, known, ownedRows(), epoch);
                 JSONObject expected = validateTip(first.optJSONObject("tip"));
                 journalEvents(first);
-                known = refreshWindow(known, expected, false, epoch);
+                MobileClaimBlockWindow advanced = MobileClaimBlockWindow.fromDelta(known, first);
+                readAfterFirst = advanced == null && !MobileClaimBlockWindow.sameTip(known.tip(), expected);
+                known = advanced == null ? refreshWindow(known, expected, false, epoch) : advanced;
                 recent = known.blocks();
             }
         }
@@ -593,15 +665,22 @@ public final class MobileClaimsEngine implements AutoCloseable {
     }
     private void replay(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
                         MobileClaimBlockWindow window, JSONObject first) throws Exception {
+        replay(epoch, newBlock, staged, recent, startCursor, window, first, first != null && window != blockWindow);
+    }
+    private void replay(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
+                        MobileClaimBlockWindow window, JSONObject first, boolean readAfterFirst) throws Exception {
         synchronized (this) { check(epoch); replayPending = true; }
-        try { replaySnapshot(epoch, newBlock, staged, recent, startCursor, window, first); }
+        try { replaySnapshot(epoch, newBlock, staged, recent, startCursor, window, first, readAfterFirst); }
         finally { synchronized (this) { replayPending = false; } }
     }
     private void replaySnapshot(long epoch, String newBlock, Map<String, Candidate> staged, Map<String, Long> recent, String startCursor,
-                                MobileClaimBlockWindow window, JSONObject first) throws Exception {
+                                MobileClaimBlockWindow window, JSONObject first, boolean readAfterFirst) throws Exception {
         Map<String, Candidate> next = new LinkedHashMap<>(); Map<String, Retained> nextRetained = new LinkedHashMap<>(); String nextCursor; JSONObject nextTip;
         Map<String, Long> canonical; boolean replayAfterFirst;
         Set<String> dirtyBlocks = new HashSet<>();
+        Set<String> needsStream = new HashSet<>();
+        Map<String, Map<String, Candidate>> inline = new LinkedHashMap<>();
+        Set<String> completeFeedBlocks = new HashSet<>();
         Set<String> reopened = new HashSet<>();
         Map<String, Candidate> exited = new LinkedHashMap<>();
         long validatedFrom = now();
@@ -616,7 +695,22 @@ public final class MobileClaimsEngine implements AutoCloseable {
             }
             nextCursor = startCursor == null ? cursor : startCursor; nextTip = tip;
             canonical = new LinkedHashMap<>(recent == null ? blocks : recent);
-            replayAfterFirst = first != null && window != blockWindow;
+            needsStream.addAll(feedNeedsStream); needsStream.retainAll(canonical.keySet()); if (newBlock != null) needsStream.remove(newBlock);
+            for (Map.Entry<String, Map<String, Candidate>> entry : feedCandidates.entrySet()) {
+                if (!canonical.containsKey(entry.getKey())) continue;
+                if (entry.getKey().equals(newBlock)) {
+                    require(staged != null, "CLAIMS_RPC_DATA");
+                    for (Candidate expected : entry.getValue().values()) {
+                        Candidate actual = staged.get(expected.key);
+                        require(actual != null && actual.sameMetadata(expected) && actual.height == expected.height && actual.blockHash.equals(expected.blockHash), "CLAIMS_RPC_DATA");
+                    }
+                } else {
+                    Map<String, Candidate> candidates = new LinkedHashMap<>();
+                    for (Candidate row : entry.getValue().values()) candidates.put(row.key, row.copy());
+                    inline.put(entry.getKey(), candidates);
+                }
+            }
+            replayAfterFirst = first != null && readAfterFirst;
             // A complete stream replaces that block, including rows that have
             // disappeared. Preserve public accounting for surviving outpoints.
             if (staged != null) for (Candidate source : staged.values()) {
@@ -638,11 +732,21 @@ public final class MobileClaimsEngine implements AutoCloseable {
         require(nextRetained.size() <= MAX_RETAINED_WINNERS, "CLAIMS_CAPACITY");
         boolean more = true; long previousSequence = -1;
         for (int page = 0; (more || replayAfterFirst) && page < MAX_REPLAY_PAGES; page++) {
-            JSONObject changes = page == 0 && first != null ? first : request("getbountychanges", new JSONObject().put("cursor", nextCursor), epoch);
+            Map<String, JSONObject> immutable = new LinkedHashMap<>();
+            for (Candidate row : next.values()) immutable.put(row.key, row.bounty);
+            for (Retained row : nextRetained.values()) immutable.putIfAbsent(row.row.key, row.row.bounty);
+            for (Map<String, Candidate> rows : inline.values()) for (Candidate row : rows.values()) immutable.put(row.key, row.bounty);
+            JSONObject changes = page == 0 && first != null ? first : changes(nextCursor, window, immutable, epoch, previousSequence);
             if (page > 0 || first == null) replayAfterFirst = false;
             nextTip = validateTip(changes.optJSONObject("tip"));
             JSONArray events = journalEvents(changes);
-            if (window != null && !MobileClaimBlockWindow.sameTip(window.tip(), nextTip)) throw new ChainMoved();
+            if (window != null && !MobileClaimBlockWindow.sameTip(window.tip(), nextTip)) {
+                MobileClaimBlockWindow advanced = MobileClaimBlockWindow.fromDelta(window, changes);
+                if (advanced == null) throw new ChainMoved();
+                window = advanced; recent = window.blocks(); canonical = new LinkedHashMap<>(recent);
+                for (var iterator = next.entrySet().iterator(); iterator.hasNext();) { Candidate row = iterator.next().getValue(); if (!canonical.containsKey(row.blockHash)) { exited.put(row.key, row); iterator.remove(); } }
+                inline.keySet().retainAll(canonical.keySet());
+            }
             String following = validCursor(changes.opt("next_cursor")); more = changes.getBoolean("has_more");
             require((!more || events.length() > 0) && (events.length() == 0 || !following.equals(nextCursor)), "CLAIMS_RPC_DATA");
             for (int index = 0; index < events.length(); index++) {
@@ -652,9 +756,65 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 String txid = hash(event.opt("txid")); long vout = integer(event.opt("vout"), 0, 0xffffffffL); String key = txid + ":" + vout;
                 String type = event.optString("type", ""); Candidate row = next.get(key);
                 if (row == null && nextRetained.containsKey(key)) row = nextRetained.get(key).row;
+                if (row == null) for (Map<String, Candidate> candidates : inline.values()) if (candidates.containsKey(key)) { row = candidates.get(key); break; }
+                if (changes.has("bounty_deltas")) {
+                    require(MobileBountyCodec.number(changes.opt("bounty_deltas"), 1, 1) == 1, "CLAIMS_RPC_DATA");
+                    JSONObject publication = validateTip(event.optJSONObject("tip"));
+                    require(publication.getLong("height") <= nextTip.getLong("height"), "CLAIMS_RPC_DATA");
+                    if (publication.getLong("height") == nextTip.getLong("height")) require(MobileClaimBlockWindow.sameTip(publication, nextTip), "CLAIMS_RPC_DATA");
+                    for (Map.Entry<String, Long> block : canonical.entrySet()) if (block.getValue() == publication.getLong("height") && !block.getKey().equals(publication.getString("hash"))) throw new ChainMoved();
+                    if (type.equals("window_exit")) {
+                        require(event.has("bounty") && event.isNull("bounty"), "CLAIMS_RPC_DATA");
+                        if (row != null && canonical.containsKey(row.blockHash)) throw new IllegalArgumentException("CLAIMS_RESYNC");
+                    }
+                    else {
+                        require(type.equals("added") || MobileBountyCodec.stateEvent(type), "CLAIMS_RPC_DATA");
+                        JSONObject full = event.optJSONObject("bounty"); MobileBountyCodec.validateRow(full, publication);
+                        MobileBountyCodec.bindOuterBlock(event, full);
+                        require(txid.equals(full.getString("txid")) && vout == full.getLong("vout"), "CLAIMS_RPC_DATA");
+                        if (event.has("spending_txid") && !event.isNull("spending_txid")) hash(event.opt("spending_txid"));
+                        Candidate replacement = new Candidate(full, full.getString("block_hash"), transactions.fee());
+                        if (type.equals("added")) require(hash(event.opt("block_hash")).equals(replacement.blockHash) && integer(event.opt("block_height"), 0, SAFE_MAX) == replacement.height, "CLAIMS_RPC_DATA");
+                        if (row != null) {
+                            require(row.sameMetadata(replacement), "CLAIMS_RPC_DATA");
+                            require(row.blockHash.equals(replacement.blockHash) || !canonical.containsKey(row.blockHash), "CLAIMS_RPC_DATA");
+                            replacement.reuse(row.progress);
+                            if (row.state.equals("pending_spend") && replacement.state.equals("available")) reopened.add(key);
+                        } else synchronized (this) { Candidate.Progress previous = progress.get(key); if (previous != null) replacement.reuse(previous); }
+                        if (canonical.containsKey(replacement.blockHash)) {
+                            require(canonical.get(replacement.blockHash) == replacement.height, "CLAIMS_RPC_DATA");
+                            Long count = window == null ? null : window.counts().get(replacement.blockHash);
+                            require(count == null || count > 0, "CLAIMS_RPC_DATA");
+                            if (loaded.contains(replacement.blockHash) || replacement.blockHash.equals(newBlock)) next.put(key, replacement);
+                            else {
+                                Map<String, Candidate> candidates = inline.computeIfAbsent(replacement.blockHash, ignored -> new LinkedHashMap<>());
+                                Candidate old = candidates.get(key); if (old != null) require(old.sameMetadata(replacement) && old.height == replacement.height, "CLAIMS_RPC_DATA");
+                                candidates.put(key, replacement); require(candidates.size() <= MAX_CATALOG && (count == null || candidates.size() <= count), "CLAIMS_CAPACITY");
+                                dirtyBlocks.add(replacement.blockHash);
+                            }
+                        } else {
+                            // A full historical row may have normally aged out.
+                            // A different currently canonical hash at its height is a contradiction.
+                            for (Map.Entry<String, Long> known : canonical.entrySet()) if (known.getValue() == replacement.height) require(known.getKey().equals(replacement.blockHash), "CLAIMS_RPC_DATA");
+                            if (nextRetained.containsKey(key)) nextRetained.get(key).row = replacement;
+                            if (exited.containsKey(key)) exited.put(key, replacement);
+                        }
+                        if (nextRetained.containsKey(key)) nextRetained.get(key).row = replacement;
+                        require(next.size() + inline.values().stream().mapToInt(Map::size).sum() <= MAX_CATALOG, "CLAIMS_CAPACITY");
+                        continue;
+                    }
+                }
+                if (!changes.has("bounty_deltas") && row != null && inline.containsKey(row.blockHash)) {
+                    // Legacy events can describe a historical transition rather
+                    // than the row's current coalesced state. Preserve identities
+                    // but require a coherent stream before candidate admission.
+                    needsStream.add(row.blockHash); dirtyBlocks.add(row.blockHash);
+                    if (type.equals("window_exit") && canonical.containsKey(row.blockHash)) throw new IllegalArgumentException("CLAIMS_RESYNC");
+                }
                 if (type.equals("window_exit")) {
                     if (row != null) exited.put(key, row);
                     next.remove(key);
+                    for (Map<String, Candidate> candidates : inline.values()) candidates.remove(key);
                 }
                 else if (type.equals("added")) {
                     String blockHash = hash(event.opt("block_hash")); long height = integer(event.opt("block_height"), 0, SAFE_MAX);
@@ -663,13 +823,16 @@ public final class MobileClaimsEngine implements AutoCloseable {
                         // outputs, but its old proof/location is no longer owned.
                         require(!canonical.containsKey(row.blockHash), "CLAIMS_RPC_DATA");
                         row.state = "unavailable"; next.remove(key);
+                        for (Map<String, Candidate> candidates : inline.values()) candidates.remove(key);
                         if (nextRetained.containsKey(key)) nextRetained.get(key).row.state = "unavailable";
                         row = null;
                     }
                     if (row != null) require(row.height == height, "CLAIMS_RPC_DATA");
                     if (canonical.containsKey(blockHash)) {
                         require(canonical.get(blockHash) == height, "CLAIMS_RPC_DATA");
-                        if (row == null) dirtyBlocks.add(blockHash);
+                        Long count = window == null ? null : window.counts().get(blockHash);
+                        require(count == null || count > 0, "CLAIMS_RPC_DATA");
+                        if (row == null) { dirtyBlocks.add(blockHash); needsStream.add(blockHash); }
                     }
                 }
                 else if (type.equals("spent") || type.equals("pending_spend")) {
@@ -686,9 +849,25 @@ public final class MobileClaimsEngine implements AutoCloseable {
             nextCursor = following;
         }
         require(!more && !replayAfterFirst, "CLAIMS_SYNC_BUSY");
+        if (window != null) for (Map.Entry<String, Long> count : window.counts().entrySet()) {
+            Map<String, Candidate> candidates = inline.get(count.getKey());
+            if (count.getValue() == 0) {
+                require(next.values().stream().noneMatch(row -> row.blockHash.equals(count.getKey())) && (candidates == null || candidates.isEmpty()), "CLAIMS_RPC_DATA");
+                completeFeedBlocks.add(count.getKey());
+            } else if (candidates != null && candidates.size() == count.getValue() && !needsStream.contains(count.getKey())) {
+                next.putAll(candidates); completeFeedBlocks.add(count.getKey()); dirtyBlocks.remove(count.getKey());
+            }
+            if (count.getKey().equals(newBlock) && staged != null) require(staged.size() == count.getValue(), "CLAIMS_RPC_DATA");
+            if (loaded.contains(count.getKey()) || count.getKey().equals(newBlock)) {
+                long actual = next.values().stream().filter(row -> row.blockHash.equals(count.getKey())).count();
+                require(actual == count.getValue(), "CLAIMS_RPC_DATA");
+            }
+        }
         // Never mark mixed-branch rows fresh. This inexpensive fence replaces
         // a second full-window transfer and also protects each progressive block.
-        JSONObject finalTip = validateTip(request("getchaintip", new JSONObject(), epoch));
+        // A fully drained coherent enriched page is itself the publication
+        // fence; there has been no intervening asynchronous indexed read.
+        JSONObject finalTip = enrichedFeed ? nextTip : validateTip(request("getchaintip", new JSONObject(), epoch));
         if (!MobileClaimBlockWindow.sameTip(nextTip, finalTip) || window != null && !MobileClaimBlockWindow.sameTip(window.tip(), finalTip)) throw new ChainMoved();
         synchronized (this) {
             check(epoch);
@@ -696,6 +875,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
             Map<String, Long> nextBlocks = recent == null ? blocks : recent;
             if (newBlock != null && !nextBlocks.containsKey(newBlock)) throw new IllegalArgumentException("CLAIMS_SYNC_BUSY");
             Set<String> nextLoaded = new HashSet<>(loaded); nextLoaded.retainAll(nextBlocks.keySet()); if (newBlock != null) nextLoaded.add(newBlock);
+            nextLoaded.addAll(completeFeedBlocks);
             nextLoaded.removeAll(dirtyBlocks);
             Map<Long, String> canonicalHeights = new HashMap<>(); for (Map.Entry<String, Long> block : nextBlocks.entrySet()) canonicalHeights.put(block.getValue(), block.getKey());
             // Missing overlap also occurs after a long pause; it is not proof
@@ -756,7 +936,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 if (!completed.orphaned && (finalTip.getLong("height") < completed.height || canonicalHash != null && !canonicalHash.equals(completed.blockHash))) completed.orphaned = true;
                 if (!completed.orphaned) continue;
                 Candidate row = next.get(entry.getKey());
-                if (newBlock != null && newBlock.equals(item.blockHash) && staged != null && staged.containsKey(entry.getKey())
+                if ((newBlock != null && newBlock.equals(item.blockHash) && staged != null && staged.containsKey(entry.getKey()) || completeFeedBlocks.contains(item.blockHash))
                         && row != null && row.blockHash.equals(item.blockHash) && row.progress.metadata.equals(item.metadata)) completed.reloadedFundingBlock = item.blockHash;
                 if (item.blockHash.equals(completed.reloadedFundingBlock) && row != null && row.blockHash.equals(item.blockHash) && row.progress.metadata.equals(item.metadata) && row.state.equals("available")) {
                     completed.reopened = true; confirmedReopened.add(entry.getKey());
@@ -765,6 +945,9 @@ public final class MobileClaimsEngine implements AutoCloseable {
             if (recent != null) { blocks.clear(); blocks.putAll(recent); }
             if (window != null) blockWindow = window;
             loaded.clear(); loaded.addAll(nextLoaded); catalog.clear(); catalog.putAll(next);
+            feedCandidates.clear();
+            for (Map.Entry<String, Map<String, Candidate>> entry : inline.entrySet()) if (!completeFeedBlocks.contains(entry.getKey()) && nextBlocks.containsKey(entry.getKey()) && !entry.getValue().isEmpty()) feedCandidates.put(entry.getKey(), entry.getValue());
+            feedNeedsStream.clear(); feedNeedsStream.addAll(needsStream); feedNeedsStream.retainAll(nextBlocks.keySet()); feedNeedsStream.removeAll(nextLoaded);
             retained.clear(); retained.putAll(nextRetained); pruneRetained();
             // Reopening is evidence only after the complete journal/final tip
             // fence commits. Never let a partial page authorize a new claim.
@@ -778,7 +961,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 if (pending == null && saved == null && (item == null || item.confirmed == null || item.confirmed.reopened)) retired.remove(key);
             }
             for (String key : confirmedReopened) if (!pendingWinners.containsKey(key) && !savedWinners.containsKey(key)) retired.remove(key);
-            resyncBlocks.retainAll(nextBlocks.keySet()); if (newBlock != null) resyncBlocks.remove(newBlock);
+            resyncBlocks.retainAll(nextBlocks.keySet()); if (newBlock != null) resyncBlocks.remove(newBlock); resyncBlocks.removeAll(completeFeedBlocks);
             resyncSnapshotPending = false;
             if (resyncBlocks.isEmpty()) catalogGate = false;
             progress.clear(); progress.putAll(nextProgress); scheduleDirty = true;
@@ -877,7 +1060,7 @@ public final class MobileClaimsEngine implements AutoCloseable {
     private void recordRpcError(MobileRpcClient.RpcFailure failure, String fallbackMethod, String stage) {
         try {
             String method = failure.method;
-            if (!java.util.Arrays.asList("getchaintip", "getbountychanges", "getrecentblockhashes", "getblockbounties", "gettransaction", "sendrawtransaction").contains(method)) method = fallbackMethod;
+            if (!java.util.Arrays.asList("getchaintip", "getbountychanges", "getrecentblockhashes", "getblockbounties", "gettransaction", "gettransactionstatus", "sendrawtransaction").contains(method)) method = fallbackMethod;
             String phase = failure.phase;
             if (phase == null || !phase.matches("[a-z_]{1,32}")) phase = "unknown";
             lastRpcError = new JSONObject().put("code", failure.code).put("method", method).put("phase", phase).put("stage", stage)
@@ -938,7 +1121,10 @@ public final class MobileClaimsEngine implements AutoCloseable {
                 // Keep preparation under the shared RPC method quota. Hashing
                 // 100 proofs/s must never mean 100 funding lookups/s.
                 synchronized (this) { nextPreparation = now() + 1500; }
-                JSONObject parent = request("gettransaction", new JSONObject().put("txid", txid), epoch);
+                capabilities(); JSONObject parent;
+                JSONObject fundingParams = new JSONObject().put("txid", txid); if (rawFunding) fundingParams.put("raw_only", true);
+                try { parent = request("gettransaction", fundingParams, epoch); }
+                catch (ReadFailure failure) { capabilities(); if (!rawFunding || !"-32602".equals(failure.failure.code)) throw failure; rawFunding = false; parent = request("gettransaction", new JSONObject().put("txid", txid), epoch); }
                 validateTip(parent.optJSONObject("tip")); JSONObject tx = parent.optJSONObject("transaction");
                 require(tx != null && tx.opt("hex") instanceof String, "CLAIMS_RPC_DATA"); parentHex = tx.getString("hex");
             }
@@ -1258,6 +1444,21 @@ public final class MobileClaimsEngine implements AutoCloseable {
         }
         return new ReceiptEnvelope(receiptTip, changed);
     }
+    static JSONObject validateCompactReceipt(JSONObject response, String expectedTxid) throws Exception {
+        require(response != null && expectedTxid.equals(hash(response.opt("txid"))), "CLAIMS_RPC_DATA");
+        JSONObject observed = validateTip(response.optJSONObject("tip")); String status = response.optString("status", "");
+        require(!response.has("transaction") && !response.has("hex"), "CLAIMS_RPC_DATA");
+        if (status.equals("pending")) {
+            require(response.length() == 4 && !response.has("block_hash") && !response.has("block_height") && integer(response.opt("confirmations"), 0, 0) == 0, "CLAIMS_RPC_DATA");
+        } else {
+            require(status.equals("confirmed") && response.length() == 6, "CLAIMS_RPC_DATA");
+            String block = hash(response.opt("block_hash")); long height = integer(response.opt("block_height"), 0, observed.getLong("height"));
+            require(integer(response.opt("confirmations"), 1, SAFE_MAX) == observed.getLong("height") - height + 1, "CLAIMS_RPC_DATA");
+            require(height != 0 || block.equals(GENESIS), "CLAIMS_RPC_DATA");
+            require(height != observed.getLong("height") || block.equals(observed.getString("hash")), "CLAIMS_RPC_DATA");
+        }
+        return observed;
+    }
     private boolean restoreSaved(Winner winner, long epoch) {
         if (savedWinners.get(winner.row.key) != winner || reservations.size() >= MAX_CONCURRENCY || !catalogFresh() || !winnerOwnedAvailable(winner)
                 || winner.acknowledged && catalogValidatedAt <= winner.acknowledgedAt) return false;
@@ -1299,8 +1500,20 @@ public final class MobileClaimsEngine implements AutoCloseable {
             lookup.retryDue = now() + 30000;
         }
         final Winner winner = lookup;
-        JSONObject response;
-        try { response = request("gettransaction", new JSONObject().put("txid", winner.txid), epoch); }
+        // Status alone never proves a preserved claim is locally valid. Bind
+        // and validate our original proof/bytes before any compact receipt read.
+        validateObserved(winner.transactionHex, winner.txid, winner.transactionHex, winner.row.target);
+        capabilities(); JSONObject response; boolean metadata = compactReceipts;
+        try {
+            if (metadata) {
+                try { response = request("gettransactionstatus", new JSONObject().put("txid", winner.txid), epoch); }
+                catch (ReadFailure unsupported) {
+                    capabilities();
+                    if (!"-32601".equals(unsupported.failure.code)) throw unsupported;
+                    compactReceipts = false; metadata = false; response = request("gettransaction", new JSONObject().put("txid", winner.txid), epoch);
+                }
+            } else response = request("gettransaction", new JSONObject().put("txid", winner.txid), epoch);
+        }
         catch (ReadFailure failure) {
             if (!failure.failure.code.equals("-32004") || failure.failure.unknownOutcome || failure.failure.explicitRejection || failure.failure.nodeCode != null) throw failure;
             synchronized (this) {
@@ -1315,11 +1528,13 @@ public final class MobileClaimsEngine implements AutoCloseable {
             }
             return;
         }
-        ReceiptEnvelope envelope = validateReceiptEnvelope(response, winner.txid);
-        JSONObject transaction = response.getJSONObject("transaction");
-        validateObserved(transaction.getString("hex"), winner.txid, winner.transactionHex, winner.row.target);
-        if (envelope.locationChanged) throw new ChainMoved();
-        JSONObject confirmedTip = envelope.tip;
+        JSONObject confirmedTip;
+        if (metadata) confirmedTip = validateCompactReceipt(response, winner.txid);
+        else {
+            ReceiptEnvelope envelope = validateReceiptEnvelope(response, winner.txid);
+            validateObserved(response.getJSONObject("transaction").getString("hex"), winner.txid, winner.transactionHex, winner.row.target);
+            if (envelope.locationChanged) throw new ChainMoved(); confirmedTip = envelope.tip;
+        }
         String location = response.getString("status");
         String block = null; long height = -1;
         if (location.equals("confirmed")) {

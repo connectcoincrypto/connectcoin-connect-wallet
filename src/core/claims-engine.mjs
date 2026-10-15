@@ -72,7 +72,7 @@ export class ClaimsEngine {
     this.tasks = new Set(); this.preparing = new Set(); this.resolving = new Set(); this.controllers = new Set();
     this.waitingDns = new Set();
     this.scheduler = new ClaimScheduler({ connectionRate: job => this.connectionRate(job), isReady: job => this.ready(job) });
-    this.enabled = false; this.paused = false; this.catalogBlocked = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
+    this.enabled = false; this.paused = false; this.catalogBlocked = false; this.preparedCapturesAllowed = false; this.dirty = true; this.nextDiagnosticId = 0; this.nextToken = 0; this.generation = 0;
     this.nextStart = 0; this.startIdle = true; this.timer = null; this.refreshTimer = null; this.coordinator = null; this.stopping = null;
     this.state = { enabled: false, status: 'off', queued: 0, completed: 0, attempts: 0, lastError: null, lastErrorCategory: null, lastErrorDiagnostic: false, lastErrorTransient: false };
     this.diagnosticRunId = 0; this.diagnosticRun = null;
@@ -166,7 +166,7 @@ export class ClaimsEngine {
     this.tasks.add(tracked); return tracked;
   }
   eligible(job) { return !job.unavailable && !job.retired && !job.winner && !job.budgetExceeded; }
-  ready(job) { return this.eligible(job) && !job.preparing &&
+  ready(job) { return this.eligible(job) && !job.preparing && (!this.catalogBlocked || this.preparedCapturesAllowed && Boolean(job.prepared)) &&
     !(job.recoveryProbe && this.pendingRecovery.size > 0); }
   drawIndex(length) {
     const value = this.randomIndex(length);
@@ -223,7 +223,7 @@ export class ClaimsEngine {
   }
   nextReady(now = Date.now()) {
     if (this.dirty) this.rebuild();
-    return this.scheduler.next(now, { allowPreparation: this.preparing.size < 4 });
+    return this.scheduler.next(now, { allowPreparation: !this.catalogBlocked && this.preparing.size < 4 });
   }
   markAssigned(jobOrSelection) { this.scheduler.commit(jobOrSelection); }
   enqueue(bounties) {
@@ -448,14 +448,17 @@ export class ClaimsEngine {
     if (wasPaused && this.diagnosticRun) report(this.onDiagnostic, 'claims.resumed', this.diagnosticSnapshot());
     this.kick();
   }
-  setCatalogBlocked(blocked) {
+  get capturesBlocked() { return this.catalogBlocked && !this.preparedCapturesAllowed; }
+  setCatalogBlocked(blocked, { allowPreparedCaptures = false } = {}) {
     this.catalogBlocked = Boolean(blocked);
+    this.preparedCapturesAllowed = this.catalogBlocked && allowPreparedCaptures === true;
+    this.dirty = true;
     const pool = this.pool, generation = this.generation;
-    const gate = pool?.setAdmissionAllowed?.(!this.catalogBlocked);
+    const gate = pool?.setAdmissionAllowed?.(!this.capturesBlocked);
     if (gate) void Promise.resolve(gate).catch(error => {
       if (this.pool === pool && generation === this.generation && this.enabled && !this.paused) this.fatal(error);
     });
-    if (this.catalogBlocked) { clearTimeout(this.timer); this.timer = null; }
+    if (this.capturesBlocked) { clearTimeout(this.timer); this.timer = null; }
     else this.kick();
   }
   schedule(delay) {
@@ -465,7 +468,7 @@ export class ClaimsEngine {
     clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; this.kick(); }, Math.min(2_147_483_647, Math.max(1, delay))); this.timer.unref?.();
   }
   kick() {
-    if (!this.enabled || this.paused || this.catalogBlocked || this.stopping) return;
+    if (!this.enabled || this.paused || this.capturesBlocked || this.stopping) return;
     if (this.coordinator) { this.wakeRequested = true; return; }
     if (!this.isUnlocked()) { void this.stop('locked'); this.notify({ status: 'locked' }); return; }
     clearTimeout(this.timer); this.timer = null;
@@ -479,7 +482,7 @@ export class ClaimsEngine {
     });
   }
   async pump(generation) {
-    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
+    if (!this.enabled || this.paused || this.capturesBlocked || generation !== this.generation) return;
     if (!this.pool) {
       let pool;
       const onFailure = error => queueMicrotask(() => {
@@ -491,8 +494,8 @@ export class ClaimsEngine {
       this.poolReady = pool.start(this.options);
       await this.poolReady;
     } else await this.poolReady;
-    await this.pool?.setAdmissionAllowed?.(!this.catalogBlocked);
-    if (!this.enabled || this.paused || this.catalogBlocked || generation !== this.generation) return;
+    await this.pool?.setAdmissionAllowed?.(!this.capturesBlocked);
+    if (!this.enabled || this.paused || this.capturesBlocked || generation !== this.generation) return;
     this.refreshDnsReadiness();
     this.retrySubmissions(generation);
     for (let checked = 0; checked < this.maxQueue + 8; checked++) {
@@ -667,7 +670,7 @@ export class ClaimsEngine {
       }
     }
     const controller = new AbortController(), token = ++this.nextToken;
-    const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime() } : {}) });
+    const context = validateClaimContext({ ...job.prepared.context, ...(this.getValidationTime ? { validation_time: this.getValidationTime(job.prepared.context) } : {}) });
     if (recoveryProbe && !this.connectionPolicy.reserveProbe(policyOf(job), token)) {
       this.refreshRecoveryReadiness(); this.wakeRequested = true; return;
     }
@@ -764,7 +767,7 @@ export class ClaimsEngine {
     }
   }
   nextProofDue() {
-    if (this.submitting.size >= 4) return Infinity; // A completion will wake queued submissions.
+    if (this.catalogBlocked || this.submitting.size >= 4) return Infinity; // A release/completion wakes queued submissions.
     let due = Infinity;
     for (const [key, pending] of this.pendingProofs) {
       const job = this.queue.get(key);
@@ -788,6 +791,7 @@ export class ClaimsEngine {
   }
   releaseDnsSlot() { this.refreshDnsReadiness(); }
   retrySubmissions(generation) {
+    if (this.catalogBlocked) return;
     // At most 256 cached proposals. A proof retry never spends a TLS slot or
     // resets the successful-capture budget/challenge.
     for (const [key, pending] of this.pendingProofs) {
@@ -803,7 +807,7 @@ export class ClaimsEngine {
     const key = keyOf(job.bounty), pending = this.pendingProofs.get(key);
     // Fresh winners and retries share the same RPC budget. Keep excess verified
     // proofs queued; completing a submission wakes the coordinator to drain them.
-    if (job.submitting || this.submitting.size >= 4 || !pending || generation !== this.generation || !this.enabled || this.paused || controller.signal.aborted ||
+    if (this.catalogBlocked || job.submitting || this.submitting.size >= 4 || !pending || generation !== this.generation || !this.enabled || this.paused || controller.signal.aborted ||
         job.unavailable || !this.isUnlocked() || this.queue.get(key) !== job) return;
     const started = performance.now(); job.submitting = true; job.submitController = controller; job.submissionPending = pending; this.submitting.add(job);
     const operation = this.beginOperation('submit', controller);

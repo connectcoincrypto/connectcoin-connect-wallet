@@ -55,6 +55,27 @@ final class ClaimSavedSubmission {
             agedAbsenceMayRestoreOwnPending(current: current, oldestHeight: oldestHeight, coherent: coherent))
     }
     enum Location: Equatable { case pending, confirmed }
+    /// The caller has revalidated these locally preserved bytes before querying
+    /// the index. Txid does not commit the witness: never discard that proof
+    /// merely because a compact location assertion was received.
+    func expandStatus(_ response: JSONObject) throws -> JSONObject {
+        if response["transaction"] != nil { return response } // Explicit legacy method fallback.
+        let tip = try ClaimRecentWindow.Tip(response["tip"])
+        try walletRequire(try PJ.hash(response["txid"]) == retry.txid, "CLAIMS_RPC_DATA")
+        let state = try PJ.string(response["status"]), count = try PJ.integer(response["confirmations"], 0, 9_007_199_254_740_991)
+        var tx: JSONObject = ["hex": retry.hex, "txid": retry.txid, "confirmations": count]
+        if state == "pending" {
+            try walletRequire(count == 0 && response["block_hash"] == nil && response["block_height"] == nil, "CLAIMS_RPC_DATA")
+        } else {
+            try walletRequire(state == "confirmed", "CLAIMS_RPC_DATA")
+            let height = try PJ.integer(response["block_height"], 0, tip.height), hash = try PJ.hash(response["block_hash"])
+            try walletRequire(count == tip.height - height + 1 && (height != tip.height || hash == tip.hash) &&
+                (height != 0 || hash == NativePaymentChecks.GENESIS), "CLAIMS_RPC_DATA")
+            tx["blockhash"] = hash
+        }
+        var full = response; full["transaction"] = tx
+        return full
+    }
     /// gettransaction is index-backed, but its raw transaction and canonical
     /// location still have to agree before an ACK record may be discarded.
     func location(_ response: JSONObject, known: ClaimRecentWindow?) throws -> Location {

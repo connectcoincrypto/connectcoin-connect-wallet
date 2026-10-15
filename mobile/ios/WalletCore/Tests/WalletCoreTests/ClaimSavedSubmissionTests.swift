@@ -2,6 +2,25 @@ import XCTest
 @testable import WalletCore
 
 final class ClaimSavedSubmissionTests: XCTestCase {
+    func testCompactPendingAndConfirmedReceiptsKeepLocalProofValidation() throws {
+        let (saved, window) = try fixture()
+        _ = try NativeTransactions.validateObservedClaim(saved.retry.hex, expectedTxid: saved.retry.txid,
+            originalHex: saved.retry.hex, target: saved.row.target)
+        let pending: JSONObject = ["tip": window.tip.json, "txid": saved.retry.txid, "status": "pending", "confirmations": 0]
+        XCTAssertEqual(try saved.location(saved.expandStatus(pending), known: window), .pending)
+        let confirmed: JSONObject = ["tip": window.tip.json, "txid": saved.retry.txid, "status": "confirmed", "confirmations": 2,
+            "block_hash": window.blocks[1].hash, "block_height": window.blocks[1].height]
+        XCTAssertEqual(try saved.location(saved.expandStatus(confirmed), known: window), .confirmed)
+        let changes: [JSONObject] = [["confirmations": 1], ["txid": String(repeating: "ab", count: 32)],
+                                   ["block_hash": window.tip.hash], ["confirmations": NSNull()]]
+        for change in changes {
+            XCTAssertThrowsError(try saved.expandStatus(pending.merging(change) { _, new in new }))
+        }
+        var wrong = confirmed; wrong["confirmations"] = 3
+        XCTAssertThrowsError(try saved.expandStatus(wrong))
+        XCTAssertEqual(saved.retry.hex, try PJ.string(PJ.object(PaymentVectors.fixture()["attached"])["hex"]))
+        XCTAssertFalse(saved.acknowledged); XCTAssertFalse(saved.counted)
+    }
     private func fixture() throws -> (ClaimSavedSubmission, ClaimRecentWindow) {
         let claim = try PJ.object(PaymentVectors.fixture()["attached"])
         let blocks: [JSONObject] = (0...3).reversed().map { height in

@@ -443,7 +443,7 @@ final class ClaimRecentWindowTests: XCTestCase {
             let resumed = WindowFixture()
             let fresh = try await resumed.run(known: known, retained: [row.key: row])
             XCTAssertNil(resumed.calls.first?.1["cursor"]); XCTAssertEqual(resumed.calls.first?.0, "getbountychanges")
-            XCTAssertEqual(resumed.hashCounts, [5]); XCTAssertTrue(fresh.catalog.isEmpty); XCTAssertTrue(fresh.loaded.isEmpty)
+            XCTAssertEqual(resumed.hashCounts, [600]); XCTAssertTrue(fresh.catalog.isEmpty); XCTAssertTrue(fresh.loaded.isEmpty)
             XCTAssertTrue(fresh.retained[row.key]!.progress === row.progress)
             XCTAssertFalse(ClaimSubmissionRetry.canSubmitPreserved(catalog: nil, retained: fresh.retained[row.key],
                 captured: row, normallyAged: false, coherent: true), "In-window work must await its complete block")
@@ -546,11 +546,11 @@ final class ClaimRecentWindowTests: XCTestCase {
         XCTAssertTrue(result.loaded.contains(row.block)); XCTAssertEqual(row.state, "available")
     }
 
-    func testMissingCursorForcesFreshPrefixAndDropsAllBountyStateEvenAtSameTip() async throws {
+    func testMissingCursorForcesFreshManifestAndDropsAllBountyStateEvenAtSameTip() async throws {
         let known = try ClaimRecentWindow(recentWindow()), row = try candidate(known)
         let f = WindowFixture()
         let result = try await f.run(known: known, rows: [row.key: row], loaded: Set(known.order))
-        XCTAssertEqual(f.hashCounts, [5]); XCTAssertEqual(result.window, known)
+        XCTAssertEqual(f.hashCounts, [600]); XCTAssertEqual(result.window, known)
         XCTAssertTrue(result.catalog.isEmpty); XCTAssertTrue(result.loaded.isEmpty)
         XCTAssertNil(f.calls.first?.1["cursor"])
         for code in ["-32011", "-32004"] {
@@ -808,7 +808,7 @@ final class ClaimRecentWindowTests: XCTestCase {
             let f = WindowFixture(recentWindow(701, depth: 600))
             let result = try await f.run(known: known, cursor: cursor, rows: [row.key: row],
                 loaded: Set(known.order), retained: [row.key: row])
-            XCTAssertEqual(f.hashCounts, [5, 100, 600])
+            XCTAssertEqual(f.hashCounts, cursor == nil ? [600] : [5, 100, 600])
             XCTAssertNotNil(result.retained[row.key]); XCTAssertTrue(result.normallyAged.contains(row.key))
             XCTAssertTrue(ClaimSubmissionRetry.canSubmitPreserved(catalog: nil, retained: result.retained[row.key],
                 captured: row, normallyAged: result.normallyAged.contains(row.key), coherent: true))

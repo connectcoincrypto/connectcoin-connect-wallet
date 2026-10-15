@@ -171,6 +171,172 @@ test('a reorg push invalidates an in-flight snapshot before it can resume claims
   assert.equal(s.claimCursor, 'journal-0');
 });
 
+const heightTip = (height, branch = 1) => ({ ...tip, height,
+  hash: height === 0 ? tip.hash : (branch * 10000 + height).toString(16).padStart(64, '0') });
+function recentTips(current, count, branch = 1) {
+  return { tip: current, window: 600, blocks: Array.from({ length: Math.min(count ?? 600, current.height + 1) },
+    (_, index) => ({ height: current.height - index, hash: heightTip(current.height - index, branch).hash })) };
+}
+async function tipCheckFixture(t) {
+  const result = await fixture(t), s = result.service;
+  s.engine.enabled = true;
+  s.syncBounties = async () => {};
+  s.refreshInternal = async () => {};
+  s.confirmationTip = heightTip(10);
+  s.claimCursor = 'keep-journal'; s.claimBlocks.set(heightTip(5).hash, []);
+  return result;
+}
+
+test('a delayed lower tip is confirmed before any catalog invalidation', async t => {
+  const { service: s, releases } = await tipCheckFixture(t);
+  const gate = deferred(); releases.push(gate.resolve);
+  let queries = 0;
+  const original = s.rpc.request.bind(s.rpc);
+  s.rpc.request = async (method, ...args) => {
+    if (method === 'getchaintip') { queries++; await gate.promise; return heightTip(10); }
+    return original(method, ...args);
+  };
+  const revision = s.claimRevision;
+  s.rpc.notice('tip', { tip: heightTip(9) });
+  assert.equal(s.claimCursor, 'keep-journal');
+  assert.equal(s.claimBlocks.size, 1);
+  assert.equal(s.claimRevision, revision);
+  await until(() => queries === 1);
+  gate.resolve();
+  await until(() => !s.tipUpdates.running && !s.tipUpdates.timer);
+  assert.equal(s.claimCursor, 'keep-journal');
+  assert.equal(s.claimBlocks.size, 1);
+  assert.equal(s.claimRevision, revision);
+  assert.equal(s.confirmationTip.hash, heightTip(10).hash);
+  assert.notEqual(s.engine.catalogBlocked, true);
+});
+
+for (const lower of [true, false]) test(`a fresh unflagged ${lower ? 'rollback' : 'same-height fork'} still invalidates the catalog`, async t => {
+  const { service: s } = await tipCheckFixture(t);
+  const current = heightTip(lower ? 9 : 10, 2);
+  const original = s.rpc.request.bind(s.rpc);
+  s.rpc.request = async (method, ...args) => method === 'getchaintip' ? current : original(method, ...args);
+  const revision = s.claimRevision;
+  s.rpc.notice('tip', { tip: current });
+  assert.equal(s.claimCursor, 'keep-journal', 'The push alone is not authoritative');
+  await until(() => s.claimRevision > revision);
+  assert.equal(s.claimCursor, null);
+  assert.equal(s.claimBlocks.size, 0);
+  assert.equal(s.confirmationTip.hash, current.hash);
+  assert.equal(s.engine.catalogBlocked, true);
+});
+
+for (const fork of [false, true]) test(`a delayed tip checks ancestry when the fresh chain has ${fork ? 'forked and grown' : 'grown normally'}`, async t => {
+  const { service: s } = await tipCheckFixture(t);
+  const branch = fork ? 2 : 1, current = heightTip(12, branch);
+  const calls = [];
+  s.rpc.request = async (method, params) => {
+    calls.push(method);
+    if (method === 'getchaintip') return current;
+    if (method === 'getrecentblockhashes') return recentTips(current, params.count, branch);
+    throw new Error(`Unexpected request: ${method}`);
+  };
+  const revision = s.claimRevision;
+  s.rpc.notice('tip', { tip: heightTip(9) });
+  await until(() => calls.filter(method => method === 'getchaintip').length === 2 && !s.tipUpdates.running);
+  assert.deepEqual(calls, ['getchaintip', 'getrecentblockhashes', 'getchaintip']);
+  assert.equal(s.claimRevision, revision + Number(fork));
+  assert.equal(s.claimCursor, fork ? null : 'keep-journal');
+  assert.equal(s.claimBlocks.size, fork ? 0 : 1);
+  assert.equal(s.confirmationTip.hash, current.hash);
+});
+
+test('suspect-tip bursts coalesce and a newer tip supersedes an in-flight confirmation', async t => {
+  const { service: s, releases } = await tipCheckFixture(t);
+  const gate = deferred(); releases.push(gate.resolve);
+  let queries = 0;
+  s.rpc.request = async method => {
+    assert.equal(method, 'getchaintip');
+    if (++queries === 1) { await gate.promise; return heightTip(9, 2); }
+    return heightTip(11);
+  };
+  const revision = s.claimRevision;
+  for (let i = 0; i < 50; i++) s.rpc.notice('tip', { tip: heightTip(9) });
+  await until(() => queries === 1);
+  for (let i = 0; i < 50; i++) s.rpc.notice('tip', { tip: heightTip(9) });
+  s.rpc.notice('tip', { tip: heightTip(11) });
+  gate.resolve();
+  await until(() => queries === 2 && !s.tipUpdates.running && !s.tipUpdates.timer);
+  assert.equal(queries, 2);
+  assert.equal(s.claimRevision, revision);
+  assert.equal(s.claimCursor, 'keep-journal');
+  assert.equal(s.confirmationTip.hash, heightTip(11).hash);
+});
+
+test('an explicit reorg supersedes a pending tip confirmation immediately', async t => {
+  const { service: s, releases } = await tipCheckFixture(t);
+  const gate = deferred(); releases.push(gate.resolve);
+  let queries = 0;
+  s.rpc.request = async method => {
+    assert.equal(method, 'getchaintip'); queries++; await gate.promise; return heightTip(10);
+  };
+  const revision = s.claimRevision;
+  s.rpc.notice('tip', { tip: heightTip(9) });
+  await until(() => queries === 1);
+  s.rpc.notice('tip', { tip: heightTip(8, 2), reorg: true });
+  assert.equal(s.claimRevision, revision + 1);
+  assert.equal(s.claimCursor, null);
+  assert.equal(s.engine.catalogBlocked, true);
+  gate.resolve();
+  await until(() => !s.tipUpdates.running && !s.tipUpdates.timer);
+  assert.equal(queries, 1);
+  assert.equal(s.claimRevision, revision + 1);
+  assert.equal(s.confirmationTip.hash, heightTip(8, 2).hash);
+});
+
+for (const stop of ['lock', 'replacement', 'disconnect']) test(`a late tip confirmation cannot publish after ${stop}`, async t => {
+  const { service: s, releases } = await tipCheckFixture(t);
+  const gate = deferred(); releases.push(gate.resolve);
+  let querying = false;
+  const rpc = s.rpc, original = rpc.request.bind(rpc);
+  rpc.request = async (method, ...args) => {
+    if (method === 'getchaintip') { querying = true; await gate.promise; return heightTip(9, 2); }
+    return original(method, ...args);
+  };
+  s.rpc.notice('tip', { tip: heightTip(9) });
+  await until(() => querying);
+  const work = s.tipUpdates.running;
+  if (stop === 'lock') await s.lock();
+  else if (stop === 'replacement') s.connectClient();
+  else { rpc.disconnect(); s.stopLiveUpdates(); }
+  const revision = s.claimRevision;
+  s.claimCursor = 'new-context';
+  gate.resolve(); await work.catch(() => {});
+  assert.equal(s.claimRevision, revision);
+  assert.equal(s.claimCursor, 'new-context');
+  assert.notEqual(s.confirmationTip?.hash, heightTip(9, 2).hash);
+});
+
+test('a malformed or moving canonical window retries without erasing cached bounties', async t => {
+  const { service: s } = await tipCheckFixture(t);
+  s.tipUpdates.retryMs = 10;
+  let windows = 0, tips = 0;
+  s.rpc.request = async (method, params) => {
+    if (method === 'getchaintip') { tips++; return heightTip(12); }
+    assert.equal(method, 'getrecentblockhashes');
+    windows++;
+    const result = recentTips(heightTip(windows === 2 ? 13 : 12), params.count);
+    if (windows === 1) result.blocks[1].hash = result.blocks[0].hash;
+    if (windows <= 2) {
+      assert.equal(s.claimCursor, 'keep-journal');
+      assert.equal(s.claimBlocks.size, 1);
+    }
+    return result;
+  };
+  const revision = s.claimRevision;
+  s.rpc.notice('tip', { tip: heightTip(9) });
+  await until(() => windows === 3 && !s.tipUpdates.running && !s.tipUpdates.timer);
+  assert.equal(tips, 4);
+  assert.equal(s.claimRevision, revision);
+  assert.equal(s.claimCursor, 'keep-journal');
+  assert.equal(s.claimBlocks.size, 1);
+});
+
 test('disconnect reconnects and resubscribes, while lock rejects old pushes and reopening starts new watches', async t => {
   const { service: s } = await fixture(t);
   s.config.claims.enabled = true;
@@ -309,7 +475,8 @@ test('transient claim startup failures retry without another push or a periodic 
   assert.equal(s.claimsResumePending, true);
   await until(() => s.engine.enabled && s.engine.resumes === 1,
     'Transient startup failure left Automatic Claims idle without a new notification');
-  assert.equal(tipAttempts, 4, 'Two failed startup reads, one successful startup tip and the final discovery tip fence.');
+  assert.equal(tipAttempts, 3, 'Two failed startup reads and one successful startup tip; the validated journal supplies the final discovery fence.');
+  assert.ok(s.rpc.calls.some(call => call.method === 'getbountychanges'), 'Startup must still reconcile the journal before admitting claims.');
   assert.equal(notifications, 0);
   assert.equal(s.claimsResumePending, false);
   assert.equal(s.claimCursor, 'journal-0');

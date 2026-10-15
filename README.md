@@ -162,7 +162,9 @@ Locking drops the decrypted session, invalidates payment reviews and stops claim
 
 Automatic Claims is off in every new network profile, including the new mainnet profile when a legacy testnet wallet exists. Its on/off preference is saved in that profile's `config.json` as `claims.enabled`, together with the connection limits and lookback window; preferences are not inherited across networks. Locking or closing the wallet stops the worker without disabling that preference. After a successful unlock, a saved enabled preference resumes claiming once the helper and RPC network checks succeed. No claims run while the wallet is locked. An unavailable helper or offline RPC does not discard the saved limits or preference. An uncertain broadcast disables Automatic Claims for safety; inspect the reported transaction before enabling it again.
 
-The main process requests recent block hashes and complete bounty streams, reading the oldest required blocks first to reduce window-expiry retries while the chain advances. A validated hash window is reused while the tip is unchanged. New blocks and reorganizations request 5, then 100, then 600 hashes as needed to reconstruct the complete window from a matching cached hash and height. Partial streams are rejected; every journal page and mempool update is still replayed, and a final tip check guards publication. Older RPC servers remain supported through a validated full-window fallback. Metadata is limited to the server's recent window, but address history is chain-wide.
+The main process keeps a validated recent-block window and replays the incremental bounty journal. On supported RPC servers, canonical block deltas handle ordinary new blocks without requesting another hash list. Reorganizations or gaps use 5, then 100, then 600 hashes as necessary to reconstruct a complete window from a matching cached hash and height. Authoritative all-output counts allow empty blocks, or complete sets of validated bounty rows received in the journal, to avoid another block stream. Missing rows or counts still require complete streams, reading the oldest required blocks first. Every page, block count, immutable outpoint and mempool change is checked before publishing the catalog and its cursor together. Any intervening stream/hash reads require another journal fence, not an unconditional duplicate poll or chain-tip request. Older RPC servers remain supported through validated expanded/full-window fallbacks. Metadata is limited to the server's recent window, but address history is chain-wide.
+
+Compact bounty formats v1–v3 reconstruct only explicitly defined defaults and references bound to the validated request state. Invalid successful responses never downgrade to a less strict mode. Capability negotiation is scoped to the RPC connection. Funding requests prefer `raw_only:true`, still checking the transaction ID and every selected output locally; only an explicit unsupported option permits the legacy response. These changes do not remove wallet/address subscriptions, change connection limits or add periodic desktop catalog polling.
 
 The lookback window selects new work; it does not expire P2C outputs. Connections already started, and submissions already in progress, may finish after their bounty leaves that window. Unstarted candidates leave the discovery queue, and an aged-out attempt is not retried after failure. Catalog resynchronization pauses new socket admission and broadcast while preserving started captures and verified proofs; both journal and push resets use this barrier. The native helper acknowledges the admission gate, including already queued pre-start work. Known spends and confirmed reorganizations still invalidate affected work; wallet locking cancels all work. Each new connection uses the validated chain median time from the shared wallet/discovery refresh, without an extra chain-tip request per connection; the full node validates the submitted proof against its own current consensus state.
 
@@ -187,10 +189,14 @@ acknowledgement, and a confirmation racing a retry's acknowledgement credits
 only one success. A validated confirmation also takes precedence over a late
 rejection or ambiguous RPC error for
 that same prepared transaction; it cannot reopen the proof or halt unrelated
-claims. Since transaction IDs exclude witness data, a confirmed
-transaction may contain another proof for the identical input and payout; its
-canonical transaction, proof framing, challenge and work must still validate.
-Observed proof bytes never replace the original bytes used for retransmission.
+claims. Compact `gettransactionstatus` receipts avoid downloading the proof again:
+the preserved transaction, proof framing, challenge and work are checked locally,
+and the receipt must match its transaction ID, network and canonical confirmation.
+Transaction IDs exclude witness data, so the full node may have accepted another
+proof for the identical input and payout. A legacy server explicitly lacking the
+status method uses the previous full-receipt verification, including validation
+of any observed witness. Observed bytes never replace the original retransmission
+payload. Missing, malformed or unanchored receipts never authorize discarding it.
 
 After witness compaction, the desktop retains at most 20,000 small confirmation
 markers (transaction ID and confirming block). A complete, coherent catalog must

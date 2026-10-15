@@ -24,9 +24,10 @@ struct ClaimRecentWindow: Equatable {
     struct Block: Equatable { let height: Int64, hash: String }
     let tip: Tip
     let blocks: [Block]
+    let counts: [String: Int]
     var heights: [String: Int64] { Dictionary(uniqueKeysWithValues: blocks.map { ($0.hash, $0.height) }) }
     var order: [String] { blocks.map(\.hash) }
-    private init(tip: Tip, blocks: [Block]) { self.tip = tip; self.blocks = blocks }
+    private init(tip: Tip, blocks: [Block], counts: [String: Int] = [:]) { self.tip = tip; self.blocks = blocks; self.counts = counts }
 
     private static func response(_ value: JSONObject, count: Int) throws -> ClaimRecentWindow {
         try walletRequire((1...600).contains(count), "CLAIMS_RPC_DATA")
@@ -34,14 +35,18 @@ struct ClaimRecentWindow: Equatable {
         let size = Int(min(600, tip.height + 1))
         try walletRequire(try PJ.integer(value["window"]) == 600 &&
             (rows.count == Int(min(Int64(count), tip.height + 1)) || rows.count == size), "CLAIMS_RPC_DATA")
-        var blocks = [Block](), seen = Set<String>()
+        let hasCounts = value["bounty_counts"] != nil
+        if hasCounts { try walletRequire(try PJ.integer(value["bounty_counts"]) == 1, "CLAIMS_RPC_DATA") }
+        var blocks = [Block](), seen = Set<String>(), counts: [String: Int] = [:]
         for (index, row) in rows.enumerated() {
             let height = try PJ.integer(row["height"]), hash = try PJ.hash(row["hash"])
             try walletRequire(height == tip.height - Int64(index) && seen.insert(hash).inserted &&
                 (index != 0 || hash == tip.hash) && (height != 0 || hash == NativePaymentChecks.GENESIS), "CLAIMS_RPC_DATA")
             blocks.append(Block(height: height, hash: hash))
+            if hasCounts { counts[hash] = Int(try PJ.integer(row["bounty_count"], 0, Int64(ClaimSubmissionRetry.maximumCatalogEntries))) }
+            else { try walletRequire(row["bounty_count"] == nil, "CLAIMS_RPC_DATA") }
         }
-        return ClaimRecentWindow(tip: tip, blocks: blocks)
+        return ClaimRecentWindow(tip: tip, blocks: blocks, counts: counts)
     }
     init(_ complete: JSONObject) throws { self = try Self.response(complete, count: 600) }
 
@@ -60,19 +65,54 @@ struct ClaimRecentWindow: Equatable {
             }
         }
         let size = Int(min(600, tip.height + 1))
-        if blocks.count == size { return self }
+        for (hash, count) in counts {
+            if let previous = known.counts[hash] { try walletRequire(previous == count, "CLAIMS_RPC_DATA") }
+        }
+        if blocks.count == size { return ClaimRecentWindow(tip: tip, blocks: blocks,
+            counts: known.counts.filter { heights[$0.key] != nil }.merging(counts) { _, new in new }) }
         guard let anchor else { return nil }
         let combined = Array((Array(blocks.prefix(anchor)) + known.blocks.filter { $0.height <= blocks[anchor].height }).prefix(size))
         guard combined.count == size else { return nil } // Rollback may lack the oldest required tail.
-        return try ClaimRecentWindow(["window": 600, "tip": tip.json,
+        let validated = try ClaimRecentWindow(["window": 600, "tip": tip.json,
             "blocks": combined.map { ["height": $0.height, "hash": $0.hash] as JSONObject }])
+        return ClaimRecentWindow(tip: validated.tip, blocks: validated.blocks,
+            counts: known.counts.merging(counts) { _, new in new }.filter { validated.heights[$0.key] != nil })
+    }
+
+    /// Only an explicitly canonical, request-bound delta can extend a window.
+    /// Null means reorg/large gap: retain the bounded 5/100/600 fallback.
+    func applying(_ page: JSONObject) throws -> ClaimRecentWindow? {
+        guard page["block_deltas"] != nil else {
+            try walletRequire(page["block_delta"] == nil, "CLAIMS_RPC_DATA"); return nil
+        }
+        try walletRequire(try PJ.integer(page["block_deltas"]) == 1 && PJ.integer(page["bounty_deltas"]) == 1,
+            "CLAIMS_RPC_DATA")
+        let current = try Tip(page["tip"])
+        if page["block_delta"] is NSNull {
+            try walletRequire(try !tip.same(as: current), "CLAIMS_RPC_DATA"); return nil
+        }
+        let delta = try PJ.object(page["block_delta"]), additions = try PJ.objects(delta["blocks"])
+        try walletRequire(try PJ.integer(delta["base_height"]) == tip.height && PJ.hash(delta["base_hash"]) == tip.hash &&
+            additions.count <= 5 && Int64(additions.count) == current.height - tip.height, "CLAIMS_RPC_DATA")
+        _ = try tip.same(as: current)
+        var seen = Set(order), newBlocks: [Block] = [], newCounts = counts
+        for (index, item) in additions.enumerated() {
+            let height = try PJ.integer(item["height"]), hash = try PJ.hash(item["hash"])
+            let count = Int(try PJ.integer(item["bounty_count"], 0, Int64(ClaimSubmissionRetry.maximumCatalogEntries)))
+            try walletRequire(height == tip.height + Int64(index) + 1 && seen.insert(hash).inserted, "CLAIMS_RPC_DATA")
+            newBlocks.append(Block(height: height, hash: hash)); newCounts[hash] = count
+        }
+        let combined = Array((Array(newBlocks.reversed()) + blocks).prefix(Int(min(600, current.height + 1))))
+        let checked = try ClaimRecentWindow(["window": 600, "tip": current.json,
+            "blocks": combined.map { ["height": $0.height, "hash": $0.hash] as JSONObject }])
+        return ClaimRecentWindow(tip: current, blocks: checked.blocks, counts: newCounts.filter { checked.heights[$0.key] != nil })
     }
 
     static func refresh(expected: Tip, known: ClaimRecentWindow?, force: Bool = false,
                         query: (JSONObject) async throws -> JSONObject) async throws -> ClaimRecentWindow {
         try Task.checkCancellation()
         if let known, try known.tip.same(as: expected), !force { return known }
-        let counts = known == nil ? [600] : [5, 100, 600]
+        let counts = known == nil || force ? [600] : [5, 100, 600]
         for count in counts {
             try Task.checkCancellation()
             var value: JSONObject
@@ -85,6 +125,13 @@ struct ClaimRecentWindow: Equatable {
             try Task.checkCancellation()
             let prefix = try response(value, count: count)
             _ = try expected.same(as: prefix.tip)
+            if force {
+                // A new journal watermark invalidates all cached count
+                // capabilities. Obtain today's complete manifest, not a
+                // short prefix spliced onto yesterday's count metadata.
+                if let known { _ = try prefix.joining(known) }
+                return prefix
+            }
             if let known {
                 if let full = try prefix.joining(known) { return full }
             } else { return prefix }

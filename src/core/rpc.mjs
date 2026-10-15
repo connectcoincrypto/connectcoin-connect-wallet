@@ -5,10 +5,10 @@ import { performance } from 'node:perf_hooks';
 import { validateRpcEndpoint } from './config.mjs';
 
 const PARAMS = Object.freeze({
-  getchaintip: [], getrecentblockhashes: ['count'], getblockbounties: ['block_hash'],
+  getchaintip: [], getrecentblockhashes: ['count', 'include_bounty_counts'], getblockbounties: ['block_hash'],
   getaddressbalance: ['address'], getaddresshistory: ['address', 'cursor'], getaddressutxos: ['address', 'cursor', 'include_pending_spent'],
   getaddresschanges: ['addresses', 'cursor'],
-  gettransaction: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor'],
+  gettransaction: ['txid', 'raw_only'], gettransactionstatus: ['txid'], gettransactions: ['txids'], sendrawtransaction: ['transaction_hex'], getbountychanges: ['cursor', 'include_bounties', 'known_tip', 'compact', 'compact_version', 'known_state'],
   subscribebounties: [], subscribeaddress: ['address', 'changes_only'], subscribetip: [], unsubscribe: ['subscription_id'],
 });
 const MAX_FRAME = 2 * 1024 * 1024;
@@ -27,18 +27,44 @@ export function validateRpcParams(method, params) {
   const clean = {};
   for (const key of PARAMS[method]) {
     if (!Object.hasOwn(params, key)) {
-      if (key !== 'cursor' && key !== 'include_pending_spent' && key !== 'changes_only' && key !== 'count') throw new Error(`Missing RPC parameter: ${key}.`);
+      if (!['cursor', 'include_pending_spent', 'changes_only', 'count', 'include_bounties', 'known_tip', 'compact', 'compact_version', 'known_state', 'include_bounty_counts', 'raw_only'].includes(key)) throw new Error(`Missing RPC parameter: ${key}.`);
       continue;
     }
     const descriptor = Object.getOwnPropertyDescriptor(params, key);
     if (!Object.hasOwn(descriptor, 'value')) throw new Error('RPC parameters must be plain data.');
     const value = descriptor.value;
+    if (['compact', 'include_bounty_counts', 'raw_only'].includes(key)) {
+      if (typeof value !== 'boolean' || (key === 'compact' && value && clean.include_bounties !== true)) throw new Error(`Invalid RPC ${key} option.`);
+      clean[key] = value; continue;
+    }
+    if (key === 'compact_version') {
+      if (![2, 3].includes(value) || clean.compact !== true || clean.include_bounties !== true) throw new Error('Invalid RPC compact version.');
+      clean[key] = value; continue;
+    }
+    if (key === 'known_state') {
+      if (clean.compact !== true || !clean.known_tip || typeof clean.cursor !== 'string' ||
+          typeof value !== 'string' || !/^[0-9a-f]{64}$/i.test(value)) throw new Error('Invalid RPC known state.');
+      clean[key] = value.toLowerCase(); continue;
+    }
+    if (key === 'known_tip') {
+      if (clean.include_bounties !== true || !PLAIN(value) || Reflect.ownKeys(value).length !== 2 ||
+          Reflect.ownKeys(value).some(key => !['height', 'hash'].includes(key))) throw new Error('Invalid RPC known tip.');
+      const height = Object.getOwnPropertyDescriptor(value, 'height'), hash = Object.getOwnPropertyDescriptor(value, 'hash');
+      if (!height || !hash || !Object.hasOwn(height, 'value') || !Object.hasOwn(hash, 'value') ||
+          !Number.isSafeInteger(height.value) || height.value < 0 ||
+          typeof hash.value !== 'string' || !/^[0-9a-f]{64}$/.test(hash.value)) throw new Error('Invalid RPC known tip.');
+      clean[key] = { height: height.value, hash: hash.value }; continue;
+    }
     if (key === 'count') {
       if (!Number.isSafeInteger(value) || value < 1 || value > 600) throw new Error('Invalid RPC recent-block count.');
       clean[key] = value; continue;
     }
     if (key === 'include_pending_spent') {
       if (typeof value !== 'boolean') throw new Error('Invalid RPC pending-spend option.');
+      clean[key] = value; continue;
+    }
+    if (key === 'include_bounties') {
+      if (typeof value !== 'boolean') throw new Error('Invalid RPC bounty delta option.');
       clean[key] = value; continue;
     }
     if (key === 'changes_only') {

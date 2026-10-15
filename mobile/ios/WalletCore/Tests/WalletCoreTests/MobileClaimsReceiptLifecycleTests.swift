@@ -18,6 +18,14 @@ private final class ClaimReceiptWire: RpcWire, @unchecked Sendable {
         do {
             let request = try JSON.decode(Data(bytes.dropLast()))
             mutex.lock(); requests.append(request); mutex.unlock(); completed(true)
+            // These lifecycle tests exercise legacy full-transaction receipt
+            // validation. Negotiate that path explicitly, never by returning
+            // a legacy payload to the compact status method.
+            if request["method"] as? String == "gettransactionstatus" {
+                let bytes = try JSON.encode(["jsonrpc": "2.0", "id": request["id"]!,
+                    "error": ["code": -32601, "message": "Method not found"]]) + Data([10])
+                mutex.lock(); let callback = receive; mutex.unlock(); callback?(bytes)
+            }
         } catch { completed(false) }
     }
     func reply(_ request: JSONObject, _ response: JSONObject) throws {

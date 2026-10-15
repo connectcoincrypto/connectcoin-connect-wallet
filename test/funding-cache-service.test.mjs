@@ -45,6 +45,44 @@ test('raw funding LRU accounts replacements, byte/entry bounds, oversize and cle
   for (const options of [{ maxEntries: 0 }, { maxEntries: 257 }, { maxBytes: Infinity }, { maxBytes: 0 }]) assert.throws(() => new FundingBytesCache(options));
 });
 
+test('funding asks only for raw bytes and keeps shared validation/cache', async t => {
+  const { service, rpc, txid, response, raw } = fixture(t), calls = [];
+  rpc.request = async (method, params) => { calls.push({ method, params }); return response; };
+  assert.equal(await service.funding(txid), raw); assert.equal(await service.funding(txid), raw);
+  assert.deepEqual(calls, [{ method: 'gettransaction', params: { txid, raw_only: true } }]);
+});
+
+test('only unsupported raw_only permits fallback, remembered until reconnect', async t => {
+  const { service, rpc, txid, response, raw } = fixture(t), calls = [];
+  rpc.request = async (method, params) => {
+    calls.push(params);
+    if (params.raw_only) throw Object.assign(new Error('Unsupported option'), { code: -32602 });
+    return response;
+  };
+  assert.equal(await service.funding(txid), raw);
+  service.clearFundingCache(); assert.equal(await service.funding(txid), raw);
+  assert.deepEqual(calls, [{ txid, raw_only: true }, { txid }, { txid }]);
+  service.engine.stop = async () => {}; service.clientFactory = () => rpc;
+  service.connectClient(); t.after(() => service.stopLiveUpdates());
+  assert.equal(await service.funding(txid), raw);
+  assert.deepEqual(calls.slice(-2), [{ txid, raw_only: true }, { txid }]);
+});
+
+for (const code of [-32002, -32004, -32029]) test(`raw funding ${code} never triggers expanded retry`, async t => {
+  const { service, rpc, txid } = fixture(t); let calls = 0;
+  rpc.request = async () => { calls++; throw Object.assign(new Error('Read failed'), { code }); };
+  await assert.rejects(service.funding(txid), { code });
+  assert.equal(calls, 1); assert.notEqual(service.bountyCapabilities.rawFunding, false);
+  assert.equal(service.fundingCache.size, 0);
+});
+
+test('malformed raw funding success cannot downgrade or populate cache', async t => {
+  const { service, rpc, txid, response } = fixture(t); let calls = 0;
+  rpc.request = async () => { calls++; return { ...response, transaction: { hex: '00' } }; };
+  await assert.rejects(service.funding(txid)); assert.equal(calls, 1);
+  assert.notEqual(service.bountyCapabilities.rawFunding, false); assert.equal(service.fundingCache.size, 0);
+});
+
 for (const transition of ['epoch', 'rpc', 'wallet-generation', 'clear']) test(`claim parents are parsed once across outputs but validated anew after ${transition}`, async t => {
   const { service, raw, bounties, response } = fixture(t);
   let parses = 0; const from = Buffer.from;

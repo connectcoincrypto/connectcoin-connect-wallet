@@ -68,6 +68,15 @@ async function fixture(t, { initialHeight = 0, initialHash = initialHeight ? has
             const height = state.tip.height - index; return { height, hash: height ? hash(height + 100) : tip.hash };
           }) });
         else if (request.method === 'getchaintip') reply(state.tip);
+        else if (request.method === 'gettransactionstatus') {
+          if (!state.compactReceipts) socket.write(frame({ jsonrpc: '2.0', id: request.id,
+            error: { code: -32601, message: 'Legacy fixture lacks compact receipts.' } }));
+          else if (state.receipt === 'missing' || state.receipt === 'backend-error') socket.write(frame({ jsonrpc: '2.0', id: request.id,
+            error: { code: state.receipt === 'missing' ? -32004 : -32002, message: 'Receipt unavailable.' } }));
+          else reply({ tip: state.tip, txid: request.params.txid, status: state.receipt,
+            confirmations: state.receipt === 'confirmed' ? state.tip.height + 1 : 0,
+            ...(state.receipt === 'confirmed' ? { block_height: 0, block_hash: tip.hash } : {}), ...state.receiptOverride });
+        }
         else if (request.method === 'gettransaction') {
           const heldParent = state.holdFundingEntries?.get(request.params.txid);
           if (heldParent) state.releaseFunding.push(() => reply({ tip: state.tip, transaction: { hex: heldParent.hex } }));
@@ -161,6 +170,206 @@ async function submitOnce(f) {
   assert.equal(service.engine.state.completed, 1); assert.equal(service.engine.state.attempts, 1);
   assert.equal(service.engine.successCounts.get(key), 1n); assert.equal(service.claimsReviewRequired, false);
 }
+
+async function captureBehindCatalogBarrier(f) {
+  const { service, job, key, prepared, requests } = f, gates = [], contexts = [];
+  // The adapter represents an already-authenticated native response. Exercise
+  // the real engine/service ownership and RPC path, not TLS cryptography here.
+  service.engine.pendingProofs.delete(key); service.engine.successCounts.delete(key);
+  service.engine.state.attempts = 0; job.winner = false;
+  service.engine.pool = { pacesStarts: true,
+    async setAdmissionAllowed(allowed) { gates.push(allowed); }, async close() {},
+    async attempt(context, callbacks) {
+      contexts.push(context); callbacks.onStarted(); callbacks.onCapture({ captured: true });
+      return { started: true, captured: true, verified: true, proof: structuralProof(prepared),
+        validationPassed: true, seconds: 0.01 };
+    },
+  };
+  service.blockClaimCatalog('journal-reset');
+  assert.deepEqual(gates, [true]);
+  assert.equal(service.engine.catalogBlocked, true); assert.equal(service.engine.preparedCapturesAllowed, true);
+  assert.equal(service.engine.ready(job), true);
+  const unprepared = service.engine.queue.get(bountyKey(f.rows[1]));
+  assert.equal(service.engine.ready(unprepared), false, 'Only authenticated preparations may keep capturing.');
+  service.engine.dispatch([key, job], service.engine.generation);
+  await Promise.all([...service.engine.tasks]);
+  assert.equal(contexts.length, 1);
+  assert.equal(service.engine.state.attempts, 1); assert.equal(service.engine.state.completed, 0);
+  assert.equal(service.engine.successCounts.get(key), 1n);
+  f.winner = service.engine.pendingProofs.get(key);
+  assert.equal(f.winner.proof, structuralProof(prepared));
+  assert.equal(service.engine.submitting.size, 0);
+  assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
+  await service.engine.submitVerified(job, new AbortController(), service.engine.generation);
+  assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
+  return { gates, contexts };
+}
+
+test('compact pending/confirmed receipts retain the proof until canonical confirmation without downloading it', async t => {
+  const f = await fixture(t), { service, state, requests, key, winner } = f;
+  state.compactReceipts = true; await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key);
+  saved.due = 0; service.claimReceiptNext = 0;
+  await service.syncBounties();
+  assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+  assert.equal(saved.pending.proof, winner.proof);
+  assert.equal(requests.filter(r => r.method === 'gettransactionstatus').length, 1);
+  assert.equal(requests.filter(r => r.method === 'gettransaction' && r.params.txid === saved.txid).length, 0);
+  state.receipt = 'confirmed'; saved.due = 0; service.claimReceiptNext = 0;
+  await service.syncBounties();
+  assert.equal(service.engine.acceptedProofs.has(key), false);
+  assert.equal(service.engine.state.completed, 1); assert.equal(service.engine.state.attempts, 1);
+  assert.equal(requests.filter(r => r.method === 'gettransactionstatus').length, 2);
+});
+
+test('compact missing receipt replays the identical saved witness, counting acceptance once', async t => {
+  const f = await fixture(t), { service, state, requests, key } = f;
+  state.compactReceipts = true; await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key), raw = state.claimHex;
+  state.receipt = 'missing'; saved.due = 0; service.claimReceiptNext = 0;
+  await service.syncBounties();
+  const job = service.engine.queue.get(key); assert.ok(job);
+  await service.engine.submitVerified(job, new AbortController(), service.engine.generation);
+  assert.equal(service.engine.state.completed, 1); assert.equal(service.engine.state.attempts, 1);
+  assert.deepEqual(requests.filter(r => r.method === 'sendrawtransaction').map(r => r.params.transaction_hex), [raw, raw]);
+});
+
+for (const override of [{ txid: hash(987) }, { confirmations: 99 }, { status: 'unknown' }, { block_hash: hash(789) }]) {
+  test(`malformed compact receipt ${JSON.stringify(override)} never falls back or erases the proof`, async t => {
+    const f = await fixture(t), { service, state, requests, key } = f;
+    state.compactReceipts = true; await submitOnce(f);
+    const saved = service.engine.acceptedProofs.get(key);
+    state.receipt = 'confirmed'; state.receiptOverride = override;
+    saved.due = 0; service.claimReceiptNext = 0; await service.syncBounties();
+    assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+    assert.equal(service.engine.state.completed, 1);
+    assert.equal(requests.filter(r => r.method === 'gettransaction' && r.params.txid === saved.txid).length, 0);
+    assert.notEqual(service.bountyCapabilities.claimStatus, false);
+  });
+}
+
+test('a modified local saved proof cannot be discarded by a compact confirmation', async t => {
+  const f = await fixture(t), { service, state, requests, key } = f;
+  state.compactReceipts = true; await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key);
+  saved.pending.proof += '00'; state.receipt = 'confirmed'; saved.due = 0; service.claimReceiptNext = 0;
+  await service.syncBounties();
+  assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+  assert.equal(requests.filter(r => r.method === 'gettransactionstatus').length, 0);
+});
+
+test('legacy receipt fallback is negotiated once without dropping witness validation', async t => {
+  const f = await fixture(t), { service, requests, key } = f;
+  await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key);
+  for (let turn = 0; turn < 2; turn++) {
+    saved.due = 0; service.claimReceiptNext = 0; await service.syncBounties();
+    assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+  }
+  assert.equal(requests.filter(r => r.method === 'gettransactionstatus').length, 1);
+  assert.equal(requests.filter(r => r.method === 'gettransaction' && r.params.txid === saved.txid).length, 2);
+});
+
+for (const code of [-32602, -32002, -32029]) test(`compact status ${code} is not a compatibility signal`, async t => {
+  const f = await fixture(t), { service, key } = f;
+  await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key), calls = [];
+  const request = service.rpc.request.bind(service.rpc);
+  service.rpc.request = async (method, params, options) => {
+    calls.push(method);
+    if (method === 'gettransactionstatus') throw Object.assign(new Error('Synthetic failure'), { code });
+    return request(method, params, options);
+  };
+  await assert.rejects(service.readClaimReceipt(saved, () => {}), { code });
+  assert.deepEqual(calls, ['gettransactionstatus']);
+  assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+  assert.notEqual(service.bountyCapabilities.claimStatus, false);
+});
+
+for (const transition of ['connection', 'proof']) test(`compact receipt rejects a ${transition} change during its read`, async t => {
+  const f = await fixture(t), { service, state, key } = f;
+  await submitOnce(f);
+  const saved = service.engine.acceptedProofs.get(key);
+  let release, entered;
+  const enteredRead = new Promise(resolve => { entered = resolve; });
+  const reply = new Promise(resolve => { release = resolve; });
+  service.rpc.request = async () => { entered(); return reply; };
+  const receipt = service.readClaimReceipt(saved, () => {});
+  const rejected = assert.rejects(receipt);
+  await enteredRead;
+  if (transition === 'connection') service.bountyCapabilities = {};
+  else saved.pending.proof += '00';
+  release({ tip: state.tip, txid: saved.txid, status: 'confirmed', confirmations: 1, block_height: 0, block_hash: tip.hash });
+  await rejected;
+  assert.strictEqual(service.engine.acceptedProofs.get(key), saved);
+});
+
+test('wallet catalog barrier permits prepared TLS work but keeps its winner unsent until a coherent snapshot releases it', async t => {
+  const f = await fixture(t), { service, requests, key } = f;
+  const { gates, contexts } = await captureBehindCatalogBarrier(f);
+  assert.equal(contexts[0].validation_time, tip.mediantime);
+  const winner = service.engine.pendingProofs.get(key);
+  await service.syncBounties();
+  assert.equal(service.claimCatalogGate, null); assert.equal(service.engine.catalogBlocked, false);
+  assert.strictEqual(service.engine.pendingProofs.get(key), winner);
+  assert.equal(gates.at(-1), true);
+  assert.ok(requests.some(request => request.method === 'getrecentblockhashes'));
+  assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
+  await submitOnce(f);
+  assert.equal(contexts.length, 1, 'The retained proof is submitted without another capture.');
+});
+
+for (const invalidation of ['spent', 'reorg', 'lock', 'disconnect']) {
+test(`wallet catalog barrier never sends a retained winner after ${invalidation}`, async t => {
+  const f = await fixture(t, { initialHeight: 1 }), { service, rows, state, requests, key } = f;
+  await captureBehindCatalogBarrier(f);
+  if (invalidation === 'spent') {
+    rows[0].status = 'spent'; rows[0].spending_txid = hash(999);
+    state.events = [{ type: 'spent', sequence: 1, txid: rows[0].txid, vout: 0, spending_txid: hash(999) }];
+    await service.syncBounties();
+  } else if (invalidation === 'reorg') {
+    state.tip = { ...tip };
+    await service.syncBounties();
+  } else if (invalidation === 'lock') await service.lock();
+  else {
+    service.rpc.socket.destroy(); await until(() => state.disconnected === 1); await service.claimSuspending;
+  }
+  service.engine.retrySubmissions(service.engine.generation);
+  await Promise.all([...service.engine.tasks]);
+  assert.equal(requests.some(request => request.method === 'sendrawtransaction'), false);
+  assert.equal(service.engine.state.completed, 0);
+  assert.equal(service.engine.state.attempts, invalidation === 'lock' ? 0 : 1);
+  if (invalidation === 'disconnect') {
+    assert.equal(service.engine.enabled, false);
+    assert.strictEqual(service.engine.pendingProofs.get(key), f.winner, 'Disconnect preserves the proof without authorizing transmission.');
+    assert.equal(service.engine.successCounts.get(key), 1n);
+  } else assert.equal(service.engine.pendingProofs.has(key), false);
+  assert.equal(service.claimsReviewRequired, false);
+});
+}
+
+test('wallet capture validation time uses current tip then retained anchor and only gated prepared context', async t => {
+  const { service, prepared } = await fixture(t);
+  const current = { ...tip, mediantime: tip.mediantime + 20 }, anchor = { ...tip, mediantime: tip.mediantime + 10 };
+  service.claimWindow = { tip: anchor }; service.blockClaimCatalog('tip-confirmation');
+  service.tip = current;
+  assert.equal(service.engine.getValidationTime(prepared.context), current.mediantime);
+  service.tip = null;
+  assert.equal(service.engine.getValidationTime(prepared.context), anchor.mediantime);
+  service.claimWindow = null;
+  assert.equal(service.engine.getValidationTime(prepared.context), prepared.context.validation_time);
+  service.releaseClaimCatalog();
+  assert.throws(() => service.engine.getValidationTime(prepared.context), /invalid chain tip/);
+  service.claimWindow = { tip: anchor };
+  assert.throws(() => service.engine.getValidationTime(prepared.context), /invalid chain tip/,
+    'An old anchor cannot supply validation time outside the resync barrier.');
+  service.blockClaimCatalog('tip-confirmation');
+  service.tip = { ...current, mediantime: 'private-invalid-time' };
+  assert.throws(() => service.engine.getValidationTime(prepared.context), /invalid chain tip/);
+  service.tip = null; service.claimWindow.tip = { ...anchor, genesis_hash: hash(888) };
+  assert.throws(() => service.engine.getValidationTime(prepared.context), /invalid chain tip/,
+    'Malformed current/anchor metadata must not silently fall back to a prepared context.');
+});
 
 for (const gated of [false, true]) test(`local RPC queue pressure after cancelled funding reads retries discovery ${gated ? 'behind the reset gate' : 'without a reset'} and preserves one winner`, async t => {
   const f = await fixture(t, { timeoutMs: 5000 }), { service, state, key, winner, job, requests } = f;

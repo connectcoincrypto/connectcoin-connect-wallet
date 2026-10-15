@@ -736,9 +736,15 @@ for (const when of ['later scan', 'same scan']) test(`a retired in-flight claim 
   const signal = service.engine.controller.signal;
   const snapshot = mockDiscovery(service, { height: 600 });
   const request = service.rpc.request;
-  let fences = 0, replace = false;
+  const readBlock = service.blockBounties;
+  let pages = 0, streams = 0, replace = false, replacedDuringFence = false;
+  service.blockBounties = async (...args) => { streams++; return readBlock(...args); };
   service.rpc.request = async (method, params) => {
-    if (replace || method === 'getchaintip' && ++fences === 1 && when === 'same scan') {
+    // The complete journal page is now the post-stream fence. Inject the fork
+    // after reading the former chain, not at the removed getchaintip poll.
+    const duringFence = method === 'getbountychanges' && ++pages === 2 && when === 'same scan';
+    if (duringFence) { assert.ok(streams > 0); replacedDuringFence = true; }
+    if (replace || duringFence) {
       // Replacing an ancestor also changes the descendant tip: a block hash
       // cannot identify two conflicting ancestral chains.
       snapshot.blocks.find(block => block.height === 599).hash = hash(15000);
@@ -747,6 +753,7 @@ for (const when of ['later scan', 'same scan']) test(`a retired in-flight claim 
     return request(method, params);
   };
   await service.syncBountiesInternal(service.epoch);
+  if (when === 'same scan') assert.equal(replacedDuringFence, true, 'The reorg must race with this scan after its stream.');
   assert.equal(service.claimBlocks.has(bounty.block_hash), false);
   if (when === 'later scan') {
     assert.equal(signal.aborted, false);

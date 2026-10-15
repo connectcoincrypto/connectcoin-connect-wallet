@@ -82,10 +82,11 @@ for the bounty journal or proof validation.
 
 - An unchanged tip reuses the window without downloading another hash list.
   Bounty/mempool changes and every journal page are still processed.
-- A changed tip first requests the latest 5 hashes, then 100, then the full
-  600 if necessary. Normal block arrivals and reorganizations use the same
-  path. A cached overlap must match both hash and height, and overlapping
-  ancestors must agree before the complete window can be reconstructed.
+- On compatible servers, ordinary new blocks extend the cached window using
+  canonical `block_delta` entries bound to its exact previous tip. Reorganizations,
+  missing deltas and legacy servers use 5, then 100, then 600 hashes as needed.
+  A cached overlap must match both hash and height, and overlapping ancestors
+  must agree before the complete window can be reconstructed.
 - Partial results from separate requests are never spliced together. A tip
   race, rollback or missing overlap cannot silently truncate the active window.
 - Only an explicit invalid-parameters response to the optional `count`
@@ -93,12 +94,48 @@ for the bounty journal or proof validation.
   may return a complete, validated window. Malformed responses still fail.
 - Journal reset invalidates the bounty snapshot and forces a fresh window
   query; cached hashes can only supply a validated reconstruction anchor.
-  A final lightweight tip check protects publication of the staged result.
+  A final validated journal response fences publication of the staged result;
+  a second `getchaintip` is not needed after that journal fence on the optimized
+  path. Mobile retains its existing explicit tip fence for legacy feed servers.
 
-These changes do not increase RPC quotas, skip block-bounty streams, alter
+These changes do not increase RPC quotas, skip validation of bounty data, alter
 claim counters, or change transaction submission/retry rules. Tests use
 controlled RPC fixtures for new blocks, shallow/deep reorganizations, cursor
 reset, pagination, mempool changes and inconsistent responses.
+
+## RPC traffic port (2026-10-15)
+
+The traffic contract is ported from claimer
+`4a773f787cec400eb7366e4cfb10eb1a69331ed2` and the compatible JSON-RPC
+implementation `5592444756584e05c1be5c6736ceec018b034b48`.
+
+- Enriched journal events carry the complete updated bounty. Compatible block
+  manifests carry immutable counts of **all** bounty outputs, not merely the
+  currently available or profitable subset. A block can be marked loaded from
+  the feed only after every unique row is validated and that count is complete.
+  Zero-count blocks need no empty stream; incomplete blocks still use streams.
+- Compact formats v1/v2/v3 remove repeated fields without changing their
+  meaning. Request-base aliases, state hashes, immutable row digests, chain
+  identity, confirmations and per-page cursors are validated before publication.
+  A missing local reference retries the same watermark with expanded rows;
+  it never advances past an undecoded event.
+- Capability knowledge belongs to the actual RPC connection. Explicit
+  unsupported options/methods can negotiate older formats. A timeout, malformed
+  success or inconsistent chain is not evidence of legacy support and cannot
+  silently bypass the validation or publication barrier.
+- Claim funding requests raw transaction bytes without the redundant decoded
+  object, retaining txid, typed-output and proposal checks. Accepted-claim
+  reconciliation can request compact indexed status after checking the original
+  locally preserved transaction/proof. Unsupported status methods keep the full
+  legacy receipt path. Metadata never replaces the original replay bytes.
+- Reconnection, lifecycle cancellation, reorgs, unknown broadcasts and retry
+  ownership retain their existing safeguards. Discovery caches and compact
+  wire formats are not independent consensus verification or authentication of
+  the plaintext RPC server.
+
+This is not a measured Wallet bandwidth target. Wallet balance/address watches,
+payments and platform lifecycle differ from the headless claimer. The port does
+not disable those notifications or change the existing claim rate/concurrency.
 
 ## Latest native and scheduler port (2026-10-13)
 

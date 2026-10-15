@@ -17,6 +17,7 @@ public actor MobileClaimsEngine {
     private var epoch: UInt64 = 0, run: UInt64 = 0, nextCapture: UInt64 = 0
     private var address = "", cursor: String?, tip: JSONObject?
     private var recentWindow: ClaimRecentWindow?
+    private var discoveryCandidates: [String: ClaimCandidate] = [:], discoveryDirtyBlocks = Set<String>()
     private var status = "stopped", lastError = "", lastTxid = "", receiptStatus = ""
     private var pendingReceiptRetryAllowed = false
     private var lastRpcError: JSONObject?
@@ -245,6 +246,7 @@ public actor MobileClaimsEngine {
         retainAdmittedWork()
         blocks.removeAll(); blockOrder.removeAll(); loaded.removeAll(); catalog.removeAll(); scheduler.clear()
         cursor = nil; tip = nil; recentWindow = nil; healthy = false; dirty = true; catalogAt = 0
+        discoveryCandidates.removeAll(); discoveryDirtyBlocks.removeAll()
         snapshotPending = false; catalogRevision &+= 1
         pendingRevalidation.removeAll(); normallyAged.removeAll()
         lastError = ""; lastRpcError = nil; nextDiscovery = 0; nextBlock = 0; nextPreparation = 0; retryAt = 0
@@ -415,7 +417,8 @@ public actor MobileClaimsEngine {
         try walletRequire(lastError != "CLAIMS_RECEIPT_UNAVAILABLE", "CLAIMS_RECEIPT_UNAVAILABLE")
         try walletRequire(foreground && unknownBlocked && !lastTxid.isEmpty, "No indeterminate claim submission to resolve.")
         let expected = lastTxid, receiptEpoch = epoch
-        let response = try await rpc.call("gettransaction", ["txid": expected])
+        let saved = savedSubmissions.values.first(where: { $0.retry.txid == expected })
+        let response = try await receipt(expected, saved: saved)
         try Task.checkCancellation()
         // The actor can be stopped/closed, or a concurrent receipt check can
         // resolve this outcome while the RPC is in flight. Its old callback
@@ -455,7 +458,7 @@ public actor MobileClaimsEngine {
     }
     private func request(_ method: String, _ params: JSONObject, _ token: UInt64) async throws -> JSONObject {
         try check(token)
-        do { let response = try await rpc.call(method, params); try check(token); return response }
+        do { let response = try await rpc.claimRead(method, params); try check(token); return response }
         catch let failure as RpcFailure {
             if token == epoch {
                 lastRpcError = ["code": failure.code, "method": method, "phase": "request", "stage": "discovery", "elapsedMs": 0, "queuedMs": 0, "bytesReceived": 0]
@@ -510,6 +513,7 @@ public actor MobileClaimsEngine {
                 staged[candidate.key] = candidate
             }
         }
+        if let expected = recentWindow?.counts[hash] { try walletRequire(staged.count == expected, "CLAIMS_RPC_DATA") }
         try await replay(token, newBlock: hash, staged: staged)
         nextBlock = now() + 1.5
     }
@@ -528,7 +532,8 @@ public actor MobileClaimsEngine {
         }
         let began = now()
         let result = try await ClaimDiscoveryReplay.read(known: recentWindow, cursor: cursor, catalog: catalog,
-            loaded: loaded, newBlock: newBlock, staged: staged, retained: retained) { method, params in
+            loaded: loaded, newBlock: newBlock, staged: staged, retained: retained,
+            incomplete: discoveryCandidates, requiresStreams: discoveryDirtyBlocks) { method, params in
                 try await self.request(method, params, token)
             }
         try check(token)
@@ -539,6 +544,7 @@ public actor MobileClaimsEngine {
             window: result.window, loaded: nextLoaded, protected: protected)
         blocks = nextBlocks; blockOrder = result.window.order; recentWindow = result.window
         loaded = nextLoaded; catalog = next; progress = nextProgress
+        discoveryCandidates = result.incomplete; discoveryDirtyBlocks = result.requiresStreams
         retained = result.retained.filter { protectedKeys.contains($0.key) }
         normallyAged = result.normallyAged.intersection(Set(retained.keys))
         pendingRevalidation = Set(retained.values.filter { nextBlocks[$0.block] != nil && !nextLoaded.contains($0.block) }.map(\.block))
@@ -590,7 +596,7 @@ public actor MobileClaimsEngine {
         if parent == nil {
             guard now() >= nextPreparation else { return }
             nextPreparation = now() + 1.5
-            let response = try await request("gettransaction", ["txid": txid], token)
+            let response = try await request("gettransaction", ["txid": txid, "raw_only": true], token)
             _ = try Self.validateTip(response["tip"])
             parent = try PJ.string(PJ.object(response["transaction"])["hex"])
         }
@@ -612,6 +618,15 @@ public actor MobileClaimsEngine {
         retired.insert(key); reservations.insert(key); scheduler.remove(key)
         winners.append(Winner(saved: saved, epoch: epoch, validUntil: catalogAt + 60))
     }
+    private func receipt(_ txid: String, saved: ClaimSavedSubmission?) async throws -> JSONObject {
+        // A compact status can never replace a lost local proof. Recovery with
+        // only a persisted txid keeps the full observed-transaction path.
+        guard let saved else { return try await rpc.call("gettransaction", ["txid": txid]) }
+        _ = try NativeTransactions.validateObservedClaim(saved.retry.hex, expectedTxid: txid,
+            originalHex: saved.retry.hex, target: saved.row.target)
+        let response = try await rpc.claimRead("gettransactionstatus", ["txid": txid])
+        return try saved.expandStatus(response)
+    }
     /// Confirmation polling shares the ordinary RPC quota. It neither creates
     /// another proof nor releases a record on a timeout, absence or malformed ACK.
     private func reconcileSaved(_ token: UInt64) async throws {
@@ -626,7 +641,7 @@ public actor MobileClaimsEngine {
         nextSavedCheck = now() + 5; nextPreparation = max(nextPreparation, now() + 1.5)
         saved.nextCheck = now() + 30
         do {
-            let response = try await rpc.call("gettransaction", ["txid": saved.retry.txid])
+            let response = try await receipt(saved.retry.txid, saved: saved)
             try check(token)
             guard savedSubmissions[saved.row.key] === saved else { return }
             if try saved.location(response, known: recentWindow) == .confirmed {
