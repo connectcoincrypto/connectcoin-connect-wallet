@@ -64,6 +64,28 @@ test('adding 1.1.1 release notes preserves the previously published 1.1.0 text e
     '4a81fe0f613227aa9f42e8ad5989ac175512e17d651ae77ff41ee063630d22fd');
 });
 
+test('1.1.7 release notes describe RPC and wallet efficiency without weakening safeguards', () => {
+  const notes = releaseNotes('1.1.7', '5678', sha);
+  for (const text of [
+    '# ConnectWallet 1.1.7', '## New in 1.1.7', 'compact bounty updates',
+    'full response validation', 'existing RPC quotas remain enforced',
+    'Verified proofs and uncertain submissions', 'cross-batch convergence',
+    'atomic publication', 'notifications arriving during a refresh',
+    'Local ownership, transaction, amount, fee, conflict and cancellation checks',
+    'No fixed bandwidth, latency or throughput improvement is promised',
+    'mobile app is not included', 'wallet keys or the encrypted wallet format',
+    'no Python runtime is required', 'Installers use English',
+    'Windows downloads are unsigned', 'not Developer-ID signed or notarized',
+    'SHA256SUMS', '/blob/v1.1.7/README.md', '/actions/runs/5678', sha,
+  ]) assert.ok(notes.includes(text), text);
+  assert.equal((notes.match(/## Downloads/g) ?? []).length, 1);
+  assert.equal((notes.match(/## New in 1\.1\.7/g) ?? []).length, 1);
+  assert.ok(notes.indexOf('## New in 1.1.7') < notes.indexOf('## Downloads'));
+  for (const other of ['1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', '1.1.5', '1.1.6', '1.2.0']) {
+    assert.ok(!releaseNotes(other, '5678', sha).includes('## New in 1.1.7'));
+  }
+});
+
 test('1.1.6 release notes describe the native runtime, recovery and retained safety checks', () => {
   const notes = releaseNotes('1.1.6', '5678', sha);
   for (const text of [

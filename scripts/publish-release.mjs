@@ -327,6 +327,20 @@ function baseReleaseNotes(version, runId, sha) {
 
 export function releaseNotes(version, runId, sha) {
   const notes = baseReleaseNotes(version, runId, sha);
+  if (version === '1.1.7') {
+    const highlights = [
+      '## New in 1.1.7',
+      '',
+      '- **Lower Automatic Claims RPC traffic:** compact bounty updates and incremental block-window reconciliation reduce repeated catalog transfers on compatible servers. Reconnection, journal reset and reorganization recovery retain full response validation; compatibility fallbacks and existing RPC quotas remain enforced. Verified proofs and uncertain submissions retain their recovery safeguards.',
+      '- **More efficient balance and history updates:** validated journal responses avoid redundant chain-tip preflights, copy only changed address data and reuse unchanged display projections. New blocks still update confirmations and maturity; cursor checks, cross-batch convergence, cancellation and atomic publication remain required.',
+      '- **Less repeated local processing:** history aggregation, receive-address access, QR mask selection and Activity rendering avoid unnecessary allocations or repeated calculations. Live updates still publish current state, and notifications arriving during a refresh retain their follow-up work.',
+      '- **Streamlined payment preparation:** unchanged funding candidates are not repeatedly sorted and planned, and parent-download progress counts selected inputs without rescanning the full input set. Local ownership, transaction, amount, fee, conflict and cancellation checks remain in place.',
+      '- Additional regression tests cover stale replies, reorganizations, shared snapshots, payment preparation and UI responsiveness. No fixed bandwidth, latency or throughput improvement is promised.',
+      '',
+      'This is a desktop release; the mobile app is not included. No changes to ConnectCoin consensus, transaction signing, wallet keys or the encrypted wallet format. Close ConnectWallet before upgrading, keep a secure recovery backup and use the same Windows installer family as your current installation.',
+    ].join('\n');
+    return notes.replace('\n\n## Downloads\n', `\n\n${highlights}\n\n## Downloads\n`);
+  }
   if (version === '1.1.6') {
     const highlights = [
       '## New in 1.1.6',
