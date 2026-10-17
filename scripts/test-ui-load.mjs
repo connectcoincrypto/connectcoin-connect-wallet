@@ -75,6 +75,52 @@ try {
   assert.deepEqual(await page.locator('.balance-detail strong').allTextContents(), ['1 CONN', '0.0000000001 CONN']);
   assert.equal(await page.locator('.activity-row .amount').first().textContent(), '+0.0000000001 CONN');
   assert.doesNotMatch(await page.locator('#app').textContent(), /\bCC\b/, 'Overview must use the CONN monetary ticker.');
+
+  stage = 'All activity avoids filtering while status filters still evaluate current rows';
+  await page.evaluate(() => {
+    window.loadTestHistoryFilterVisits = 0;
+    window.loadTestOriginalFilter = Array.prototype.filter;
+    Array.prototype.filter = function(callback, thisArg) {
+      const history = this.length === 500 && this[0]?.txid === '0'.repeat(64);
+      return window.loadTestOriginalFilter.call(this, history ? function(value, index, array) {
+        window.loadTestHistoryFilterVisits++;
+        return callback.call(this, value, index, array);
+      } : callback, thisArg);
+    };
+  });
+  await page.locator('[data-view="activity"]').first().click();
+  assert.equal(await page.locator('.activity-row').count(), 500);
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 0);
+  await page.locator('[data-filter="pending"]').click();
+  assert.equal(await page.locator('.activity-row').count(), 0);
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 500);
+  await page.locator('[data-filter="confirmed"]').click();
+  assert.equal(await page.locator('.activity-row').count(), 500);
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 1000);
+  await page.locator('[data-filter="all"]').click();
+  assert.equal(await page.locator('.activity-row').count(), 500);
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 1000);
+  await application.evaluate(({ BrowserWindow }, snapshot) => {
+    BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', {
+      ...snapshot, history: snapshot.history.map((row, index) => index === 0 ? { ...row, status: 'pending', confirmations: 0 } : row),
+    });
+  }, fixture);
+  await page.locator('.activity-row .status-badge.pending').waitFor();
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 1000, 'A new All snapshot must render without filtering.');
+  await page.locator('[data-filter="pending"]').click();
+  assert.equal(await page.locator('.activity-row').count(), 1);
+  await page.locator('[data-filter="confirmed"]').click();
+  assert.equal(await page.locator('.activity-row').count(), 499);
+  assert.equal(await page.evaluate(() => window.loadTestHistoryFilterVisits), 2000, 'Status filters must inspect the updated snapshot.');
+  await page.locator('[data-filter="all"]').click();
+  await application.evaluate(({ BrowserWindow }, snapshot) => {
+    BrowserWindow.getAllWindows()[0].webContents.send('connectwallet:state', snapshot);
+  }, fixture);
+  await page.locator('.activity-row .status-badge.pending').waitFor({ state: 'detached' });
+  await page.evaluate(() => {
+    Array.prototype.filter = window.loadTestOriginalFilter;
+    delete window.loadTestOriginalFilter;
+  });
   await page.locator('[data-view="send"]').first().click();
   for (const mode of ['address', 'bounty']) {
     await page.locator(`[data-send-mode="${mode}"]`).click();

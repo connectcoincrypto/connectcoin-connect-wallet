@@ -388,6 +388,51 @@ async function copyFixture(t) {
   return { ...context, expectedUri, payload: { ...payment, expectedAddress: address, expectedUri } };
 }
 
+test('Copy address reads the current receive address without projecting wallet history or making RPC calls', async t => {
+  const { service, clipboard, handler, event } = await copyFixture(t);
+  const next = deriveAccount(mnemonic, { network: 'testnet4', index: 1 }); next.privateKey.fill(0);
+  let snapshots = 0;
+  service.getState = () => { snapshots++; assert.fail('Copy must not construct the full wallet state'); };
+  service.history = Array.from({ length: 20000 }, (_, index) => ({ txid: index.toString(16).padStart(64, '0') }));
+  service.rpc = { request() { assert.fail('Copy must not query the server'); } };
+  service.makeQR = () => assert.fail('Copy must not regenerate the QR');
+  assert.equal((await handler(event, 'copyAddress', { address: 'renderer-controlled-canary' })).ok, true);
+  assert.deepEqual(clipboard.writes, [address]);
+  service.accounts = [
+    { address, change: 1, index: 1 },
+    { address, change: 0, index: 0 },
+    { address: next.address, change: 0, index: 1 },
+  ];
+  service.session.data.receiveIndex = 1;
+  assert.equal((await handler(event, 'copyAddress', {})).ok, true);
+  assert.deepEqual(clipboard.writes, [address, next.address]);
+  assert.equal(snapshots, 0);
+  assert.equal(clipboard.reads, 0);
+});
+
+test('Copy address rejects locked wallets and unavailable or invalid receive addresses before clipboard access', async t => {
+  const { service, clipboard, handler, event } = await copyFixture(t);
+  service.getState = () => assert.fail('Copy must not construct the full wallet state');
+  const session = service.session;
+  for (const walletExists of [false, true]) {
+    service.walletExists = walletExists; service.session = null;
+    const reply = await handler(event, 'copyAddress', {});
+    assert.equal(reply.ok, false); assert.match(reply.error, /locked or changed/);
+    assert.deepEqual(clipboard.writes, []);
+  }
+  service.session = session;
+  for (const accounts of [[], [{ address, change: 1, index: 0 }],
+    [{ address, change: 0, index: 1 }], [{ address: 'invalid-address-canary', change: 0, index: 0 }]]) {
+    service.accounts = accounts;
+    const reply = await handler(event, 'copyAddress', {});
+    assert.equal(reply.ok, false); assert.match(reply.error, /receive address/);
+    assert.doesNotMatch(reply.error, /canary/); assert.deepEqual(clipboard.writes, []);
+  }
+  service.accounts = [{ address, change: 0, index: 0 }];
+  assert.equal((await handler(event, 'copyAddress', {})).ok, true, 'Failures release the serialized action gate');
+  assert.deepEqual(clipboard.writes, [address]);
+});
+
 test('Copy address and payment request await the async clipboard write before reporting success', async t => {
   for (const method of ['copyAddress', 'copyPaymentRequest']) {
     const { clipboard, handler, event, payload, expectedUri } = await copyFixture(t);

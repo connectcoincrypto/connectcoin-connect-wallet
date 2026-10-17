@@ -65,6 +65,62 @@ function assertPublicAccount(account) {
   }
 }
 
+function referenceLiveAddresses(service) {
+  const current = service.accounts.filter(account => account.index === service.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
+  return [...new Set([...current, ...service.accounts, ...service.accountCache.values()].map(account => account.address))];
+}
+
+test('live address scope preserves exact current-address priority, stable order and deduplication', t => {
+  const service = fixture(t);
+  for (let scenario = 0; scenario < 80; scenario++) {
+    const accounts = Array.from({ length: 30 + scenario }, (_, index) => Object.freeze({
+      index: Math.floor(index / 2), change: index % 2,
+      address: `publicaddress${(index + scenario) % (23 + scenario)}`,
+    }));
+    if (scenario % 2) accounts.reverse();
+    service.accounts = Object.freeze(accounts);
+    service.accountCache = new Map([...accounts, ...accounts.slice().reverse(),
+      Object.freeze({ index: 999, change: 0, address: 'cachedonlyaddress' })].map((account, index) => [index, account]));
+    service.session.data.receiveIndex = scenario % 12; service.session.data.changeIndex = (scenario + 3) % 12;
+    const beforeAccounts = structuredClone(service.accounts), beforeCache = [...service.accountCache];
+    const expected = referenceLiveAddresses(service), actual = service.liveUpdates.getAddresses();
+    assert.deepEqual(actual, expected);
+    assert.deepEqual([...service.liveUpdates.addresses()], expected, 'live validation still sees the complete scope');
+    assert.equal(new Set(actual).size, actual.length);
+    assert.deepEqual(service.accounts, beforeAccounts); assert.deepEqual([...service.accountCache], beforeCache);
+  }
+});
+
+test('live address scope is fresh after receive rotation and cache-only additions or removals', t => {
+  const service = fixture(t);
+  const zero = Object.freeze({ index: 0, change: 0, address: 'receiveaddresszero' });
+  const one = Object.freeze({ index: 1, change: 0, address: 'receiveaddressone' });
+  const change = Object.freeze({ index: 0, change: 1, address: 'changeaddresszero' });
+  service.accounts = Object.freeze([zero, one, change]); service.accountCache = new Map();
+  service.session.data.receiveIndex = 0;
+  const old = service.liveUpdates.getAddresses();
+  assert.deepEqual(old, [zero.address, change.address, one.address]);
+  service.session.data.receiveIndex = 1;
+  assert.deepEqual(service.liveUpdates.getAddresses(), [one.address, change.address, zero.address]);
+  service.accountCache.set('recovery', { index: 2, change: 1, address: 'recoverycacheaddress' });
+  assert.deepEqual(service.liveUpdates.getAddresses(), [one.address, change.address, zero.address, 'recoverycacheaddress']);
+  service.accounts = Object.freeze([one, change]); service.accountCache.clear();
+  assert.deepEqual(service.liveUpdates.getAddresses(), [one.address, change.address]);
+  assert.deepEqual(old, [zero.address, change.address, one.address], 'earlier arrays remain independent');
+  const current = service.liveUpdates.getAddresses(); current.push('calleronlyaddress');
+  assert.deepEqual(service.liveUpdates.getAddresses(), [one.address, change.address]);
+});
+
+test('direct scope construction does not filter malformed cached addresses around live validation', t => {
+  const service = fixture(t);
+  service.accounts = [{ index: 0, change: 0, address: 'validfixtureaddress' }];
+  for (const address of [undefined, null, 123, '', 'bad address', 'a'.repeat(91)]) {
+    service.accountCache = new Map([['invalid', { index: 99, change: 1, address }]]);
+    assert.deepEqual(service.liveUpdates.getAddresses(), referenceLiveAddresses(service));
+    assert.throws(() => service.liveUpdates.addresses(), /Invalid wallet addresses/);
+  }
+});
+
 for (const network of ['main', 'testnet4']) {
   test(`${network}: publicAccount lazily reuses one scoped public deriver and cached public objects`, t => {
     const service = fixture(t, network);

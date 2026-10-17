@@ -3,6 +3,14 @@
 import { normalizeAmountInput } from '../../src/ui/amount-input.mjs';
 import { formatConn, parseMainnetAddress } from './model.mjs';
 
+// Membership only: callers must still obtain a freshly validated partial
+// funding set and reject a missing set. Never retain this Set across frames or
+// actions, and check every selected member even when both arrays are identical.
+export function fundingSelectionIsCurrent(partial, selected) {
+  const current = new Set(partial);
+  return !selected?.some(address => !current.has(address));
+}
+
 export function createSendRequest({ address, amount, feeRate, subtractFeeFromAmount, useAllBalance } = {}) {
   if (typeof address !== 'string' || address.includes(':')) throw new Error('Enter a mainnet address, or use Paste payment link.');
   address = parseMainnetAddress(address.trim());

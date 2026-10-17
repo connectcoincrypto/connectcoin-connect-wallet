@@ -384,6 +384,47 @@ async function expectNoIntakePayment(page) {
 }
 
 test.describe('General settings', () => {
+  test('unchanged settings polling avoids DOM mutations and preserves live draft focus', async ({ page }, testInfo) => {
+    await page.clock.install(); await openNativeWallet(page, { watchConnected: false, deferredMethods: { viewRecoveryPhrase: true } });
+    await page.clock.runFor(3000); await page.locator('#open-settings').click();
+    await page.evaluate(() => {
+      window.settingsMutations = [];
+      new MutationObserver(records => window.settingsMutations.push(...records.map(record => ({
+        type: record.type, target: record.target.id, attribute: record.attributeName,
+      })))).observe(document.getElementById('settings-panel'), { attributes: true, childList: true, characterData: true, subtree: true });
+    });
+    const callsBefore = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'getState').length);
+    const publicBefore = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic'));
+    await page.clock.runFor(10000);
+    const callsAfter = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'getState').length);
+    expect(callsAfter - callsBefore).toBe(10);
+    const mutations = await page.evaluate(() => window.settingsMutations);
+    await testInfo.attach('settings-polling-dom-count.json', { body: JSON.stringify({ polls: callsAfter - callsBefore, mutations: mutations.length }), contentType: 'application/json' });
+    expect(mutations).toEqual([]);
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic'))).toEqual(publicBefore);
+    await page.locator('#settings-rpc-host').fill('new-node.example.org');
+    await page.locator('#settings-rpc-host').focus();
+    await page.evaluate(() => { document.getElementById('settings-rpc-host').setSelectionRange(4, 8); window.settingsMutations = []; });
+    await page.clock.runFor(5000);
+    await expect(page.locator('#settings-rpc-host')).toHaveValue('new-node.example.org');
+    await expect(page.locator('#settings-rpc-host')).toBeFocused();
+    expect(await page.locator('#settings-rpc-host').evaluate(input => [input.selectionStart, input.selectionEnd])).toEqual([4, 8]);
+    await expect(page.locator('#save-settings')).toBeEnabled();
+    expect(await page.evaluate(() => window.settingsMutations)).toEqual([]);
+    expect(await page.evaluate(() => window.testNative.calls.some(call => call.method === 'saveSettings'))).toBe(false);
+    // Equality checks must never suppress a real availability transition.
+    await page.locator('#view-recovery-phrase').click();
+    await expect(page.locator('#save-settings')).toBeDisabled();
+    await expect(page.locator('#view-recovery-phrase')).toBeDisabled();
+    await expect(page.locator('#view-recovery-phrase')).toHaveText('Open in the native dialog…');
+    await expect(page.locator('#settings-rpc-host')).toHaveValue('new-node.example.org');
+    await page.evaluate(() => window.testNative.releaseResponses());
+    await expect(page.locator('#save-settings')).toBeEnabled();
+    await expect(page.locator('#view-recovery-phrase')).toBeEnabled();
+    await expect(page.locator('#view-recovery-phrase')).toHaveText('View recovery phrase');
+    await expect(page.locator('#settings-rpc-host')).toHaveValue('new-node.example.org');
+  });
+
   test('settings work before a wallet exists and persist the explicit foreground-only default', async ({ page }) => {
     await fakeNative(page, { exists: false, accountAddress: null });
     await page.goto('/'); await waitReady(page);
@@ -766,6 +807,123 @@ test.describe('HD wallet', () => {
     await expect(page.locator('#send-available')).toHaveText('Available: 9 CONN');
   });
 
+  test('a partial-wallet render validates the identical funding selection only once for both review controls', async ({ page }) => {
+    await page.clock.install();
+    await openNativeWallet(page, { hd: true, hdUtxosByAddress: funds(), watchConnected: false, deferredMethods: { history: true } });
+    await expect(page.locator('#balance')).toHaveText('7');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    const scans = await page.evaluate(addresses => {
+      const original = Array.prototype.map;
+      let count = 0;
+      try {
+        // Synchronous, test-only instrumentation of the owned-descriptor scan.
+        // No test hook or retained cache is added to the app.
+        Array.prototype.map = function (...args) {
+          const result = Reflect.apply(original, this, args);
+          if (this.length === addresses.length && this.every((value, index) => value?.address === addresses[index]) &&
+              result.every((value, index) => value === addresses[index])) count++;
+          return result;
+        };
+        document.getElementById('send-amount').dispatchEvent(new Event('input', { bubbles: true }));
+        return count;
+      } finally { Array.prototype.map = original; }
+    }, hdAccounts.map(account => account.address));
+    expect(scans).toBe(1);
+    await expect(page.locator('#review-payment')).toBeEnabled();
+    await expect(page.locator('#review-p2c')).toBeEnabled();
+  });
+
+  for (const [section, operation, review, progressId, lockId] of [
+    ['Send', 'reviewPayment', 'review-payment', 'send-progress', 'lock-wallet'],
+    ['P2C', 'reviewP2C', 'review-p2c', 'p2c-progress', 'p2c-lock-wallet'],
+  ]) test(`${section} funding progress does not rescan the partial wallet and remains cancellable`, async ({ page }) => {
+    await page.clock.install();
+    await openNativeWallet(page, { hd: true, hdUtxosByAddress: funds(), watchConnected: false,
+      deferredMethods: { history: true }, cancelPendingOnLock: true });
+    await expect(page.locator('#balance')).toHaveText('7');
+    await page.getByRole('button', { name: section, exact: true }).click();
+    if (section === 'Send') {
+      await page.locator('#send-address').fill(otherAddress); await page.locator('#send-amount').fill('1');
+    } else {
+      await page.locator('#p2c-domain').fill('example.com'); await page.locator('#p2c-amount').fill('1');
+    }
+    await page.evaluate(operation => {
+      window.testNative.deferPayment = true; window.testNative.deferP2C = true;
+      window.testNative.deferredMethods[operation] = true;
+    }, operation);
+    await page.locator(`#${review}`).click();
+    const before = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length);
+    const result = await page.evaluate(({ address, addresses, operation, progressId }) => {
+      const original = Array.prototype.map;
+      let scans = 0, displayed = 0;
+      try {
+        Array.prototype.map = function (...args) {
+          const result = Reflect.apply(original, this, args);
+          if (this.length === addresses.length && this.every((value, index) => value?.address === addresses[index]) &&
+              result.every((value, index) => value === addresses[index])) scans++;
+          return result;
+        };
+        for (let completed = 1; completed <= 100; completed++) {
+          window.testNative.emit('NativeWallet', 'paymentPreparation', { address, operation, stage: 'funding', completed, total: 1000, retryAfterMs: 0 });
+          if (document.getElementById(progressId).textContent.includes(`${completed} / 1000`)) displayed++;
+        }
+        return { scans, displayed };
+      } finally { Array.prototype.map = original; }
+    }, { address, addresses: hdAccounts.map(account => account.address), operation, progressId });
+    expect(result).toEqual({ scans: 0, displayed: 100 });
+    await expect(page.locator(`#${progressId}`)).toContainText('100 / 1000');
+    await expect(page.locator(`#${review}`)).toBeDisabled();
+    await expect(page.locator(`#${lockId}`)).toBeEnabled();
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length)).toBe(before);
+    await page.evaluate(({ address, operation }) => {
+      for (const patch of [{ address: 'unrelated' }, { operation: 'unrelated' }, { completed: 1001 }, { total: '1000' }]) {
+        window.testNative.emit('NativeWallet', 'paymentPreparation', { address, operation, stage: 'funding', completed: 900, total: 1000, retryAfterMs: 0, ...patch });
+      }
+    }, { address, operation });
+    await expect(page.locator(`#${progressId}`)).toContainText('100 / 1000');
+    await page.locator(`#${lockId}`).click();
+    await expect(page.locator(`#${progressId}`)).toBeHidden();
+    await page.evaluate(({ address, operation }) => window.testNative.emit('NativeWallet', 'paymentPreparation', {
+      address, operation, stage: 'funding', completed: 900, total: 1000, retryAfterMs: 0,
+    }), { address, operation });
+    await expect(page.locator(`#${progressId}`)).toBeHidden();
+    expect(await page.evaluate(operation => window.testNative.calls.filter(call => call.method === operation).length, operation)).toBe(1);
+  });
+
+  test('a reset after a valid partial frame disables both reviews and actions recheck current funding', async ({ page }) => {
+    await page.clock.install();
+    await openNativeWallet(page, { hd: true, hdUtxosByAddress: funds(), watchConnected: false, deferredMethods: { history: true } });
+    await expect(page.locator('#balance')).toHaveText('7');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.locator('#send-address').fill(otherAddress);
+    await page.locator('#send-use-all').click();
+    await expect(page.locator('#send-amount')).toHaveValue('7');
+    await expect(page.locator('#review-payment')).toBeEnabled();
+    await page.evaluate(address => {
+      const native = window.testNative;
+      native.emit('NativeWallet', 'walletChanged', { address, reason: 'tip', tip: { ...native.tip }, resync_required: true });
+    }, address);
+    await expect(page.locator('#review-payment')).toBeDisabled();
+    await expect(page.locator('#send-use-all')).toBeDisabled();
+    await expect(page.locator('#send-all-hint')).toBeHidden();
+    // Dispatching submit directly must still re-evaluate fresh state, not trust
+    // either an earlier frame's cached result or the disabled HTML button.
+    await page.locator('#send-form').dispatchEvent('submit');
+    await page.getByRole('button', { name: 'P2C', exact: true }).click();
+    await page.locator('#p2c-domain').fill('example.com'); await page.locator('#p2c-amount').fill('1');
+    await expect(page.locator('#review-p2c')).toBeDisabled();
+    await page.locator('#p2c-form').dispatchEvent('submit');
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => ['reviewPayment', 'reviewP2C'].includes(call.method)))).toEqual([]);
+    await page.evaluate(() => window.testNative.releaseResponses());
+    await page.clock.runFor(4000);
+    await expect(page.locator('#partial-state-status')).toBeHidden();
+    await expect(page.locator('#review-p2c')).toBeEnabled();
+    await page.locator('#review-p2c').click();
+    await expect(page.locator('#p2c-status')).toContainText('TEST_ONLY');
+    const request = await page.evaluate(() => window.testNative.calls.find(call => call.method === 'reviewP2C').params);
+    expect(request).toEqual({ domain: 'example.com', amount: '1', expectedConnections: '1' });
+  });
+
   test('Send and P2C review restrict funding to the verified addresses during synchronization', async ({ page }) => {
     await openNativeWallet(page, { hd: true, hdUtxosByAddress: funds(), deferredMethods: { history: true } });
     await expect(page.locator('#balance')).toHaveText('7');
@@ -1018,10 +1176,205 @@ test.describe('HD wallet', () => {
   });
 });
 
+test.describe('keyed activity rendering', () => {
+  const button = (page, txid) => page.locator(`#history button[data-txid="${txid}"]`);
+  const captureNodes = page => page.evaluate(() => {
+    window.activityNodes = new Map([...document.querySelectorAll('#history li')].map(row => [
+      row.querySelector('button').dataset.txid, { row, descendants: [...row.querySelectorAll('*')],
+        amountText: row.querySelector('.amount').firstChild },
+    ]));
+    window.activityMutations = [];
+    new MutationObserver(records => window.activityMutations.push(...records.map(record => ({
+      targetClass: record.target.className ?? '', type: record.type,
+    })))).observe(document.querySelector('#history'), { subtree: true, childList: true, characterData: true, attributes: true });
+  });
+  const sameNodes = page => page.evaluate(() => [...window.activityNodes].every(([id, previous]) => {
+    const row = document.querySelector(`#history button[data-txid="${id}"]`)?.closest('li');
+    return row === previous.row && [...row.querySelectorAll('*')].every((node, index) => node === previous.descendants[index]);
+  }));
+
+  test('busy and identical snapshots keep existing nodes, focus and text untouched', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory, pendingHistory] });
+    await page.clock.runFor(3000); await captureNodes(page);
+    await button(page, pendingHistory.txid).focus();
+    await page.evaluate(address => {
+      const native = window.testNative; native.deferredMethods.history = true;
+      native.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, address);
+    await page.clock.runFor(1000);
+    await expect.poll(() => page.evaluate(() => window.testNative.pendingResponses.some(item => item.method === 'history'))).toBe(true);
+    await expect(page.locator('#refresh')).toBeDisabled();
+    expect(await sameNodes(page)).toBe(true);
+    await expect(button(page, pendingHistory.txid)).toBeFocused();
+    await page.evaluate(address => {
+      for (let index = 0; index < 10; index++) window.testNative.emit('NativeWallet', 'walletChanged', {
+        address, reason: 'tip', tip: { ...window.testNative.tip }, reorg: false,
+      });
+      window.testNative.releaseResponses();
+    }, address);
+    await page.clock.runFor(3000);
+    await expect(page.locator('#refresh')).toBeEnabled();
+    expect(await sameNodes(page)).toBe(true);
+    await expect(button(page, pendingHistory.txid)).toBeFocused();
+    expect(await page.evaluate(() => window.activityMutations)).toEqual([]);
+    expect(await page.evaluate(() => window.testNative.calls.some(call =>
+      ['reviewPayment', 'reviewP2C', 'claimsStart'].includes(call.method)))).toBe(false);
+  });
+
+  test('tip projection changes only confirmation text and keeps open details current without RPC', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory, pendingHistory] });
+    await page.clock.runFor(3000); await captureNodes(page);
+    await button(page, confirmedHistory.txid).click();
+    const before = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length);
+    await page.evaluate(address => {
+      const native = window.testNative;
+      Object.assign(native.tip, { height: 126, hash: 'e'.repeat(64), mediantime: 1800000180 });
+      native.emit('NativeWallet', 'walletChanged', { address, reason: 'tip', tip: { ...native.tip }, reorg: false });
+    }, address);
+    await expect(button(page, confirmedHistory.txid).locator('.state')).toHaveText('6 confirmations');
+    await expect(button(page, pendingHistory.txid).locator('.state')).toHaveText('Unconfirmed');
+    await expect(page.locator('#transaction-confirmations')).toHaveText('6');
+    expect(await sameNodes(page)).toBe(true);
+    expect(await page.evaluate(() => [...window.activityNodes].every(([id, previous]) =>
+      document.querySelector(`#history button[data-txid="${id}"] .amount`).firstChild === previous.amountText))).toBe(true);
+    const mutations = await page.evaluate(() => window.activityMutations);
+    expect(mutations.length).toBeGreaterThan(0);
+    expect(mutations.every(item => item.targetClass === 'state')).toBe(true);
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length)).toBe(before);
+    await page.locator('#transaction-close').click();
+    await expect(button(page, confirmedHistory.txid)).toBeFocused();
+  });
+
+  test('changed values and order update retained rows while removing obsolete details and nodes', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory, pendingHistory] });
+    await page.clock.runFor(3000); await captureNodes(page);
+    await button(page, pendingHistory.txid).click();
+    const added = { ...pendingHistory, txid: 'f'.repeat(64) };
+    const changed = { ...pendingHistory, status: 'confirmed', block_height: 120, block_hash: 'e'.repeat(64),
+      confirmations: 4, received: '10000000000', spent: '30000000000', balance_delta: '-20000000000' };
+    await page.evaluate(({ address, added, changed, confirmed }) => {
+      window.testNative.history = [changed, confirmed, added];
+      window.testNative.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, { address, added, changed, confirmed: confirmedHistory });
+    await page.clock.runFor(3000);
+    expect(await page.locator('#history button').evaluateAll(nodes => nodes.map(node => node.dataset.txid)))
+      .toEqual([added.txid, confirmedHistory.txid, pendingHistory.txid]);
+    expect(await sameNodes(page)).toBe(true);
+    await expect(button(page, pendingHistory.txid).locator('span').first()).toHaveText('Sent');
+    await expect(button(page, pendingHistory.txid).locator('.amount')).toHaveText('-2 CONN');
+    await expect(button(page, pendingHistory.txid).locator('.state')).toHaveText('4 confirmations');
+    await expect(page.locator('#transaction-status')).toHaveText('Confirmed');
+    await expect(page.locator('#transaction-received')).toHaveText('1 CONN');
+    await expect(page.locator('#transaction-spent')).toHaveText('3 CONN');
+    await expect(page.locator('#transaction-net')).toHaveText('-2 CONN');
+    await expect(page.locator('#transaction-block-height')).toHaveText('120');
+    await expect(page.locator('#transaction-block-hash')).toHaveText(changed.block_hash);
+    await page.evaluate(({ address, id }) => {
+      window.testNative.history = window.testNative.history.filter(row => row.txid !== id);
+      window.testNative.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, { address, id: pendingHistory.txid });
+    await page.clock.runFor(3000);
+    await expect(page.locator('#transaction-details')).toBeHidden();
+    await expect(button(page, pendingHistory.txid)).toHaveCount(0);
+    expect(await page.evaluate(id => window.activityNodes.get(id).row.isConnected, pendingHistory.txid)).toBe(false);
+    expect(await page.evaluate(id => document.querySelector(`#history button[data-txid="${id}"]`).closest('li') ===
+      window.activityNodes.get(id).row, confirmedHistory.txid)).toBe(true);
+  });
+
+  test('owner replacement cannot reuse old nodes even for the same txid and account removal clears them', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory] });
+    await page.clock.runFor(3000); await captureNodes(page);
+    await button(page, confirmedHistory.txid).click();
+    await page.evaluate(otherAddress => { window.testNative.setAccount(otherAddress); }, otherAddress);
+    await page.clock.runFor(3000);
+    await expect(page.locator('#current-address')).toHaveText(otherAddress);
+    await expect(page.locator('#transaction-details')).toBeHidden();
+    await expect(button(page, confirmedHistory.txid)).toHaveCount(1);
+    expect(await page.evaluate(id => window.activityNodes.get(id).row.isConnected, confirmedHistory.txid)).toBe(false);
+    expect(await sameNodes(page)).toBe(false);
+    await button(page, confirmedHistory.txid).click();
+    await expect(page.locator('#transaction-address')).toHaveText(otherAddress);
+    await page.evaluate(() => window.testNative.setAccount(null, true));
+    await page.clock.runFor(3000);
+    await expect(page.locator('#transaction-details')).toBeHidden();
+    await expect(page.locator('#history li')).toHaveCount(0);
+    expect(await page.evaluate(() => window.testNative.calls.some(call =>
+      ['reviewPayment', 'reviewP2C', 'claimsStart', 'openTransaction'].includes(call.method)))).toBe(false);
+  });
+
+  test('moving the focused surviving row preserves its button and keyboard activation', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory, pendingHistory] });
+    await page.clock.runFor(3000); await captureNodes(page);
+    await button(page, pendingHistory.txid).focus();
+    expect(await page.locator('#history button').evaluateAll(nodes => nodes.map(node => node.dataset.txid)))
+      .toEqual([pendingHistory.txid, confirmedHistory.txid]);
+    await page.evaluate(({ address, id }) => {
+      window.testNative.history = window.testNative.history.map(row => row.txid === id
+        ? { ...row, status: 'confirmed', block_height: 120, block_hash: 'e'.repeat(64), confirmations: 4 } : row);
+      window.testNative.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, { address, id: pendingHistory.txid });
+    await page.clock.runFor(3000);
+    expect(await page.locator('#history button').evaluateAll(nodes => nodes.map(node => node.dataset.txid)))
+      .toEqual([confirmedHistory.txid, pendingHistory.txid]);
+    expect(await sameNodes(page)).toBe(true);
+    await expect(button(page, pendingHistory.txid)).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#transaction-id')).toHaveText(pendingHistory.txid);
+    await expect(page.locator('#transaction-confirmations')).toHaveText('4');
+    await page.keyboard.press('Escape');
+    await expect(button(page, pendingHistory.txid)).toBeFocused();
+  });
+});
+
 test.describe('transaction details', () => {
   const historyButton = (page, txid) => page.locator(`#history button.history-transaction[data-txid="${txid}"]`);
   const publicAndPaymentCalls = page => page.evaluate(() => window.testNative.calls.filter(call =>
     ['queryPublic', 'reviewPayment', 'reviewP2C', 'claimsStart', 'openTransaction'].includes(call.method)));
+
+  test('unchanged detail amounts retain their text nodes through refresh and tip frames while changed values update', async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { history: [confirmedHistory] });
+    await page.clock.runFor(3000); await historyButton(page, confirmedHistory.txid).click();
+    await page.evaluate(() => {
+      window.detailsAmounts = ['received', 'spent', 'net'].map(id => document.getElementById(`transaction-${id}`));
+      window.detailsAmountNodes = window.detailsAmounts.map(node => node.firstChild);
+      window.detailsAmountWrites = [];
+      const observer = new MutationObserver(records => window.detailsAmountWrites.push(...records.map(record => record.target.id)));
+      for (const node of window.detailsAmounts) observer.observe(node, { childList: true, characterData: true, subtree: true });
+    });
+    await page.evaluate(address => {
+      window.testNative.deferredMethods.history = true;
+      window.testNative.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, address);
+    await page.clock.runFor(1000);
+    await expect(page.locator('#refresh')).toBeDisabled();
+    await page.evaluate(() => window.testNative.releaseResponses());
+    await page.clock.runFor(3000);
+    await expect(page.locator('#refresh')).toBeEnabled();
+    const before = await publicAndPaymentCalls(page);
+    await page.evaluate(address => {
+      const native = window.testNative;
+      Object.assign(native.tip, { height: 126, hash: 'e'.repeat(64), mediantime: 1800000180 });
+      native.emit('NativeWallet', 'walletChanged', { address, reason: 'tip', tip: { ...native.tip }, reorg: false });
+    }, address);
+    await expect(page.locator('#transaction-confirmations')).toHaveText('6');
+    expect(await publicAndPaymentCalls(page)).toEqual(before);
+    expect(await page.evaluate(() => window.detailsAmountWrites)).toEqual([]);
+    expect(await page.evaluate(() => window.detailsAmounts.every((node, index) => node.firstChild === window.detailsAmountNodes[index]))).toBe(true);
+    await page.evaluate(address => {
+      const native = window.testNative;
+      native.history = native.history.map(row => ({ ...row, spent: '30000000000', balance_delta: '-20000000000', confirmations: 6 }));
+      native.emit('NativeWallet', 'walletChanged', { address, reason: 'address' });
+    }, address);
+    await page.clock.runFor(3000);
+    await expect(page.locator('#transaction-received')).toHaveText('1 CONN');
+    await expect(page.locator('#transaction-spent')).toHaveText('3 CONN');
+    await expect(page.locator('#transaction-net')).toHaveText('-2 CONN');
+    expect(await page.evaluate(() => window.detailsAmountWrites)).toEqual(['transaction-spent', 'transaction-net']);
+    await page.locator('#transaction-close').click(); await historyButton(page, confirmedHistory.txid).click();
+    await expect(page.locator('#transaction-spent')).toHaveText('3 CONN');
+    await expect(page.locator('#transaction-net')).toHaveText('-2 CONN');
+    expect(await page.evaluate(() => window.testNative.calls.some(call => ['reviewPayment', 'reviewP2C', 'claimsStart', 'openTransaction'].includes(call.method)))).toBe(false);
+  });
 
   test('confirmed activity opens exact public details without a query or payment', async ({ page }) => {
     await page.clock.install();
@@ -1615,7 +1968,8 @@ test('unrelated blocks never refresh the balance but an owned-address event stil
   }, address);
   await page.clock.runFor(1000);
   await expect(page.locator('#send-available')).toHaveText('Available: 2 CONN');
-  expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length)).toBe(before + 3);
+  expect(await page.evaluate(before => window.testNative.calls.filter(call => call.method === 'queryPublic')
+    .slice(before).map(call => call.params.method), before)).toEqual(['getaddressbalance', 'getaddresshistory']);
 });
 
 test('ordinary tip events advance confirmed activity locally without balance reads or disabling Use all', async ({ page }) => {
@@ -1667,7 +2021,7 @@ test('owned-address events validate both balance and activity after local tip up
   await page.clock.runFor(3000);
   await expect(row).toHaveText('1 confirmations');
   expect(await page.evaluate(before => window.testNative.calls.filter(call => call.method === 'queryPublic')
-    .slice(before).map(call => call.params.method), before)).toEqual(['getchaintip', 'getaddressbalance', 'getaddresshistory']);
+    .slice(before).map(call => call.params.method), before)).toEqual(['getaddressbalance', 'getaddresshistory']);
 });
 
 test('reorg tips cannot project old activity while the replacement baseline is still loading', async ({ page }) => {
@@ -1735,6 +2089,76 @@ test('resume and RPC reconnection restore Use all without a manual refresh', asy
   await expect(page.locator('#send-use-all')).toBeDisabled();
   await page.evaluate(address => window.testNative.emit('NativeWallet', 'walletChanged', { address, reason: 'connected' }), address);
   await page.clock.runFor(2500); await expect(page.locator('#send-use-all')).toBeEnabled();
+});
+
+for (const hd of [false, true]) {
+  test(`verified ${hd ? 'HD' : 'legacy'} startup without watch hints does not schedule an artificial second read`, async ({ page }) => {
+    await page.clock.install(); await openNativeWallet(page, { hd, watchConnected: false });
+    await expect(page.locator('#balance')).toHaveText(hd ? '0' : '1');
+    await expect(page.locator('#wallet-load-progress')).toBeHidden();
+    await expect(page.locator('#partial-state-status')).toBeHidden();
+    await expect(page.locator('#refresh')).toBeEnabled();
+    const queries = () => page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').map(call => call.params));
+    const completed = await queries();
+    if (!hd) expect(completed.map(call => call.method)).toEqual(['getaddressbalance', 'getaddresshistory']);
+    else {
+      expect(completed.filter(call => call.method === 'getaddresshistory')).toHaveLength(3);
+      expect(completed.filter(call => call.method === 'getaddressutxos')).toHaveLength(3);
+    }
+    await page.clock.runFor(120000);
+    expect(await queries()).toEqual(completed);
+  });
+}
+
+for (const reason of ['connected', 'address']) {
+  test(`verified startup preserves a ${reason} hint received while its initial history is pending`, async ({ page }) => {
+    await page.clock.install();
+    await openNativeWallet(page, { watchConnected: false, deferredMethods: { history: true }, history: [confirmedHistory] });
+    await expect.poll(() => page.evaluate(() => window.testNative.pendingResponses.map(item => item.method))).toContain('history');
+    await page.evaluate(({ address, reason }) => {
+      const native = window.testNative;
+      Object.assign(native.balance, { confirmed: '20000000000', available_confirmed: '20000000000', total: '20000000000' });
+      native.emit('NativeWallet', 'walletChanged', { address, reason });
+    }, { address, reason });
+    await page.clock.runFor(1500);
+    expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length)).toBe(2);
+    await page.evaluate(() => window.testNative.releaseResponses());
+    await page.clock.runFor(3000);
+    await expect(page.locator('#balance')).toHaveText('2');
+    const queries = () => page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').map(call => call.params.method));
+    expect(await queries()).toEqual(['getaddressbalance', 'getaddresshistory', 'getaddressbalance', 'getaddresshistory']);
+    await page.clock.runFor(60000);
+    expect(await queries()).toHaveLength(4);
+  });
+}
+
+test('malformed native scope revokes reads and old in-flight results until a validated descriptor is restored', async ({ page }) => {
+  await page.clock.install(); await openNativeWallet(page, { watchConnected: false, history: [confirmedHistory] });
+  await expect(page.locator('#balance')).toHaveText('1');
+  await page.evaluate(() => {
+    const native = window.testNative;
+    native.goodAccount = { ...native.vault.account };
+    Object.assign(native.balance, { confirmed: '90000000000', available_confirmed: '90000000000', total: '90000000000' });
+    native.deferredMethods = { balance: true, history: true };
+  });
+  await page.locator('#refresh').click();
+  await expect.poll(() => page.evaluate(() => window.testNative.pendingResponses.length)).toBe(2);
+  await page.evaluate(() => { window.testNative.vault.account.address = 'malformed'; });
+  await page.clock.runFor(1500);
+  await page.evaluate(() => window.testNative.releaseResponses());
+  await page.clock.runFor(1000);
+  await expect(page.locator('#balance')).toHaveText('1');
+  await expect(page.locator('#refresh')).toBeEnabled();
+  const count = await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length);
+  await page.locator('#refresh').click();
+  await expect(page.locator('#refresh')).toBeEnabled();
+  expect(await page.evaluate(() => window.testNative.calls.filter(call => call.method === 'queryPublic').length)).toBe(count);
+  await page.evaluate(() => { window.testNative.vault.account = { ...window.testNative.goodAccount }; });
+  // The failed manual read retains the existing 60-second conservative retry
+  // backoff. Restoring descriptors must not reset that RPC quota protection.
+  await page.clock.runFor(65000);
+  await expect(page.locator('#balance')).toHaveText('9');
+  await expect(page.locator('#wallet-error')).toBeEmpty();
 });
 
 test('startup recovers a failed initial snapshot without a subscription ACK or manual Refresh', async ({ page }) => {
@@ -2063,7 +2487,7 @@ test('Send Refresh repairs a history failure without querying history again', as
   await page.locator('#send-refresh-balance').click(); await expect(page.locator('#send-use-all')).toBeEnabled();
   await expect(page.locator('#send-available')).toHaveText('Available: 1 CONN');
   expect(await page.evaluate(before => window.testNative.calls.slice(before)
-    .filter(call => call.method === 'queryPublic').map(call => call.params.method), before)).toEqual(['getchaintip', 'getaddressbalance']);
+    .filter(call => call.method === 'queryPublic').map(call => call.params.method), before)).toEqual(['getaddressbalance']);
   await page.getByRole('button', { name: 'Receive', exact: true }).click();
   await page.getByRole('button', { name: 'Send', exact: true }).click();
   await expect(page.locator('#send-use-all')).toBeEnabled();

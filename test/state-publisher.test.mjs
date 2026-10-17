@@ -172,3 +172,249 @@ test('critical errors, stopped claims and Developer Mode bypass progress delay',
   assert.equal(states.at(-1).error, 'RPC disconnected');
   await service.close();
 });
+
+function refreshGate() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+test('automatic refresh constructs snapshots only for coalesced state publications', async () => {
+  const fixture = serviceFixture(), { service, scheduler, states } = fixture;
+  service.connectClient();
+  const gate = refreshGate(); let reads = 0;
+  service.refreshInternal = async () => { reads++; await gate.promise; service.walletReadRevision = service.walletUpdateRevision; };
+  service.walletUpdateRevision++;
+  const automatic = service.walletUpdates.run(), operation = service.refreshing;
+  assert.ok(operation); assert.equal(reads, 1);
+  assert.equal(fixture.snapshots, states.length);
+  gate.resolve(); await automatic;
+  assert.equal(await operation, undefined);
+  assert.equal(service.refreshing, null);
+  assert.equal(fixture.snapshots, states.length, 'the unused automatic return must not project history');
+  scheduler.advance(200);
+  assert.equal(fixture.snapshots, states.length);
+  assert.equal(states.at(-1).busy, false);
+  const before = fixture.snapshots;
+  await service.walletUpdates.run();
+  assert.equal(reads, 1); assert.equal(fixture.snapshots, before, 'an acknowledged revision requires no extra read or projection');
+  await service.close();
+});
+
+test('manual callers join an automatic read and obtain independent final snapshots after busy clears', async () => {
+  const fixture = serviceFixture(), { service, scheduler, states } = fixture;
+  service.connectClient();
+  const gate = refreshGate(); let reads = 0;
+  service.history = [{ txid: 'public-fixture', confirmations: 2, status: 'confirmed', blockHeight: 1 }];
+  service.refreshInternal = async () => { reads++; await gate.promise; };
+  service.walletUpdateRevision++;
+  const automatic = service.walletUpdates.run(), operation = service.refreshing;
+  // Renderer parameters remain ignored; only the module's private marker can
+  // suppress a return snapshot. Concurrent callers still share one read.
+  const first = service.refresh({ returnState: false }), second = service.refresh(null);
+  assert.equal(service.refreshing, operation); assert.equal(reads, 1);
+  gate.resolve(); const [one, two] = await Promise.all([first, second]); await automatic;
+  assert.equal(one.phase, 'unlocked'); assert.equal(one.busy, false); assert.equal(two.busy, false);
+  assert.notEqual(one, two); assert.notEqual(one.history, two.history);
+  assert.equal(fixture.snapshots, states.length + 2);
+  scheduler.advance(200);
+  assert.equal(fixture.snapshots, states.length + 2);
+  assert.equal(states.at(-1).busy, false); assert.equal(reads, 1);
+  await service.close();
+});
+
+test('manual refresh never returns history captured before a lock', async () => {
+  const { service, scheduler, states } = serviceFixture();
+  service.connectClient(); const gate = refreshGate();
+  service.history = [{ txid: 'previous-private-history' }];
+  service.refreshInternal = async () => { await gate.promise; };
+  const pending = service.refresh();
+  await service.lock(); const lockedIndex = states.length;
+  gate.resolve(); const result = await pending;
+  assert.equal(result.phase, 'locked'); assert.equal(result.wallet, null); assert.equal(result.busy, false);
+  assert.deepEqual(result.history, []);
+  scheduler.advance(1000);
+  assert.ok(states.slice(lockedIndex).every(state => state.phase === 'locked' && state.history.length === 0));
+  await service.close();
+});
+
+test('an old completion cannot clear a replacement connection read or return its old snapshot', async () => {
+  const { service } = serviceFixture(); service.connectClient();
+  const firstGate = refreshGate(), secondGate = refreshGate();
+  service.refreshInternal = async () => { await firstGate.promise; };
+  const first = service.refresh(), oldOperation = service.refreshing;
+  service.epoch++; service.connectClient();
+  service.network.height = 123; service.history = [{ txid: 'replacement-history' }];
+  service.refreshInternal = async () => { await secondGate.promise; };
+  const second = service.refresh(), replacementOperation = service.refreshing;
+  assert.notEqual(replacementOperation, oldOperation);
+  firstGate.resolve(); const oldCallerResult = await first;
+  assert.equal(service.refreshing, replacementOperation);
+  assert.equal(oldCallerResult.securityEpoch, service.epoch);
+  assert.equal(oldCallerResult.busy, true); assert.equal(oldCallerResult.network.height, 123);
+  assert.equal(oldCallerResult.history[0].txid, 'replacement-history');
+  secondGate.resolve(); assert.equal((await second).busy, false);
+  assert.equal(service.refreshing, null);
+  await service.close();
+});
+
+test('a shared refresh failure reaches every caller without constructing return snapshots', async () => {
+  const fixture = serviceFixture(), { service, states } = fixture;
+  service.connectClient(); const gate = refreshGate(), error = new Error('isolated refresh failure');
+  service.refreshInternal = async () => { await gate.promise; };
+  service.walletUpdateRevision++;
+  const automatic = service.walletUpdates.run(), manual = service.refresh();
+  const automaticRejected = assert.rejects(automatic, value => value === error);
+  const manualRejected = assert.rejects(manual, value => value === error);
+  gate.reject(error); await Promise.all([automaticRejected, manualRejected]);
+  assert.equal(service.refreshing, null); assert.equal(service.error, error.message);
+  assert.equal(fixture.snapshots, states.length);
+  assert.ok(service.walletReadRevision < service.walletUpdateRevision, 'failed work must not acknowledge its notification revision');
+  await service.close();
+});
+
+function addressRotationFixture() {
+  const fixture = serviceFixture(), { service } = fixture;
+  const calls = { persisted: 0, refreshed: 0, requested: 0 };
+  service.persist = async () => { calls.persisted++; };
+  service.refresh = async () => { calls.refreshed++; };
+  service.walletUpdates = { request() { calls.requested++; }, close() {} };
+  service.buildAccounts = async () => {
+    const index = service.session.data.receiveIndex;
+    service.accounts = [
+      { change: 1, index, address: 'change-address' },
+      { change: 0, index: index - 1, address: 'previous-address' },
+      { change: 0, index, address: `receive-address-${index}` },
+    ];
+  };
+  service.makeQR = async () => { service.qrDataUrl = `current-qr-${service.session.data.receiveIndex}`; };
+  return { fixture, calls };
+}
+
+test('address rotation returns the current address and QR without constructing an unused full snapshot', async () => {
+  const { fixture, calls } = addressRotationFixture(), { service, scheduler, states } = fixture;
+  service.history = Array.from({ length: 1000 }, (_, i) => ({ txid: `history-${i}` }));
+  const result = await service.newAddress();
+  assert.deepEqual(result, { address: 'receive-address-1', qrDataUrl: 'current-qr-1' });
+  assert.deepEqual(calls, { persisted: 1, refreshed: 1, requested: 1 });
+  assert.equal(fixture.snapshots, states.length, 'only state publications may project the history');
+  assert.equal(states.at(-1).wallet.address, result.address);
+  assert.equal(states.at(-1).wallet.qrDataUrl, result.qrDataUrl);
+  scheduler.advance(200);
+  assert.equal(fixture.snapshots, states.length);
+  await service.close();
+});
+
+test('address rotation cannot return an earlier address after locking during QR generation', async () => {
+  const { fixture, calls } = addressRotationFixture(), { service } = fixture;
+  const entered = refreshGate(), finish = refreshGate();
+  service.makeQR = async () => { entered.resolve(); await finish.promise; };
+  const pending = service.newAddress();
+  const rejected = assert.rejects(pending, /Wallet locked or changed/);
+  await entered.promise; await service.lock(); finish.resolve(); await rejected;
+  assert.equal(service.qrDataUrl, null); assert.deepEqual(service.accounts, []);
+  assert.equal(calls.refreshed, 0);
+  await service.close();
+});
+
+test('address rotation rechecks the session if a state listener locks it before the reply', async () => {
+  const { fixture } = addressRotationFixture(), { service } = fixture;
+  let locking;
+  service.on('state', state => { if (state.phase === 'unlocked') locking = service.lock(); });
+  await assert.rejects(service.newAddress(), /Wallet locked or changed/);
+  await locking;
+  assert.equal(service.session, null); assert.equal(service.qrDataUrl, null);
+  await service.close();
+});
+
+function referenceHistoryProjection(service) {
+  return service.session ? service.history.map(row => ({ ...row,
+    ...(service.confirmationTip && !service.confirmationsStale && row.status === 'confirmed' &&
+      Number.isSafeInteger(row.blockHeight) && row.blockHeight >= 0 && row.blockHeight <= service.confirmationTip.height
+      ? { confirmations: service.confirmationTip.height - row.blockHeight + 1 } : {}),
+    ...service.session.data.paymentDetails?.[row.txid] })) : [];
+}
+
+test('history display projection matches the original fields and ordering for every confirmation guard', async () => {
+  const { service } = serviceFixture();
+  const rows = [];
+  for (const status of ['confirmed', 'pending']) {
+    for (const blockHeight of [undefined, null, -1, 0, 90, 100, 101, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const row = { txid: `projection-${rows.length}`, direction: 'received', amount: '1', status };
+      if (blockHeight !== undefined) row.blockHeight = blockHeight;
+      if (rows.length % 2) row.confirmations = rows.length;
+      rows.push(Object.freeze(row));
+    }
+  }
+  service.history = Object.freeze(rows);
+  const original = structuredClone(rows);
+  for (const confirmationTip of [null, { height: 100 }]) {
+    for (const stale of [false, true]) {
+      for (const annotated of [false, true]) {
+        service.confirmationTip = confirmationTip; service.confirmationsStale = stale;
+        service.session.data.paymentDetails = annotated ? Object.freeze(Object.fromEntries(rows.filter((_, index) => index % 3 === 0)
+          .map(row => [row.txid, Object.freeze({ label: `label-${row.txid}`, message: 'saved note' })]))) : undefined;
+        const expected = referenceHistoryProjection(service), actual = service.getState().history;
+        assert.deepEqual(actual, expected);
+        assert.deepEqual(actual.map(Object.keys), expected.map(Object.keys), 'property ordering and absent fields remain unchanged');
+      }
+    }
+  }
+  assert.deepEqual(service.history, original);
+  await service.close();
+});
+
+test('history projections preserve annotation precedence without sharing mutable row envelopes', async () => {
+  const { service } = serviceFixture();
+  service.history = Object.freeze([
+    Object.freeze({ txid: 'plain-row', status: 'confirmed', blockHeight: 90, confirmations: 1 }),
+    Object.freeze({ txid: 'annotated-row', status: 'confirmed', blockHeight: 90, confirmations: 1 }),
+  ]);
+  // Keep the exact existing final-spread semantics even if an internal test or
+  // future annotation schema supplies a field also present in the projection.
+  const detail = Object.freeze({ label: 'saved label', confirmations: 77 });
+  service.session.data.paymentDetails = Object.freeze({ 'annotated-row': detail });
+  service.confirmationTip = { height: 100 };
+  const first = service.getState(), second = service.getState();
+  assert.deepEqual(first.history, referenceHistoryProjection(service));
+  assert.equal(first.history[0].confirmations, 11); assert.equal(first.history[1].confirmations, 77);
+  assert.notEqual(first.history, second.history);
+  for (let index = 0; index < first.history.length; index++) {
+    assert.notEqual(first.history[index], service.history[index]);
+    assert.notEqual(first.history[index], second.history[index]);
+    first.history[index].confirmations = -1;
+    first.history[index].label = 'changed by caller';
+  }
+  assert.equal(second.history[0].confirmations, 11); assert.equal(second.history[1].label, 'saved label');
+  assert.equal(service.history[0].confirmations, 1); assert.equal(detail.label, 'saved label');
+  assert.deepEqual(service.getState().history, second.history);
+  await service.close();
+});
+
+test('history display projection does not cache confirmations across stale tips, fresh tips or locks', async () => {
+  const { service } = serviceFixture();
+  service.history = [{ txid: 'confirmed-row', status: 'confirmed', blockHeight: 90, confirmations: 2 },
+    { txid: 'pending-row', status: 'pending', blockHeight: null, confirmations: 0 }];
+  service.confirmationTip = { height: 100 };
+  const first = service.getState().history;
+  assert.deepEqual(first.map(row => row.confirmations), [11, 0]);
+  service.confirmationsStale = true;
+  assert.deepEqual(service.getState().history.map(row => row.confirmations), [2, 0]);
+  service.confirmationsStale = false; service.confirmationTip = { height: 101 };
+  assert.deepEqual(service.getState().history.map(row => row.confirmations), [12, 0]);
+  assert.deepEqual(first.map(row => row.confirmations), [11, 0]);
+  await service.lock();
+  assert.deepEqual(service.getState().history, []);
+  await service.close();
+});
+
+test('history projection retains the complete row order without truncation', async () => {
+  const { service } = serviceFixture();
+  service.history = Array.from({ length: 10001 }, (_, index) => ({ txid: `history-${index}`, status: 'confirmed', blockHeight: index, confirmations: 1 }));
+  service.confirmationTip = { height: 10001 };
+  const result = service.getState().history;
+  assert.equal(result.length, 10001);
+  assert.deepEqual(result, referenceHistoryProjection(service));
+  assert.equal(result[0].txid, 'history-0'); assert.equal(result.at(-1).txid, 'history-10000');
+  await service.close();
+});

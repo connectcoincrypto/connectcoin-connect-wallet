@@ -41,6 +41,10 @@ export class WalletSession {
   // Return true only when an explicit reset or detectable replacement needs reads.
   observeTip(value, { reset = false } = {}) {
     const tip = validateTip(value), previous = this.displayTip ?? this.state.balance?.tip ?? this.state.tip;
+    // Duplicate subscription hints still pass full tip validation. Only avoid
+    // repeating the identical display publication: connected/address handling
+    // in LiveBalance remains responsible for its independent journal catch-up.
+    if (!reset && this.displayTip && sameTip(this.displayTip, tip)) return false;
     const replaced = previous && (tip.height < previous.height || tip.height === previous.height && !sameTip(previous, tip));
     if (reset || replaced) {
       // Duplicate reset hints must not continually cancel the replacement read.
@@ -97,13 +101,33 @@ export class WalletSession {
     this.pendingRefreshes++;
     this.state.busy = true; this.state.error = ''; this.emit();
     const current = () => generation === this.generation && this.active && this.connected;
+    const checkKnownTip = tip => {
+      // Reusing a block hash must never change its immutable metadata, even
+      // when both independent responses repeat the same contradictory value.
+      if ([this.state.balance?.tip, this.state.tip, this.displayTip].some(previous =>
+        previous?.hash === tip.hash && !sameTip(previous, tip))) {
+        throw Object.assign(new Error('Contradictory block metadata'), { code: '-32011' });
+      }
+    };
     try {
-      const tip = validateTip(await this.query('getchaintip', {}));
-      if (!current()) return false;
+      // A fresh balance/history response already includes its validated tip.
+      // Only pagination needs a preflight: reject a stale cursor before asking
+      // for up to 500 rows which cannot be combined with the loaded history.
+      let tip = null;
+      if (more) {
+        tip = validateTip(await this.query('getchaintip', {}));
+        if (!current()) return false;
+        if (!sameTip(this.state.tip, tip)) {
+          this.state.cursor = null;
+          this.state.historyStale = true;
+          this.state.stale = true;
+          throw Object.assign(new Error('History tip changed'), { code: '-32011' });
+        }
+      }
       if (balanceOnly) {
         const balance = validateBalance(await this.query('getaddressbalance', { address }), address);
         if (!current()) return false;
-        if (!sameTip(balance.tip, tip)) throw Object.assign(new Error('Balance tip changed'), { code: '-32011' });
+        tip = balance.tip; checkKnownTip(tip);
         // A manual/lightweight read can discover a replacement before the tip
         // stream does. Do not project old history onto that different branch.
         // A merely newer display tip during this read is not itself a rollback.
@@ -121,12 +145,6 @@ export class WalletSession {
         this.acceptReadTip(tip);
         return true;
       }
-      if (more && !sameTip(this.state.tip, tip)) {
-        this.state.cursor = null;
-        this.state.historyStale = true;
-        this.state.stale = true;
-        throw Object.assign(new Error('History tip changed'), { code: '-32011' });
-      }
       // Wait for both physical reads even if one fails. Otherwise a scheduler
       // could start another refresh while the sibling request is still live.
       const results = await Promise.allSettled([
@@ -139,6 +157,8 @@ export class WalletSession {
       const [balanceResult, historyResult] = results.map(result => result.value);
       const balance = validateBalance(balanceResult, address);
       const history = validateHistory(historyResult, address);
+      if (!tip) tip = balance.tip;
+      checkKnownTip(tip);
       // Separate RPC calls are not an atomic snapshot. Avoid combining blocks
       // or paginating through a reorg; the user can refresh without a retry loop.
       if (!sameTip(balance.tip, tip) || !sameTip(history.tip, tip)) {
@@ -151,9 +171,10 @@ export class WalletSession {
       }
       let rows = mergeHistory(more ? this.state.history : [], history.items), nextCursor = history.next_cursor;
       const cursors = new Set(cursor ? [cursor] : []);
+      let accumulated = null;
       // Revalidate the loaded portion on address events without discarding it
       // after the first page. Bound requests and publish only a consistent set.
-      for (let pages = 1; rows.length < wantedRows && nextCursor && pages < 20; pages++) {
+      for (let pages = 1; (accumulated?.size ?? rows.length) < wantedRows && nextCursor && pages < 20; pages++) {
         if (cursors.has(nextCursor)) throw Object.assign(new Error('Repeated history cursor'), { code: '-32011' });
         cursors.add(nextCursor);
         const page = validateHistory(await this.query('getaddresshistory', { address, cursor: nextCursor }), address);
@@ -161,7 +182,19 @@ export class WalletSession {
         if (!sameTip(page.tip, tip) || page.next_cursor && cursors.has(page.next_cursor)) {
           throw Object.assign(new Error('History tip changed'), { code: '-32011' });
         }
-        rows = mergeHistory(rows, page.items); nextCursor = page.next_cursor;
+        // These pages are freshly validated private copies. Retain last-wins
+        // duplicates without revalidating/copying/sorting all prior pages on
+        // each iteration; the complete merge still validates before publication.
+        accumulated ??= new Map(rows.map(row => [row.txid, row]));
+        for (const row of page.items) accumulated.set(row.txid, row);
+        nextCursor = page.next_cursor;
+      }
+      if (accumulated) {
+        const collected = [...accumulated.values()];
+        // Before the last page there are fewer than 2000 unique rows; one page
+        // adds at most 500. Keep each merge input within its original limit and
+        // let the unchanged final ordering/truncation select the same 2000.
+        rows = mergeHistory(collected.slice(0, 2000), collected.slice(2000));
       }
       if (rows.length < wantedRows && nextCursor) throw Object.assign(new Error('History reload exceeded its page limit'), { code: '-32011' });
       this.state = { ...this.state, balance, tip, history: rows, cursor: rows.length >= 2000 ? null : nextCursor,

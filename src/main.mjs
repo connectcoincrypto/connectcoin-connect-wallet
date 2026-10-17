@@ -171,7 +171,7 @@ else {
           if (SERVICE_METHODS.has(method)) value = await service[method](payload);
           else if (method === 'copyAddress') {
             service.assertSession(); const epoch = service.epoch;
-            const address = service.getState().wallet.address;
+            const { address } = service.paymentRequestUri();
             if (!address) throw new Error('No receive address is available.');
             try { await clipboard.writeText(address); }
             catch { throw new Error('Could not copy the address. Please try again.'); }

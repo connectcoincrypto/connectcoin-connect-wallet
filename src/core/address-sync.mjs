@@ -10,6 +10,14 @@ const plain = value => value !== null && typeof value === 'object' && !Array.isA
   [null, Object.prototype].includes(Object.getPrototypeOf(value));
 const invalid = () => new Error('RPC returned an invalid address synchronization response.');
 export const addressSyncStale = () => Object.assign(new Error('Address synchronization snapshot must be refreshed.'), { code: -32011 });
+function sameTip(left, right) {
+  if (left.hash !== right.hash) return false;
+  // A hash identifies the complete header. Matching only its hash must not
+  // authorize reuse when the server contradicts its height or median time.
+  if (left.height !== right.height || left.mediantime !== right.mediantime ||
+      left.chain !== right.chain || left.genesis_hash !== right.genesis_hash) throw invalid();
+  return true;
+}
 function money(value, signed = false) {
   if (typeof value !== 'string' || !/^-?\d{1,19}$/.test(value)) throw invalid();
   const amount = BigInt(value);
@@ -37,6 +45,13 @@ export function syncUtxoRow(row) {
       (row.pending_spent_by !== null && !hash(row.pending_spent_by)) || (row.status === 'pending' && row.coinbase)) throw invalid();
   return { ...result, vout: row.vout, amount: money(row.amount).toString(), coinbase: row.coinbase, mature: row.mature, pending_spent_by: row.pending_spent_by };
 }
+// Compare only fully validated, normalized rows. All canonical fields count,
+// including confirmations and spend/maturity markers; a repeated event still
+// has to pass every journal check and advance its private cursor below.
+function sameRow(previous, item) {
+  return previous !== undefined && Object.keys(previous).length === Object.keys(item).length &&
+    Object.keys(item).every(key => previous[key] === item[key]);
+}
 export function addressSetKey(addresses) { return [...new Set(addresses)].sort().join('\n'); }
 function response(value, network) {
   if (!plain(value) || value.unit !== 'connects' || !Array.isArray(value.changes) || value.changes.length > 500 ||
@@ -54,6 +69,7 @@ export async function beginAddressSync({ rpc, network, addresses, check }) {
     check(); const batch = sorted.slice(offset, offset + 100);
     const result = response(await rpc.request('getaddresschanges', { addresses: batch }), network); check();
     if (result.changes.length || result.has_more) throw invalid();
+    if (state.tip) sameTip(state.tip, result.tip);
     state.batches.push({ addresses: batch, cursor: result.next_cursor, throughSequence: result.through_sequence, journalEpoch: result.journal_epoch, tip: result.tip }); state.tip = result.tip;
   }
   return state;
@@ -61,15 +77,20 @@ export async function beginAddressSync({ rpc, network, addresses, check }) {
 export function setAddressBaseline(state, address, { history, utxos }) {
   const target = state.addresses.get(address);
   if (!target || !Array.isArray(history) || !Array.isArray(utxos) || history.length > MAX_ROWS_PER_ADDRESS || utxos.length > MAX_ROWS_PER_ADDRESS) throw invalid();
+  // Baseline merges can also target a state whose maps are shared with a
+  // previously published sibling. Validate the entire merge before replacing
+  // this state's outer map; a bad final row must not leak earlier mutations.
+  const next = { ...state }, writableRows = copyOnWriteRows(next);
   for (const raw of history) {
     const row = syncHistoryRow(raw);
     // A live baseline can contain a row twice while it changes from pending to confirmed.
-    target.history.set(row.txid, row);
+    writableRows(address, 'history').set(row.txid, row);
   }
   for (const raw of utxos) {
-    const row = syncUtxoRow(raw); target.utxos.set(`${row.txid}:${row.vout}`, row);
+    const row = syncUtxoRow(raw); writableRows(address, 'utxos').set(`${row.txid}:${row.vout}`, row);
   }
-  checkSize(state);
+  checkSize(next);
+  state.addresses = next.addresses;
 }
 function checkSize(state) {
   let total = 0;
@@ -80,12 +101,30 @@ function checkSize(state) {
   if (total > MAX_TOTAL_ROWS) throw new Error('Address synchronization exceeds this release’s local resource limit.');
 }
 function cloneState(state) {
-  return { ...state, batches: state.batches.map(batch => ({ ...batch })),
-    addresses: new Map([...state.addresses].map(([address, rows]) => [address, { history: new Map(rows.history), utxos: new Map(rows.utxos) }])) };
+  // Cursors are always private. Address rows remain shared until a validated
+  // event needs to write; empty pages do not copy the entire wallet history.
+  return { ...state, batches: state.batches.map(batch => ({ ...batch })) };
+}
+function copyOnWriteRows(state) {
+  const owned = new Map();
+  return (address, kind) => {
+    let kinds = owned.get(address);
+    if (!kinds) {
+      if (!owned.size) state.addresses = new Map(state.addresses);
+      const previous = state.addresses.get(address);
+      if (!previous) throw invalid();
+      state.addresses.set(address, { ...previous });
+      kinds = new Set(); owned.set(address, kinds);
+    }
+    const rows = state.addresses.get(address);
+    if (!kinds.has(kind)) { rows[kind] = new Map(rows[kind]); kinds.add(kind); }
+    return rows[kind];
+  };
 }
 /** Apply into a private candidate. No published cache/cursor changes before every page validates. */
 export async function updateAddressSync(state, { rpc, check }) {
   const next = cloneState(state); let eventCount = 0;
+  const writableRows = copyOnWriteRows(next);
   let pending = next.batches;
   for (let round = 0; round < 3; round++) {
    for (const batch of pending) {
@@ -96,7 +135,8 @@ export async function updateAddressSync(state, { rpc, check }) {
       cursors.add(batch.cursor);
       const result = response(await rpc.request('getaddresschanges', { addresses: batch.addresses, cursor: batch.cursor }), state.network); check();
       if (result.journal_epoch !== batch.journalEpoch) throw addressSyncStale();
-      if (frozenTip && (result.tip.hash !== frozenTip.hash || result.through_sequence !== frozenSequence)) throw addressSyncStale();
+      sameTip(batch.tip, result.tip);
+      if (frozenTip && (!sameTip(result.tip, frozenTip) || result.through_sequence !== frozenSequence)) throw addressSyncStale();
       if (result.through_sequence < batch.throughSequence) throw invalid();
       frozenTip = result.tip; frozenSequence = result.through_sequence;
       if ((result.has_more && !result.changes.length) || (result.changes.length && result.next_cursor === batch.cursor)) throw invalid();
@@ -105,16 +145,16 @@ export async function updateAddressSync(state, { rpc, check }) {
             !['history', 'utxo'].includes(event.kind) || !['upsert', 'remove'].includes(event.action) || !hash(event.txid)) throw invalid();
         previousSequence = event.sequence;
         if (++eventCount > 100000) throw new Error('Address synchronization exceeds this release’s local resource limit.');
-        const target = next.addresses.get(event.address)[event.kind === 'history' ? 'history' : 'utxos'];
+        const kind = event.kind === 'history' ? 'history' : 'utxos';
         if (event.kind === 'utxo' && (!Number.isInteger(event.vout) || event.vout < 0 || event.vout > 0xffffffff)) throw invalid();
         const key = event.kind === 'history' ? event.txid : `${event.txid}:${event.vout}`;
         if (event.action === 'remove') {
           if (event.item !== undefined) throw invalid();
-          target.delete(key);
+          if (next.addresses.get(event.address)[kind].has(key)) writableRows(event.address, kind).delete(key);
         } else {
           const item = event.kind === 'history' ? syncHistoryRow(event.item) : syncUtxoRow(event.item);
           if (item.txid !== event.txid || (event.kind === 'utxo' && item.vout !== event.vout)) throw invalid();
-          target.set(key, item);
+          if (!sameRow(next.addresses.get(event.address)[kind].get(key), item)) writableRows(event.address, kind).set(key, item);
         }
       }
       batch.cursor = result.next_cursor;
@@ -124,7 +164,7 @@ export async function updateAddressSync(state, { rpc, check }) {
    // Tip equality alone is insufficient: a mempool transfer between two
    // address batches must not count both its old inputs and its new outputs.
    const latest = pending.at(-1);
-   pending = next.batches.filter(batch => batch.tip.hash !== latest.tip.hash || batch.throughSequence !== latest.throughSequence || batch.journalEpoch !== latest.journalEpoch);
+   pending = next.batches.filter(batch => !sameTip(batch.tip, latest.tip) || batch.throughSequence !== latest.throughSequence || batch.journalEpoch !== latest.journalEpoch);
    checkSize(next); check();
    if (!pending.length) return next;
   }
@@ -149,7 +189,15 @@ export function addressSyncSnapshot(state, accounts) {
     for (const row of value.history.values()) {
       const count = confirmations(row), existing = history.get(row.txid);
       if (existing && (existing.status !== row.status || existing.block_height !== row.block_height || existing.block_hash !== row.block_hash)) throw addressSyncStale();
-      history.set(row.txid, { ...row, confirmations: count, net: (existing?.net ?? 0n) + money(row.balance_delta, true) });
+      const net = (existing?.net ?? 0n) + money(row.balance_delta, true);
+      if (existing) {
+        // This accumulator belongs only to this unpublished projection. The
+        // normalized row's txid/location are already equal; retain the latest
+        // address's amounts without copying those immutable fields again.
+        existing.received = row.received; existing.spent = row.spent;
+        existing.balance_delta = row.balance_delta;
+        existing.confirmations = count; existing.net = net;
+      } else history.set(row.txid, { ...row, confirmations: count, net });
     }
     for (const row of value.utxos.values()) {
       const count = confirmations(row), mature = !row.coinbase || count >= 100, amount = money(row.amount);

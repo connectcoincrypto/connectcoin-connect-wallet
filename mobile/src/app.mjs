@@ -11,9 +11,10 @@ import { formatConn, parseMainnetAddress } from './model.mjs';
 import { createReceiveRequest, RECEIVE_METADATA_NOTICE } from './receive-request.mjs';
 import { parsePaymentIntake } from './payment-intake.mjs';
 import { createP2CRequest } from './p2c-request.mjs';
-import { availableSendAmount, createSendRequest } from './send-request.mjs';
+import { availableSendAmount, createSendRequest, fundingSelectionIsCurrent } from './send-request.mjs';
 import { DEFAULT_CLAIMS_POLICY, DEFAULT_CLAIMS_LIMITS, evaluateClaimsPolicy, parseClaimsLimits } from './claims-policy.mjs';
-import { HdWalletSession, nativeHdAccounts } from './hd-session.mjs';
+import { HdWalletSession } from './hd-session.mjs';
+import { NativePublicScope, hasVerifiedWalletSnapshot } from './native-public-scope.mjs';
 import { hdRecoveryStatus } from './hd-recovery-status.mjs';
 import { LiveBalance } from './live-balance.mjs';
 import { nativeActionState, nativeControlState } from './native-controls.mjs';
@@ -22,11 +23,13 @@ import { parsePaymentBatch, parsePaymentBatchResponse, parsePaymentBatchDismissa
 import { claimsErrorText } from './claims-diagnostics.mjs';
 import { claimsStatusText } from './claims-status.mjs';
 import { createTransactionDetails } from './transaction-details.mjs';
+import { createHistoryRenderer } from './history-renderer.mjs';
 import { DEFAULT_SETTINGS, parseSettings, rpcEndpoint, resolvedTheme } from './settings.mjs';
 import { nativeCapabilities } from './platform.mjs';
 import './styles.css';
 
 const $ = id => document.getElementById(id);
+const renderHistory = createHistoryRenderer($('history'));
 const platform = Capacitor.getPlatform();
 const capabilities = nativeCapabilities(platform);
 const native = capabilities.wallet;
@@ -51,6 +54,7 @@ let paymentPasteErrorTimer, paymentPasteRevision = 0;
 let scanningPayment = false, scanRevision = 0, pendingPayment = null;
 let readingPaymentLink = false, paymentLinkDirty = false, paymentInputErrorTimer;
 let nativeAccountKey = '', watchCoverage = null;
+const publicScope = new NativePublicScope();
 let settings = { ...DEFAULT_SETTINGS }, settingsKnown = false, settingsOpen = false, settingsDirty = false, settingsApplying = false;
 let walletSecurityStatusTimer;
 let endpointSwitching = false, activeRpcEndpoint = rpcEndpoint(DEFAULT_SETTINGS);
@@ -87,30 +91,38 @@ function applyTheme() {
 themePreference.addEventListener('change', applyTheme);
 applyTheme();
 
+// Settings are rendered during native status polls too. Compare the live DOM,
+// not a retained settings snapshot: real edits and availability changes still
+// get applied, while identical values keep their text nodes and input state.
+function setSettingsProperty(id, property, value) {
+  const element = $(id);
+  if (element[property] !== value) element[property] = value;
+}
+
 function renderSettings() {
   if (settingsKnown && !settingsDirty && !settingsApplying) {
-    $('settings-theme').value = settings.theme;
-    $('settings-lock-mode').value = settings.autoLockMinutes === 0 ? 'never' : 'timer';
-    $('settings-lock-minutes').value = String(settings.autoLockMinutes || 5);
-    $('settings-rpc-host').value = settings.rpcHost;
-    $('settings-rpc-port').value = String(settings.rpcPort);
+    setSettingsProperty('settings-theme', 'value', settings.theme);
+    setSettingsProperty('settings-lock-mode', 'value', settings.autoLockMinutes === 0 ? 'never' : 'timer');
+    setSettingsProperty('settings-lock-minutes', 'value', String(settings.autoLockMinutes || 5));
+    setSettingsProperty('settings-rpc-host', 'value', settings.rpcHost);
+    setSettingsProperty('settings-rpc-port', 'value', String(settings.rpcPort));
   }
-  $('settings-lock-minutes-row').hidden = $('settings-lock-mode').value !== 'timer';
+  setSettingsProperty('settings-lock-minutes-row', 'hidden', $('settings-lock-mode').value !== 'timer');
   for (const id of ['settings-theme', 'settings-lock-mode', 'settings-lock-minutes', 'settings-rpc-host', 'settings-rpc-port', 'settings-default-server']) {
-    $(id).disabled = !settingsKnown || settingsApplying;
+    setSettingsProperty(id, 'disabled', !settingsKnown || settingsApplying);
   }
-  $('save-settings').disabled = !ready || !settingsKnown || !settingsDirty || settingsApplying || nativeBusy || scanningPayment || !environment.active;
-  $('save-settings').textContent = settingsApplying ? endpointSwitching ? 'Confirm in the native dialog…' : 'Saving…' : 'Save settings';
-  $('retry-settings').hidden = settingsKnown;
-  $('retry-settings').disabled = settingsApplying;
+  setSettingsProperty('save-settings', 'disabled', !ready || !settingsKnown || !settingsDirty || settingsApplying || nativeBusy || scanningPayment || !environment.active);
+  setSettingsProperty('save-settings', 'textContent', settingsApplying ? endpointSwitching ? 'Confirm in the native dialog…' : 'Saving…' : 'Save settings');
+  setSettingsProperty('retry-settings', 'hidden', settingsKnown);
+  setSettingsProperty('retry-settings', 'disabled', settingsApplying);
   const securityDisabled = !native || !ready || vault.exists !== true || nativeBusy || scanningPayment || settingsApplying || !environment.active;
-  $('change-wallet-password').disabled = securityDisabled;
-  $('view-recovery-phrase').disabled = securityDisabled;
-  $('change-wallet-password').textContent = nativeOperation === 'changePassword' ? 'Confirm in the native dialog…' : 'Change wallet password';
-  $('view-recovery-phrase').textContent = nativeOperation === 'viewRecoveryPhrase' ? 'Open in the native dialog…' : 'View recovery phrase';
-  $('wallet-security-help').textContent = !native ? 'Security and backup actions are available in the mobile app.'
+  setSettingsProperty('change-wallet-password', 'disabled', securityDisabled);
+  setSettingsProperty('view-recovery-phrase', 'disabled', securityDisabled);
+  setSettingsProperty('change-wallet-password', 'textContent', nativeOperation === 'changePassword' ? 'Confirm in the native dialog…' : 'Change wallet password');
+  setSettingsProperty('view-recovery-phrase', 'textContent', nativeOperation === 'viewRecoveryPhrase' ? 'Open in the native dialog…' : 'View recovery phrase');
+  setSettingsProperty('wallet-security-help', 'textContent', !native ? 'Security and backup actions are available in the mobile app.'
     : !vault.exists ? 'Create or import a wallet to manage its password and recovery phrase.'
-      : 'Authenticate in the native dialog to change your password or view your recovery phrase.';
+      : 'Authenticate in the native dialog to change your password or view your recovery phrase.');
 }
 
 function clearWalletSecurityStatus() {
@@ -146,6 +158,7 @@ function invalidateEndpoint(endpoint) {
   activeRpcEndpoint = endpoint;
   ++nativeStateRevision; ++watchRevision;
   watchedAccount = ''; watchingAccount = null; watchCoverage = null; nativeAccountKey = '';
+  publicScope.clear();
   liveBalance.pause();
   pendingPayment = null; useAllBalance = false; useAllFundingAddresses = null;
   transactionDetails.close({ restoreFocus: false });
@@ -158,7 +171,7 @@ function showSettings(open) {
   $('settings-panel').hidden = !open;
   $('open-settings').setAttribute('aria-expanded', String(open));
   transactionDetails.close({ restoreFocus: false });
-  render(session.state); renderSettings();
+  render(); // renderVault already updates settings in this synchronous frame.
   (open ? $('settings-title') : $('open-settings')).focus({ preventScroll: true });
   if (open) window.scrollTo({ top: 0 });
 }
@@ -287,14 +300,10 @@ const session = new HdWalletSession({
     if (!native) throw Object.assign(new Error('Native mobile app required'), { code: 'UNAVAILABLE' });
     if (endpointSwitching) throw Object.assign(new Error('Server is changing'), { code: 'RPC_INACTIVE' });
     const endpoint = activeRpcEndpoint;
-    const owned = new Set((vault.accountScope === 'hd-wallet' ? vault.accounts : [vault.account])?.map(item => item.address));
-    const requested = method === 'getaddresschanges' ? params.addresses : [params.address];
-    if (!vault.exists || !vault.account?.address ||
-        (method !== 'getchaintip' && (!Array.isArray(requested) || !requested.length || requested.some(address => !owned.has(address))))) {
-      throw Object.assign(new Error('Native wallet account required'), { code: 'RPC_INACTIVE' });
-    }
+    const scope = publicScope.authorize(method, params);
     const response = await wallet.queryPublic({ method, params });
     if (endpoint !== activeRpcEndpoint) throw Object.assign(new Error('Server changed'), { code: 'RPC_CANCELLED' });
+    publicScope.assertCurrent(scope);
     return response.result;
   },
   // Results are generation-guarded by WalletSession. Do not cancel the shared
@@ -396,7 +405,7 @@ async function loadPaymentBatch() {
     paymentBatchKnown = false;
     paymentBatchError = 'Could not load a valid saved payment result. Reload it before starting another payment.';
   } finally {
-    if (revision === paymentBatchRevision) { paymentBatchLoading = false; render(session.state); }
+    if (revision === paymentBatchRevision) { paymentBatchLoading = false; render(); }
   }
 }
 
@@ -456,21 +465,24 @@ function renderPaymentBatch() {
 function adoptNativeAccount(info) {
   // The native vault is the sole account authority. Never restore an address
   // from the removed public-profile preference or accept one from a form.
-  const address = native && info.exists === true && typeof info.account?.address === 'string'
-    ? parseMainnetAddress(info.account.address) : '';
-  if (address && address !== info.account.address) throw new Error('Invalid native wallet account.');
-  if (typeof info.rpcEndpoint === 'string' && info.rpcEndpoint !== activeRpcEndpoint) invalidateEndpoint(info.rpcEndpoint);
+  if (typeof info?.rpcEndpoint === 'string' && info.rpcEndpoint !== activeRpcEndpoint) invalidateEndpoint(info.rpcEndpoint);
+  let scope;
+  try { scope = publicScope.adopt(info, activeRpcEndpoint); }
+  catch (error) {
+    // Do not let a malformed poll authorize reads or keep funding actionable.
+    nativeAccountKey = ''; vault = { ...vault, locked: true };
+    session.disconnectWatch();
+    throw error;
+  }
+  const { address, identity, key } = scope;
   vault = info;
-  const identity = address ? walletId(info) : '';
   if (identity !== session.state.address) {
     $('wallet-file-status').textContent = ''; $('wallet-file-error').textContent = '';
     clearWalletSecurityStatus(); $('wallet-security-error').textContent = '';
   }
   // getState is polled for native lock/claims UI. Revalidate curve points only
   // when the public HD descriptor set changes, not once per second per address.
-  const key = JSON.stringify([info.accountScope, identity, info.account, info.accounts, info.hd?.complete, info.hd?.recovering]);
   if (key === nativeAccountKey) { void ensureAccountWatch(); return; }
-  if (address) nativeHdAccounts(info);
   nativeAccountKey = key;
   if (identity !== session.state.address) watchCoverage = null;
   watchedAccount = ''; ++watchRevision;
@@ -478,11 +490,13 @@ function adoptNativeAccount(info) {
   else {
     // Network refresh must not keep local unlock and Stop/Lock controls busy.
     void session.loadWallet(info)
-      .catch(() => { if (session.state.address === identity) $('global-error').textContent = 'Could not load your wallet account.'; })
+      .catch(() => { if (publicScope.isCurrent(scope) && session.state.address === identity) $('global-error').textContent = 'Could not load your wallet account.'; })
       .finally(() => {
-        // Initial history/tip failures resolve false rather than throwing. A
-        // balance-only catch-up must not depend on the separate watch ACK.
-        if (session.state.address === identity) liveBalance.request();
+        // Initial failures/cached/partial snapshots still need a fallback even
+        // without a watch ACK. A complete verified startup needs no extra read;
+        // pending connected/address hints are deliberately left untouched.
+        if (publicScope.isCurrent(scope) && session.state.address === identity &&
+            !hasVerifiedWalletSnapshot(session, scope)) liveBalance.request();
       });
   }
   void ensureAccountWatch();
@@ -558,20 +572,29 @@ function partialFundingAddresses() {
     new Set(addresses).size === addresses.length && addresses.every(address => verified.has(address)) ? addresses : null;
 }
 
-function canReviewBalance() {
+function canReviewBalance(partialFunds) {
   const state = session.state;
   if (state.cached || state.hdComplete === false) return false;
-  if (state.partial) return partialFundingAddresses() !== null;
+  // Render may reuse the result from this same synchronous frame. Actions omit
+  // the argument and always validate the CURRENT funding selection afresh.
+  if (state.partial) return (partialFunds === undefined ? partialFundingAddresses() : partialFunds) !== null;
   return !(state.scope === 'hd' && state.busy && !state.updatedAt);
 }
 
 function paymentFundingScope({ sweep = false } = {}) {
   const partial = partialFundingAddresses();
   const selected = sweep && useAllFundingAddresses ? [...useAllFundingAddresses] : partial;
-  if (session.state.partial && (!partial || selected?.some(address => !partial.includes(address)))) {
+  if (session.state.partial && (!partial || !fundingSelectionIsCurrent(partial, selected))) {
     throw new Error('Wait for the selected funds to be verified, then use the available balance again.');
   }
   return selected ? { fundingAddresses: selected } : {};
+}
+
+function renderPaymentProgress() {
+  $('send-progress').hidden = !nativeBusy || nativeOperation !== 'reviewPayment';
+  $('send-progress').textContent = nativeOperation === 'reviewPayment' && preparationProgress || 'Verifying funds and preparing the native confirmation… No funds are sent until you confirm.';
+  $('p2c-progress').hidden = !nativeBusy || nativeOperation !== 'reviewP2C';
+  $('p2c-progress').textContent = nativeOperation === 'reviewP2C' && preparationProgress || 'Verifying funds and checking the domain’s RSA-PSS support before native confirmation… No funds are sent until you confirm.';
 }
 
 function renderVault() {
@@ -622,14 +645,13 @@ function renderVault() {
   $('p2c-lock-wallet').hidden = $('lock-wallet').hidden;
   $('p2c-lock-wallet').textContent = $('lock-wallet').textContent;
   const partialFunds = partialFundingAddresses();
+  const reviewBalance = canReviewBalance(partialFunds);
   if (useAllFundingAddresses && (vault.locked || !owns || session.state.stale || session.state.cached ||
-      session.state.partial && (!partialFunds || useAllFundingAddresses.some(address => !partialFunds.includes(address))))) useAllBalance = false;
+      session.state.partial && (!partialFunds || !fundingSelectionIsCurrent(partialFunds, useAllFundingAddresses)))) useAllBalance = false;
   if (!useAllBalance) useAllFundingAddresses = null;
-  $('review-payment').disabled = !native || vault.locked || !owns || nativeBusy || recovering || !canReviewBalance() || paymentBatchBlocksPayment();
+  $('review-payment').disabled = !native || vault.locked || !owns || nativeBusy || recovering || !reviewBalance || paymentBatchBlocksPayment();
   if (scanningPayment) $('review-payment').disabled = true;
   $('review-payment').textContent = nativeBusy && nativeOperation === 'reviewPayment' ? 'Preparing payment…' : 'Review payment';
-  $('send-progress').hidden = !nativeBusy || nativeOperation !== 'reviewPayment';
-  $('send-progress').textContent = nativeOperation === 'reviewPayment' && preparationProgress || 'Verifying funds and preparing the native confirmation… No funds are sent until you confirm.';
   for (const id of ['send-address', 'send-amount', 'send-fee-rate', 'send-deduct-fees']) $(id).disabled = nativeBusy || scanningPayment || paymentBatchBlocksPayment();
   $('paste-payment').disabled = !native || nativeBusy || scanningPayment || vault.locked || paymentBatchBlocksPayment();
   $('scan-payment').disabled = !native || !ready || nativeBusy || scanningPayment || !environment.active || paymentBatchBlocksPayment();
@@ -655,15 +677,14 @@ function renderVault() {
   $('send-funding-hint').textContent = session.state.partial || useAllFundingAddresses
     ? 'Funds use only the selected verified addresses. Change uses a separate native change address. Pending conflicts require explicit native confirmation.'
     : 'Funds can use all recovered wallet addresses. Change uses a separate native change address. Pending conflicts require explicit native confirmation.';
-  $('review-p2c').disabled = !native || vault.locked || !owns || nativeBusy || recovering || !canReviewBalance() || paymentBatchBlocksPayment();
+  $('review-p2c').disabled = !native || vault.locked || !owns || nativeBusy || recovering || !reviewBalance || paymentBatchBlocksPayment();
   $('p2c-batch-notice').hidden = !paymentBatch && !paymentBatchError;
   $('p2c-balance-status').hidden = !session.state.partial;
   $('p2c-balance-status').textContent = !session.state.partial ? '' : partialFunds
     ? `Verified available balance: ${formatConn(session.state.balance.available_confirmed)} CONN · ${session.state.verifiedAddresses.length} / ${session.state.addressCount} addresses. This reward uses only those verified addresses.`
     : 'Waiting to verify the latest funding state…';
   $('review-p2c').textContent = nativeBusy ? 'Native operation in progress…' : 'Review P2C reward';
-  $('p2c-progress').hidden = !nativeBusy || nativeOperation !== 'reviewP2C';
-  $('p2c-progress').textContent = nativeOperation === 'reviewP2C' && preparationProgress || 'Verifying funds and checking the domain’s RSA-PSS support before native confirmation… No funds are sent until you confirm.';
+  renderPaymentProgress();
   for (const id of ['p2c-domain', 'p2c-amount', 'p2c-expected']) $(id).disabled = nativeBusy;
   fillPendingPaymentRequest();
 }
@@ -809,8 +830,7 @@ async function pollNative() {
   finally { polling = false; }
 }
 
-function render(state) {
-  state = session.getState();
+function render(state = session.getState()) {
   liveBalance.sync();
   const hasBatchResult = Boolean(paymentBatch || paymentBatchError);
   $('setup-panel').hidden = settingsOpen || Boolean(state.address) || hasBatchResult;
@@ -842,24 +862,8 @@ function render(state) {
   $('empty-history').textContent = state.updatedAt ? 'No activity in this history page.' : 'No history loaded yet.';
   $('load-more').hidden = !state.cursor;
   $('load-more').disabled = state.busy || !environment.active || !environment.connected;
-  const focusedTxid = document.activeElement?.closest('#history button[data-txid]')?.dataset.txid;
-  const rows = state.history.map(item => {
-    const row = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button'; button.className = 'history-transaction'; button.dataset.txid = item.txid;
-    button.setAttribute('aria-haspopup', 'dialog'); button.setAttribute('aria-controls', 'transaction-details');
-    const label = document.createElement('span');
-    label.textContent = BigInt(item.balance_delta) < 0n ? 'Sent' : BigInt(item.balance_delta) > 0n ? 'Received' : 'Transaction';
-    const amount = document.createElement('span'); amount.className = 'amount'; amount.textContent = `${formatConn(item.balance_delta)} CONN`;
-    const status = document.createElement('span'); status.className = 'state'; status.textContent = item.status === 'pending' ? 'Unconfirmed' : `${item.confirmations} confirmations`;
-    const txid = document.createElement('span'); txid.className = 'txid'; txid.textContent = item.txid;
-    const hint = document.createElement('span'); hint.className = 'history-details-hint'; hint.textContent = 'View details ›';
-    button.append(label, amount, status, hint, txid); row.append(button); return row;
-  });
-  $('history').replaceChildren(...rows);
-  if (focusedTxid) [...$('history').querySelectorAll('button[data-txid]')]
-    .find(button => button.dataset.txid === focusedTxid)?.focus({ preventScroll: true });
-  transactionDetails.render();
+  renderHistory(state.address, state.history);
+  transactionDetails.render({ ...state, confirmationsStale: session.confirmationsStale });
   $('history-limit').hidden = state.history.length < 2000;
   if (receiving !== receiveAddress) {
     receiveAddress = receiving;
@@ -1256,7 +1260,10 @@ async function start() {
   if (native) await wallet.addListener('paymentPreparation', event => {
     const text = paymentProgressText(event, { operation: nativeOperation, address: session.state.address,
       busy: nativeBusy, active: environment.active && !vault.locked });
-    if (text) { preparationProgress = text; renderVault(); }
+    // Progress can arrive for every verified parent transaction. It changes
+    // only these labels, not funding authority or native controls. Lifecycle,
+    // lock, wallet and balance handlers still perform their full render.
+    if (text) { preparationProgress = text; renderPaymentProgress(); }
   });
   if (native) await wallet.addListener('walletStateChanged', info => {
     // Inactivity locking is native. Reflect its locked state immediately and
@@ -1286,7 +1293,7 @@ async function start() {
   document.addEventListener('visibilitychange', () => {
     updateEnvironment({ active: !document.hidden });
   });
-  render(session.state);
+  render();
   await loadSettings();
   await pollNative();
   await loadPaymentBatch();

@@ -1,14 +1,29 @@
 import { WalletSession, publicError } from './session.mjs';
-import { formatConn, parseMainnetAddress, validateHistory, validateTip } from './model.mjs';
+import { parseMainnetAddress, validateHistory, validateTip } from './model.mjs';
 import { addressSetKey, addressSyncFromCheckpoints, setAddressBaseline, updateAddressSync, syncUtxoRow } from './hd-sync.mjs';
 import { readDisplayCache, createDisplayCache } from './hd-display-cache.mjs';
 
 const MAX_ACCOUNTS = 10000, MAX_ROWS = 200000, MAX_ADDRESS_ROWS = 20000, MAX_PAGES = 512;
 const COIN_LIMIT = 1_000_000_000_000_000_000n;
 export const HD_READ_CONCURRENCY = 16;
+export const HD_CACHE_HEARTBEAT_MS = 60000;
 const cancelled = () => Object.assign(new Error('Wallet changed.'), { code: 'RPC_CANCELLED' });
 const invalid = () => new Error('Could not verify the HD wallet snapshot.');
 const sameLocation = (a, b) => a.status === b.status && a.block_height === b.block_height && a.block_hash === b.block_hash;
+const sameProjectionTip = (a, b) => a.chain === b.chain && a.genesis_hash === b.genesis_hash &&
+  a.hash === b.hash && a.height === b.height && a.mediantime === b.mediantime;
+const sameAccount = (a, b) => a.address === b.address && a.index === b.index && a.change === b.change && a.path === b.path;
+
+function immutableSnapshot(snapshot) {
+  // hdSnapshot just allocated this projection and its rows/address arrays; it
+  // has not escaped to consumers. Freeze those owned objects without copying
+  // the complete history a second time. Only tip still belongs to the journal.
+  snapshot.balance.tip = Object.freeze({ ...snapshot.balance.tip });
+  Object.freeze(snapshot.balance);
+  for (const row of snapshot.history) { Object.freeze(row.addresses); Object.freeze(row); }
+  Object.freeze(snapshot.history); Object.freeze(snapshot.fundingAddresses);
+  return Object.freeze(snapshot);
+}
 
 function recoverySeeds(value, accounts, walletId) {
   const allowed = new Set(accounts.map(account => account.address)), pages = new Map(), checkpoints = [];
@@ -88,14 +103,19 @@ export function hdSnapshot(sync, accounts, walletId) {
     if (!rows) throw invalid();
     for (const row of rows.history.values()) {
       const previous = history.get(row.txid);
-      if (previous && !sameLocation(previous, row)) throw invalid();
+      if (previous && !sameLocation(previous.row, row)) throw invalid();
       const confirmations = row.status === 'confirmed' ? sync.tip.height - row.block_height + 1 : 0;
       if (confirmations < (row.status === 'confirmed' ? 1 : 0)) throw invalid();
-      history.set(row.txid, { ...row, confirmations,
-        received: ((previous ? BigInt(previous.received) : 0n) + BigInt(row.received)).toString(),
-        spent: ((previous ? BigInt(previous.spent) : 0n) + BigInt(row.spent)).toString(),
-        balance_delta: ((previous ? BigInt(previous.balance_delta) : 0n) + BigInt(row.balance_delta)).toString(),
-        addresses: [...(previous?.addresses ?? []), account.address] });
+      // Keep private accumulators until the complete wallet projection is
+      // ready. Re-parsing our own sums and copying the growing address list on
+      // every contribution makes a transaction shared by many keys quadratic.
+      const aggregate = previous ?? { received: 0n, spent: 0n, balance_delta: 0n, addresses: [] };
+      aggregate.received += BigInt(row.received);
+      aggregate.spent += BigInt(row.spent);
+      aggregate.balance_delta += BigInt(row.balance_delta);
+      aggregate.addresses.push(account.address);
+      aggregate.row = row; aggregate.confirmations = confirmations;
+      if (!previous) history.set(row.txid, aggregate);
     }
     for (const row of rows.utxos.values()) {
       const key = `${row.txid}:${row.vout}`, amount = BigInt(row.amount);
@@ -121,9 +141,19 @@ export function hdSnapshot(sync, accounts, walletId) {
   for (const [key, value] of Object.entries(totals)) {
     if (value > COIN_LIMIT || value < (key === 'pending_delta' ? -COIN_LIMIT : 0n)) throw invalid();
   }
-  const ordered = [...history.values()].sort((a, b) => a.status !== b.status ? (a.status === 'pending' ? -1 : 1)
+  const ordered = [...history.values()].map(aggregate => {
+    // Inputs have already been normalized by the journal/baseline validators.
+    // Their SUMS still need the monetary bounds formerly checked by formatConn.
+    // BigInt.toString produces the same canonical decimal representation; no
+    // decimal division/padding or discarded UI formatting is needed here.
+    for (const value of [aggregate.received, aggregate.spent, aggregate.balance_delta]) {
+      if (value > COIN_LIMIT || value < -COIN_LIMIT) throw invalid();
+    }
+    return { ...aggregate.row, confirmations: aggregate.confirmations,
+      received: aggregate.received.toString(), spent: aggregate.spent.toString(),
+      balance_delta: aggregate.balance_delta.toString(), addresses: aggregate.addresses };
+  }).sort((a, b) => a.status !== b.status ? (a.status === 'pending' ? -1 : 1)
     : (b.block_height ?? 0) - (a.block_height ?? 0) || a.txid.localeCompare(b.txid));
-  for (const row of ordered) for (const field of ['received', 'spent', 'balance_delta']) formatConn(row[field]);
   return { balance: { address: walletId, tip: sync.tip, unit: 'connects',
     ...Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, value.toString()])) }, history: ordered,
     fundingAddresses: [...fundingAddresses] };
@@ -137,6 +167,8 @@ export class HdWalletSession extends WalletSession {
     this.readRecoverySnapshots = options.readRecoverySnapshots ?? (async () => null);
     this.recoveryConsumed = false;
     this.hd = false; this.accounts = []; this.accountKey = ''; this.journal = null;
+    this.projection = null;
+    this.cacheContext = {}; this.cacheSaved = null; this.cachePending = null; this.cacheWriting = null;
     this.fullHistory = []; this.visibleRows = 500;
   }
   async loadWallet(info) {
@@ -184,10 +216,82 @@ export class HdWalletSession extends WalletSession {
     return super.clearAccount();
   }
   invalidate() {
+    this.projection = null;
+    // An already-started optional write cannot be cancelled. Keep that writer
+    // serialized, but never let its completion restore another context's cache
+    // identity or allow an old queued snapshot to reach the new endpoint.
+    this.cacheContext = {}; this.cacheSaved = null; this.cachePending = null;
     this.state.progress = null;
     this.state.verifiedAddresses = [];
     this.state.fundingAddresses = [];
     return super.invalidate();
+  }
+  project(sync, accounts, walletId) {
+    const prior = this.projection;
+    if (prior && prior.walletId === walletId &&
+        sameProjectionTip(prior.tip, sync.tip) && prior.accounts.length === accounts.length &&
+        accounts.every((account, index) => {
+          const rows = sync.addresses.get(account.address), saved = prior.accounts[index];
+          return sameAccount(saved.account, account) && rows?.history === saved.history && rows?.utxos === saved.utxos;
+        })) return prior.snapshot;
+    // This runs only AFTER complete journal validation/convergence. A missing
+    // address, changed map or different tip retains hdSnapshot's full checks.
+    const snapshot = immutableSnapshot(hdSnapshot(sync, accounts, walletId));
+    this.projection = { walletId, tip: { ...sync.tip }, snapshot,
+      accounts: accounts.map(account => ({ account: { ...account }, ...sync.addresses.get(account.address) })) };
+    return snapshot;
+  }
+  queueDisplayCache(snapshot, accounts, address, current) {
+    // One active write plus the newest pending public snapshot: slow native
+    // storage must not grow a queue on every address notification.
+    this.cachePending = { snapshot, accounts, address, current, context: this.cacheContext, state: { ...this.state } };
+    this.flushDisplayCache();
+  }
+  flushDisplayCache() {
+    if (this.cacheWriting) return;
+    this.cacheWriting = Promise.resolve().then(async () => {
+      while (this.cachePending) {
+        const job = this.cachePending; this.cachePending = null;
+        if (job.context !== this.cacheContext || !job.current()) continue;
+        let writeStarted = false;
+        try {
+          const previous = this.cacheSaved;
+          // updatedAt in the live view still advances for EVERY verified read.
+          // This display-only cache has no TTL and always restores as stale.
+          // Refresh its timestamp at most once/minute when content is unchanged,
+          // without a background timer or delaying genuinely changed content.
+          const recent = previous && job.state.updatedAt >= previous.updatedAt &&
+            job.state.updatedAt - previous.updatedAt < HD_CACHE_HEARTBEAT_MS;
+          if (recent && previous.snapshot === job.snapshot) continue;
+          const saved = createDisplayCache(job.state, job.accounts);
+          if (!saved) continue;
+          const content = JSON.stringify({ ...saved, updatedAt: 0 });
+          if (recent && previous.content === content) {
+            this.cacheSaved = { ...previous, snapshot: job.snapshot };
+            continue;
+          }
+          // Do not let an optional storage adapter mutate the identity used by
+          // deduplication after validation. Only these public fields are saved.
+          for (const row of saved.history) { Object.freeze(row.addresses); Object.freeze(row); }
+          Object.freeze(saved.history); Object.freeze(saved);
+          writeStarted = true;
+          await this.writeCache(job.address, saved);
+          if (job.context === this.cacheContext) this.cacheSaved = {
+            snapshot: job.snapshot, content, updatedAt: saved.updatedAt,
+          };
+        } catch {
+          // Storage can write successfully and still reject its acknowledgment.
+          // Its contents are then unknown: do not deduplicate against an older
+          // success, nor let an obsolete failure clear a new context's marker.
+          if (writeStarted && job.context === this.cacheContext) this.cacheSaved = null;
+        }
+      }
+    }).finally(() => {
+      this.cacheWriting = null;
+      // A reentrant completion can enqueue after the loop drained but before
+      // this finally runs. Do not strand that newest snapshot.
+      if (this.cachePending) this.flushDisplayCache();
+    });
   }
   getState() {
     return { ...super.getState(), verifiedAddresses: [...(this.state.verifiedAddresses ?? [])],
@@ -220,6 +324,9 @@ export class HdWalletSession extends WalletSession {
       checkpoints.push({ addresses, sync: await rpc.request('getaddresschanges', { addresses }) });
     }
     const candidate = addressSyncFromCheckpoints({ network: 'main', addresses: accounts.map(account => account.address), checkpoints });
+    // Baseline groups keep their original address identities throughout replay.
+    // Cache those keys once instead of sorting every group on every publication.
+    const candidateGroups = candidate.batches.map(batch => ({ batch, key: addressSetKey(batch.addresses) }));
     let totalRows = 0, completed = 0, publishing = false, lastPublished = 0, lastPublication = 0;
     const ready = new Set();
     let previousPartial = null, previouslyReady = new Set();
@@ -251,10 +358,10 @@ export class HdWalletSession extends WalletSession {
           // only addresses whose complete history AND UTXO pages were loaded.
           // Never advance candidate's cursors before the remaining baselines.
           const batches = [], rows = new Map(), initialBatches = [];
-          for (const original of candidate.batches) {
+          const retainedGroups = new Map((previousPartial?.batches ?? []).map(batch => [addressSetKey(batch.addresses), batch]));
+          for (const { batch: original, key: batchKey } of candidateGroups) {
             if (!original.addresses.some(item => selectedSet.has(item))) continue;
-            const batchKey = addressSetKey(original.addresses);
-            const retained = previousPartial?.batches.find(batch => addressSetKey(batch.addresses) === batchKey);
+            const retained = retainedGroups.get(batchKey);
             const unchanged = retained && original.addresses.every(item => selectedSet.has(item) === previouslyReady.has(item));
             batches.push(unchanged ? retained : original);
             for (const item of original.addresses) rows.set(item, (unchanged ? previousPartial : candidate).addresses.get(item));
@@ -287,10 +394,14 @@ export class HdWalletSession extends WalletSession {
         for (let pages = 0; ; pages++) {
           checkpoint();
           if (pages >= MAX_PAGES) throw new Error('This address exceeds the mobile history page limit. Its funds were not verified.');
-          const result = pages === 0 && kind === 'history' && seed ? seed : await rpc.request(method, {
+          // recoverySeeds owns a freshly normalized copy, validated before any
+          // baseline await. Reuse only that private first page; every physical
+          // RPC response (including continuations) still needs full validation.
+          const recovered = pages === 0 && kind === 'history' ? seed : null;
+          const result = recovered ?? await rpc.request(method, {
             address: account.address, ...(cursor ? { cursor } : {}), ...(kind === 'utxos' ? { include_pending_spent: true } : {}) });
           checkpoint();
-          const page = kind === 'history' ? validateHistory(result, account.address, { allowEmptyContinuation: true }) : utxoPage(result, account.address);
+          const page = recovered ?? (kind === 'history' ? validateHistory(result, account.address, { allowEmptyContinuation: true }) : utxoPage(result, account.address));
           rows.push(...page.items); totalRows += page.items.length;
           if (rows.length > MAX_ADDRESS_ROWS || totalRows > MAX_ROWS) throw new Error('Wallet history exceeds the mobile resource limit. Unverified funds were not included.');
           cursor = page.next_cursor;
@@ -308,12 +419,29 @@ export class HdWalletSession extends WalletSession {
       if (seeds.pages.size && String(error.code) === '-32011') error.recoveryBaselineExpired = true;
       throw error;
     }
-    return { candidate, reused: seeds.pages.size > 0 };
+    // A complete group in the last validated partial already has both its
+    // baseline and original journal replay. Retain those rows WITH their
+    // cursor/tip/epoch/sequence rather than downloading that replay again.
+    // Groups which gained even one ready address afterwards must start from
+    // their original checkpoint: the partial never verified that baseline.
+    let complete = candidate;
+    const retainedGroups = new Map((previousPartial?.batches ?? []).map(batch => [addressSetKey(batch.addresses), batch]));
+    for (let index = 0; index < candidateGroups.length; index++) {
+      const { batch, key } = candidateGroups[index], retained = retainedGroups.get(key);
+      if (!retained || !batch.addresses.every(item => previouslyReady.has(item))) continue;
+      if (complete === candidate) complete = { ...candidate, batches: [...candidate.batches], addresses: new Map(candidate.addresses) };
+      complete.batches[index] = retained;
+      for (const item of batch.addresses) complete.addresses.set(item, previousPartial.addresses.get(item));
+    }
+    // refresh still replays EVERY group and enforces final convergence/resource
+    // limits before this complete baseline can become the published journal.
+    return { candidate: complete, reused: seeds.pages.size > 0 };
   }
   async refresh(options = {}) {
     if (!this.hd) return super.refresh(options);
     if (!this.active || !this.connected || !this.state.hdComplete || this.state.busy || this.pendingRefreshes) return false;
-    if (options.more && this.state.cursor) {
+    if (options.more) {
+      if (!this.state.cursor) return false;
       this.generation++;
       this.visibleRows = Math.min(2000, this.visibleRows + 500);
       this.state.history = this.fullHistory.slice(0, this.visibleRows);
@@ -366,7 +494,7 @@ export class HdWalletSession extends WalletSession {
         candidate = await updateAddressSync(candidate, { rpc, check });
       }
       check();
-      const snapshot = hdSnapshot(candidate, accounts, address);
+      const snapshot = this.project(candidate, accounts, address);
       this.recoveryConsumed = true;
       this.journal = candidate; this.fullHistory = snapshot.history;
       this.state = { ...this.state, balance: snapshot.balance, tip: candidate.tip,
@@ -375,8 +503,7 @@ export class HdWalletSession extends WalletSession {
         historyStale: false, updatedAt: Date.now(), stale: false, error: '', cached: false, progress: null,
         partial: false, verifiedAddresses: accounts.map(account => account.address), fundingAddresses: snapshot.fundingAddresses };
       this.acceptReadTip(candidate.tip, { history: true });
-      const saved = createDisplayCache(this.state, accounts);
-      if (saved) void Promise.resolve().then(() => { if (current()) return this.writeCache(address, saved); }).catch(() => {});
+      this.queueDisplayCache(snapshot, accounts, address, current);
       return true;
     } catch (error) {
       if (current()) {

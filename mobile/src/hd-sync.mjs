@@ -40,6 +40,13 @@ export function syncUtxoRow(row) {
       (row.pending_spent_by !== null && !hash(row.pending_spent_by)) || (row.status === 'pending' && row.coinbase)) throw invalid();
   return { ...result, vout: row.vout, amount: money(row.amount).toString(), coinbase: row.coinbase, mature: row.mature, pending_spent_by: row.pending_spent_by };
 }
+// Compare only fully validated, normalized rows. All canonical fields count,
+// including confirmations and spend/maturity markers; a repeated event still
+// has to pass every journal check and advance its private cursor below.
+function sameRow(previous, item) {
+  return previous !== undefined && Object.keys(previous).length === Object.keys(item).length &&
+    Object.keys(item).every(key => previous[key] === item[key]);
+}
 export function addressSetKey(addresses) { return [...new Set(addresses)].sort().join('\n'); }
 function response(value, network) {
   if (!plain(value) || value.unit !== 'connects' || !Array.isArray(value.changes) || value.changes.length > 500 ||
@@ -84,8 +91,16 @@ export async function beginAddressSync({ rpc, network, addresses, check }) {
   return state;
 }
 export function setAddressBaseline(state, address, { history, utxos }) {
-  const target = state.addresses.get(address);
-  if (!target || !Array.isArray(history) || !Array.isArray(utxos) || history.length > MAX_ROWS_PER_ADDRESS || utxos.length > MAX_ROWS_PER_ADDRESS) throw invalid();
+  const previous = state.addresses.get(address);
+  if (!previous || !Array.isArray(history) || !Array.isArray(utxos) || history.length > MAX_ROWS_PER_ADDRESS || utxos.length > MAX_ROWS_PER_ADDRESS) throw invalid();
+  // An empty baseline adds nothing. Keep all resource checks, but do not copy
+  // the wallet-wide map or replace an unchanged address just to publish it.
+  if (!history.length && !utxos.length) { checkSize(state); return; }
+  // Journal snapshots may share unmodified maps. Baseline writes must replace
+  // their own maps too, including while another worker reconciles a partial
+  // baseline. Never mutate a previously published or privately staged sibling.
+  const target = { history: history.length ? new Map(previous.history) : previous.history,
+    utxos: utxos.length ? new Map(previous.utxos) : previous.utxos };
   for (const raw of history) {
     const row = syncHistoryRow(raw);
     // A live baseline can contain a row twice while it changes from pending to confirmed.
@@ -94,7 +109,10 @@ export function setAddressBaseline(state, address, { history, utxos }) {
   for (const raw of utxos) {
     const row = syncUtxoRow(raw); target.utxos.set(`${row.txid}:${row.vout}`, row);
   }
-  checkSize(state);
+  const addresses = new Map(state.addresses);
+  addresses.set(address, target);
+  checkSize({ ...state, addresses });
+  state.addresses = addresses;
 }
 function checkSize(state) {
   let total = 0;
@@ -105,19 +123,41 @@ function checkSize(state) {
   if (total > MAX_TOTAL_ROWS) throw new Error('Address synchronization exceeds this release’s local resource limit.');
 }
 function cloneState(state) {
-  return { ...state, batches: state.batches.map(batch => ({ ...batch })),
-    addresses: new Map([...state.addresses].map(([address, rows]) => [address, { history: new Map(rows.history), utxos: new Map(rows.utxos) }])) };
+  // Cursors advance privately even when every row remains unchanged. The
+  // address map can remain shared until the first validated row mutation.
+  return { ...state, batches: state.batches.map(batch => ({ ...batch })) };
 }
 /** Apply into a private candidate. No published cache/cursor changes before every page validates. */
 export async function updateAddressSync(state, { rpc, check, initialBatches }) {
   const next = cloneState(state); let eventCount = 0;
+  let ownsAddresses = false;
+  const ownedHistory = new Set(), ownedUtxos = new Set();
+  const writable = (address, kind) => {
+    const owned = kind === 'history' ? ownedHistory : ownedUtxos;
+    const previous = next.addresses.get(address);
+    if (owned.has(address)) return previous[kind];
+    // A baseline writer may replace state.addresses while RPC awaits. Track
+    // ownership locally, never by comparing against that mutable envelope.
+    if (!ownsAddresses) { next.addresses = new Map(next.addresses); ownsAddresses = true; }
+    const rows = new Map(previous[kind]);
+    next.addresses.set(address, { ...previous, [kind]: rows });
+    owned.add(address);
+    return rows;
+  };
   // Partial baseline publication can retain already-reconciled groups. Start
   // with newly populated groups, then the normal sequence/epoch/tip convergence
   // below fetches any older group affected by intervening chain/mempool changes.
   const requested = initialBatches && new Set(initialBatches);
-  if (requested && (!requested.size || requested.size !== initialBatches.length ||
-      [...requested].some(key => !next.batches.some(batch => addressSetKey(batch.addresses) === key)))) throw invalid();
-  let pending = requested ? next.batches.filter(batch => requested.has(addressSetKey(batch.addresses))) : next.batches;
+  let pending = next.batches;
+  if (requested) {
+    if (!requested.size || requested.size !== initialBatches.length) throw invalid();
+    // Keys describe the ORIGINAL cursor-bound groups. Normalize each only once
+    // instead of searching/sorting every group again for each requested key.
+    const indexed = next.batches.map(batch => ({ batch, key: addressSetKey(batch.addresses) }));
+    const known = new Set(indexed.map(item => item.key));
+    if ([...requested].some(key => !known.has(key))) throw invalid();
+    pending = indexed.filter(item => requested.has(item.key)).map(item => item.batch);
+  }
   for (let round = 0; round < 3; round++) {
    for (const batch of pending) {
     const allowed = new Set(batch.addresses), cursors = new Set(); let previousSequence = batch.throughSequence, frozenTip = null, frozenSequence;
@@ -137,16 +177,18 @@ export async function updateAddressSync(state, { rpc, check, initialBatches }) {
             !['history', 'utxo'].includes(event.kind) || !['upsert', 'remove'].includes(event.action) || !hash(event.txid)) throw invalid();
         previousSequence = event.sequence;
         if (++eventCount > 100000) throw new Error('Address synchronization exceeds this release’s local resource limit.');
-        const target = next.addresses.get(event.address)[event.kind === 'history' ? 'history' : 'utxos'];
+        const kind = event.kind === 'history' ? 'history' : 'utxos';
         if (event.kind === 'utxo' && (!Number.isInteger(event.vout) || event.vout < 0 || event.vout > 0xffffffff)) throw invalid();
         const key = event.kind === 'history' ? event.txid : `${event.txid}:${event.vout}`;
         if (event.action === 'remove') {
           if (event.item !== undefined) throw invalid();
-          target.delete(key);
+          // A valid removal of an already-absent row still advances sequence,
+          // but does not require copying that address's complete map.
+          if (next.addresses.get(event.address)[kind].has(key)) writable(event.address, kind).delete(key);
         } else {
           const item = event.kind === 'history' ? syncHistoryRow(event.item) : syncUtxoRow(event.item);
           if (item.txid !== event.txid || (event.kind === 'utxo' && item.vout !== event.vout)) throw invalid();
-          target.set(key, item);
+          if (!sameRow(next.addresses.get(event.address)[kind].get(key), item)) writable(event.address, kind).set(key, item);
         }
       }
       batch.cursor = result.next_cursor;

@@ -31,6 +31,9 @@ const ADDRESS_BUILD_BATCH = 32;
 // Pipeline round trips, not unbounded address fan-out. Each worker sends only
 // one page at a time through RpcClient's shared capacity and per-method quota.
 const ADDRESS_BASELINE_CONCURRENCY = 4;
+// Internal callers need the completed read, not an extra full UI snapshot.
+// A private marker keeps renderer-supplied refresh parameters unchanged.
+const REFRESH_WITHOUT_SNAPSHOT = Symbol('refresh-without-snapshot');
 // vault.mjs permits 131072 ciphertext hex characters, or 65536 plaintext bytes.
 // Keep every saved annotation; when full, the user can send without new notes.
 const WALLET_PLAINTEXT_LIMIT = 65536;
@@ -47,8 +50,10 @@ function validateStoredPaymentDetails(value) {
   return result;
 }
 function amount(value) {
-  if (typeof value !== 'string' || !MONEY.test(value) || BigInt(value) > 1000000000000000000n || BigInt(value) < -1000000000000000000n) throw new Error('RPC returned an invalid monetary amount.');
-  return BigInt(value);
+  if (typeof value !== 'string' || !MONEY.test(value)) throw new Error('RPC returned an invalid monetary amount.');
+  const parsed = BigInt(value);
+  if (parsed > 1000000000000000000n || parsed < -1000000000000000000n) throw new Error('RPC returned an invalid monetary amount.');
+  return parsed;
 }
 function walletName(name) {
   if (typeof name !== 'string' || !name.trim() || name.trim().length > 40 || /[\x00-\x1f]/.test(name)) throw new Error('Use a wallet name between 1 and 40 characters.');
@@ -134,7 +139,7 @@ export class WalletService extends EventEmitter {
     this.walletUpdates = new EventRefresh({ isActive: active, delayMs: 150, run: async () => {
       // An event during an existing read needs a fresh pass, not its old promise.
       if (this.refreshing) await this.refreshing.catch(() => {});
-      if (active() && this.walletReadRevision < this.walletUpdateRevision) await this.refresh();
+      if (active() && this.walletReadRevision < this.walletUpdateRevision) await this.refresh(REFRESH_WITHOUT_SNAPSHOT);
     } });
     this.bountyUpdates = new EventRefresh({ isActive: active, run: async () => {
       await this.claimSuspending;
@@ -202,8 +207,13 @@ export class WalletService extends EventEmitter {
       getAddresses: () => {
         // Watch the currently displayed receive/change addresses first when a
         // large recovered wallet reaches the shared server subscription limit.
-        const current = this.accounts.filter(account => account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']);
-        return [...new Set([...current, ...this.accounts, ...this.accountCache.values()].map(account => account.address))];
+        const addresses = new Set();
+        for (const account of this.accounts) {
+          if (account.index === this.session?.data[account.change ? 'changeIndex' : 'receiveIndex']) addresses.add(account.address);
+        }
+        for (const account of this.accounts) addresses.add(account.address);
+        for (const account of this.accountCache.values()) addresses.add(account.address);
+        return [...addresses];
       },
       onChange: flags => {
         if (!active()) return;
@@ -298,13 +308,17 @@ export class WalletService extends EventEmitter {
       wallet: this.session ? { name: this.session.data.name, address: current?.address ?? '', path: current?.path,
         qrDataUrl: this.qrDataUrl, balance: this.balance, recovering: Boolean(this.recovering), addressCount: this.accounts.length } : null,
       network: { ...this.network, ...(this.confirmationTip ? { height: this.confirmationTip.height } : {}), host: this.config.rpc.host, port: this.config.rpc.port },
-      config: structuredClone(this.config), history: this.session ? this.history.map(row => ({ ...row,
+      config: structuredClone(this.config), history: this.session ? this.history.map(row => {
+        const projected = { ...row };
         // This is a display projection, not an address-cache/cursor update and
         // never evidence that a pending transaction was mined or funds changed.
-        ...(this.confirmationTip && !this.confirmationsStale && row.status === 'confirmed' &&
-          Number.isSafeInteger(row.blockHeight) && row.blockHeight >= 0 && row.blockHeight <= this.confirmationTip.height
-          ? { confirmations: this.confirmationTip.height - row.blockHeight + 1 } : {}),
-        ...this.session.data.paymentDetails?.[row.txid] })) : [],
+        if (this.confirmationTip && !this.confirmationsStale && row.status === 'confirmed' &&
+            Number.isSafeInteger(row.blockHeight) && row.blockHeight >= 0 && row.blockHeight <= this.confirmationTip.height) {
+          projected.confirmations = this.confirmationTip.height - row.blockHeight + 1;
+        }
+        const details = this.session.data.paymentDetails?.[row.txid];
+        return details ? { ...projected, ...details } : projected;
+      }) : [],
       claims: { ...this.claimInfo, enabled: Boolean(this.engine?.enabled), available: this.claimInfo.queued ?? 0,
         lastErrorDiagnostic: this.claimInfo.lastErrorDiagnostic === true,
         sent: this.claimInfo.completed ?? 0, successful: this.claimInfo.completed ?? 0,
@@ -458,7 +472,7 @@ export class WalletService extends EventEmitter {
     await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch); this.emitState();
     this.liveUpdates.start();
     if (this.session && !this.closed && this.config.claims.enabled) void this.resumeClaims();
-    void this.refresh().catch(() => {});
+    void this.refresh(REFRESH_WITHOUT_SNAPSHOT).catch(() => {});
   }
   clearAccountDerivation() {
     const previous = this.accountDerivation;
@@ -614,8 +628,10 @@ export class WalletService extends EventEmitter {
     catch(error) { if (epoch === this.epoch && this.session) this.session.data.receiveIndex = previousIndex; throw error; }
     this.assertSession(epoch); await this.buildAccounts(); this.assertSession(epoch); await this.makeQR(); this.assertSession(epoch); this.emitState();
     this.walletUpdateRevision++; this.walletUpdates?.request();
-    void this.refresh().catch(() => {});
-    return { address: this.getState().wallet.address, qrDataUrl: this.qrDataUrl };
+    void this.refresh(REFRESH_WITHOUT_SNAPSHOT).catch(() => {});
+    this.assertSession(epoch);
+    const current = this.accounts.find(account => account.change === 0 && account.index === this.session.data.receiveIndex);
+    return { address: current?.address ?? '', qrDataUrl: this.qrDataUrl };
   }
   async getRecoveryPhrase({ password } = {}) {
     this.assertSession(); const epoch = this.epoch;
@@ -690,27 +706,39 @@ export class WalletService extends EventEmitter {
       return emptyAddresses;
     } finally { this.recovering = false; this.emitState(); }
   }
-  async refresh() {
-    if (!this.session) return this.getState();
-    if (this.refreshing) return this.refreshing;
-    const epoch = this.epoch;
-    const started = performance.now();
-    const operation = this.refreshInternal(epoch).catch(error => {
-      const cancelled = error?.name === 'AbortError' && !error.unknownOutcome;
-      this.recordDiagnostic(cancelled ? 'wallet.refresh_cancelled' : 'wallet.refresh_failed', {
-        stage: 'refresh', ...(!cancelled ? { error } : {}), durationMs: Math.round(performance.now() - started),
-      });
-      if (!cancelled && epoch === this.epoch) { this.error = error.message; if (!this.rpc.socket) this.network.status = 'offline'; this.emitState(); }
-      throw error;
-    }).finally(() => { if (this.refreshing === operation) this.refreshing = null; this.emitState(); });
-    this.refreshing = operation;
-    this.emitState(); return this.refreshing;
+  async refresh(mode) {
+    const returnState = mode !== REFRESH_WITHOUT_SNAPSHOT;
+    if (!this.session) return returnState ? this.getState() : undefined;
+    let operation = this.refreshing;
+    if (!operation) {
+      const epoch = this.epoch;
+      const started = performance.now();
+      operation = this.refreshInternal(epoch).catch(error => {
+        const cancelled = error?.name === 'AbortError' && !error.unknownOutcome;
+        this.recordDiagnostic(cancelled ? 'wallet.refresh_cancelled' : 'wallet.refresh_failed', {
+          stage: 'refresh', ...(!cancelled ? { error } : {}), durationMs: Math.round(performance.now() - started),
+        });
+        if (!cancelled && epoch === this.epoch) { this.error = error.message; if (!this.rpc.socket) this.network.status = 'offline'; this.emitState(); }
+        throw error;
+      }).finally(() => { if (this.refreshing === operation) this.refreshing = null; this.emitState(); });
+      this.refreshing = operation;
+      this.emitState();
+    }
+    // All callers share the validated read, but only the public action builds
+    // a return snapshot. Do so after finally, using the current lifecycle and
+    // busy flag rather than a snapshot captured before a lock or reconnect.
+    await operation;
+    return returnState ? this.getState() : undefined;
   }
   async refreshInternal(epoch) {
     const chainRevision = this.walletChainRevision;
-    await this.ensureNetwork(); this.assertSession(epoch); this.checkWalletChain(chainRevision);
+    this.assertSession(epoch); this.checkWalletChain(chainRevision);
     const updateRevision = this.walletUpdateRevision;
-    if (!this.session.data.needsRecovery && this.addressChangesSupported !== false && await this.refreshAddressChanges(epoch, updateRevision, chainRevision)) return this.getState();
+    // The address journal already validates the network and fences its complete
+    // snapshot with a tip. A separate preflight tip cannot strengthen that
+    // snapshot and would add a request to every notification-driven refresh.
+    if (!this.session.data.needsRecovery && this.addressChangesSupported !== false && await this.refreshAddressChanges(epoch, updateRevision, chainRevision)) return;
+    await this.ensureNetwork(); this.assertSession(epoch); this.checkWalletChain(chainRevision);
     const rpc = this.rpc, recoveryTipHash = this.tip.hash;
     const emptyAddresses = this.session.data.needsRecovery ? await this.recoverAddresses(epoch) : null;
     // Reuse only fully exhausted empty discovery results inside this refresh.
@@ -789,7 +817,7 @@ export class WalletService extends EventEmitter {
     // An explicit refresh can also recover a saved start that failed offline.
     // Normal discovery never waits here; its subscription queue runs independently.
     if (!this.engine.enabled && this.config.claims.enabled && this.claimsResumePending) await this.resumeClaims();
-    return this.getState();
+    return;
   }
   async refreshAddressChanges(epoch, updateRevision, chainRevision = this.walletChainRevision) {
     const rpc = this.rpc, accounts = [...this.accounts], addresses = accounts.map(account => account.address), key = addressSetKey(addresses);
@@ -835,9 +863,17 @@ export class WalletService extends EventEmitter {
           if (baseline.signal.aborted) throw failure;
         }
         candidate = await updateAddressSync(candidate, { rpc, check }); check();
-        const snapshot = addressSyncSnapshot(candidate, accounts);
-        const highestReceive = Math.max(this.session.data.lastUsedReceive ?? -1, snapshot.highestReceive);
-        const highestChange = Math.max(this.session.data.lastUsedChange ?? -1, snapshot.highestChange);
+        // Copy-on-write journal maps retain identity only when no row changed.
+        // The exact tip must also match: a new block can mature coinbase outputs
+        // even without any address events. Never reuse a partial/busy candidate's
+        // projection or skip the validated journal replay above.
+        const published = this.addressSync;
+        const unchanged = published && published.key === key && published.addresses === candidate.addresses &&
+          published.tip.hash === candidate.tip.hash && published.tip.height === candidate.tip.height &&
+          published.tip.mediantime === candidate.tip.mediantime && this.balance !== null;
+        const snapshot = unchanged ? null : addressSyncSnapshot(candidate, accounts);
+        const highestReceive = Math.max(this.session.data.lastUsedReceive ?? -1, snapshot?.highestReceive ?? -1);
+        const highestChange = Math.max(this.session.data.lastUsedChange ?? -1, snapshot?.highestChange ?? -1);
         if (highestReceive !== this.session.data.lastUsedReceive || highestChange !== this.session.data.lastUsedChange) {
           this.session.data.lastUsedReceive = highestReceive; this.session.data.lastUsedChange = highestChange;
           await this.persist(); check(); await this.buildAccounts(); check();
@@ -849,12 +885,14 @@ export class WalletService extends EventEmitter {
         this.addressSync = candidate;
         this.addressSyncPending = null;
         this.tip = candidate.tip; this.network = { ...this.network, status: 'online', height: candidate.tip.height, chain: candidate.tip.chain };
-        this.utxos = snapshot.utxos;
-        this.balance = Object.fromEntries(Object.entries(snapshot.totals).map(([name, value]) => [name, formatSigned(value)]));
-        this.history = [...snapshot.history.values()].sort((a, b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
-          txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
-          amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
-        }));
+        if (snapshot) {
+          this.utxos = snapshot.utxos;
+          this.balance = Object.fromEntries(Object.entries(snapshot.totals).map(([name, value]) => [name, formatSigned(value)]));
+          this.history = [...snapshot.history.values()].sort((a, b) => (b.block_height ?? Number.MAX_SAFE_INTEGER) - (a.block_height ?? Number.MAX_SAFE_INTEGER)).map(row => ({
+            txid: row.txid, direction: row.net < 0n ? 'sent' : row.net > 0n ? 'received' : 'self',
+            amount: formatCoinAmount(row.net < 0n ? -row.net : row.net), status: row.status, confirmations: row.confirmations, blockHeight: row.block_height,
+          }));
+        }
         this.observeConfirmationTip(candidate.tip); this.confirmationsStale = false;
         this.walletReadRevision = Math.max(this.walletReadRevision, updateRevision);
         this.error = null; this.emitState(); this.liveUpdates?.updateAddresses();
@@ -927,23 +965,29 @@ export class WalletService extends EventEmitter {
   }
   async paymentParents(selected, signal, onProgress) {
     const epoch = this.epoch, rpc = this.rpc, generation = this.#fundingGeneration, parents = new Map();
-    let parentHexLength = 0;
+    let parentHexLength = 0, completed = 0;
     const check = () => {
       this.assertSession(epoch);
       if (signal.aborted || rpc !== this.rpc || generation !== this.#fundingGeneration) throw Object.assign(new Error('Payment review cancelled.'), { name: 'AbortError' });
     };
-    const progress = () => onProgress(selected.filter(row => parents.has(row.txid)).length);
+    // Progress counts selected inputs, not distinct parent transactions. Keep
+    // each parent's multiplicity once instead of rescanning every input after
+    // every fetched parent (including individual legacy responses).
+    const selectedCounts = new Map();
+    for (const { txid } of selected) selectedCounts.set(txid, (selectedCounts.get(txid) ?? 0) + 1);
+    const progress = () => onProgress(completed);
     const retain = (txid, hex) => {
       if (parents.has(txid)) return;
       if (parentHexLength + hex.length > MAX_PAYMENT_PARENT_HEX_BYTES) throw new Error('Payment funding data exceeds the wallet memory safety limit. Send a smaller amount in separate payments.');
       parentHexLength += hex.length;
       parents.set(txid, hex);
+      completed += selectedCounts.get(txid);
     };
     const remember = (txid, hex) => {
       retain(txid, hex);
       this.fundingCache.set(txid, hex);
     };
-    const missing = [...new Set(selected.map(row => row.txid))].filter(txid => {
+    const missing = [...selectedCounts.keys()].filter(txid => {
       if (!this.fundingCache.has(txid)) return true;
       retain(txid, this.fundingCache.get(txid)); return false;
     });
@@ -1033,6 +1077,7 @@ export class WalletService extends EventEmitter {
     let completed = 0, pages = 0;
     report('outputs', completed, accounts.length, pages);
     for (const account of accounts) {
+      let addedFreeInput = false;
       const rows = await waitForReview(this.page('getaddressutxos', account.address, { signal, includePendingSpent: options.allowPendingSpent === true,
         onPage: () => report('outputs', completed, accounts.length, ++pages),
       }), signal);
@@ -1051,7 +1096,9 @@ export class WalletService extends EventEmitter {
           // Only a fresh identified mempool conflict can override a local
           // reservation. A checkbox alone never unlocks uncertain broadcasts.
           if (options.allowPendingSpent === true) pendingCandidates.push({ ...row, account });
-        } else if (!this.reserved.has(outpoint)) utxos.push({ ...row, account });
+        } else if (!this.reserved.has(outpoint)) {
+          utxos.push({ ...row, account }); addedFreeInput = true;
+        }
       }
       if (pendingCandidates.length > MAX_PAYMENT_INPUTS) {
         pendingCandidates.sort((a, b) => {
@@ -1062,16 +1109,25 @@ export class WalletService extends EventEmitter {
         pendingCandidates.length = MAX_PAYMENT_INPUTS; exceedsInputLimit = true;
       }
       report('outputs', ++completed, accounts.length, pages);
+      // The previous private candidate set has already failed a recoverable
+      // plan. An empty/ineligible account cannot change that result. Still
+      // validate every row and report every page/account above; pending inputs
+      // keep their separate final plan below. Track additions before the cap,
+      // since a newly added larger coin can replace one at the same final size.
+      if (!addedFreeInput) continue;
       // Match the planner's exact-coin preference for fee deduction before
       // applying the input cap; otherwise a large wallet could discard its
       // only viable no-change input. Keep the largest remaining candidates.
       // Never silently call a truncated set the wallet's entire balance.
-      utxos.sort((a, b) => {
-        const first = BigInt(a.amount), second = BigInt(b.amount);
-        if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
-        return first > second ? -1 : first < second ? 1 : 0;
-      });
-      if (utxos.length > MAX_PAYMENT_INPUTS) { exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS; }
+      // Otherwise the planner already sorts its own copy with this priority.
+      if (utxos.length > MAX_PAYMENT_INPUTS) {
+        utxos.sort((a, b) => {
+          const first = BigInt(a.amount), second = BigInt(b.amount);
+          if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
+          return first > second ? -1 : first < second ? 1 : 0;
+        });
+        exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS;
+      }
       if (!utxos.length) continue;
       try { return selectPaymentFunding({ ...options, utxos }).selected; }
       catch (error) {
@@ -1085,12 +1141,14 @@ export class WalletService extends EventEmitter {
       // Prefer an ordinary payment when free coins suffice. Only use pending
       // inputs after checking all accounts, and disclose selected conflicts.
       utxos.push(...pendingCandidates);
-      utxos.sort((a, b) => {
-        const first = BigInt(a.amount), second = BigInt(b.amount);
-        if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
-        return first > second ? -1 : first < second ? 1 : 0;
-      });
-      if (utxos.length > MAX_PAYMENT_INPUTS) { exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS; }
+      if (utxos.length > MAX_PAYMENT_INPUTS) {
+        utxos.sort((a, b) => {
+          const first = BigInt(a.amount), second = BigInt(b.amount);
+          if (exactAmount !== null && (first === exactAmount) !== (second === exactAmount)) return first === exactAmount ? -1 : 1;
+          return first > second ? -1 : first < second ? 1 : 0;
+        });
+        exceedsInputLimit = true; utxos.length = MAX_PAYMENT_INPUTS;
+      }
       try { return selectPaymentFunding({ ...options, utxos }).selected; }
       catch (error) { insufficient = error; }
     }
@@ -1247,7 +1305,7 @@ export class WalletService extends EventEmitter {
       try {
         const result = await rpc.request('sendrawtransaction', { transaction_hex: preview.hex }, { signal: confirmation.signal });
         if (result?.txid !== preview.txid) throw new Error('RPC returned an unexpected transaction ID.');
-        if (this.session) void this.refresh().catch(() => {});
+        if (this.session) void this.refresh(REFRESH_WITHOUT_SNAPSHOT).catch(() => {});
         return { txid: preview.txid, status: 'submitted' };
       } catch (error) {
         // Only the local transport's explicit pre-transmission cancellation is
@@ -1312,7 +1370,7 @@ export class WalletService extends EventEmitter {
         for (const accepted of this.engine.acceptedProofs?.values() ?? []) accepted.due = 0;
         if (this.session) {
           this.liveUpdates.start();
-          void this.refresh().catch(() => {});
+          void this.refresh(REFRESH_WITHOUT_SNAPSHOT).catch(() => {});
         }
       }
       // A lock/new unlock may have started a newer lifecycle while the old

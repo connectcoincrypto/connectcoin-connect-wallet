@@ -88,7 +88,7 @@ test('201-row/41-address wallet handles 100 new tips locally; only an address pu
     const sub = service.liveUpdates.registrations.get(kind === 'tip' ? 'tip' : `address:${rpc.used}`);
     rpc.emit('notification', { subscription_id: sub.id, kind, tip: rpc.tip, ...(kind === 'address' ? { address: rpc.used, refresh: true } : {}) });
     await settled(service);
-    assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+    assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
     assert.equal(service.history.length, 201);
   }
 });
@@ -123,7 +123,7 @@ test('a tip arriving during a delta read updates display without invalidating it
   rpc.emit('notification', { subscription_id: service.liveUpdates.registrations.get('tip').id, kind: 'tip', tip: rpc.tip });
   assert.equal(service.getState().history[0].confirmations, 3);
   release.resolve(); await pending; await settled(service);
-  assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
   assert.equal(service.addressSync.tip.height, 999);
   assert.equal(service.addressSync.batches[0].cursor, 'held-cursor');
   assert.equal(service.getState().history[0].confirmations, 3);
@@ -184,7 +184,7 @@ test('expired/reorg cursor causes bounded baseline resync and then returns to de
   await service.refresh();
   assert.equal(counts(rpc).getaddresschanges, 3); assert.equal(counts(rpc).getaddresshistory, 43);
   rpc.calls = []; await service.refresh();
-  assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
 });
 
 test('address-set growth establishes a new watermark instead of reusing a bound cursor', async t => {
@@ -259,7 +259,7 @@ test('initial baseline pipelines at most four reads, preserving watermark, subsc
   assert.equal(counts(rpc).getaddresshistory, 43); assert.equal(counts(rpc).getaddressutxos, 3);
   assert.equal(service.history.length, 201); assert.equal(service.balance.confirmed, '0.0000000201');
   rpc.calls = []; await service.refresh();
-  assert.deepEqual(counts(rpc), { getchaintip: 1, getaddresschanges: 1 });
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
 });
 
 test('failed baseline stops scheduling siblings and drains sent reads before returning the original failure', async t => {
@@ -341,5 +341,137 @@ test('parallel baseline uses the shared TCP client pacing across multiple 48-req
   assert.equal(client.queuedRequests, 0); assert.equal(client.pending.size, 0);
   assert.equal(service.history.length, 201); assert.equal(service.balance.confirmed, '0.0000000201');
   backend.calls = []; await service.refresh();
-  assert.deepEqual(counts(backend), { getchaintip: 1, getaddresschanges: 2 });
+  assert.deepEqual(counts(backend), { getaddresschanges: 2 });
+});
+
+test('validated address responses establish the network without a separate tip preflight', async t => {
+  const { service, rpc } = await fixture(t);
+  const request = rpc.request.bind(rpc);
+  rpc.request = (method, ...args) => {
+    assert.notEqual(method, 'getchaintip');
+    return request(method, ...args);
+  };
+  await service.refresh();
+  assert.equal(service.network.status, 'online');
+  assert.equal(service.tip.hash, initialTip.hash);
+  rpc.calls = []; await service.refresh();
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
+});
+
+test('empty same-tip deltas advance cursors without rebuilding the published projection', async t => {
+  const { service, rpc } = await fixture(t); await service.refresh();
+  const cache = service.addressSync, balance = service.balance, history = service.history, utxos = service.utxos;
+  rpc.calls = [];
+  await service.refresh();
+  assert.notEqual(service.addressSync.batches[0].cursor, cache.batches[0].cursor);
+  assert.equal(service.addressSync.addresses, cache.addresses);
+  assert.equal(service.balance, balance); assert.equal(service.history, history); assert.equal(service.utxos, utxos);
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
+});
+
+test('empty deltas at a newer tip still recalculate coinbase maturity and confirmations', async t => {
+  const { service, rpc } = await fixture(t);
+  const request = rpc.request.bind(rpc);
+  rpc.request = async (method, params, options) => {
+    const response = await request(method, params, options);
+    if (method === 'getaddressutxos') response.items = response.items.map(item => ({ ...item, coinbase: true, mature: false, block_height: 901, confirmations: 99 }));
+    return response;
+  };
+  await service.refresh();
+  const previous = service.balance, rows = service.addressSync.addresses;
+  assert.equal(service.balance.available, '0');
+  assert.equal(service.balance.immature, '0.0000000201');
+  rpc.tip = { ...rpc.tip, height: 1000, hash: hash(1000) };
+  rpc.calls = []; await service.refresh();
+  assert.equal(service.addressSync.addresses, rows);
+  assert.notEqual(service.balance, previous);
+  assert.equal(service.balance.available, '0.0000000201');
+  assert.equal(service.balance.immature, '0');
+  assert.equal(service.utxos[0].confirmations, 100);
+  assert.equal(service.utxos[0].mature, true);
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
+});
+
+test('validated duplicate rows advance the journal without rebuilding unchanged funds or history', async t => {
+  const { service, rpc } = await fixture(t); await service.refresh();
+  const cache = service.addressSync, balance = service.balance, history = service.history, utxos = service.utxos;
+  rpc.delta = () => ({ tip: rpc.tip, unit: 'connects', changes: [
+    { sequence: 1, address: rpc.used, kind: 'history', action: 'upsert', txid: hash(1), item: row(1) },
+    { sequence: 2, address: rpc.used, kind: 'utxo', action: 'upsert', txid: hash(1), vout: 0, item: coin() },
+    { sequence: 3, address: rpc.used, kind: 'utxo', action: 'remove', txid: hash(700), vout: 0 },
+  ], next_cursor: 'duplicate-rows-3', has_more: false, through_sequence: 3, journal_epoch: 1 });
+  await service.refresh();
+  assert.equal(service.addressSync.addresses, cache.addresses);
+  assert.equal(service.balance, balance); assert.equal(service.history, history); assert.equal(service.utxos, utxos);
+  assert.equal(service.addressSync.batches[0].throughSequence, 3);
+  assert.equal(service.addressSync.batches[0].cursor, 'duplicate-rows-3');
+  rpc.delta = () => ({ tip: rpc.tip, unit: 'connects', changes: [
+    { sequence: 4, address: rpc.used, kind: 'utxo', action: 'upsert', txid: hash(1), vout: 0, item: coin({ pending_spent_by: hash(600) }) },
+  ], next_cursor: 'real-change-4', has_more: false, through_sequence: 4, journal_epoch: 1 });
+  await service.refresh();
+  assert.notEqual(service.addressSync.addresses, cache.addresses);
+  assert.notEqual(service.balance, balance); assert.equal(service.balance.available, '0');
+});
+
+test('invalid network in an empty delta cannot reuse or replace an existing projection', async t => {
+  const { service, rpc } = await fixture(t); await service.refresh();
+  const cache = service.addressSync, balance = service.balance, history = service.history;
+  rpc.delta = () => ({ tip: { ...rpc.tip, chain: 'main' }, unit: 'connects', changes: [], next_cursor: 'foreign', has_more: false, through_sequence: 0, journal_epoch: 1 });
+  await assert.rejects(service.refresh());
+  assert.equal(service.addressSync, cache); assert.equal(service.balance, balance); assert.equal(service.history, history);
+});
+
+test('legacy monetary parsing preserves signed limits, lexical checks and exact formatting', async t => {
+  const { service, rpc } = await fixture(t, { legacy: true });
+  service.accounts = service.accounts.slice(0, 1);
+  const request = rpc.request.bind(rpc); let sample = '0';
+  rpc.request = async (method, params, options) => {
+    const result = await request(method, params, options);
+    if (method === 'getaddresshistory') return { ...result, items: [], next_cursor: null };
+    return method === 'getaddressbalance' ? { ...result, pending_delta: sample } : result;
+  };
+  const originalAmount = value => {
+    if (typeof value !== 'string' || !/^-?\d{1,19}$/.test(value) || BigInt(value) > 1000000000000000000n || BigInt(value) < -1000000000000000000n) throw new Error('invalid');
+    return BigInt(value);
+  };
+  const display = value => {
+    const sign = value < 0n ? '-' : '', absolute = value < 0n ? -value : value;
+    const fraction = (absolute % 10000000000n).toString().padStart(10, '0').replace(/0+$/, '');
+    return sign + (absolute / 10000000000n).toString() + (fraction ? '.' + fraction : '');
+  };
+  const samples = ['0', '-0', '0000000000000000000', '-0001', '10000000000', '-10000000000',
+    '999999999999999999', '-999999999999999999', '1000000000000000000', '-1000000000000000000',
+    // Preserve the existing regex semantics; this optimization is not a wire-format change.
+    '1\n', undefined, null, 1, 1n, NaN, [], ['1'], {}, { toString: () => '1' },
+    '', '-', '+1', '1.0', '1e2', ' 1', '1 ', '0x10', 'one', '１', '1\n2',
+    '1000000000000000001', '-1000000000000000001', '00000000000000000000', '9999999999999999999'];
+  for (let index = -40; index <= 40; index++) samples.push((BigInt(index) * 1234567890123456n).toString());
+  for (sample of samples) {
+    let expected;
+    try { expected = originalAmount(sample); } catch { /* The same invalid input must still fail before publication. */ }
+    if (expected !== undefined) {
+      await service.refresh();
+      assert.equal(service.balance.pending, display(expected));
+    } else {
+      const before = { balance: service.balance, history: service.history, utxos: service.utxos };
+      await assert.rejects(service.refresh(), /invalid monetary amount/);
+      assert.equal(service.balance, before.balance); assert.equal(service.history, before.history); assert.equal(service.utxos, before.utxos);
+    }
+  }
+});
+
+test('a real automatic delta refresh publishes notifications without building an unused return snapshot', async t => {
+  const { service, rpc } = await fixture(t); await service.refresh();
+  service.statePublisher.cancelPending();
+  const getState = service.getState.bind(service), observed = [];
+  let snapshots = 0;
+  service.getState = () => { snapshots++; return getState(); };
+  service.on('state', state => observed.push(state));
+  service.walletUpdateRevision++; rpc.calls = [];
+  await service.walletUpdates.run();
+  assert.equal(service.walletReadRevision, service.walletUpdateRevision);
+  assert.equal(service.refreshing, null);
+  assert.deepEqual(counts(rpc), { getaddresschanges: 1 });
+  assert.equal(snapshots, observed.length, 'all projections must correspond to a delivered state, not an ignored return');
+  assert.equal(service.history.length, 201);
 });

@@ -186,3 +186,375 @@ test('journal epoch mismatch is a genuine resync, even with equal tip and sequen
   const state = await fixture();
   await assert.rejects(updateAddressSync(state, { rpc: { request: async () => page([], { through_sequence: 0, journal_epoch: 2 }) }, check }), { code: -32011 });
 });
+
+test('empty deltas share address maps while advancing only private cursors', async () => {
+  const state = await fixture();
+  const next = await updateAddressSync(state, { rpc: { request: async () => page([], { next_cursor: 'idle-new', through_sequence: 8 }) }, check });
+  assert.notEqual(next, state);
+  assert.notEqual(next.batches, state.batches);
+  assert.notEqual(next.batches[0], state.batches[0]);
+  assert.equal(next.addresses, state.addresses);
+  assert.equal(next.addresses.get(addr), state.addresses.get(addr));
+  assert.equal(state.batches[0].cursor, 'start');
+  assert.equal(state.batches[0].throughSequence, 0);
+  assert.equal(next.batches[0].cursor, 'idle-new');
+  assert.equal(next.batches[0].throughSequence, 8);
+});
+
+test('empty block advancement shares raw rows without freezing derived maturity', async () => {
+  const state = await fixture();
+  setAddressBaseline(state, addr, { history: [], utxos: [utxo(1, { block_height: 2, coinbase: true, mature: false, confirmations: 99 })] });
+  const next = await updateAddressSync(state, { rpc: { request: async () => page([], { tip: { ...tip, height: 101, hash: hash(901) } }) }, check });
+  assert.equal(next.addresses, state.addresses);
+  assert.equal(addressSyncSnapshot(state, [{ address: addr, change: 0, index: 0 }]).totals.immature, 100n);
+  assert.equal(addressSyncSnapshot(next, [{ address: addr, change: 0, index: 0 }]).totals.available, 100n);
+});
+
+test('a history delta copies only its address envelope and history map', async () => {
+  const { state, addresses } = await largeFixture();
+  const first = addresses[0], other = addresses[1];
+  setAddressBaseline(state, first, { history: [history(1)], utxos: [utxo(1)] });
+  setAddressBaseline(state, other, { history: [history(2)], utxos: [utxo(2)] });
+  let calls = 0;
+  const next = await updateAddressSync(state, { rpc: { request: async () => page(++calls === 1
+    ? [event(1, 'history', 'upsert', history(3), { address: first })] : [], { next_cursor: `cow-${calls}`, through_sequence: 1 }) }, check });
+  assert.notEqual(next.addresses, state.addresses);
+  assert.notEqual(next.addresses.get(first), state.addresses.get(first));
+  assert.notEqual(next.addresses.get(first).history, state.addresses.get(first).history);
+  assert.equal(next.addresses.get(first).utxos, state.addresses.get(first).utxos);
+  assert.equal(next.addresses.get(first).history.get(hash(1)), state.addresses.get(first).history.get(hash(1)));
+  assert.equal(next.addresses.get(other), state.addresses.get(other));
+  assert.equal(next.addresses.get(addresses[100]), state.addresses.get(addresses[100]));
+  assert.equal(state.addresses.get(first).history.size, 1);
+  assert.equal(next.addresses.get(first).history.size, 2);
+});
+
+test('utxo writes do not clone history and both kinds remain isolated across pages', async () => {
+  const state = await fixture();
+  const sibling = await updateAddressSync(state, { rpc: { request: async () => page([], { next_cursor: 'sibling', through_sequence: 0 }) }, check });
+  const utxoOnly = await updateAddressSync(sibling, { rpc: { request: async () => page([event(1, 'utxo', 'upsert', utxo(2))]) }, check });
+  assert.equal(utxoOnly.addresses.get(addr).history, state.addresses.get(addr).history);
+  assert.notEqual(utxoOnly.addresses.get(addr).utxos, state.addresses.get(addr).utxos);
+  let calls = 0;
+  const both = await updateAddressSync(sibling, { rpc: { request: async () => ++calls === 1
+    ? page([event(1, 'utxo', 'remove', utxo(1))], { next_cursor: 'middle', has_more: true })
+    : page([event(2, 'history', 'upsert', history(3)), event(3, 'utxo', 'upsert', utxo(3))], { next_cursor: 'end' }) }, check });
+  assert.equal(both.addresses.get(addr).history.size, 2);
+  assert.deepEqual([...both.addresses.get(addr).utxos.keys()], [`${hash(3)}:0`]);
+  for (const original of [state, sibling]) {
+    assert.deepEqual([...original.addresses.get(addr).utxos.keys()], [`${hash(1)}:0`]);
+    assert.equal(original.addresses.get(addr).history.size, 1);
+  }
+  assert.equal(utxoOnly.addresses.get(addr).utxos.size, 2);
+});
+
+test('baseline merges detach shared maps in either sibling without replacing unaffected kinds', async () => {
+  const state = await fixture();
+  const sibling = await updateAddressSync(state, { rpc: { request: async () => page([], { through_sequence: 0 }) }, check });
+  const originalRows = state.addresses.get(addr);
+  setAddressBaseline(sibling, addr, { history: [history(2), history(2, { received: '150', balance_delta: '150' })], utxos: [] });
+  assert.notEqual(sibling.addresses, state.addresses);
+  assert.equal(sibling.addresses.get(addr).utxos, originalRows.utxos);
+  assert.equal(sibling.addresses.get(addr).history.size, 2);
+  assert.equal(sibling.addresses.get(addr).history.get(hash(2)).received, '150');
+  assert.equal(state.addresses.get(addr), originalRows);
+  setAddressBaseline(state, addr, { history: [], utxos: [utxo(3)] });
+  assert.equal(state.addresses.get(addr).history, originalRows.history);
+  assert.equal(sibling.addresses.get(addr).utxos.size, 1);
+  assert.equal(state.addresses.get(addr).utxos.size, 2);
+});
+
+test('an empty baseline preserves shared identity and a malformed merge is atomic', async () => {
+  const state = await fixture();
+  const sibling = await updateAddressSync(state, { rpc: { request: async () => page([], { through_sequence: 0 }) }, check });
+  setAddressBaseline(sibling, addr, { history: [], utxos: [] });
+  assert.equal(sibling.addresses, state.addresses);
+  assert.throws(() => setAddressBaseline(sibling, addr, {
+    history: [history(2)], utxos: [utxo(2), utxo(3, { amount: '-1' })],
+  }), /invalid address synchronization/);
+  assert.equal(sibling.addresses, state.addresses);
+  assert.equal(state.addresses.get(addr).history.size, 1);
+  assert.equal(state.addresses.get(addr).utxos.size, 1);
+});
+
+test('baseline capacity rejection does not commit a partially merged shared map', async () => {
+  const state = await fixture();
+  setAddressBaseline(state, addr, { history: [], utxos: Array.from({ length: 20000 }, (_, i) => utxo(i + 1)) });
+  const sibling = await updateAddressSync(state, { rpc: { request: async () => page([], { through_sequence: 0 }) }, check });
+  assert.throws(() => setAddressBaseline(sibling, addr, { history: [history(2)], utxos: [utxo(20001)] }), /local resource limit/);
+  assert.equal(sibling.addresses, state.addresses);
+  assert.equal(state.addresses.get(addr).history.size, 1);
+  assert.equal(state.addresses.get(addr).utxos.size, 20000);
+});
+
+test('cancellation after a private first-page mutation preserves all shared siblings', async () => {
+  const state = await fixture();
+  const sibling = await updateAddressSync(state, { rpc: { request: async () => page([], { through_sequence: 0 }) }, check });
+  let calls = 0, cancelled = false;
+  await assert.rejects(updateAddressSync(sibling, { rpc: { request: async () => {
+    if (++calls === 1) return page([event(1, 'utxo', 'remove', utxo(1))], { next_cursor: 'middle', has_more: true });
+    cancelled = true; return page([event(2, 'history', 'remove', history(1))]);
+  } }, check: () => { if (cancelled) throw Object.assign(new Error('cancelled'), { name: 'AbortError' }); } }), { name: 'AbortError' });
+  assert.equal(calls, 2);
+  assert.equal(sibling.addresses, state.addresses);
+  assert.equal(state.addresses.get(addr).utxos.size, 1);
+  assert.equal(state.addresses.get(addr).history.size, 1);
+  assert.equal(sibling.batches[0].cursor, 'cursor1');
+});
+
+test('a busy candidate owns its writes and remains unchanged if its retry fails', async () => {
+  const { state, addresses } = await largeFixture();
+  setAddressBaseline(state, addresses[0], { history: [], utxos: [utxo(1)] });
+  let calls = 0, pending;
+  await assert.rejects(updateAddressSync(state, { rpc: { request: async () => {
+    calls++;
+    return page(calls === 1 ? [event(1, 'utxo', 'upsert', utxo(1, { amount: '200' }), { address: addresses[0] })] : [],
+      { through_sequence: calls, next_cursor: `busy-${calls}` });
+  } }, check }), error => { assert.equal(error.code, 'ADDRESS_SYNC_BUSY'); pending = error.candidate; return true; });
+  assert.equal(state.addresses.get(addresses[0]).utxos.get(`${hash(1)}:0`).amount, '100');
+  assert.equal(pending.addresses.get(addresses[0]).utxos.get(`${hash(1)}:0`).amount, '200');
+  assert.equal(pending.addresses.get(addresses[1]), state.addresses.get(addresses[1]));
+  calls = 0;
+  await assert.rejects(updateAddressSync(pending, { rpc: { request: async () => ++calls === 1
+    ? page([event(5, 'utxo', 'remove', utxo(1), { address: addresses[0] })], { through_sequence: 5, next_cursor: 'retry-first' })
+    : page([event(6, 'utxo', 'upsert', utxo(2), { address: 'foreignaddress' })], { through_sequence: 6, next_cursor: 'retry-second' }) }, check }), /invalid address synchronization/);
+  assert.equal(pending.addresses.get(addresses[0]).utxos.get(`${hash(1)}:0`).amount, '200');
+  assert.equal(state.addresses.get(addresses[0]).utxos.get(`${hash(1)}:0`).amount, '100');
+});
+
+for (const field of ['height', 'mediantime']) {
+  test(`a cached tip cannot keep its hash while changing ${field}`, async () => {
+    const state = await fixture();
+    await assert.rejects(updateAddressSync(state, { rpc: { request: async () => page([], { tip: { ...tip, [field]: tip[field] + 1 } }) }, check }), /invalid address synchronization/);
+    assert.equal(state.batches[0].cursor, 'start');
+  });
+
+  test(`a frozen paginated tip cannot change ${field} at the same hash`, async () => {
+    const state = await fixture(); let calls = 0;
+    const fresh = { ...tip, height: 101, hash: hash(101), mediantime: tip.mediantime + 1 };
+    await assert.rejects(updateAddressSync(state, { rpc: { request: async () => ++calls === 1
+      ? page([event(1, 'utxo', 'remove', utxo(1))], { tip: fresh, next_cursor: 'middle', has_more: true })
+      : page([], { tip: { ...fresh, [field]: fresh[field] + 1 } }) }, check }), /invalid address synchronization/);
+    assert.equal(state.addresses.get(addr).utxos.size, 1);
+  });
+
+  test(`separate address batches reject contradictory ${field} for the same hash`, async () => {
+    const { state } = await largeFixture(); let calls = 0;
+    const fresh = { ...tip, height: 101, hash: hash(101), mediantime: tip.mediantime + 1 };
+    await assert.rejects(updateAddressSync(state, { rpc: { request: async () => page([], {
+      tip: ++calls === 1 ? fresh : { ...fresh, [field]: fresh[field] + 1 }, next_cursor: `cross-${calls}`,
+    }) }, check }), /invalid address synchronization/);
+    assert.equal(state.batches[0].cursor, 'start');
+    assert.equal(state.batches[1].cursor, 'start');
+  });
+}
+
+
+test('identical normalized upserts and absent removals reuse rows across pages while advancing metadata', async () => {
+  const state = await fixture(), before = state.addresses.get(addr);
+  const pages = [
+    page([event(1, 'history', 'upsert', history(1, { received: '000100', spent: '00', balance_delta: '000100' })),
+      event(2, 'utxo', 'remove', utxo(99))], { next_cursor: 'noop-middle', has_more: true }),
+    page([event(3, 'utxo', 'upsert', utxo(1, { amount: '000100' })),
+      event(4, 'history', 'remove', history(99)),
+      event(5, 'history', 'upsert', history(1))], { next_cursor: 'noop-end' }),
+  ];
+  const next = await updateAddressSync(state, { rpc: { request: async () => pages.shift() }, check });
+  assert.equal(pages.length, 0);
+  assert.equal(next.addresses, state.addresses);
+  assert.equal(next.addresses.get(addr), before);
+  assert.equal(next.addresses.get(addr).history.get(hash(1)), before.history.get(hash(1)));
+  assert.equal(next.addresses.get(addr).utxos.get(hash(1) + ':0'), before.utxos.get(hash(1) + ':0'));
+  assert.equal(next.batches[0].cursor, 'noop-end');
+  assert.equal(next.batches[0].throughSequence, 100);
+  assert.equal(state.batches[0].cursor, 'start');
+  assert.equal(state.batches[0].throughSequence, 0);
+});
+
+test('every changed canonical field still detaches and updates its history or UTXO map', async () => {
+  const cases = [
+    ['history', history(1, { confirmations: 12 })],
+    ['history', history(1, { block_height: 89 })],
+    ['history', history(1, { block_hash: hash(901) })],
+    ['history', history(1, { received: '101', balance_delta: '101' })],
+    ['history', history(1, { spent: '1', balance_delta: '99' })],
+    ['history', history(1, { status: 'pending', block_height: null, block_hash: null, confirmations: 0 })],
+    ['history', history(2)],
+    ['utxo', utxo(1, { confirmations: 12 })],
+    ['utxo', utxo(1, { block_height: 89 })],
+    ['utxo', utxo(1, { amount: '101' })],
+    ['utxo', utxo(1, { coinbase: true })],
+    ['utxo', utxo(1, { mature: false })],
+    ['utxo', utxo(1, { pending_spent_by: hash(2) })],
+    ['utxo', utxo(1, { status: 'pending', block_height: null, confirmations: 0 })],
+    ['utxo', utxo(1, { vout: 1 })],
+    ['utxo', utxo(2)],
+  ];
+  for (const [kind, item] of cases) {
+    const state = await fixture(), before = state.addresses.get(addr);
+    const next = await updateAddressSync(state, { rpc: { request: async () => page([
+      event(1, kind, 'upsert', item), event(2, kind, 'upsert', { ...item }),
+    ]) }, check });
+    const key = kind === 'history' ? item.txid : item.txid + ':' + item.vout;
+    const map = kind === 'history' ? 'history' : 'utxos';
+    const other = kind === 'history' ? 'utxos' : 'history';
+    assert.notEqual(next.addresses.get(addr)[map], before[map]);
+    assert.equal(next.addresses.get(addr)[other], before[other]);
+    assert.deepEqual(next.addresses.get(addr)[map].get(key), kind === 'history' ? syncHistoryRow(item) : syncUtxoRow(item));
+    assert.deepEqual(before.history.get(hash(1)), syncHistoryRow(history(1)));
+    assert.deepEqual(before.utxos.get(hash(1) + ':0'), syncUtxoRow(utxo(1)));
+  }
+});
+
+test('apparently repeated rows and absent removals never bypass item or event validation', async () => {
+  const cases = [
+    event(1, 'history', 'upsert', history(1, { confirmations: -1 })),
+    event(1, 'history', 'upsert', history(1, { received: 100 })),
+    event(1, 'history', 'upsert', history(1, { balance_delta: '99' })),
+    event(1, 'history', 'upsert', history(1, { block_hash: [hash(900)] })),
+    event(1, 'history', 'upsert', history(1), { txid: hash(2) }),
+    event(1, 'utxo', 'upsert', utxo(1, { amount: 100 })),
+    event(1, 'utxo', 'upsert', utxo(1, { pending_spent_by: undefined })),
+    event(1, 'utxo', 'upsert', utxo(1, { mature: 'true' })),
+    event(1, 'utxo', 'upsert', utxo(1), { vout: 2 }),
+    event(1, 'history', 'remove', history(99), { item: history(99) }),
+    event(1, 'utxo', 'remove', utxo(99), { vout: -1 }),
+    event(1, 'history', 'upsert', history(1), { address: 'foreign' }),
+  ];
+  for (const item of cases) {
+    const state = await fixture(), before = state.addresses;
+    await assert.rejects(updateAddressSync(state, { rpc: { request: async () => page([item]) }, check }), /invalid address synchronization/);
+    assert.equal(state.addresses, before);
+    assert.equal(state.batches[0].cursor, 'start');
+  }
+});
+
+test('no-op pages followed by an invalid page do not publish a cursor or alter shared rows', async () => {
+  const state = await fixture(), before = state.addresses; let calls = 0;
+  await assert.rejects(updateAddressSync(state, { rpc: { request: async () => ++calls === 1
+    ? page([event(1, 'history', 'upsert', history(1))], { next_cursor: 'noop-middle', has_more: true })
+    : page([event(1, 'utxo', 'upsert', utxo(1))], { next_cursor: 'noop-end' }) }, check }), /invalid address synchronization/);
+  assert.equal(calls, 2); assert.equal(state.addresses, before);
+  assert.equal(state.batches[0].cursor, 'start');
+  assert.equal(state.batches[0].throughSequence, 0);
+});
+
+test('no-op rows do not conceal journal epoch or same-hash tip contradictions', async () => {
+  for (const extra of [{ journal_epoch: 2 }, { tip: { ...tip, height: 101 } }, { tip: { ...tip, mediantime: tip.mediantime + 1 } }]) {
+    const state = await fixture();
+    await assert.rejects(updateAddressSync(state, { rpc: { request: async () => page([
+      event(1, 'history', 'upsert', history(1)), event(2, 'utxo', 'upsert', utxo(1)),
+    ], extra) }, check }));
+    assert.equal(state.batches[0].cursor, 'start');
+  }
+});
+
+test('no-op events at a new tip still recompute coinbase maturity from the complete tip', async () => {
+  const state = await fixture(), coinbase = utxo(1, { block_height: 2, coinbase: true, mature: false, confirmations: 99 });
+  setAddressBaseline(state, addr, { history: [], utxos: [coinbase] });
+  const before = state.addresses.get(addr);
+  const next = await updateAddressSync(state, { rpc: { request: async () => page([
+    event(1, 'utxo', 'upsert', coinbase), event(2, 'history', 'upsert', history(1)),
+  ], { tip: { ...tip, height: 101, hash: hash(101) } }) }, check });
+  assert.equal(next.addresses.get(addr), before);
+  const snapshot = addressSyncSnapshot(next, [{ address: addr, index: 0, change: 0 }]);
+  assert.equal(snapshot.utxos[0].mature, true); assert.equal(snapshot.utxos[0].confirmations, 100);
+  assert.equal(snapshot.totals.available, 100n);
+  assert.equal(before.utxos.get(hash(1) + ':0').mature, false);
+});
+
+test('no-op events still consume the event work budget without publishing their cursors', async () => {
+  const state = await fixture(), before = state.addresses; let sequence = 0, calls = 0;
+  await assert.rejects(updateAddressSync(state, { rpc: { request: async () => {
+    calls++;
+    const count = Math.min(500, 100001 - sequence);
+    const changes = Array.from({ length: count }, () => event(++sequence, 'utxo', 'remove', utxo(99)));
+    return page(changes, { next_cursor: 'budget-' + calls, through_sequence: 100001, has_more: sequence < 100001 });
+  } }, check }), /local resource limit/);
+  assert.equal(sequence, 100001); assert.equal(calls, 201);
+  assert.equal(state.addresses, before); assert.equal(state.batches[0].cursor, 'start');
+});
+
+test('no-op replay still checks cancellation after its response', async () => {
+  const state = await fixture(); let cancelled = false;
+  await assert.rejects(updateAddressSync(state, { rpc: { request: async () => {
+    cancelled = true; return page([event(1, 'history', 'upsert', history(1))]);
+  } }, check: () => { if (cancelled) throw Object.assign(new Error('cancelled'), { name: 'AbortError' }); } }), { name: 'AbortError' });
+  assert.equal(state.batches[0].cursor, 'start'); assert.equal(state.batches[0].throughSequence, 0);
+});
+
+// Reference the pre-optimization accumulation so every field, insertion order,
+// signed sum and last-address value is compared, not only displayed balances.
+function referenceHistorySnapshot(state, accounts) {
+  const result = new Map();
+  for (const account of accounts) for (const item of state.addresses.get(account.address).history.values()) {
+    const previous = result.get(item.txid);
+    result.set(item.txid, { ...item, confirmations: item.status === 'pending' ? 0 : state.tip.height - item.block_height + 1,
+      net: (previous?.net ?? 0n) + BigInt(item.balance_delta) });
+  }
+  return result;
+}
+
+test('private transaction accumulators match the former projection across repeated multi-address histories', async () => {
+  for (let seed = 1; seed <= 80; seed++) {
+    const accounts = Array.from({ length: 2 + seed % 39 }, (_, index) => ({ address: `snapshot-${seed}-${index}`, index, change: index % 2 }));
+    const state = await beginAddressSync({ rpc: { request: async () => page([], { next_cursor: 'start', through_sequence: 0 }) },
+      network: 'testnet4', addresses: accounts.map(account => account.address), check });
+    for (let index = 0; index < accounts.length; index++) {
+      const items = [];
+      for (let tx = 1; tx <= 31; tx++) {
+        if ((tx + index + seed) % 4 === 0) continue;
+        const received = BigInt((seed * 71 + index * 13 + tx) % 1000), spent = BigInt((seed * 5 + index * 29 + tx) % 1000);
+        items.push(history(tx, { received: received.toString(), spent: spent.toString(), balance_delta: (received - spent).toString(),
+          ...(tx % 7 === 0 ? { status: 'pending', block_height: null, block_hash: null, confirmations: 0 } : {}),
+        }));
+      }
+      setAddressBaseline(state, accounts[index].address, { history: items, utxos: [] });
+      for (const item of state.addresses.get(accounts[index].address).history.values()) Object.freeze(item);
+    }
+    const before = structuredClone(state), expected = referenceHistorySnapshot(state, accounts);
+    const snapshot = addressSyncSnapshot(state, accounts);
+    assert.deepEqual([...snapshot.history], [...expected]);
+    assert.deepEqual(state, before);
+    for (const account of accounts) for (const item of state.addresses.get(account.address).history.values()) {
+      assert.notEqual(snapshot.history.get(item.txid), item);
+      assert.equal(Object.hasOwn(item, 'net'), false);
+    }
+    const repeated = addressSyncSnapshot(state, accounts);
+    assert.deepEqual([...repeated.history], [...expected]);
+    for (const [txid, item] of snapshot.history) assert.notEqual(repeated.history.get(txid), item);
+  }
+});
+
+test('private aggregation retains signed large sums and the final normalized address fields', async () => {
+  const accounts = [0, 1, 2].map(index => ({ address: `large-net-${index}`, index, change: 0 }));
+  const state = await beginAddressSync({ rpc: { request: async () => page() }, network: 'testnet4', addresses: accounts.map(account => account.address), check });
+  const limit = 1000000000000000000n;
+  for (let index = 0; index < accounts.length; index++) {
+    const received = index === 2 ? 0n : limit, spent = index === 2 ? 1n : 0n;
+    setAddressBaseline(state, accounts[index].address, { history: [history(1, {
+      received: received.toString(), spent: spent.toString(), balance_delta: (received - spent).toString(),
+    })], utxos: [] });
+  }
+  const snapshot = addressSyncSnapshot(state, accounts), item = snapshot.history.get(hash(1));
+  assert.equal(item.net, 2n * limit - 1n);
+  assert.equal(item.received, '0'); assert.equal(item.spent, '1'); assert.equal(item.balance_delta, '-1');
+  assert.deepEqual([...snapshot.history], [...referenceHistorySnapshot(state, accounts)]);
+});
+
+test('late contradictory locations and invalid amounts cannot mutate source rows or an earlier projection', async () => {
+  for (const patch of [
+    { block_hash: hash(901) }, { block_height: 89 },
+    { status: 'pending', block_height: null, block_hash: null, confirmations: 0 },
+    { block_height: tip.height + 1 }, { balance_delta: '1000000000000000001' },
+  ]) {
+    const accounts = [0, 1, 2].map(index => ({ address: `failed-aggregation-${index}`, index, change: 0 }));
+    const state = await beginAddressSync({ rpc: { request: async () => page() }, network: 'testnet4', addresses: accounts.map(account => account.address), check });
+    for (const account of accounts) setAddressBaseline(state, account.address, { history: [history(1)], utxos: [] });
+    const published = addressSyncSnapshot(state, accounts), before = structuredClone(published);
+    state.addresses.get(accounts[2].address).history.set(hash(1), Object.freeze({ ...history(1), ...patch }));
+    const source = structuredClone(state);
+    assert.throws(() => addressSyncSnapshot(state, accounts));
+    assert.deepEqual(state, source); assert.deepEqual(published, before);
+  }
+});

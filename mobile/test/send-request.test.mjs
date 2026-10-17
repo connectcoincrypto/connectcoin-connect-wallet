@@ -2,10 +2,44 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bech32m } from '@scure/base';
-import { availableSendAmount, createSendRequest } from '../src/send-request.mjs';
+import { availableSendAmount, createSendRequest, fundingSelectionIsCurrent } from '../src/send-request.mjs';
 
 const address = bech32m.encode('cc', [1, ...bech32m.toWords(secp256k1.Point.BASE.toBytes(true).slice(1))]);
 const draft = { address, amount: '1', feeRate: '1500', subtractFeeFromAmount: false, useAllBalance: false };
+
+test('funding membership matches the original guard for reordered, removed and repeated selections without retaining state', () => {
+  const original = (partial, selected) => !selected?.some(value => !partial.includes(value));
+  for (const partial of [[], ['a'], ['a', 'b'], ['a', 'b', 'c']]) {
+    for (const selected of [null, undefined, [], ['a'], ['b', 'a'], ['a', 'a'], ['a', 'missing'], ['missing', 'a']]) {
+      assert.equal(fundingSelectionIsCurrent(partial, selected), original(partial, selected));
+    }
+  }
+  const partial = ['a', 'b', 'c'], selected = ['c', 'a'];
+  assert.equal(fundingSelectionIsCurrent(partial, selected), true);
+  partial.splice(2, 1); // A subsequent frame/action must see the removal.
+  assert.equal(fundingSelectionIsCurrent(partial, selected), false);
+  partial.push('c'); assert.equal(fundingSelectionIsCurrent(partial, selected), true);
+  assert.deepEqual(selected, ['c', 'a']);
+});
+
+test('large partial selections check every member once and never use repeated linear includes scans', () => {
+  const partial = Array.from({ length: 10000 }, (_, index) => `verified-${index}`);
+  let tested = 0;
+  Object.defineProperty(partial, 'includes', { value: () => { throw new Error('Unexpected quadratic scan'); } });
+  const selected = [...partial].reverse();
+  Object.defineProperty(selected, 'some', { value: callback => Array.prototype.some.call(selected, value => { tested++; return callback(value); }) });
+  assert.equal(fundingSelectionIsCurrent(partial, selected), true);
+  assert.equal(tested, 10000);
+  tested = 0; selected[9999] = 'no-longer-verified';
+  assert.equal(fundingSelectionIsCurrent(partial, selected), false);
+  assert.equal(tested, 10000);
+  // The non-sweep path must still check membership, not bypass validation just
+  // because its selected array is the same freshly validated source array.
+  let sameArrayChecks = 0;
+  Object.defineProperty(partial, 'some', { value: callback => Array.prototype.some.call(partial, value => { sameArrayChecks++; return callback(value); }) });
+  assert.equal(fundingSelectionIsCurrent(partial, partial), true);
+  assert.equal(sameArrayChecks, 10000);
+});
 
 test('Send passes five exact public fields, independent fee modes and decimal normalization', () => {
   assert.deepEqual(createSendRequest({ ...draft, address: ` ${address.toUpperCase()} `, amount: '0001,25', feeRate: '01500.', hex: 'ignored' }),

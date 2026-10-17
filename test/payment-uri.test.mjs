@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 import QRCode from 'qrcode';
+import MaskPattern from 'qrcode/lib/core/mask-pattern.js';
 import { buildPaymentUri, PAYMENT_LABEL_MAX_LENGTH, PAYMENT_MESSAGE_MAX_LENGTH, PAYMENT_URI_MAX_LENGTH } from '../src/core/payment-uri.mjs';
 import { paymentQrDataUrl } from '../src/core/payment-qr.mjs';
 import { WalletService } from '../src/core/wallet-service.mjs';
@@ -79,7 +80,10 @@ test('payment URI rejects address injection and unsupported address shapes', () 
 });
 
 test('payment QR preserves a quiet zone and integer pixels per module for small and large requests', async () => {
-  for (const uri of [baseUri, buildPaymentUri({ address, message: '🍵'.repeat(70) })]) {
+  for (const uri of [baseUri, buildPaymentUri({ address, message: '🍵'.repeat(70) }),
+    buildPaymentUri({ address, amount: '0.0000000001', label: 'Café & shop + 🍵', message: 'pedido?amount=999#x / 50%' }),
+    buildPaymentUri({ address, amount: '100000000', label: 'A'.repeat(100), message: '1234567890'.repeat(20) }),
+    ...[25, 50, 100, 150, 200].map(length => buildPaymentUri({ address, message: 'Aa0123 /'.repeat(25).slice(0, length) }))]) {
     const options = { errorCorrectionLevel: 'M', margin: 4, color: { dark: '#17211b', light: '#ffffff' } };
     const modules = QRCode.create(uri, options).modules.size + 8;
     const width = modules * Math.max(4, Math.ceil(280 / modules));
@@ -91,6 +95,27 @@ test('payment QR preserves a quiet zone and integer pixels per module for small 
     assert.equal(png.readUInt32BE(20), width);
     assert.equal(width % modules, 0);
     assert.ok(width >= 280 && width / modules >= 4);
+  }
+});
+
+test('payment QR reuses every selected mask including zero without a second mask search', async t => {
+  const options = { errorCorrectionLevel: 'M', margin: 4, color: { dark: '#17211b', light: '#ffffff' } };
+  const search = MaskPattern.getBestMask;
+  let selectedMask = 0;
+  // Exercise all valid outcomes deterministically. The real search still runs;
+  // only its choice is overridden in this fixture. Natural automatic choices
+  // and byte-for-byte equivalence are covered by the separate URI corpus test.
+  const chooseMask = t.mock.method(MaskPattern, 'getBestMask', (...args) => {
+    search(...args); return selectedMask;
+  });
+  for (; selectedMask < 8; selectedMask++) {
+    const uri = buildPaymentUri({ address, label: `Request ${selectedMask}` });
+    const modules = QRCode.create(uri, { ...options, maskPattern: selectedMask }).modules.size + 8;
+    const width = modules * Math.max(4, Math.ceil(280 / modules));
+    const expected = await QRCode.toDataURL(uri, { ...options, width, maskPattern: selectedMask });
+    const before = chooseMask.mock.callCount();
+    assert.equal(await paymentQrDataUrl(uri), expected, `PNG changed for mask ${selectedMask}`);
+    assert.equal(chooseMask.mock.callCount() - before, 1, `Repeated mask search for mask ${selectedMask}`);
   }
 });
 

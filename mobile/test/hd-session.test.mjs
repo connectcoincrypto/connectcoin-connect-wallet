@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bech32m } from '@scure/base';
 import { MAINNET_GENESIS } from '../src/model.mjs';
-import { HdWalletSession, nativeHdAccounts, HD_READ_CONCURRENCY } from '../src/hd-session.mjs';
+import { HdWalletSession, nativeHdAccounts, HD_READ_CONCURRENCY, HD_CACHE_HEARTBEAT_MS } from '../src/hd-session.mjs';
 import { availableSendAmount } from '../src/send-request.mjs';
 import { LiveBalance } from '../src/live-balance.mjs';
 
@@ -51,6 +51,103 @@ test('recovery first pages and empty accounts are reused instead of duplicate hi
   assert.equal(availableSendAmount(session.state), '1');
   assert.ok(events.some(progress => progress?.completed === 3 && progress.total === 3));
   assert.equal(session.state.progress, null);
+});
+
+test('private recovery first pages validate once while RPC continuations retain full envelope validation', async t => {
+  const group = recoveryGroup(accounts, { [walletId]: [history(1, '10')] });
+  group.histories[0].next_cursor = 'native.more';
+  const calls = [], descriptor = Object.getOwnPropertyDescriptor;
+  let validations = 0;
+  t.mock.method(Object, 'getOwnPropertyDescriptor', (value, key) => {
+    const result = descriptor(value, key);
+    if (key === 'live' && result?.value === true) validations++;
+    return result;
+  });
+  const session = new HdWalletSession({ query: async () => { throw new Error('Unexpected public query'); },
+    readRecoverySnapshots: async () => ({ walletId, groups: [group] }) });
+  const { candidate, reused } = await session.baseline({ accounts, address: walletId, check: () => {}, progress: () => {},
+    rpc: { request: async (method, params) => {
+      calls.push({ method, params });
+      assert.equal(params.address, walletId);
+      if (method === 'getaddresshistory') {
+        assert.equal(params.cursor, 'native.more');
+        return page(walletId, [history(2, '20')]);
+      }
+      assert.equal(method, 'getaddressutxos'); return page(walletId, [utxo(1, '10')]);
+    } } });
+  assert.equal(validations, accounts.length + 1); // Three seeds, one physical history response.
+  assert.equal(reused, true);
+  assert.deepEqual(calls.map(call => call.method), ['getaddresshistory', 'getaddressutxos']);
+  assert.deepEqual([...candidate.addresses.get(walletId).history.values()], [history(1, '10'), history(2, '20')]);
+  assert.deepEqual(group.histories[0].items, [history(1, '10')]);
+});
+
+test('normalized recovery pages cannot be changed by the hint owner across a baseline await', async () => {
+  const members = makeAccounts(4), group = recoveryGroup(members.slice(0, 3), { [walletId]: [history(1, '10')] });
+  group.sync = journal({ tip: { ...tip }, next_cursor: 'native.checkpoint' });
+  for (const raw of group.histories) raw.tip = { ...tip };
+  let tampered = false;
+  const session = new HdWalletSession({ query: async () => { throw new Error('Unexpected public query'); },
+    readRecoverySnapshots: async () => ({ walletId, groups: [group] }) });
+  const { candidate } = await session.baseline({ accounts: members, address: walletId, check: () => {}, progress: () => {},
+    rpc: { request: async (method, params) => {
+      if (method === 'getaddresschanges') {
+        assert.deepEqual(params.addresses, [members[3].address]);
+        for (const raw of group.histories) {
+          raw.address = 'forged'; raw.unit = 'unknown'; raw.tip.chain = 'testnet4';
+          raw.next_cursor = 'forged.cursor';
+          for (const row of raw.items) row.received = '999999999999999999999';
+          raw.items.push(history(999, '999'));
+        }
+        tampered = true; return journal({ next_cursor: 'missing.checkpoint' });
+      }
+      if (method === 'getaddresshistory') assert.equal(params.address, members[3].address);
+      else assert.equal(method, 'getaddressutxos');
+      return page(params.address, []);
+    } } });
+  assert.equal(tampered, true);
+  assert.deepEqual([...candidate.addresses.get(walletId).history.values()], [history(1, '10')]);
+  assert.equal(candidate.addresses.get(members[1].address).history.size, 0);
+  assert.equal(candidate.addresses.get(members[2].address).history.size, 0);
+  assert.equal(candidate.batches[0].cursor, 'native.checkpoint');
+  assert.deepEqual(candidate.batches[0].tip, tip);
+});
+
+test('untrusted recovery pages still fail full validation and fall back to fresh verified reads', async () => {
+  for (const tamper of [
+    raw => { raw.address = accounts[1].address; },
+    raw => { raw.tip = { ...tip, chain: 'testnet4' }; },
+    raw => { raw.items[0].balance_delta = '9'; },
+    raw => { raw.items[0].extra = true; },
+  ]) {
+    const group = recoveryGroup(accounts, { [walletId]: [history(1, '10')] }); tamper(group.histories[0]);
+    const { session, calls } = fixture({ options: { readRecoverySnapshots: async () => ({ walletId, groups: [group] }) } });
+    assert.equal(await session.loadWallet(info()), true);
+    assert.equal(calls.filter(call => call.method === 'getaddresshistory').length, accounts.length);
+    assert.equal(session.state.history.length, 0); assert.equal(session.state.balance.total, '0');
+  }
+});
+
+test('a validated recovery seed never trusts malformed subsequent RPC history pages', async () => {
+  for (const tamper of [
+    raw => { raw.address = accounts[1].address; },
+    raw => { raw.tip = { ...tip, genesis_hash: hash(999) }; },
+    raw => { raw.items[0].confirmations = 0; },
+    raw => { raw.items[0].extra = true; },
+  ]) {
+    const group = recoveryGroup(accounts, { [walletId]: [history(1, '10')] });
+    group.histories[0].next_cursor = 'native.more';
+    const { session, calls } = fixture({ options: { readRecoverySnapshots: async () => ({ walletId, groups: [group] }) },
+      override: (method, params) => {
+        if (method !== 'getaddresshistory') return;
+        assert.equal(params.cursor, 'native.more');
+        const raw = page(walletId, [history(2, '20')]); tamper(raw); return raw;
+      } });
+    assert.equal(await session.loadWallet(info()), false);
+    assert.equal(calls.filter(call => call.method === 'getaddresshistory').length, 1);
+    assert.equal(session.journal, null); assert.equal(session.recoveryConsumed, false);
+    assert.equal(availableSendAmount(session.state), null);
+  }
 });
 
 test('recovery reuse catches same-tip incoming money and pending spends through the ORIGINAL checkpoint', async () => {
@@ -636,6 +733,61 @@ test('1000 addresses reuse reconciled groups without quadratically repeating old
   assert.ok(changes.length < 110, `unexpected checkpoint requests: ${changes.length}`);
 });
 
+test('indexed partial groups retain original memberships and frozen-page replay as individual accounts become ready', async () => {
+  const members = expandedAccounts.slice(0, 6), gates = members.map(() => deferred()), started = deferred();
+  const stages = [deferred(), deferred(), deferred()], changes = [], partial = [];
+  const groups = [[members[4], members[2], members[0]], [members[5], members[3], members[1]]].map((group, index) => ({
+    ...recoveryGroup(group, Object.fromEntries(group.map(account => [account.address, [history(account.index + 1, '1')]]))),
+    sync: journal({ next_cursor: `seed.${index}` }),
+  }));
+  const original = structuredClone(groups);
+  const freeze = value => { if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); } return value; };
+  groups.forEach(freeze);
+  let reads = 0;
+  const { session } = fixture({ options: {
+    readRecoverySnapshots: async () => ({ walletId, groups }),
+    onChange: state => {
+      if (!state.partial || state.verifiedAddresses.length > 3) return;
+      const count = state.verifiedAddresses.length;
+      partial[count - 1] = state.balance.total; stages[count - 1].resolve();
+    },
+  }, override: async (method, params) => {
+    if (method === 'getaddressutxos') {
+      if (++reads === members.length) started.resolve();
+      const index = members.findIndex(account => account.address === params.address);
+      await gates[index].promise; return page(params.address, [utxo(index + 1, '1')]);
+    }
+    if (method !== 'getaddresschanges') return;
+    const index = params.addresses.includes(members[0].address) ? 0 : 1;
+    assert.deepEqual([...params.addresses].sort(), groups[index].addresses.slice().sort());
+    changes.push({ group: index, cursor: params.cursor });
+    const address = members[index].address, id = index + 1;
+    if (params.cursor === `seed.${index}`) return journal({ through_sequence: 2, has_more: true,
+      next_cursor: `frozen.${index}`, changes: [{ sequence: 1, address, kind: 'history', action: 'upsert',
+        txid: hash(id), item: history(id, '10') }] });
+    if (params.cursor === `frozen.${index}`) return journal({ through_sequence: 2, next_cursor: `live.${index}`,
+      changes: [{ sequence: 2, address, kind: 'utxo', action: 'upsert', txid: hash(id), vout: 0, item: utxo(id, '10') }] });
+    assert.equal(params.cursor, `live.${index}`);
+    return journal({ through_sequence: 2, next_cursor: `live.${index}` });
+  } });
+  const loading = session.loadWallet(info({ accounts: members }));
+  try {
+    await started.promise;
+    for (let index = 0; index < 3; index++) { gates[index].resolve(); await stages[index].promise; }
+    assert.deepEqual(partial, ['10', '20', '21']);
+    assert.deepEqual(changes, [
+      { group: 0, cursor: 'seed.0' }, { group: 0, cursor: 'frozen.0' },
+      { group: 1, cursor: 'seed.1' }, { group: 1, cursor: 'frozen.1' },
+      { group: 0, cursor: 'seed.0' }, { group: 0, cursor: 'frozen.0' },
+    ]);
+    assert.equal(session.journal, null);
+  } finally { gates.forEach(gate => gate.resolve()); }
+  assert.equal(await loading, true);
+  assert.equal(session.state.balance.total, '24'); assert.equal(session.state.history.length, 6);
+  assert.equal(session.journal.batches.length, 2);
+  assert.deepEqual(groups, original);
+});
+
 test('a funded second completion after an empty publication is not lost while all others wait', async () => {
   const emptyPublished = deferred(), fundedPublished = deferred(), second = deferred(), last = deferred();
   const { session } = fixture({ utxos: { [accounts[1].address]: [utxo(2, '20000000000')] }, options: {
@@ -657,4 +809,226 @@ test('a funded second completion after an empty publication is not lost while al
     assert.deepEqual(session.state.fundingAddresses, [accounts[1].address]);
   } finally { second.resolve(); last.resolve(); }
   assert.equal(await loading, true);
+});
+
+test('unchanged reconciled rows reuse the HD projection but still read, validate, advance and emit', async () => {
+  let sequence = 0, emits = 0;
+  const { session, calls } = fixture({ histories: { [walletId]: [history(1, '10000000000')] },
+    utxos: { [walletId]: [utxo(1, '10000000000')] }, options: { onChange: () => emits++ },
+    override: method => method === 'getaddresschanges' ? journal({ through_sequence: ++sequence, next_cursor: `journal.${sequence}` }) : undefined });
+  assert.equal(await session.loadWallet(info()), true);
+  const balance = session.state.balance, full = session.fullHistory, row = session.state.history[0];
+  const generation = session.generation, cursor = session.journal.batches[0].cursor, count = calls.length, emitted = emits;
+  assert.equal(await session.refresh(), true);
+  assert.equal(session.state.balance, balance); assert.equal(session.fullHistory, full); assert.equal(session.state.history[0], row);
+  assert.deepEqual(calls.slice(count).map(call => call.method), ['getaddresschanges']);
+  assert.notEqual(session.journal.batches[0].cursor, cursor); assert.equal(session.generation, generation + 1);
+  assert.ok(emits > emitted); assert.equal(session.state.busy, false); assert.equal(session.state.stale, false);
+  assert.throws(() => { session.state.balance.confirmed = '999'; }, TypeError);
+  assert.throws(() => { row.received = '999'; }, TypeError);
+  assert.throws(() => { row.addresses.push(accounts[1].address); }, TypeError);
+  assert.throws(() => { session.state.balance.tip.height++; }, TypeError);
+});
+
+test('a same-tip journal mutation invalidates projection reuse and never hides malformed later pages', async () => {
+  let mode = 'empty', sequence = 0;
+  const { session } = fixture({ histories: { [walletId]: [history(1, '10000000000')] },
+    utxos: { [walletId]: [utxo(1, '10000000000')] }, override: method => {
+      if (method !== 'getaddresschanges') return;
+      const changes = mode === 'pending' ? [{ sequence: ++sequence, address: walletId, kind: 'utxo', action: 'upsert',
+        txid: hash(1), vout: 0, item: utxo(1, '10000000000', { pending_spent_by: hash(2) }) }] : [];
+      return journal({ changes, through_sequence: sequence, next_cursor: `journal.${sequence}`,
+        ...(mode === 'malformed' ? { has_more: true } : {}) });
+    } });
+  assert.equal(await session.loadWallet(info()), true);
+  const before = session.state.balance;
+  mode = 'pending'; assert.equal(await session.refresh(), true);
+  assert.notEqual(session.state.balance, before); assert.equal(session.state.balance.pending_spent, '10000000000');
+  const current = session.state.balance, cursor = session.journal.batches[0].cursor;
+  mode = 'malformed'; assert.equal(await session.refresh(), false);
+  assert.equal(session.state.balance, current); assert.equal(session.journal.batches[0].cursor, cursor);
+  assert.equal(session.state.stale, true);
+});
+
+test('tip advancement recomputes coinbase maturity even when no rows changed', async () => {
+  let advanced = false;
+  const { session } = fixture({ histories: { [walletId]: [history(1, '10000000000')] },
+    utxos: { [walletId]: [utxo(1, '10000000000', { coinbase: true, mature: false, block_height: 102, confirmations: 99 })] },
+    override: method => method === 'getaddresschanges' && advanced
+      ? journal({ tip: { ...tip, height: 201, hash: hash(201) } }) : undefined });
+  assert.equal(await session.loadWallet(info()), true);
+  const before = session.state.balance;
+  assert.equal(before.immature, '10000000000');
+  advanced = true; assert.equal(await session.refresh(), true);
+  assert.notEqual(session.state.balance, before); assert.equal(session.state.balance.immature, '0');
+  assert.equal(session.state.balance.available_confirmed, '10000000000');
+});
+
+test('projection cache is scoped to descriptors and lifecycle, not the visible history slice', async () => {
+  const { session } = fixture({ histories: { [walletId]: [history(1, '10000000000')] } });
+  assert.equal(await session.loadWallet(info()), true);
+  let before = session.state.balance;
+  const changed = accounts.map((account, index) => index === 1 ? { ...account, index: 9, path: "m/44'/0'/0'/0/9" } : account);
+  await session.loadWallet(info({ accounts: changed })); assert.equal(await session.refresh(), true);
+  assert.notEqual(session.state.balance, before); before = session.state.balance;
+  session.visibleRows = 1000; assert.equal(await session.refresh(), true);
+  assert.equal(session.state.balance, before);
+  await session.invalidate(); assert.equal(await session.refresh(), true);
+  assert.notEqual(session.state.balance, before);
+});
+
+async function cacheSettled(session) {
+  while (session.cacheWriting) await session.cacheWriting;
+}
+
+test('unchanged cache writes are deduplicated while live timestamps advance, with a refresh-only heartbeat', async t => {
+  let now = 1800000000000; t.mock.method(Date, 'now', () => now);
+  const saves = [];
+  const { session } = fixture({ options: { writeCache: async (_, value) => saves.push(value) } });
+  assert.equal(await session.loadWallet(info()), true); await cacheSettled(session);
+  const first = now;
+  assert.equal(saves.length, 1); assert.equal(saves[0].updatedAt, first);
+  now += HD_CACHE_HEARTBEAT_MS - 1;
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(session.state.updatedAt, now); assert.equal(saves.length, 1);
+  now++;
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(saves.length, 2); assert.equal(saves[1].updatedAt, now);
+  // A wall-clock adjustment must not suppress writes indefinitely.
+  now -= 1000;
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(saves.length, 3); assert.equal(saves[2].updatedAt, now);
+});
+
+test('same-tip data changes persist immediately but identical upserts deduplicate after validation', async () => {
+  let changed = false, sequence = 0;
+  const saves = [];
+  const { session } = fixture({ options: { writeCache: async (_, value) => saves.push(value) }, override: method => {
+    if (method !== 'getaddresschanges' || !changed) return;
+    return journal({ changes: [{ sequence: ++sequence, address: walletId, kind: 'history', action: 'upsert',
+      txid: hash(1), item: history(1, '10') }], through_sequence: sequence, next_cursor: `same.${sequence}` });
+  } });
+  await session.loadWallet(info()); await cacheSettled(session);
+  changed = true;
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(saves.length, 2); assert.equal(saves[1].history[0].received, '10');
+  const previousProjection = session.projection.snapshot;
+  // Even when equivalent validated maps have produced a new projection, the
+  // persisted public content (not object identity alone) can be deduplicated.
+  session.projection = null;
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.notEqual(session.projection.snapshot, previousProjection);
+  assert.equal(saves.length, 2);
+  assert.throws(() => { saves[1].history[0].received = '999'; }, TypeError);
+  assert.throws(() => { saves[1].history[0].addresses.push('foreign'); }, TypeError);
+});
+
+test('failed optional persistence is retried and only successful writes deduplicate', async () => {
+  let attempts = 0;
+  const { session } = fixture({ options: { writeCache: async () => { if (++attempts === 1) throw new Error('storage unavailable'); } } });
+  assert.equal(await session.loadWallet(info()), true); await cacheSettled(session);
+  assert.equal(session.cacheSaved, null); assert.equal(session.state.stale, false);
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(attempts, 2); assert.ok(session.cacheSaved);
+  assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(attempts, 2);
+});
+
+test('an uncertain write invalidates the previous success before content returns to that older value', async () => {
+  let amount = '10', sequence = 0, stored = null, attempts = 0;
+  const { session } = fixture({ options: { writeCache: async (_, value) => {
+    stored = value; if (++attempts === 2) throw new Error('write completed but acknowledgment failed');
+  } }, override: (method, params) => {
+    if (method !== 'getaddresschanges' || !params.cursor) return;
+    return journal({ changes: [{ sequence: ++sequence, address: walletId, kind: 'history', action: 'upsert',
+      txid: hash(1), item: history(1, amount) }], through_sequence: sequence, next_cursor: `uncertain.${sequence}` });
+  } });
+  assert.equal(await session.loadWallet(info()), true); await cacheSettled(session);
+  assert.equal(stored.history[0].received, '10');
+  amount = '20'; assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(stored.history[0].received, '20'); assert.equal(session.cacheSaved, null);
+  amount = '10'; assert.equal(await session.refresh(), true); await cacheSettled(session);
+  assert.equal(attempts, 3); assert.equal(stored.history[0].received, '10'); assert.ok(session.cacheSaved);
+});
+
+test('slow cache writes serialize and retain only the latest pending snapshot', async () => {
+  const gate = deferred(), entered = deferred(), saves = [];
+  let active = 0, maximum = 0, amount = 0, sequence = 0;
+  const { session } = fixture({ options: { writeCache: async (_, value) => {
+    active++; maximum = Math.max(maximum, active); saves.push(value);
+    try { if (saves.length === 1) { entered.resolve(); await gate.promise; } } finally { active--; }
+  } }, override: method => {
+    if (method !== 'getaddresschanges' || !amount) return;
+    return journal({ changes: [{ sequence: ++sequence, address: walletId, kind: 'history', action: 'upsert',
+      txid: hash(1), item: history(1, String(amount)) }], through_sequence: sequence, next_cursor: `amount.${sequence}` });
+  } });
+  await session.loadWallet(info()); await entered.promise;
+  try {
+    for (amount = 1; amount <= 8; amount++) assert.equal(await session.refresh(), true);
+    assert.equal(saves.length, 1); assert.equal(session.cacheSaved, null);
+    assert.equal(session.cachePending.state.history[0].received, '8');
+  } finally { gate.resolve(); }
+  await cacheSettled(session);
+  assert.equal(maximum, 1); assert.equal(saves.length, 2);
+  assert.equal(saves[1].history[0].received, '8'); assert.equal(session.cachePending, null);
+});
+
+test('context replacement discards queued cache writes and cannot inherit an old successful write', async () => {
+  const gate = deferred(), entered = deferred(), saves = [];
+  const { session } = fixture({ options: { writeCache: async (_, value) => {
+    saves.push(value); if (saves.length === 1) { entered.resolve(); await gate.promise; }
+  } } });
+  await session.loadWallet(info()); await entered.promise;
+  await session.refresh();
+  assert.ok(session.cachePending);
+  const oldContext = session.cacheContext;
+  await session.invalidate();
+  assert.notEqual(session.cacheContext, oldContext); assert.equal(session.cachePending, null);
+  // Same public content, but from a newly verified context: it must be saved.
+  assert.equal(await session.refresh(), true);
+  gate.resolve(); await cacheSettled(session);
+  assert.equal(saves.length, 2); assert.ok(session.cacheSaved);
+});
+
+test('locking during persistence cannot restore cache state or schedule the discarded queued snapshot', async () => {
+  const gate = deferred(), entered = deferred(), saves = [];
+  const { session } = fixture({ options: { writeCache: async (_, value) => {
+    saves.push(value); entered.resolve(); await gate.promise;
+  } } });
+  await session.loadWallet(info()); await entered.promise; await session.refresh();
+  session.clearAccount(); gate.resolve(); await cacheSettled(session);
+  assert.equal(saves.length, 1); assert.equal(session.cacheSaved, null); assert.equal(session.cachePending, null);
+  assert.equal(session.state.address, ''); assert.equal(session.state.balance, null);
+});
+
+test('cache adapters can trigger a refresh without deadlock, overlap or losing a newer pending value', async () => {
+  let sequence = 0, changed = false, active = 0, maximum = 0;
+  const saves = [];
+  const { session } = fixture({ options: { writeCache: async (_, value) => {
+    active++; maximum = Math.max(maximum, active); saves.push(value);
+    try { if (saves.length === 1) { changed = true; assert.equal(await session.refresh(), true); } } finally { active--; }
+  } }, override: method => {
+    if (method !== 'getaddresschanges' || !changed) return;
+    return journal({ changes: [{ sequence: ++sequence, address: walletId, kind: 'history', action: 'upsert',
+      txid: hash(1), item: history(1, '11') }], through_sequence: sequence, next_cursor: `reentrant.${sequence}` });
+  } });
+  assert.equal(await session.loadWallet(info()), true); await cacheSettled(session);
+  assert.equal(maximum, 1); assert.equal(saves.length, 2); assert.equal(saves[1].history[0].received, '11');
+});
+
+test('HD More reveals a local slice without discarding the complete projection or issuing a read at the end', async () => {
+  const rows = Array.from({ length: 600 }, (_, index) => history(index + 1, '1'));
+  const { session, calls } = fixture({ override: (method, params) => method === 'getaddresshistory' && params.address === walletId
+    ? page(walletId, params.cursor ? rows.slice(500) : rows.slice(0, 500), params.cursor ? null : 'history.more') : undefined });
+  assert.equal(await session.loadWallet(info()), true); await cacheSettled(session);
+  const full = session.fullHistory, projection = session.projection.snapshot, count = calls.length;
+  assert.equal(session.state.history.length, 500);
+  assert.equal(await session.refresh({ more: true }), true);
+  assert.equal(session.state.history.length, 600); assert.equal(session.state.cursor, null); assert.equal(calls.length, count);
+  const generation = session.generation;
+  assert.equal(await session.refresh({ more: true }), false);
+  assert.equal(calls.length, count); assert.equal(session.generation, generation);
+  assert.equal(await session.refresh(), true);
+  assert.equal(session.fullHistory, full); assert.equal(session.projection.snapshot, projection);
+  assert.equal(session.state.history.length, 600);
 });
